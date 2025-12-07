@@ -50,7 +50,8 @@ async fn test_1_encrypted_data_is_unreadable() -> anyhow::Result<()> {
     println!("🔐 Test 1: Encrypted data is unreadable on server");
     println!("   Testing that server-stored data doesn't contain plaintext...");
 
-    let encryption = EncryptionConfig::new();
+    // Use without_privacy so we can inspect raw server data with known keys
+    let encryption = EncryptionConfig::new_without_privacy();
     let config = Config::new("http://localhost:9000")
         .with_token("test-token");
     let encrypted_client = EncryptedClient::new(config.clone(), encryption)?;
@@ -112,8 +113,8 @@ async fn test_2_wrong_key_cannot_decrypt() -> anyhow::Result<()> {
     println!("\n🔐 Test 2: Wrong keys cannot decrypt data");
     println!("   Testing that attacker with different keys cannot read data...");
 
-    // Owner's encryption config
-    let owner_encryption = EncryptionConfig::new();
+    // Owner's encryption config (without privacy for predictable key paths)
+    let owner_encryption = EncryptionConfig::new_without_privacy();
     let owner_config = Config::new("http://localhost:9000")
         .with_token("owner-token");
     let owner_client = EncryptedClient::new(owner_config, owner_encryption)?;
@@ -125,8 +126,8 @@ async fn test_2_wrong_key_cannot_decrypt() -> anyhow::Result<()> {
     let secret = "Bank account: 1234567890, PIN: 9999";
     owner_client.put_object_encrypted(bucket, "bank.txt", secret.as_bytes().to_vec()).await?;
 
-    // Attacker tries with different keys
-    let attacker_encryption = EncryptionConfig::new();
+    // Attacker tries with different keys (also without privacy to use same key path)
+    let attacker_encryption = EncryptionConfig::new_without_privacy();
     let attacker_config = Config::new("http://localhost:9000")
         .with_token("attacker-token");
     let attacker_client = EncryptedClient::new(attacker_config, attacker_encryption)?;
@@ -211,8 +212,8 @@ async fn test_4_key_recovery_works() -> anyhow::Result<()> {
     println!("\n🔐 Test 4: Key recovery functionality");
     println!("   Testing that exported keys can decrypt data...");
 
-    // Original encryption setup
-    let encryption = EncryptionConfig::new();
+    // Original encryption setup (without privacy for predictable key paths)
+    let encryption = EncryptionConfig::new_without_privacy();
     
     // Export the secret key (simulating backup)
     let secret_key_backup = encryption.export_secret_key().to_base64();
@@ -230,7 +231,8 @@ async fn test_4_key_recovery_works() -> anyhow::Result<()> {
 
     // Simulate key loss - create new client with recovered key
     let recovered_secret = SecretKey::from_base64(&secret_key_backup)?;
-    let recovered_encryption = EncryptionConfig::from_secret_key(recovered_secret);
+    let recovered_encryption = EncryptionConfig::from_secret_key(recovered_secret)
+        .with_metadata_privacy(false); // Match original client settings
     let recovered_client = EncryptedClient::new(config, recovered_encryption)?;
 
     // Decrypt with recovered key
@@ -331,7 +333,8 @@ async fn test_7_server_never_sees_plaintext() -> anyhow::Result<()> {
     println!("\n🔐 Test 7: Server-side plaintext isolation");
     println!("   Testing that plaintext never reaches the server...");
 
-    let encryption = EncryptionConfig::new();
+    // Without privacy so we can inspect raw server data with known keys
+    let encryption = EncryptionConfig::new_without_privacy();
     let config = Config::new("http://localhost:9000")
         .with_token("test-token");
     let client = EncryptedClient::new(config.clone(), encryption)?;
