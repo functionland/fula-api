@@ -236,6 +236,10 @@ cargo run --example sharing_demo
 # Metadata Privacy
 cargo run --example metadata_privacy
 
+# Metadata fetch only
+cargo run --example file_manager_demo
+
+
 ```
 
 ## Security

@@ -423,6 +423,276 @@ impl EncryptedClient {
     pub async fn delete_object_by_storage_key(&self, bucket: &str, storage_key: &str) -> Result<()> {
         self.inner.delete_object(bucket, storage_key).await
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // METADATA-ONLY OPERATIONS (No file content download required)
+    // These methods are optimized for file managers and directory browsers
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Get file metadata WITHOUT downloading the file content.
+    /// 
+    /// This is ideal for file managers that need to display file information
+    /// (name, size, type, timestamps) without the bandwidth cost of downloading files.
+    /// 
+    /// Returns decrypted metadata including:
+    /// - Original filename (not the obfuscated storage key)
+    /// - Original file size (not ciphertext size)
+    /// - Content type
+    /// - Timestamps
+    /// - User-defined metadata
+    pub async fn head_object_decrypted(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+    ) -> Result<FileMetadata> {
+        // HEAD request - only gets headers, NOT file content
+        let head_result = self.inner.head_object(bucket, storage_key).await?;
+        
+        // Check if encrypted
+        let is_encrypted = head_result.metadata
+            .get("encrypted")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        if !is_encrypted {
+            return Ok(FileMetadata {
+                storage_key: storage_key.to_string(),
+                original_key: storage_key.to_string(),
+                original_size: head_result.content_length,
+                content_type: head_result.content_type,
+                created_at: None,
+                modified_at: None,
+                user_metadata: HashMap::new(),
+                is_encrypted: false,
+            });
+        }
+
+        // Parse encryption metadata from headers
+        let enc_metadata_str = head_result.metadata
+            .get("encryption")
+            .ok_or_else(|| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption("Missing encryption metadata".to_string())
+            ))?;
+
+        let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(e.to_string())
+            ))?;
+
+        // Unwrap the DEK (needed to decrypt private metadata)
+        let wrapped_key: EncryptedData = serde_json::from_value(
+            enc_metadata["wrapped_key"].clone()
+        ).map_err(|e| ClientError::Encryption(
+            fula_crypto::CryptoError::Decryption(e.to_string())
+        ))?;
+
+        let decryptor = Decryptor::new(self.encryption.key_manager.keypair());
+        let dek = decryptor.decrypt_dek(&wrapped_key)
+            .map_err(ClientError::Encryption)?;
+
+        // Decrypt private metadata if present (this is tiny - just a few hundred bytes)
+        if let Some(private_meta_str) = enc_metadata["private_metadata"].as_str() {
+            let encrypted_meta = EncryptedPrivateMetadata::from_json(private_meta_str)
+                .map_err(ClientError::Encryption)?;
+            let private_meta = encrypted_meta.decrypt(&dek)
+                .map_err(ClientError::Encryption)?;
+            
+            Ok(FileMetadata {
+                storage_key: storage_key.to_string(),
+                original_key: private_meta.original_key,
+                original_size: private_meta.actual_size,
+                content_type: private_meta.content_type,
+                created_at: Some(private_meta.created_at),
+                modified_at: Some(private_meta.modified_at),
+                user_metadata: private_meta.user_metadata,
+                is_encrypted: true,
+            })
+        } else {
+            // No private metadata - use visible metadata
+            Ok(FileMetadata {
+                storage_key: storage_key.to_string(),
+                original_key: storage_key.to_string(),
+                original_size: head_result.content_length,
+                content_type: head_result.content_type,
+                created_at: None,
+                modified_at: None,
+                user_metadata: HashMap::new(),
+                is_encrypted: true,
+            })
+        }
+    }
+
+    /// List all objects in a bucket with decrypted metadata.
+    /// 
+    /// **This does NOT download any file content** - only metadata headers.
+    /// Perfect for building file managers, directory browsers, or sync tools.
+    /// 
+    /// For each file, returns:
+    /// - Original filename (decrypted)
+    /// - Original size
+    /// - Content type
+    /// - Timestamps
+    /// 
+    /// Bandwidth: Only ~1-2KB per file (just headers), not the file content.
+    pub async fn list_objects_decrypted(
+        &self,
+        bucket: &str,
+        options: Option<ListObjectsOptions>,
+    ) -> Result<Vec<FileMetadata>> {
+        // Get list of storage keys
+        let list_result = self.inner.list_objects(bucket, options).await?;
+        
+        let mut files = Vec::with_capacity(list_result.objects.len());
+        
+        for obj in list_result.objects {
+            // HEAD each object to get metadata without downloading content
+            match self.head_object_decrypted(bucket, &obj.key).await {
+                Ok(metadata) => files.push(metadata),
+                Err(e) => {
+                    // Log error but continue with other files
+                    tracing::warn!("Failed to get metadata for {}: {:?}", obj.key, e);
+                    // Include with storage key as fallback
+                    files.push(FileMetadata {
+                        storage_key: obj.key.clone(),
+                        original_key: obj.key,
+                        original_size: obj.size,
+                        content_type: None,
+                        created_at: None,
+                        modified_at: None,
+                        user_metadata: HashMap::new(),
+                        is_encrypted: false,
+                    });
+                }
+            }
+        }
+        
+        Ok(files)
+    }
+
+    /// List objects as a directory tree structure.
+    /// 
+    /// Groups files by their original directory paths for easy tree rendering.
+    /// Does NOT download file content - only metadata.
+    pub async fn list_directory(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<DirectoryListing> {
+        let options = prefix.map(|p| ListObjectsOptions {
+            prefix: Some(p.to_string()),
+            ..Default::default()
+        });
+
+        let files = self.list_objects_decrypted(bucket, options).await?;
+        
+        let mut directories: HashMap<String, Vec<FileMetadata>> = HashMap::new();
+        
+        for file in files {
+            let dir = if let Some(last_slash) = file.original_key.rfind('/') {
+                file.original_key[..last_slash].to_string()
+            } else {
+                "/".to_string()
+            };
+            
+            directories.entry(dir).or_default().push(file);
+        }
+        
+        Ok(DirectoryListing {
+            bucket: bucket.to_string(),
+            prefix: prefix.map(|s| s.to_string()),
+            directories,
+        })
+    }
+}
+
+/// File metadata (without file content) - optimized for file managers
+#[derive(Debug, Clone)]
+pub struct FileMetadata {
+    /// The obfuscated storage key (what server sees)
+    pub storage_key: String,
+    /// Original file name/path (decrypted)
+    pub original_key: String,
+    /// Original file size in bytes (not ciphertext size)
+    pub original_size: u64,
+    /// Content type (MIME type)
+    pub content_type: Option<String>,
+    /// Creation timestamp (Unix seconds)
+    pub created_at: Option<i64>,
+    /// Last modified timestamp (Unix seconds)
+    pub modified_at: Option<i64>,
+    /// User-defined metadata
+    pub user_metadata: HashMap<String, String>,
+    /// Whether file is encrypted
+    pub is_encrypted: bool,
+}
+
+impl FileMetadata {
+    /// Get the filename (last component of path)
+    pub fn filename(&self) -> &str {
+        self.original_key.rsplit('/').next().unwrap_or(&self.original_key)
+    }
+
+    /// Get the directory path (without filename)
+    pub fn directory(&self) -> &str {
+        if let Some(last_slash) = self.original_key.rfind('/') {
+            &self.original_key[..last_slash]
+        } else {
+            ""
+        }
+    }
+
+    /// Get human-readable size
+    pub fn size_human(&self) -> String {
+        const KB: u64 = 1024;
+        const MB: u64 = KB * 1024;
+        const GB: u64 = MB * 1024;
+        
+        if self.original_size >= GB {
+            format!("{:.1} GB", self.original_size as f64 / GB as f64)
+        } else if self.original_size >= MB {
+            format!("{:.1} MB", self.original_size as f64 / MB as f64)
+        } else if self.original_size >= KB {
+            format!("{:.1} KB", self.original_size as f64 / KB as f64)
+        } else {
+            format!("{} B", self.original_size)
+        }
+    }
+}
+
+/// Directory listing result
+#[derive(Debug, Clone)]
+pub struct DirectoryListing {
+    /// Bucket name
+    pub bucket: String,
+    /// Prefix filter (if any)
+    pub prefix: Option<String>,
+    /// Files grouped by directory path
+    pub directories: HashMap<String, Vec<FileMetadata>>,
+}
+
+impl DirectoryListing {
+    /// Get all unique directory paths
+    pub fn get_directories(&self) -> Vec<&str> {
+        self.directories.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Get files in a specific directory
+    pub fn get_files(&self, directory: &str) -> Option<&Vec<FileMetadata>> {
+        self.directories.get(directory)
+    }
+
+    /// Get total file count
+    pub fn file_count(&self) -> usize {
+        self.directories.values().map(|v| v.len()).sum()
+    }
+
+    /// Get total size of all files
+    pub fn total_size(&self) -> u64 {
+        self.directories.values()
+            .flat_map(|v| v.iter())
+            .map(|f| f.original_size)
+            .sum()
+    }
 }
 
 /// Decrypted object information including private metadata

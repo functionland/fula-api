@@ -46,7 +46,7 @@ mod types;
 
 pub use client::FulaClient;
 pub use config::Config;
-pub use encryption::{EncryptedClient, EncryptionConfig, DecryptedObjectInfo};
+pub use encryption::{EncryptedClient, EncryptionConfig, DecryptedObjectInfo, FileMetadata, DirectoryListing};
 pub use error::{ClientError, Result};
 pub use multipart::{MultipartUpload, UploadProgress, ProgressCallback, upload_large_file};
 pub use types::*;
