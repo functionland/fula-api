@@ -405,4 +405,229 @@ mod tests {
             deserialized.encapsulated_key.as_bytes()
         );
     }
+
+    // ==================== Security Tests ====================
+
+    /// Test that tampering with ciphertext is detected
+    #[test]
+    fn test_ciphertext_tampering_detected() {
+        let keypair = KekKeyPair::generate();
+        let plaintext = b"Authenticated message";
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let mut encrypted = encryptor.encrypt(plaintext).unwrap();
+
+        // Tamper with ciphertext
+        if !encrypted.ciphertext.is_empty() {
+            encrypted.ciphertext[0] ^= 0xFF;
+        }
+
+        let decryptor = Decryptor::new(&keypair);
+        assert!(decryptor.decrypt(&encrypted).is_err(), "Tampered ciphertext should fail");
+    }
+
+    /// Test that tampering with nonce is detected
+    #[test]
+    fn test_nonce_tampering_detected() {
+        let keypair = KekKeyPair::generate();
+        let plaintext = b"Message with nonce integrity";
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let mut encrypted = encryptor.encrypt(plaintext).unwrap();
+
+        // Tamper with nonce
+        let mut nonce_bytes = encrypted.nonce.as_bytes().to_vec();
+        nonce_bytes[0] ^= 0x01;
+        encrypted.nonce = Nonce::from_bytes(&nonce_bytes).unwrap();
+
+        let decryptor = Decryptor::new(&keypair);
+        assert!(decryptor.decrypt(&encrypted).is_err(), "Tampered nonce should fail");
+    }
+
+    /// Test that tampering with encapsulated key is detected
+    #[test]
+    fn test_encapsulated_key_tampering_detected() {
+        let keypair = KekKeyPair::generate();
+        let plaintext = b"Message with key integrity";
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let mut encrypted = encryptor.encrypt(plaintext).unwrap();
+
+        // Tamper with encapsulated key
+        encrypted.encapsulated_key.ephemeral_public[0] ^= 0x01;
+
+        let decryptor = Decryptor::new(&keypair);
+        assert!(decryptor.decrypt(&encrypted).is_err(), "Tampered encapsulated key should fail");
+    }
+
+    /// Test that same plaintext produces different ciphertexts (semantic security)
+    #[test]
+    fn test_semantic_security() {
+        let keypair = KekKeyPair::generate();
+        let plaintext = b"Same message encrypted multiple times";
+
+        let encryptor = Encryptor::new(keypair.public_key());
+
+        let encrypted1 = encryptor.encrypt(plaintext).unwrap();
+        let encrypted2 = encryptor.encrypt(plaintext).unwrap();
+        let encrypted3 = encryptor.encrypt(plaintext).unwrap();
+
+        // All ciphertexts should be different
+        assert_ne!(encrypted1.ciphertext, encrypted2.ciphertext);
+        assert_ne!(encrypted2.ciphertext, encrypted3.ciphertext);
+        assert_ne!(encrypted1.ciphertext, encrypted3.ciphertext);
+
+        // All nonces should be different
+        assert_ne!(encrypted1.nonce.as_bytes(), encrypted2.nonce.as_bytes());
+        assert_ne!(encrypted2.nonce.as_bytes(), encrypted3.nonce.as_bytes());
+
+        // All encapsulated keys should be different (ephemeral keys)
+        assert_ne!(
+            encrypted1.encapsulated_key.as_bytes(),
+            encrypted2.encapsulated_key.as_bytes()
+        );
+    }
+
+    /// Test that ciphertext doesn't contain plaintext patterns
+    #[test]
+    fn test_no_plaintext_leakage() {
+        let keypair = KekKeyPair::generate();
+        let plaintext = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";  // Repeated pattern
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let encrypted = encryptor.encrypt(plaintext).unwrap();
+
+        // Ciphertext should not contain long runs of the same byte
+        let max_run = encrypted.ciphertext.windows(4)
+            .filter(|w| w.iter().all(|&b| b == w[0]))
+            .count();
+        
+        assert!(max_run < 3, "Ciphertext may leak plaintext patterns");
+    }
+
+    /// Test key isolation - one keypair cannot decrypt another's data
+    #[test]
+    fn test_key_isolation() {
+        let keypair1 = KekKeyPair::generate();
+        let keypair2 = KekKeyPair::generate();
+        let keypair3 = KekKeyPair::generate();
+
+        let encryptor1 = Encryptor::new(keypair1.public_key());
+        let encrypted = encryptor1.encrypt(b"secret for keypair1").unwrap();
+
+        // Only keypair1 can decrypt
+        let decryptor1 = Decryptor::new(&keypair1);
+        assert!(decryptor1.decrypt(&encrypted).is_ok());
+
+        // keypair2 and keypair3 cannot decrypt
+        let decryptor2 = Decryptor::new(&keypair2);
+        let decryptor3 = Decryptor::new(&keypair3);
+        assert!(decryptor2.decrypt(&encrypted).is_err());
+        assert!(decryptor3.decrypt(&encrypted).is_err());
+    }
+
+    /// Test empty plaintext handling
+    #[test]
+    fn test_empty_plaintext() {
+        let keypair = KekKeyPair::generate();
+        let plaintext = b"";
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let encrypted = encryptor.encrypt(plaintext).unwrap();
+
+        let decryptor = Decryptor::new(&keypair);
+        let decrypted = decryptor.decrypt(&encrypted).unwrap();
+
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+    }
+
+    /// Test large message handling
+    #[test]
+    fn test_large_message() {
+        let keypair = KekKeyPair::generate();
+        let plaintext = vec![0x42u8; 1024 * 1024];  // 1 MB
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let encrypted = encryptor.encrypt(&plaintext).unwrap();
+
+        let decryptor = Decryptor::new(&keypair);
+        let decrypted = decryptor.decrypt(&encrypted).unwrap();
+
+        assert_eq!(plaintext, decrypted);
+    }
+
+    /// Test binary data with all byte values
+    #[test]
+    fn test_binary_data() {
+        let keypair = KekKeyPair::generate();
+        let plaintext: Vec<u8> = (0..=255).collect();
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let encrypted = encryptor.encrypt(&plaintext).unwrap();
+
+        let decryptor = Decryptor::new(&keypair);
+        let decrypted = decryptor.decrypt(&encrypted).unwrap();
+
+        assert_eq!(plaintext, decrypted);
+    }
+
+    /// Test that version field is correctly set
+    #[test]
+    fn test_version_field() {
+        let keypair = KekKeyPair::generate();
+        let encryptor = Encryptor::new(keypair.public_key());
+        let encrypted = encryptor.encrypt(b"test").unwrap();
+
+        assert_eq!(encrypted.version, crate::CRYPTO_VERSION);
+    }
+
+    /// Test decryption from secret key directly
+    #[test]
+    fn test_decrypt_from_secret_key() {
+        let keypair = KekKeyPair::generate();
+        let plaintext = b"Decrypt using secret key directly";
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let encrypted = encryptor.encrypt(plaintext).unwrap();
+
+        // Decrypt using secret key directly
+        let decryptor = Decryptor::from_secret_key(keypair.secret_key());
+        let decrypted = decryptor.decrypt(&encrypted).unwrap();
+
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+    }
+
+    /// Test that truncated ciphertext fails
+    #[test]
+    fn test_truncated_ciphertext_fails() {
+        let keypair = KekKeyPair::generate();
+        let plaintext = b"Message that will be truncated";
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let mut encrypted = encryptor.encrypt(plaintext).unwrap();
+
+        // Truncate ciphertext
+        if encrypted.ciphertext.len() > 10 {
+            encrypted.ciphertext.truncate(encrypted.ciphertext.len() - 10);
+        }
+
+        let decryptor = Decryptor::new(&keypair);
+        assert!(decryptor.decrypt(&encrypted).is_err(), "Truncated ciphertext should fail");
+    }
+
+    /// Test that appended data fails
+    #[test]
+    fn test_appended_data_fails() {
+        let keypair = KekKeyPair::generate();
+        let plaintext = b"Original message";
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let mut encrypted = encryptor.encrypt(plaintext).unwrap();
+
+        // Append extra data
+        encrypted.ciphertext.extend_from_slice(b"extra garbage");
+
+        let decryptor = Decryptor::new(&keypair);
+        assert!(decryptor.decrypt(&encrypted).is_err(), "Appended data should fail");
+    }
 }

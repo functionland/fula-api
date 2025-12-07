@@ -403,6 +403,16 @@
     white-space: pre;
 }
 
+/* Section CTA */
+.section-cta {
+    margin-top: 32px;
+    text-align: center;
+}
+
+.section-cta .btn {
+    display: inline-block;
+}
+
 /* Data Structures */
 .ds-grid {
     display: grid;

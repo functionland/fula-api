@@ -1,0 +1,1023 @@
+/* Security Page Specific Styles */
+
+.security-content {
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+.security-hero {
+    background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-primary) 100%);
+    padding: 3rem 2rem;
+    border-radius: 12px;
+    margin-bottom: 2rem;
+    text-align: center;
+}
+
+.security-hero h1 {
+    font-size: 2.5rem;
+    margin-bottom: 1rem;
+}
+
+.security-hero .hero-subtitle {
+    font-size: 1.2rem;
+    color: var(--text-secondary);
+    margin-bottom: 1.5rem;
+}
+
+.hero-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    justify-content: center;
+}
+
+.badge-item {
+    background: var(--bg-tertiary);
+    padding: 0.5rem 1rem;
+    border-radius: 20px;
+    font-size: 0.9rem;
+    border: 1px solid var(--border-color);
+}
+
+/* Section Styling */
+.security-section {
+    padding: 2.5rem 2rem;
+    margin-bottom: 1rem;
+    border-radius: 12px;
+}
+
+.security-section h2 {
+    font-size: 1.8rem;
+    margin-bottom: 1.5rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 2px solid var(--accent-color);
+}
+
+.security-section.alt-bg {
+    background: var(--bg-secondary);
+}
+
+.section-intro {
+    font-size: 1.1rem;
+    color: var(--text-secondary);
+    margin-bottom: 2rem;
+}
+
+/* Security Summary Grid */
+.security-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+}
+
+.summary-card {
+    background: var(--bg-tertiary);
+    padding: 1.5rem;
+    border-radius: 10px;
+    text-align: center;
+    border: 1px solid var(--border-color);
+}
+
+.summary-icon {
+    font-size: 2.5rem;
+    margin-bottom: 0.75rem;
+}
+
+.summary-card h3 {
+    font-size: 1rem;
+    margin-bottom: 0.5rem;
+}
+
+.summary-card p {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+}
+
+/* Crypto Stack Table */
+.crypto-stack {
+    margin-top: 2rem;
+}
+
+.crypto-stack h3 {
+    margin-bottom: 1rem;
+}
+
+.crypto-table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--bg-tertiary);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.crypto-table th,
+.crypto-table td {
+    padding: 0.75rem 1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.crypto-table th {
+    background: var(--bg-secondary);
+    font-weight: 600;
+}
+
+.crypto-table tr:last-child td {
+    border-bottom: none;
+}
+
+/* Trust Model */
+.trust-diagram {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 2rem;
+    flex-wrap: wrap;
+    margin-bottom: 2rem;
+}
+
+.trust-zone {
+    flex: 1;
+    min-width: 280px;
+    max-width: 400px;
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.trust-zone.trusted {
+    background: linear-gradient(135deg, #1a3d1a 0%, #0d1f0d 100%);
+    border: 2px solid #2d6a2d;
+}
+
+.trust-zone.untrusted {
+    background: linear-gradient(135deg, #3d1a1a 0%, #1f0d0d 100%);
+    border: 2px solid #6a2d2d;
+}
+
+.zone-header {
+    padding: 1rem;
+    font-weight: 600;
+    font-size: 1rem;
+    text-align: center;
+}
+
+.zone-content {
+    padding: 1rem;
+}
+
+.zone-item {
+    padding: 0.75rem;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 6px;
+    margin-bottom: 0.5rem;
+}
+
+.zone-item strong {
+    display: block;
+    margin-bottom: 0.25rem;
+}
+
+.zone-item span {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.trust-arrow {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.arrow-label {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.arrow-icon {
+    font-size: 2rem;
+    color: var(--accent-color);
+}
+
+.trust-assumptions {
+    background: var(--bg-tertiary);
+    padding: 1.5rem;
+    border-radius: 8px;
+    border-left: 4px solid var(--accent-color);
+}
+
+.trust-assumptions h3 {
+    margin-bottom: 1rem;
+}
+
+.trust-assumptions li {
+    margin-bottom: 0.5rem;
+}
+
+/* Flow Diagram Detailed */
+.flow-diagram-detailed {
+    margin-top: 1rem;
+}
+
+.flow-diagram-detailed h3 {
+    margin: 2rem 0 1rem 0;
+    padding: 0.75rem 1rem;
+    background: var(--bg-tertiary);
+    border-radius: 8px;
+}
+
+.flow-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+}
+
+.flow-step-detailed {
+    background: var(--bg-tertiary);
+    border-radius: 10px;
+    border: 1px solid var(--border-color);
+    overflow: hidden;
+}
+
+.step-header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 1rem;
+    background: var(--bg-secondary);
+}
+
+.step-num {
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--accent-color);
+    color: white;
+    border-radius: 50%;
+    font-weight: 600;
+}
+
+.step-title {
+    font-weight: 600;
+    font-size: 1.1rem;
+}
+
+.step-body {
+    padding: 1rem;
+}
+
+.step-body p {
+    margin-bottom: 1rem;
+    color: var(--text-secondary);
+}
+
+.code-snippet {
+    background: var(--bg-primary);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.code-snippet pre {
+    padding: 1rem;
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+    font-size: 0.85rem;
+    overflow-x: auto;
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.flow-connector-v {
+    width: 2px;
+    height: 30px;
+    background: var(--accent-color);
+    margin: 0 auto;
+}
+
+/* Key Architecture */
+.key-arch-diagram {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    margin-bottom: 2rem;
+}
+
+.key-tier {
+    width: 100%;
+    max-width: 600px;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 2px solid var(--border-color);
+}
+
+.key-tier.kek-tier {
+    border-color: #6366f1;
+}
+
+.key-tier.dek-tier {
+    border-color: #10b981;
+}
+
+.key-tier.data-tier {
+    border-color: #f59e0b;
+}
+
+.tier-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 1rem;
+    background: var(--bg-secondary);
+}
+
+.tier-icon {
+    font-size: 1.5rem;
+}
+
+.tier-title {
+    font-weight: 600;
+    font-size: 1.1rem;
+}
+
+.tier-body {
+    padding: 1rem;
+    background: var(--bg-tertiary);
+}
+
+.tier-details {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+}
+
+.detail-item {
+    font-size: 0.9rem;
+}
+
+.key-components {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.key-component {
+    flex: 1;
+    min-width: 200px;
+    padding: 0.75rem;
+    background: var(--bg-primary);
+    border-radius: 6px;
+}
+
+.component-label {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+}
+
+.component-desc {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.key-arrow {
+    padding: 1rem;
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 1.2rem;
+}
+
+.key-benefits {
+    margin-top: 2rem;
+}
+
+.key-benefits h3 {
+    margin-bottom: 1rem;
+}
+
+.benefits-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 1rem;
+}
+
+.benefit-card {
+    padding: 1rem;
+    background: var(--bg-tertiary);
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+}
+
+.benefit-card strong {
+    display: block;
+    margin-bottom: 0.5rem;
+}
+
+.benefit-card p {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+}
+
+/* HPKE Section */
+.hpke-details {
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+}
+
+.hpke-config {
+    background: var(--bg-tertiary);
+    padding: 1.5rem;
+    border-radius: 10px;
+}
+
+.config-table {
+    width: 100%;
+}
+
+.config-table td {
+    padding: 0.5rem 0;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.config-table tr:last-child td {
+    border-bottom: none;
+}
+
+.hpke-diagram {
+    background: var(--bg-tertiary);
+    padding: 1.5rem;
+    border-radius: 10px;
+}
+
+.diagram-box {
+    background: var(--bg-primary);
+    border-radius: 8px;
+    overflow-x: auto;
+}
+
+.diagram-ascii {
+    padding: 1rem;
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    white-space: pre;
+    margin: 0;
+}
+
+.hpke-properties {
+    background: var(--bg-tertiary);
+    padding: 1.5rem;
+    border-radius: 10px;
+}
+
+.properties-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.property-item {
+    display: flex;
+    gap: 1rem;
+    padding: 1rem;
+    background: var(--bg-primary);
+    border-radius: 8px;
+}
+
+.property-icon {
+    font-size: 1.5rem;
+}
+
+.property-content strong {
+    display: block;
+    margin-bottom: 0.25rem;
+}
+
+.property-content p {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+}
+
+/* Symmetric Encryption */
+.cipher-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+}
+
+.cipher-card {
+    background: var(--bg-tertiary);
+    border-radius: 10px;
+    padding: 1.5rem;
+    border: 2px solid var(--border-color);
+    position: relative;
+}
+
+.cipher-card.primary {
+    border-color: var(--accent-color);
+}
+
+.cipher-badge {
+    position: absolute;
+    top: -10px;
+    right: 20px;
+    background: var(--accent-color);
+    color: white;
+    padding: 0.25rem 0.75rem;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+.cipher-badge.alt {
+    background: var(--text-secondary);
+}
+
+.cipher-card h4 {
+    margin-bottom: 1rem;
+    font-size: 1.1rem;
+}
+
+.cipher-card ul {
+    list-style: none;
+    padding: 0;
+}
+
+.cipher-card li {
+    margin-bottom: 0.5rem;
+    font-size: 0.9rem;
+}
+
+.aead-structure {
+    margin-bottom: 2rem;
+}
+
+.structure-diagram {
+    background: var(--bg-tertiary);
+    padding: 1.5rem;
+    border-radius: 10px;
+}
+
+.structure-row {
+    display: flex;
+    margin-bottom: 1rem;
+}
+
+.structure-item {
+    padding: 1rem;
+    border-radius: 6px;
+    text-align: center;
+}
+
+.structure-item.ciphertext-part {
+    flex: 3;
+    background: #3b82f6;
+}
+
+.structure-item.tag-part {
+    flex: 1;
+    background: #10b981;
+}
+
+.part-label {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+}
+
+.part-desc {
+    font-size: 0.85rem;
+    opacity: 0.9;
+}
+
+.structure-formula {
+    text-align: center;
+    padding: 0.75rem;
+    background: var(--bg-primary);
+    border-radius: 6px;
+}
+
+.nonce-handling {
+    background: var(--bg-tertiary);
+    padding: 1.5rem;
+    border-radius: 10px;
+}
+
+.nonce-info > p {
+    color: #f59e0b;
+    font-weight: 600;
+    margin-bottom: 1rem;
+}
+
+.nonce-strategy {
+    background: var(--bg-primary);
+    padding: 1rem;
+    border-radius: 8px;
+}
+
+.nonce-strategy h4 {
+    margin-bottom: 0.75rem;
+}
+
+/* Integrity Section */
+.layers-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+}
+
+.layer-card {
+    background: var(--bg-tertiary);
+    border-radius: 10px;
+    padding: 1.5rem;
+    border: 1px solid var(--border-color);
+    position: relative;
+}
+
+.layer-num {
+    position: absolute;
+    top: -12px;
+    left: 20px;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--accent-color);
+    color: white;
+    border-radius: 50%;
+    font-weight: 600;
+}
+
+.layer-card h4 {
+    margin-bottom: 0.75rem;
+    padding-top: 0.5rem;
+}
+
+.layer-card p {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    margin-bottom: 1rem;
+}
+
+.layer-check {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem;
+    background: var(--bg-primary);
+    border-radius: 6px;
+    font-size: 0.85rem;
+}
+
+.check-icon {
+    font-size: 1.2rem;
+}
+
+.blake3-section,
+.bao-section {
+    background: var(--bg-tertiary);
+    padding: 1.5rem;
+    border-radius: 10px;
+    margin-bottom: 1.5rem;
+}
+
+.blake3-features {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1rem;
+}
+
+.blake3-features .feature {
+    padding: 1rem;
+    background: var(--bg-primary);
+    border-radius: 8px;
+}
+
+.blake3-features .feature strong {
+    display: block;
+    margin-bottom: 0.5rem;
+}
+
+.blake3-features .feature p {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.bao-diagram {
+    background: var(--bg-primary);
+    border-radius: 8px;
+    overflow-x: auto;
+}
+
+/* Key Management */
+.key-mgmt-details {
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+}
+
+.key-generation,
+.key-rotation,
+.key-backup,
+.key-zeroization {
+    background: var(--bg-tertiary);
+    padding: 1.5rem;
+    border-radius: 10px;
+}
+
+.rotation-process {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+}
+
+.rotation-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 1rem;
+    padding: 0.75rem;
+    background: var(--bg-primary);
+    border-radius: 8px;
+}
+
+.rotation-num {
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--accent-color);
+    color: white;
+    border-radius: 50%;
+    font-weight: 600;
+    flex-shrink: 0;
+}
+
+.rotation-content strong {
+    display: block;
+    margin-bottom: 0.25rem;
+}
+
+.rotation-content p {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.rotation-note {
+    padding: 0.75rem;
+    background: var(--bg-primary);
+    border-left: 4px solid var(--accent-color);
+    border-radius: 0 6px 6px 0;
+    font-size: 0.9rem;
+}
+
+.backup-warning {
+    display: flex;
+    gap: 1rem;
+    padding: 1rem;
+    background: #3d1a1a;
+    border-radius: 8px;
+    border: 1px solid #6a2d2d;
+    margin-bottom: 1.5rem;
+}
+
+.warning-icon {
+    font-size: 2rem;
+}
+
+.warning-content strong {
+    display: block;
+    margin-bottom: 0.5rem;
+    color: #f87171;
+}
+
+.warning-content p {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+}
+
+.backup-options h4 {
+    margin-bottom: 0.75rem;
+}
+
+.backup-options ul {
+    list-style: none;
+    padding: 0;
+}
+
+.backup-options li {
+    margin-bottom: 0.75rem;
+    padding: 0.75rem;
+    background: var(--bg-primary);
+    border-radius: 6px;
+}
+
+.backup-options code {
+    background: var(--bg-secondary);
+    padding: 0.2rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.85rem;
+}
+
+.zeroization-info ul {
+    list-style: none;
+    padding: 0;
+    margin-bottom: 1rem;
+}
+
+.zeroization-info li {
+    margin-bottom: 0.5rem;
+    padding-left: 1.5rem;
+    position: relative;
+}
+
+.zeroization-info li::before {
+    content: "✓";
+    position: absolute;
+    left: 0;
+    color: #10b981;
+}
+
+/* Guarantees Section */
+.guarantees-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+    gap: 1.5rem;
+}
+
+.guarantee-card {
+    background: var(--bg-tertiary);
+    border-radius: 10px;
+    padding: 1.5rem;
+}
+
+.guarantee-card.provided {
+    border: 2px solid #10b981;
+}
+
+.guarantee-card.not-provided {
+    border: 2px solid #f59e0b;
+}
+
+.guarantee-card h3 {
+    margin-bottom: 1rem;
+}
+
+.guarantee-card ul {
+    list-style: none;
+    padding: 0;
+}
+
+.guarantee-card li {
+    margin-bottom: 0.75rem;
+    padding: 0.5rem 0;
+    border-bottom: 1px solid var(--border-color);
+    font-size: 0.9rem;
+}
+
+.guarantee-card li:last-child {
+    border-bottom: none;
+}
+
+/* Threat Model */
+.threat-analysis {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+    gap: 1.5rem;
+}
+
+.threat-category {
+    background: var(--bg-tertiary);
+    border-radius: 10px;
+    padding: 1.5rem;
+}
+
+.threat-category.protected {
+    border: 2px solid #10b981;
+}
+
+.threat-category.not-protected {
+    border: 2px solid #f59e0b;
+}
+
+.threat-category h3 {
+    margin-bottom: 1rem;
+}
+
+.threat-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.threat-item {
+    padding: 0.75rem;
+    background: var(--bg-primary);
+    border-radius: 8px;
+}
+
+.threat-item strong {
+    display: block;
+    margin-bottom: 0.25rem;
+}
+
+.threat-item p {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+/* Best Practices */
+.practices-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1.5rem;
+}
+
+.practice-card {
+    background: var(--bg-tertiary);
+    border-radius: 10px;
+    padding: 1.5rem;
+    border: 1px solid var(--border-color);
+}
+
+.practice-icon {
+    font-size: 2rem;
+    margin-bottom: 1rem;
+}
+
+.practice-card h3 {
+    margin-bottom: 1rem;
+}
+
+.practice-card ul {
+    list-style: none;
+    padding: 0;
+}
+
+.practice-card li {
+    margin-bottom: 0.5rem;
+    padding-left: 1.25rem;
+    position: relative;
+    font-size: 0.9rem;
+}
+
+.practice-card li::before {
+    content: "•";
+    position: absolute;
+    left: 0;
+    color: var(--accent-color);
+}
+
+/* Footer */
+footer {
+    text-align: center;
+    padding: 2rem;
+    border-top: 1px solid var(--border-color);
+    margin-top: 2rem;
+}
+
+.footer-links a {
+    color: var(--text-secondary);
+    text-decoration: none;
+}
+
+.footer-links a:hover {
+    color: var(--accent-color);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .security-hero h1 {
+        font-size: 1.8rem;
+    }
+
+    .security-section {
+        padding: 1.5rem 1rem;
+    }
+
+    .trust-diagram {
+        flex-direction: column;
+    }
+
+    .trust-arrow {
+        transform: rotate(90deg);
+    }
+
+    .diagram-ascii {
+        font-size: 0.6rem;
+    }
+
+    .guarantees-grid,
+    .threat-analysis {
+        grid-template-columns: 1fr;
+    }
+}

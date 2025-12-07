@@ -291,4 +291,245 @@ mod tests {
         assert_eq!(nonce.as_bytes()[NONCE_SIZE - 1], 0);
         assert_eq!(nonce.as_bytes()[NONCE_SIZE - 2], 1);
     }
+
+    // ==================== Security Tests ====================
+
+    /// Test that wrong key fails to decrypt
+    #[test]
+    fn test_wrong_key_fails() {
+        let key1 = DekKey::generate();
+        let key2 = DekKey::generate();
+        let plaintext = b"Secret message";
+        
+        let (nonce, ciphertext) = encrypt(&key1, plaintext).unwrap();
+        let result = decrypt(&key2, &nonce, &ciphertext);
+        
+        assert!(result.is_err(), "Wrong key should fail to decrypt");
+    }
+
+    /// Test that tampered ciphertext fails authentication
+    #[test]
+    fn test_ciphertext_tampering_detected() {
+        let key = DekKey::generate();
+        let plaintext = b"Authenticated message";
+        
+        let (nonce, mut ciphertext) = encrypt(&key, plaintext).unwrap();
+        
+        // Tamper with ciphertext
+        if !ciphertext.is_empty() {
+            ciphertext[0] ^= 0xFF;
+        }
+        
+        let result = decrypt(&key, &nonce, &ciphertext);
+        assert!(result.is_err(), "Tampered ciphertext should fail");
+    }
+
+    /// Test that tampered authentication tag fails
+    #[test]
+    fn test_tag_tampering_detected() {
+        let key = DekKey::generate();
+        let plaintext = b"Message with tag";
+        
+        let (nonce, mut ciphertext) = encrypt(&key, plaintext).unwrap();
+        
+        // Tamper with the last byte (part of the auth tag)
+        if !ciphertext.is_empty() {
+            let last = ciphertext.len() - 1;
+            ciphertext[last] ^= 0x01;
+        }
+        
+        let result = decrypt(&key, &nonce, &ciphertext);
+        assert!(result.is_err(), "Tampered tag should fail");
+    }
+
+    /// Test that wrong nonce fails to decrypt correctly
+    #[test]
+    fn test_wrong_nonce_fails() {
+        let key = DekKey::generate();
+        let plaintext = b"Nonce-protected message";
+        
+        let (nonce1, ciphertext) = encrypt(&key, plaintext).unwrap();
+        let nonce2 = Nonce::generate();
+        
+        // Different nonce should fail
+        assert_ne!(nonce1.as_bytes(), nonce2.as_bytes());
+        let result = decrypt(&key, &nonce2, &ciphertext);
+        assert!(result.is_err(), "Wrong nonce should fail to decrypt");
+    }
+
+    /// Test that truncated ciphertext fails
+    #[test]
+    fn test_truncated_ciphertext_fails() {
+        let key = DekKey::generate();
+        let plaintext = b"Message to truncate";
+        
+        let (nonce, mut ciphertext) = encrypt(&key, plaintext).unwrap();
+        
+        // Truncate the ciphertext
+        ciphertext.truncate(ciphertext.len() / 2);
+        
+        let result = decrypt(&key, &nonce, &ciphertext);
+        assert!(result.is_err(), "Truncated ciphertext should fail");
+    }
+
+    /// Test that appended data fails
+    #[test]
+    fn test_appended_data_fails() {
+        let key = DekKey::generate();
+        let plaintext = b"Original message";
+        
+        let (nonce, mut ciphertext) = encrypt(&key, plaintext).unwrap();
+        
+        // Append extra data
+        ciphertext.extend_from_slice(b"extra");
+        
+        let result = decrypt(&key, &nonce, &ciphertext);
+        assert!(result.is_err(), "Appended data should fail");
+    }
+
+    /// Test nonce uniqueness
+    #[test]
+    fn test_nonce_uniqueness() {
+        let mut nonces = std::collections::HashSet::new();
+        
+        for _ in 0..1000 {
+            let nonce = Nonce::generate();
+            let nonce_bytes = nonce.as_bytes().to_vec();
+            assert!(nonces.insert(nonce_bytes), "Nonce collision detected!");
+        }
+    }
+
+    /// Test same plaintext produces different ciphertexts (due to random nonce)
+    #[test]
+    fn test_ciphertext_randomness() {
+        let key = DekKey::generate();
+        let plaintext = b"Same message";
+        
+        let (_, ct1) = encrypt(&key, plaintext).unwrap();
+        let (_, ct2) = encrypt(&key, plaintext).unwrap();
+        let (_, ct3) = encrypt(&key, plaintext).unwrap();
+        
+        assert_ne!(ct1, ct2, "Ciphertexts should be different");
+        assert_ne!(ct2, ct3, "Ciphertexts should be different");
+        assert_ne!(ct1, ct3, "Ciphertexts should be different");
+    }
+
+    /// Test empty plaintext handling
+    #[test]
+    fn test_empty_plaintext() {
+        let key = DekKey::generate();
+        let plaintext = b"";
+        
+        let (nonce, ciphertext) = encrypt(&key, plaintext).unwrap();
+        let decrypted = decrypt(&key, &nonce, &ciphertext).unwrap();
+        
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+        // Empty plaintext still has auth tag
+        assert!(!ciphertext.is_empty());
+    }
+
+    /// Test large message encryption
+    #[test]
+    fn test_large_message() {
+        let key = DekKey::generate();
+        let plaintext = vec![0x42u8; 1024 * 1024]; // 1 MB
+        
+        let (nonce, ciphertext) = encrypt(&key, &plaintext).unwrap();
+        let decrypted = decrypt(&key, &nonce, &ciphertext).unwrap();
+        
+        assert_eq!(plaintext, decrypted);
+    }
+
+    /// Test binary data with all byte values
+    #[test]
+    fn test_all_byte_values() {
+        let key = DekKey::generate();
+        let plaintext: Vec<u8> = (0..=255).collect();
+        
+        let (nonce, ciphertext) = encrypt(&key, &plaintext).unwrap();
+        let decrypted = decrypt(&key, &nonce, &ciphertext).unwrap();
+        
+        assert_eq!(plaintext, decrypted);
+    }
+
+    /// Test ciphertext expansion (plaintext + tag)
+    #[test]
+    fn test_ciphertext_expansion() {
+        let key = DekKey::generate();
+        let plaintext = b"Test message";
+        
+        let (_, ciphertext) = encrypt(&key, plaintext).unwrap();
+        
+        // AES-GCM adds 16-byte auth tag
+        assert_eq!(ciphertext.len(), plaintext.len() + 16);
+    }
+
+    /// Test that both cipher algorithms work correctly
+    #[test]
+    fn test_both_ciphers() {
+        let key = DekKey::generate();
+        let plaintext = b"Test both ciphers";
+        let nonce = Nonce::generate();
+        
+        // AES-256-GCM
+        let aead_aes = Aead::new(&key, AeadCipher::Aes256Gcm);
+        let ct_aes = aead_aes.encrypt(&nonce, plaintext).unwrap();
+        let pt_aes = aead_aes.decrypt(&nonce, &ct_aes).unwrap();
+        assert_eq!(plaintext.as_slice(), pt_aes.as_slice());
+        
+        // ChaCha20-Poly1305
+        let aead_chacha = Aead::new(&key, AeadCipher::ChaCha20Poly1305);
+        let ct_chacha = aead_chacha.encrypt(&nonce, plaintext).unwrap();
+        let pt_chacha = aead_chacha.decrypt(&nonce, &ct_chacha).unwrap();
+        assert_eq!(plaintext.as_slice(), pt_chacha.as_slice());
+        
+        // Ciphertexts should be different between algorithms
+        assert_ne!(ct_aes, ct_chacha);
+    }
+
+    /// Test cross-cipher decryption fails
+    #[test]
+    fn test_cross_cipher_fails() {
+        let key = DekKey::generate();
+        let plaintext = b"Cipher-specific message";
+        let nonce = Nonce::generate();
+        
+        // Encrypt with AES
+        let aead_aes = Aead::new(&key, AeadCipher::Aes256Gcm);
+        let ciphertext = aead_aes.encrypt(&nonce, plaintext).unwrap();
+        
+        // Try to decrypt with ChaCha20
+        let aead_chacha = Aead::new(&key, AeadCipher::ChaCha20Poly1305);
+        let result = aead_chacha.decrypt(&nonce, &ciphertext);
+        
+        assert!(result.is_err(), "Cross-cipher decryption should fail");
+    }
+
+    /// Test AAD provides additional binding
+    #[test]
+    fn test_aad_binding() {
+        let key = DekKey::generate();
+        let plaintext = b"Bound to context";
+        let nonce = Nonce::generate();
+        let aad = b"file:/path/to/file.txt";
+        
+        let aead = Aead::new_default(&key);
+        let ciphertext = aead.encrypt_with_aad(&nonce, plaintext, aad).unwrap();
+        
+        // Decryption with correct AAD succeeds
+        let decrypted = aead.decrypt_with_aad(&nonce, &ciphertext, aad).unwrap();
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+        
+        // Decryption without AAD fails
+        let result = aead.decrypt(&nonce, &ciphertext);
+        assert!(result.is_err(), "Missing AAD should fail");
+        
+        // Decryption with different AAD fails
+        let result = aead.decrypt_with_aad(&nonce, &ciphertext, b"different-context");
+        assert!(result.is_err(), "Wrong AAD should fail");
+        
+        // Decryption with empty AAD fails
+        let result = aead.decrypt_with_aad(&nonce, &ciphertext, b"");
+        assert!(result.is_err(), "Empty AAD should fail");
+    }
 }

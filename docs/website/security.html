@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
+    <title>Security & Encryption - Fula API Documentation</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="css/security.css">
+    <script>
+        (function() {
+            const saved = localStorage.getItem('fula-docs-theme');
+            if (saved) document.documentElement.setAttribute('data-theme', saved);
+        })();
+    </script>
+</head>
+<body>
+    <!-- Mobile Header -->
+    <header class="mobile-header">
+        <button class="hamburger" aria-label="Toggle menu">
+            <span></span>
+            <span></span>
+            <span></span>
+        </button>
+        <span class="logo-text">Fula API</span>
+        <div class="mobile-header-actions">
+            <button class="theme-toggle" aria-label="Toggle theme">
+                <span class="icon-sun">☀️</span>
+                <span class="icon-moon">🌙</span>
+            </button>
+        </div>
+    </header>
+    
+    <div class="sidebar-overlay"></div>
+    
+    <nav class="sidebar">
+        <div class="sidebar-header">
+            <div class="logo">
+                <h1>Fula API</h1>
+                <span class="version">v0.1.0</span>
+            </div>
+            <button class="theme-toggle" aria-label="Toggle theme">
+                <span class="icon-sun">☀️</span>
+                <span class="icon-moon">🌙</span>
+            </button>
+        </div>
+        <div class="nav-section">
+            <h3>Documentation</h3>
+            <ul>
+                <li><a href="index.html">Introduction</a></li>
+                <li><a href="security.html" class="active">Security & Encryption</a></li>
+                <li><a href="api.html">API Reference</a></li>
+                <li><a href="sdk.html">SDK Examples</a></li>
+                <li><a href="platforms.html">Platform Guides</a></li>
+            </ul>
+        </div>
+        <div class="nav-section">
+            <h3>On This Page</h3>
+            <ul>
+                <li><a href="#overview">Security Overview</a></li>
+                <li><a href="#trust-model">Trust Model</a></li>
+                <li><a href="#encryption-flow">Encryption Flow</a></li>
+                <li><a href="#key-architecture">Key Architecture</a></li>
+                <li><a href="#hpke">HPKE Implementation</a></li>
+                <li><a href="#symmetric">Symmetric Encryption</a></li>
+                <li><a href="#integrity">Data Integrity</a></li>
+                <li><a href="#key-management">Key Management</a></li>
+                <li><a href="#security-guarantees">Security Guarantees</a></li>
+                <li><a href="#threat-model">Threat Model</a></li>
+                <li><a href="#best-practices">Best Practices</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <main class="content security-content">
+        <!-- Hero Section -->
+        <section class="hero security-hero">
+            <div class="hero-content">
+                <h1>🔒 Security & Encryption</h1>
+                <p class="hero-subtitle">In-Depth Technical Documentation of Fula's Cryptographic Implementation</p>
+                <div class="hero-badges">
+                    <span class="badge-item">🔐 HPKE (RFC 9180)</span>
+                    <span class="badge-item">⚡ AES-256-GCM</span>
+                    <span class="badge-item">🔑 X25519</span>
+                    <span class="badge-item">✅ BLAKE3</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Security Overview -->
+        <section id="overview" class="security-section">
+            <h2>Security Overview</h2>
+            <div class="overview-content">
+                <p>Fula implements a <strong>Trust-No-One (TNO)</strong> security model where all encryption happens client-side. Storage nodes and the gateway <strong>never</strong> see your plaintext data or encryption keys.</p>
+                
+                <div class="security-summary-grid">
+                    <div class="summary-card">
+                        <div class="summary-icon">🔐</div>
+                        <h3>Client-Side Encryption</h3>
+                        <p>All encryption/decryption happens on your device before data leaves</p>
+                    </div>
+                    <div class="summary-card">
+                        <div class="summary-icon">🔑</div>
+                        <h3>User-Held Keys</h3>
+                        <p>Only you possess the private keys needed to decrypt your data</p>
+                    </div>
+                    <div class="summary-card">
+                        <div class="summary-icon">✅</div>
+                        <h3>Verified Integrity</h3>
+                        <p>Cryptographic proofs detect any tampering, even from malicious nodes</p>
+                    </div>
+                    <div class="summary-card">
+                        <div class="summary-icon">🔄</div>
+                        <h3>Forward Secrecy</h3>
+                        <p>Ephemeral keys ensure past communications remain secure</p>
+                    </div>
+                </div>
+
+                <div class="crypto-stack">
+                    <h3>Cryptographic Primitives Stack</h3>
+                    <table class="crypto-table">
+                        <thead>
+                            <tr>
+                                <th>Layer</th>
+                                <th>Algorithm</th>
+                                <th>Purpose</th>
+                                <th>Key Size</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Key Exchange</td>
+                                <td><strong>X25519</strong></td>
+                                <td>Elliptic Curve Diffie-Hellman</td>
+                                <td>256-bit</td>
+                            </tr>
+                            <tr>
+                                <td>Key Derivation</td>
+                                <td><strong>BLAKE3 KDF</strong></td>
+                                <td>Derive encryption keys from shared secrets</td>
+                                <td>256-bit output</td>
+                            </tr>
+                            <tr>
+                                <td>Symmetric Encryption</td>
+                                <td><strong>AES-256-GCM</strong></td>
+                                <td>Authenticated encryption of data</td>
+                                <td>256-bit key, 96-bit nonce</td>
+                            </tr>
+                            <tr>
+                                <td>Alternative Cipher</td>
+                                <td><strong>ChaCha20-Poly1305</strong></td>
+                                <td>Authenticated encryption (software-optimized)</td>
+                                <td>256-bit key, 96-bit nonce</td>
+                            </tr>
+                            <tr>
+                                <td>Hashing</td>
+                                <td><strong>BLAKE3</strong></td>
+                                <td>Content addressing, integrity verification</td>
+                                <td>256-bit output</td>
+                            </tr>
+                            <tr>
+                                <td>Streaming Verification</td>
+                                <td><strong>Bao</strong></td>
+                                <td>Incremental integrity verification</td>
+                                <td>Merkle tree based</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- Trust Model -->
+        <section id="trust-model" class="security-section alt-bg">
+            <h2>Trust Model</h2>
+            <div class="trust-model-content">
+                <div class="trust-diagram">
+                    <div class="trust-zone trusted">
+                        <div class="zone-header">🟢 Trusted Zone (Your Device)</div>
+                        <div class="zone-content">
+                            <div class="zone-item">
+                                <strong>Private Keys</strong>
+                                <span>Never leave your device</span>
+                            </div>
+                            <div class="zone-item">
+                                <strong>Plaintext Data</strong>
+                                <span>Only exists here</span>
+                            </div>
+                            <div class="zone-item">
+                                <strong>Encryption/Decryption</strong>
+                                <span>Performed locally</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="trust-arrow">
+                        <span class="arrow-label">Encrypted Data Only</span>
+                        <span class="arrow-icon">→</span>
+                    </div>
+                    
+                    <div class="trust-zone untrusted">
+                        <div class="zone-header">🔴 Untrusted Zone (Network)</div>
+                        <div class="zone-content">
+                            <div class="zone-item">
+                                <strong>Fula Gateway</strong>
+                                <span>Sees only ciphertext</span>
+                            </div>
+                            <div class="zone-item">
+                                <strong>IPFS Nodes</strong>
+                                <span>Store encrypted blocks</span>
+                            </div>
+                            <div class="zone-item">
+                                <strong>Network Transport</strong>
+                                <span>All data is encrypted</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="trust-assumptions">
+                    <h3>Security Assumptions</h3>
+                    <ul>
+                        <li><strong>Your device is secure</strong> - If compromised, keys can be extracted</li>
+                        <li><strong>Cryptographic primitives are secure</strong> - X25519, AES-256-GCM, BLAKE3 are industry-standard</li>
+                        <li><strong>Random number generator is secure</strong> - Using OS-provided CSPRNG (OsRng)</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- Encryption Flow -->
+        <section id="encryption-flow" class="security-section">
+            <h2>Encryption Flow</h2>
+            <p class="section-intro">Complete data flow from plaintext to encrypted storage and back.</p>
+
+            <div class="flow-diagram-detailed">
+                <h3>📤 Upload (Encryption) Flow</h3>
+                <div class="flow-steps">
+                    <div class="flow-step-detailed">
+                        <div class="step-header">
+                            <span class="step-num">1</span>
+                            <span class="step-title">Generate DEK</span>
+                        </div>
+                        <div class="step-body">
+                            <p>A fresh 256-bit Data Encryption Key (DEK) is generated using CSPRNG for each object.</p>
+                            <div class="code-snippet">
+                                <pre>DEK = random_bytes(32)  // 256 bits from OsRng</pre>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="flow-connector-v"></div>
+
+                    <div class="flow-step-detailed">
+                        <div class="step-header">
+                            <span class="step-num">2</span>
+                            <span class="step-title">Encrypt Data with DEK</span>
+                        </div>
+                        <div class="step-body">
+                            <p>Plaintext is encrypted using AES-256-GCM with a random 96-bit nonce.</p>
+                            <div class="code-snippet">
+                                <pre>nonce = random_bytes(12)  // 96 bits
+ciphertext = AES-256-GCM.encrypt(DEK, nonce, plaintext)
+// ciphertext includes 128-bit authentication tag</pre>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="flow-connector-v"></div>
+
+                    <div class="flow-step-detailed">
+                        <div class="step-header">
+                            <span class="step-num">3</span>
+                            <span class="step-title">Wrap DEK with HPKE</span>
+                        </div>
+                        <div class="step-body">
+                            <p>The DEK is encrypted using HPKE for the owner's public key.</p>
+                            <div class="code-snippet">
+                                <pre>ephemeral_secret = X25519.generate()
+ephemeral_public = X25519.public_key(ephemeral_secret)
+shared_secret = X25519.dh(ephemeral_secret, recipient_public)
+wrap_key = BLAKE3.derive_key("fula-hpke-v1", shared_secret)
+wrapped_DEK = AES-256-GCM.encrypt(wrap_key, nonce2, DEK)</pre>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="flow-connector-v"></div>
+
+                    <div class="flow-step-detailed">
+                        <div class="step-header">
+                            <span class="step-num">4</span>
+                            <span class="step-title">Store with Metadata</span>
+                        </div>
+                        <div class="step-body">
+                            <p>Ciphertext is uploaded with encryption metadata (nonce, wrapped DEK, ephemeral public key).</p>
+                            <div class="code-snippet">
+                                <pre>metadata = {
+  "x-fula-encrypted": "true",
+  "x-fula-encryption": {
+    "version": 1,
+    "algorithm": "AES-256-GCM",
+    "nonce": base64(nonce),
+    "wrapped_key": {
+      "ephemeral_public": base64(ephemeral_public),
+      "ciphertext": base64(wrapped_DEK)
+    }
+  }
+}</pre>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <h3>📥 Download (Decryption) Flow</h3>
+                <div class="flow-steps">
+                    <div class="flow-step-detailed">
+                        <div class="step-header">
+                            <span class="step-num">1</span>
+                            <span class="step-title">Fetch Encrypted Data</span>
+                        </div>
+                        <div class="step-body">
+                            <p>Retrieve ciphertext and encryption metadata from the gateway.</p>
+                        </div>
+                    </div>
+
+                    <div class="flow-connector-v"></div>
+
+                    <div class="flow-step-detailed">
+                        <div class="step-header">
+                            <span class="step-num">2</span>
+                            <span class="step-title">Unwrap DEK</span>
+                        </div>
+                        <div class="step-body">
+                            <p>Use your secret key to derive shared secret and decrypt the DEK.</p>
+                            <div class="code-snippet">
+                                <pre>shared_secret = X25519.dh(your_secret_key, ephemeral_public)
+wrap_key = BLAKE3.derive_key("fula-hpke-v1", shared_secret)
+DEK = AES-256-GCM.decrypt(wrap_key, nonce2, wrapped_DEK)</pre>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="flow-connector-v"></div>
+
+                    <div class="flow-step-detailed">
+                        <div class="step-header">
+                            <span class="step-num">3</span>
+                            <span class="step-title">Decrypt Data</span>
+                        </div>
+                        <div class="step-body">
+                            <p>Use the recovered DEK to decrypt the ciphertext.</p>
+                            <div class="code-snippet">
+                                <pre>plaintext = AES-256-GCM.decrypt(DEK, nonce, ciphertext)
+// Authentication tag verified automatically</pre>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Key Architecture -->
+        <section id="key-architecture" class="security-section alt-bg">
+            <h2>Key Architecture (KEK/DEK)</h2>
+            <p class="section-intro">Fula uses a two-tier key hierarchy for efficient and secure encryption.</p>
+
+            <div class="key-arch-diagram">
+                <div class="key-tier kek-tier">
+                    <div class="tier-header">
+                        <span class="tier-icon">🔑</span>
+                        <span class="tier-title">KEK (Key Encryption Key)</span>
+                    </div>
+                    <div class="tier-body">
+                        <div class="tier-details">
+                            <div class="detail-item">
+                                <strong>Type:</strong> X25519 Key Pair (Asymmetric)
+                            </div>
+                            <div class="detail-item">
+                                <strong>Size:</strong> 256-bit (32 bytes)
+                            </div>
+                            <div class="detail-item">
+                                <strong>Lifetime:</strong> Long-lived (until rotation)
+                            </div>
+                            <div class="detail-item">
+                                <strong>Purpose:</strong> Encrypt/wrap DEKs, enable sharing
+                            </div>
+                        </div>
+                        <div class="key-components">
+                            <div class="key-component">
+                                <span class="component-label">Secret Key</span>
+                                <span class="component-desc">Kept private, never transmitted</span>
+                            </div>
+                            <div class="key-component">
+                                <span class="component-label">Public Key</span>
+                                <span class="component-desc">Shared freely for receiving encrypted data</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="key-arrow">
+                    <span>Wraps ↓</span>
+                </div>
+
+                <div class="key-tier dek-tier">
+                    <div class="tier-header">
+                        <span class="tier-icon">🗝️</span>
+                        <span class="tier-title">DEK (Data Encryption Key)</span>
+                    </div>
+                    <div class="tier-body">
+                        <div class="tier-details">
+                            <div class="detail-item">
+                                <strong>Type:</strong> AES-256 Key (Symmetric)
+                            </div>
+                            <div class="detail-item">
+                                <strong>Size:</strong> 256-bit (32 bytes)
+                            </div>
+                            <div class="detail-item">
+                                <strong>Lifetime:</strong> Per-object (unique for each file)
+                            </div>
+                            <div class="detail-item">
+                                <strong>Purpose:</strong> Encrypt actual file content
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="key-arrow">
+                    <span>Encrypts ↓</span>
+                </div>
+
+                <div class="key-tier data-tier">
+                    <div class="tier-header">
+                        <span class="tier-icon">📄</span>
+                        <span class="tier-title">Your Data</span>
+                    </div>
+                    <div class="tier-body">
+                        <p>Files, photos, documents, any content you store</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="key-benefits">
+                <h3>Benefits of KEK/DEK Architecture</h3>
+                <div class="benefits-grid">
+                    <div class="benefit-card">
+                        <strong>🔄 Efficient Key Rotation</strong>
+                        <p>Rotate KEK without re-encrypting all data - just re-wrap existing DEKs</p>
+                    </div>
+                    <div class="benefit-card">
+                        <strong>🤝 Secure Sharing</strong>
+                        <p>Share access by wrapping DEK with recipient's public key</p>
+                    </div>
+                    <div class="benefit-card">
+                        <strong>⚡ Performance</strong>
+                        <p>Symmetric DEKs are fast; asymmetric KEK only used for small DEKs</p>
+                    </div>
+                    <div class="benefit-card">
+                        <strong>🔒 Key Isolation</strong>
+                        <p>Compromise of one DEK doesn't affect other files</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- HPKE Implementation -->
+        <section id="hpke" class="security-section">
+            <h2>HPKE Implementation</h2>
+            <p class="section-intro">Hybrid Public Key Encryption following RFC 9180 for secure key encapsulation.</p>
+
+            <div class="hpke-details">
+                <div class="hpke-config">
+                    <h3>HPKE Configuration</h3>
+                    <table class="config-table">
+                        <tr>
+                            <td><strong>KEM (Key Encapsulation)</strong></td>
+                            <td>DHKEM(X25519, HKDF-SHA256)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>KDF (Key Derivation)</strong></td>
+                            <td>BLAKE3 with context "fula-hpke-v1"</td>
+                        </tr>
+                        <tr>
+                            <td><strong>AEAD (Encryption)</strong></td>
+                            <td>AES-256-GCM (default) or ChaCha20-Poly1305</td>
+                        </tr>
+                    </table>
+                </div>
+
+                <div class="hpke-diagram">
+                    <h3>HPKE Encryption Process</h3>
+                    <div class="diagram-box">
+                        <pre class="diagram-ascii">
+┌─────────────────────────────────────────────────────────────────────┐
+│                         SENDER (Encryptor)                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────┐         ┌──────────────────────────────────────┐  │
+│  │ Ephemeral   │         │        Recipient's Public Key         │  │
+│  │ Secret Key  │         │         (known to sender)             │  │
+│  │ (random)    │         └──────────────────────────────────────┘  │
+│  └──────┬──────┘                          │                        │
+│         │                                 │                        │
+│         ▼                                 ▼                        │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │              X25519 Diffie-Hellman Key Exchange               │  │
+│  │     shared_secret = DH(ephemeral_secret, recipient_public)    │  │
+│  └──────────────────────────────┬───────────────────────────────┘  │
+│                                 │                                   │
+│                                 ▼                                   │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │               BLAKE3 Key Derivation Function                  │  │
+│  │        encryption_key = derive_key("fula-hpke-v1",            │  │
+│  │                                    shared_secret)             │  │
+│  └──────────────────────────────┬───────────────────────────────┘  │
+│                                 │                                   │
+│                                 ▼                                   │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                  AES-256-GCM Encryption                       │  │
+│  │        ciphertext = encrypt(encryption_key, nonce, DEK)       │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  OUTPUT: { ephemeral_public_key, nonce, ciphertext }               │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                       RECIPIENT (Decryptor)                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────┐         ┌──────────────────────────────────────┐  │
+│  │ Recipient's │         │       Ephemeral Public Key            │  │
+│  │ Secret Key  │         │       (from ciphertext)               │  │
+│  │ (private)   │         └──────────────────────────────────────┘  │
+│  └──────┬──────┘                          │                        │
+│         │                                 │                        │
+│         ▼                                 ▼                        │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │              X25519 Diffie-Hellman Key Exchange               │  │
+│  │     shared_secret = DH(recipient_secret, ephemeral_public)    │  │
+│  └──────────────────────────────┬───────────────────────────────┘  │
+│                                 │                                   │
+│                                 ▼                                   │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │           Same shared_secret → Same encryption_key            │  │
+│  └──────────────────────────────┬───────────────────────────────┘  │
+│                                 │                                   │
+│                                 ▼                                   │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                  AES-256-GCM Decryption                       │  │
+│  │            DEK = decrypt(encryption_key, nonce,               │  │
+│  │                         ciphertext)                           │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘</pre>
+                    </div>
+                </div>
+
+                <div class="hpke-properties">
+                    <h3>Security Properties</h3>
+                    <div class="properties-list">
+                        <div class="property-item">
+                            <span class="property-icon">✅</span>
+                            <div class="property-content">
+                                <strong>Forward Secrecy</strong>
+                                <p>Each encryption uses a fresh ephemeral key pair. Compromise of long-term keys doesn't decrypt past messages.</p>
+                            </div>
+                        </div>
+                        <div class="property-item">
+                            <span class="property-icon">✅</span>
+                            <div class="property-content">
+                                <strong>Recipient Authentication</strong>
+                                <p>Only the holder of the recipient's secret key can derive the shared secret and decrypt.</p>
+                            </div>
+                        </div>
+                        <div class="property-item">
+                            <span class="property-icon">✅</span>
+                            <div class="property-content">
+                                <strong>Ciphertext Integrity</strong>
+                                <p>AES-GCM provides authenticated encryption - any tampering is detected.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Symmetric Encryption -->
+        <section id="symmetric" class="security-section alt-bg">
+            <h2>Symmetric Encryption (AEAD)</h2>
+            <p class="section-intro">Authenticated Encryption with Associated Data for file content.</p>
+
+            <div class="symmetric-details">
+                <div class="cipher-options">
+                    <h3>Supported Ciphers</h3>
+                    <div class="cipher-grid">
+                        <div class="cipher-card primary">
+                            <div class="cipher-badge">Default</div>
+                            <h4>AES-256-GCM</h4>
+                            <ul>
+                                <li><strong>Key Size:</strong> 256 bits (32 bytes)</li>
+                                <li><strong>Nonce Size:</strong> 96 bits (12 bytes)</li>
+                                <li><strong>Tag Size:</strong> 128 bits (16 bytes)</li>
+                                <li><strong>Best For:</strong> Hardware with AES-NI support</li>
+                            </ul>
+                        </div>
+                        <div class="cipher-card">
+                            <div class="cipher-badge alt">Alternative</div>
+                            <h4>ChaCha20-Poly1305</h4>
+                            <ul>
+                                <li><strong>Key Size:</strong> 256 bits (32 bytes)</li>
+                                <li><strong>Nonce Size:</strong> 96 bits (12 bytes)</li>
+                                <li><strong>Tag Size:</strong> 128 bits (16 bytes)</li>
+                                <li><strong>Best For:</strong> Software-only implementations</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="aead-structure">
+                    <h3>Ciphertext Structure</h3>
+                    <div class="structure-diagram">
+                        <div class="structure-row">
+                            <div class="structure-item ciphertext-part">
+                                <span class="part-label">Ciphertext</span>
+                                <span class="part-desc">Encrypted plaintext (same length as input)</span>
+                            </div>
+                            <div class="structure-item tag-part">
+                                <span class="part-label">Auth Tag</span>
+                                <span class="part-desc">16 bytes</span>
+                            </div>
+                        </div>
+                        <div class="structure-formula">
+                            <code>output_length = plaintext_length + 16 bytes (tag)</code>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="nonce-handling">
+                    <h3>Nonce Generation</h3>
+                    <div class="nonce-info">
+                        <p><strong>⚠️ Critical:</strong> Nonces must NEVER be reused with the same key.</p>
+                        <div class="nonce-strategy">
+                            <h4>Fula's Strategy: Random Nonces</h4>
+                            <ul>
+                                <li>96-bit nonces generated from CSPRNG (OsRng)</li>
+                                <li>Collision probability: ~2<sup>-48</sup> after 2<sup>48</sup> encryptions</li>
+                                <li>Each file gets a unique DEK, so nonce space is per-DEK</li>
+                                <li>Safe for virtually unlimited encryptions per file</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Data Integrity -->
+        <section id="integrity" class="security-section">
+            <h2>Data Integrity Verification</h2>
+            <p class="section-intro">Cryptographic guarantees that your data hasn't been tampered with.</p>
+
+            <div class="integrity-details">
+                <div class="integrity-layers">
+                    <h3>Multi-Layer Integrity</h3>
+                    <div class="layers-grid">
+                        <div class="layer-card">
+                            <div class="layer-num">1</div>
+                            <h4>AEAD Authentication Tag</h4>
+                            <p>Every encrypted block includes a 128-bit authentication tag that verifies both ciphertext integrity and the encryption key used.</p>
+                            <div class="layer-check">
+                                <span class="check-icon">✅</span>
+                                <span>Detects: bit flips, truncation, appending</span>
+                            </div>
+                        </div>
+                        <div class="layer-card">
+                            <div class="layer-num">2</div>
+                            <h4>Content Addressing (CID)</h4>
+                            <p>Every block stored in IPFS has a CID derived from its BLAKE3 hash. Retrieving by CID guarantees content matches.</p>
+                            <div class="layer-check">
+                                <span class="check-icon">✅</span>
+                                <span>Detects: storage corruption, node manipulation</span>
+                            </div>
+                        </div>
+                        <div class="layer-card">
+                            <div class="layer-num">3</div>
+                            <h4>Bao Streaming Verification</h4>
+                            <p>For large files, Bao provides Merkle tree-based verification allowing you to verify chunks before downloading the entire file.</p>
+                            <div class="layer-check">
+                                <span class="check-icon">✅</span>
+                                <span>Detects: partial corruption in large files</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="blake3-section">
+                    <h3>BLAKE3 Hashing</h3>
+                    <div class="blake3-info">
+                        <div class="blake3-features">
+                            <div class="feature">
+                                <strong>⚡ Speed</strong>
+                                <p>Faster than MD5, SHA-1, SHA-256, SHA-3 on modern CPUs</p>
+                            </div>
+                            <div class="feature">
+                                <strong>🔒 Security</strong>
+                                <p>256-bit security level, resistant to length extension</p>
+                            </div>
+                            <div class="feature">
+                                <strong>🔀 Parallelizable</strong>
+                                <p>Scales with CPU cores for large data</p>
+                            </div>
+                            <div class="feature">
+                                <strong>🔑 KDF Mode</strong>
+                                <p>Built-in key derivation with context separation</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bao-section">
+                    <h3>Bao Verified Streaming</h3>
+                    <div class="bao-diagram">
+                        <pre class="diagram-ascii">
+                        Root Hash (32 bytes)
+                              │
+              ┌───────────────┴───────────────┐
+              │                               │
+         Hash(L||R)                       Hash(L||R)
+              │                               │
+       ┌──────┴──────┐                 ┌──────┴──────┐
+       │             │                 │             │
+    Hash(L||R)   Hash(L||R)        Hash(L||R)   Hash(L||R)
+       │             │                 │             │
+    ┌──┴──┐       ┌──┴──┐          ┌──┴──┐       ┌──┴──┐
+    │     │       │     │          │     │       │     │
+  Chunk Chunk   Chunk Chunk      Chunk Chunk   Chunk Chunk
+    1     2       3     4          5     6       7     8
+
+  • Verify any chunk with O(log n) proof from root
+  • Detect corruption before downloading entire file
+  • Stream large files with incremental verification</pre>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Key Management -->
+        <section id="key-management" class="security-section alt-bg">
+            <h2>Key Management</h2>
+            <p class="section-intro">How Fula handles key generation, storage, rotation, and recovery.</p>
+
+            <div class="key-mgmt-details">
+                <div class="key-generation">
+                    <h3>Key Generation</h3>
+                    <div class="generation-info">
+                        <table class="config-table">
+                            <tr>
+                                <td><strong>Random Source</strong></td>
+                                <td>OsRng (Operating System CSPRNG)</td>
+                            </tr>
+                            <tr>
+                                <td><strong>KEK Generation</strong></td>
+                                <td>32 random bytes → X25519 secret key</td>
+                            </tr>
+                            <tr>
+                                <td><strong>DEK Generation</strong></td>
+                                <td>32 random bytes → AES-256 key</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Nonce Generation</strong></td>
+                                <td>12 random bytes per encryption</td>
+                            </tr>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="key-rotation">
+                    <h3>Key Rotation</h3>
+                    <div class="rotation-process">
+                        <div class="rotation-step">
+                            <span class="rotation-num">1</span>
+                            <div class="rotation-content">
+                                <strong>Generate New KEK</strong>
+                                <p>Create a fresh X25519 key pair</p>
+                            </div>
+                        </div>
+                        <div class="rotation-step">
+                            <span class="rotation-num">2</span>
+                            <div class="rotation-content">
+                                <strong>Re-wrap DEKs</strong>
+                                <p>Decrypt each DEK with old KEK, re-encrypt with new KEK</p>
+                            </div>
+                        </div>
+                        <div class="rotation-step">
+                            <span class="rotation-num">3</span>
+                            <div class="rotation-content">
+                                <strong>Update Metadata</strong>
+                                <p>Store new wrapped DEKs, increment version counter</p>
+                            </div>
+                        </div>
+                        <div class="rotation-step">
+                            <span class="rotation-num">4</span>
+                            <div class="rotation-content">
+                                <strong>Secure Delete Old KEK</strong>
+                                <p>Zeroize old secret key from memory</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="rotation-note">
+                        <strong>Note:</strong> Data does NOT need to be re-encrypted - only the DEK wrappers change.
+                    </div>
+                </div>
+
+                <div class="key-backup">
+                    <h3>Key Backup & Recovery</h3>
+                    <div class="backup-warning">
+                        <span class="warning-icon">⚠️</span>
+                        <div class="warning-content">
+                            <strong>Critical: If you lose your secret key, your data is UNRECOVERABLE.</strong>
+                            <p>Fula uses true end-to-end encryption. There are no backdoors, no "forgot password" recovery, no master keys.</p>
+                        </div>
+                    </div>
+                    <div class="backup-options">
+                        <h4>Recommended Backup Strategies</h4>
+                        <ul>
+                            <li><strong>Export as Base64:</strong> <code>secret_key.to_base64()</code> → store in password manager</li>
+                            <li><strong>Hardware Security Module:</strong> Store key in HSM or secure enclave</li>
+                            <li><strong>Paper Backup:</strong> Print Base64 key, store in secure physical location</li>
+                            <li><strong>Split Key:</strong> Use Shamir's Secret Sharing for distributed backup</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="key-zeroization">
+                    <h3>Memory Security</h3>
+                    <div class="zeroization-info">
+                        <p>All key types implement <code>Zeroize</code> and <code>ZeroizeOnDrop</code>:</p>
+                        <ul>
+                            <li>Keys are automatically zeroed when dropped from memory</li>
+                            <li>Prevents keys from lingering in memory after use</li>
+                            <li>Protects against memory dump attacks</li>
+                        </ul>
+                        <div class="code-snippet">
+                            <pre>// From fula-crypto/src/keys.rs
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct SecretKey {
+    bytes: [u8; 32],
+}
+// When SecretKey is dropped, bytes are overwritten with zeros</pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Security Guarantees -->
+        <section id="security-guarantees" class="security-section">
+            <h2>Security Guarantees</h2>
+            <p class="section-intro">What the current implementation provides and its limitations.</p>
+
+            <div class="guarantees-grid">
+                <div class="guarantee-card provided">
+                    <h3>✅ Provided</h3>
+                    <ul>
+                        <li><strong>Confidentiality:</strong> Data encrypted with AES-256-GCM; only key holder can decrypt</li>
+                        <li><strong>Integrity:</strong> AEAD tags detect any tampering with ciphertext</li>
+                        <li><strong>Authenticity:</strong> Only holder of secret key can produce valid decryption</li>
+                        <li><strong>Forward Secrecy:</strong> Ephemeral keys in HPKE protect past data</li>
+                        <li><strong>Key Isolation:</strong> Each file has unique DEK; compromise affects only that file</li>
+                        <li><strong>Semantic Security:</strong> Same plaintext encrypts to different ciphertext each time</li>
+                        <li><strong>Ciphertext Indistinguishability:</strong> Encrypted data appears random</li>
+                    </ul>
+                </div>
+
+                <div class="guarantee-card not-provided">
+                    <h3>❌ Not Provided</h3>
+                    <ul>
+                        <li><strong>Sender Authentication:</strong> Recipients can't verify who encrypted the data</li>
+                        <li><strong>Deniability:</strong> Encryption proves you had the key</li>
+                        <li><strong>Metadata Privacy:</strong> File names, sizes, timestamps are not encrypted</li>
+                        <li><strong>Traffic Analysis Resistance:</strong> Access patterns may be observable</li>
+                        <li><strong>Post-Quantum Security:</strong> X25519 vulnerable to quantum computers</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- Threat Model -->
+        <section id="threat-model" class="security-section alt-bg">
+            <h2>Threat Model</h2>
+            <p class="section-intro">What attacks Fula protects against and what it doesn't.</p>
+
+            <div class="threat-analysis">
+                <div class="threat-category protected">
+                    <h3>🛡️ Protected Against</h3>
+                    <div class="threat-list">
+                        <div class="threat-item">
+                            <strong>Malicious Storage Nodes</strong>
+                            <p>Nodes only see encrypted data. They cannot read your files or forge valid data.</p>
+                        </div>
+                        <div class="threat-item">
+                            <strong>Network Eavesdroppers</strong>
+                            <p>All data in transit is encrypted. Even if intercepted, it's unreadable.</p>
+                        </div>
+                        <div class="threat-item">
+                            <strong>Data Tampering</strong>
+                            <p>AEAD tags and content addressing detect any modifications.</p>
+                        </div>
+                        <div class="threat-item">
+                            <strong>Gateway Compromise</strong>
+                            <p>Gateway never sees plaintext or keys. Compromise only affects availability, not confidentiality.</p>
+                        </div>
+                        <div class="threat-item">
+                            <strong>Replay Attacks</strong>
+                            <p>Unique nonces prevent replaying old ciphertexts.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="threat-category not-protected">
+                    <h3>⚠️ Not Protected Against</h3>
+                    <div class="threat-list">
+                        <div class="threat-item">
+                            <strong>Compromised Client Device</strong>
+                            <p>If your device is compromised, attacker can extract keys.</p>
+                        </div>
+                        <div class="threat-item">
+                            <strong>Rubber Hose Cryptanalysis</strong>
+                            <p>Coercion/legal compulsion to reveal keys.</p>
+                        </div>
+                        <div class="threat-item">
+                            <strong>Side-Channel Attacks</strong>
+                            <p>Timing, power analysis on the local device.</p>
+                        </div>
+                        <div class="threat-item">
+                            <strong>Quantum Computers</strong>
+                            <p>X25519 can be broken by sufficiently powerful quantum computers.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Best Practices -->
+        <section id="best-practices" class="security-section">
+            <h2>Security Best Practices</h2>
+            <p class="section-intro">Recommendations for securely using Fula encryption.</p>
+
+            <div class="practices-grid">
+                <div class="practice-card">
+                    <div class="practice-icon">🔑</div>
+                    <h3>Key Management</h3>
+                    <ul>
+                        <li>Generate keys on a secure, trusted device</li>
+                        <li>Back up your secret key in multiple secure locations</li>
+                        <li>Never share or transmit your secret key</li>
+                        <li>Rotate keys periodically or after potential compromise</li>
+                    </ul>
+                </div>
+
+                <div class="practice-card">
+                    <div class="practice-icon">💻</div>
+                    <h3>Client Security</h3>
+                    <ul>
+                        <li>Keep your device and OS updated</li>
+                        <li>Use full-disk encryption</li>
+                        <li>Use a hardware security module if available</li>
+                        <li>Clear keys from memory after use</li>
+                    </ul>
+                </div>
+
+                <div class="practice-card">
+                    <div class="practice-icon">🔒</div>
+                    <h3>Data Handling</h3>
+                    <ul>
+                        <li>Always enable encryption for sensitive data</li>
+                        <li>Verify file integrity after download</li>
+                        <li>Don't store sensitive metadata in unencrypted fields</li>
+                        <li>Use unique DEKs per file (default behavior)</li>
+                    </ul>
+                </div>
+
+                <div class="practice-card">
+                    <div class="practice-icon">🔄</div>
+                    <h3>Operational Security</h3>
+                    <ul>
+                        <li>Monitor for unauthorized access attempts</li>
+                        <li>Have an incident response plan for key compromise</li>
+                        <li>Test key recovery procedures periodically</li>
+                        <li>Audit encryption settings regularly</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <footer>
+            <p>Fula API Security Documentation • Built with ❤️ for decentralized security</p>
+            <p class="footer-links">
+                <a href="https://github.com/functionland/fula-api">GitHub</a> •
+                <a href="https://fx.land">Functionland</a>
+            </p>
+        </footer>
+    </main>
+
+    <script src="js/app.js"></script>
+</body>
+</html>
