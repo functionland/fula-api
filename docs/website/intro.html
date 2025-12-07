@@ -416,62 +416,165 @@ Chunks: [CID1] [CID2] [CID3] [CID4]</pre>
         <!-- Getting Started Section -->
         <section id="getting-started" class="intro-section">
             <h2>Getting Started</h2>
-            <div class="getting-started-grid">
+            
+            <!-- Row 1: Setup -->
+            <h3 class="section-subtitle">1. Setup Your Environment</h3>
+            <div class="getting-started-grid setup-row">
                 <div class="gs-card">
                     <h3>🐳 Docker Compose</h3>
-                    <p>Quickest way to run a local Fula gateway:</p>
+                    <p>Quickest way to run locally:</p>
                     <div class="code-block">
                         <pre>git clone https://github.com/functionland/fula-api
 cd fula-api
-docker-compose up -d
-
-# Gateway available at http://localhost:9000</pre>
+docker-compose up -d</pre>
                     </div>
                 </div>
                 <div class="gs-card">
                     <h3>🔧 From Source</h3>
                     <p>Build and run with Cargo:</p>
                     <div class="code-block">
-                        <pre>git clone https://github.com/functionland/fula-api
-cd fula-api
-cargo build --release
+                        <pre>cargo build --release
 ./target/release/fula-cli serve</pre>
                     </div>
                 </div>
                 <div class="gs-card">
                     <h3>⚙️ Configuration</h3>
-                    <p>Set environment variables:</p>
+                    <p>Environment variables:</p>
                     <div class="code-block">
-                        <pre># Gateway
-FULA_HOST=0.0.0.0
+                        <pre>FULA_HOST=0.0.0.0
 FULA_PORT=9000
-
-# IPFS
 IPFS_API_URL=http://localhost:5001
-CLUSTER_API_URL=http://localhost:9094
-
-# Auth
 JWT_SECRET=your-secret-key</pre>
                     </div>
                 </div>
-                <div class="gs-card">
-                    <h3>🧪 Test with AWS CLI</h3>
-                    <p>Verify your setup:</p>
-                    <div class="code-block">
-                        <pre># Configure endpoint
-alias fula='aws --endpoint-url http://localhost:9000'
+            </div>
 
-# Create bucket
-fula s3 mb s3://test-bucket
+            <!-- Row 2: Quick Start Code Example -->
+            <h3 class="section-subtitle">2. Upload & Manage Photos (JavaScript)</h3>
+            <div class="quickstart-code">
+                <div class="code-header">
+                    <span class="code-title">📸 Complete Example: Encrypt, Upload, and List Photos</span>
+                    <span class="code-lang">JavaScript / TypeScript</span>
+                </div>
+                <div class="code-block large">
+                    <pre><span class="code-comment">// 1. Install dependencies</span>
+<span class="code-comment">// npm install @aws-sdk/client-s3 crypto-js</span>
 
-# Upload file
-fula s3 cp ./file.txt s3://test-bucket/
+import { S3Client, PutObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
 
-# List files
-fula s3 ls s3://test-bucket/</pre>
-                    </div>
+<span class="code-comment">// 2. Configure the Fula client</span>
+const fula = new S3Client({
+  endpoint: 'http://localhost:9000',
+  region: 'us-east-1',
+  credentials: {
+    accessKeyId: 'YOUR_ACCESS_KEY',
+    secretAccessKey: 'YOUR_SECRET_KEY',
+  },
+  forcePathStyle: true,
+});
+
+const BUCKET = 'my-photos';
+
+<span class="code-comment">// 3. Helper: Encrypt data before upload (client-side encryption)</span>
+async function encryptData(data: ArrayBuffer, password: string): Promise&lt;ArrayBuffer&gt; {
+  const encoder = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']
+  );
+  const key = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: encoder.encode('fula-salt'), iterations: 100000, hash: 'SHA-256' },
+    keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['encrypt']
+  );
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, data);
+  <span class="code-comment">// Prepend IV to encrypted data</span>
+  const result = new Uint8Array(iv.length + encrypted.byteLength);
+  result.set(iv);
+  result.set(new Uint8Array(encrypted), iv.length);
+  return result.buffer;
+}
+
+<span class="code-comment">// 4. Upload an encrypted photo</span>
+async function uploadPhoto(filename: string, photoData: ArrayBuffer, password: string) {
+  console.log(`📤 Encrypting and uploading: ${filename}`);
+  
+  <span class="code-comment">// Encrypt locally BEFORE sending to gateway</span>
+  const encryptedData = await encryptData(photoData, password);
+  
+  await fula.send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: `photos/${filename}`,
+    Body: new Uint8Array(encryptedData),
+    ContentType: 'application/octet-stream', <span class="code-comment">// Encrypted = opaque bytes</span>
+    Metadata: {
+      'x-amz-meta-encrypted': 'true',
+      'x-amz-meta-original-type': 'image/jpeg',
+    },
+  }));
+  
+  console.log(`✅ Uploaded: photos/${filename}`);
+}
+
+<span class="code-comment">// 5. List all photos in the folder</span>
+async function listPhotos() {
+  console.log('📂 Listing photos folder...');
+  
+  const response = await fula.send(new ListObjectsV2Command({
+    Bucket: BUCKET,
+    Prefix: 'photos/',
+  }));
+  
+  const files = response.Contents || [];
+  console.log(`Found ${files.length} photo(s):`);
+  files.forEach(file =&gt; {
+    console.log(`  📷 ${file.Key} (${file.Size} bytes)`);
+  });
+  
+  return files;
+}
+
+<span class="code-comment">// 6. Run the complete workflow</span>
+async function main() {
+  const password = 'my-secret-encryption-key';
+  
+  <span class="code-comment">// Simulate photo data (in real app, read from file/camera)</span>
+  const photo1 = new TextEncoder().encode('fake-jpeg-data-for-sunset.jpg');
+  const photo2 = new TextEncoder().encode('fake-jpeg-data-for-beach.jpg');
+  
+  <span class="code-comment">// Upload first photo (encrypted)</span>
+  await uploadPhoto('sunset.jpg', photo1.buffer, password);
+  
+  <span class="code-comment">// List folder - should show 1 photo</span>
+  await listPhotos();
+  <span class="code-comment">// Output: Found 1 photo(s): 📷 photos/sunset.jpg</span>
+  
+  <span class="code-comment">// Upload second photo (encrypted)</span>
+  await uploadPhoto('beach.jpg', photo2.buffer, password);
+  
+  <span class="code-comment">// List folder again - should show 2 photos</span>
+  await listPhotos();
+  <span class="code-comment">// Output: Found 2 photo(s): 📷 photos/sunset.jpg, 📷 photos/beach.jpg</span>
+}
+
+main().catch(console.error);</pre>
+                </div>
+                <div class="code-output">
+                    <div class="output-header">Expected Output</div>
+                    <pre>📤 Encrypting and uploading: sunset.jpg
+✅ Uploaded: photos/sunset.jpg
+📂 Listing photos folder...
+Found 1 photo(s):
+  📷 photos/sunset.jpg (156 bytes)
+
+📤 Encrypting and uploading: beach.jpg
+✅ Uploaded: photos/beach.jpg
+📂 Listing photos folder...
+Found 2 photo(s):
+  📷 photos/sunset.jpg (156 bytes)
+  📷 photos/beach.jpg (152 bytes)</pre>
                 </div>
             </div>
+
             <div class="next-steps">
                 <h3>Next Steps</h3>
                 <div class="next-links">
