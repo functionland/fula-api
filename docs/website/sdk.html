@@ -58,6 +58,9 @@
             <ul>
                 <li><a href="#rust-client">Rust Client</a></li>
                 <li><a href="#encryption">Encryption</a></li>
+                <li><a href="#metadata-privacy">Metadata Privacy</a></li>
+                <li><a href="#file-manager">File Manager API</a></li>
+                <li><a href="#secure-sharing">Secure Sharing</a></li>
                 <li><a href="#multipart">Multipart Uploads</a></li>
                 <li><a href="#aws-cli">AWS CLI</a></li>
                 <li><a href="#python">Python (boto3)</a></li>
@@ -220,6 +223,287 @@ let restored = KekKeyPair::from_bytes(&private_bytes)?;
 let mut manager = KeyManager::new(keypair);
 manager.add_recipient("alice", alice_public_key);
 manager.add_recipient("bob", bob_public_key);</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- Metadata Privacy Section -->
+        <section id="metadata-privacy" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>🔒 Metadata Privacy</h2>
+                    <p>Protect not just your file content, but also file names, sizes, and timestamps from the server.</p>
+                    
+                    <h3>What's Protected</h3>
+                    <ul>
+                        <li><strong>File Names</strong> - Server sees obfuscated hash, not "tax_returns_2024.pdf"</li>
+                        <li><strong>File Sizes</strong> - Server sees ciphertext size, not original</li>
+                        <li><strong>Content Types</strong> - Server sees "application/octet-stream"</li>
+                        <li><strong>Timestamps</strong> - Encrypted in private metadata</li>
+                        <li><strong>User Metadata</strong> - All custom fields encrypted</li>
+                    </ul>
+                    
+                    <h3>Obfuscation Modes</h3>
+                    <ul>
+                        <li><strong>DeterministicHash</strong> - Same path → same key (default)</li>
+                        <li><strong>RandomUuid</strong> - Maximum privacy, random keys</li>
+                        <li><strong>PreserveStructure</strong> - Keep folders, hash filenames</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Metadata Privacy (Enabled by Default)</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">use fula_client::{EncryptedClient, EncryptionConfig, KeyObfuscation, Config};
+
+// Metadata privacy is ENABLED by default
+let encryption = EncryptionConfig::new();
+
+// Or customize the obfuscation mode
+let encryption = EncryptionConfig::new()
+    .with_obfuscation_mode(KeyObfuscation::PreserveStructure);
+
+// Disable if not needed (not recommended)
+let encryption = EncryptionConfig::new_without_privacy();
+
+let config = Config::new("http://localhost:9000").with_token("token");
+let client = EncryptedClient::new(config, encryption)?;
+
+// Upload - server sees: "e/a7c3f9b2e8d14a6f"
+// You use:               "/finances/tax_2024.pdf"
+client.put_object_encrypted(bucket, "/finances/tax_2024.pdf", data).await?;
+
+// Retrieve using original path
+let data = client.get_object_decrypted(bucket, "/finances/tax_2024.pdf").await?;</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">What Server Sees vs What You See</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">// SERVER'S VIEW (Storage Node):
+// ┌─────────────────────────────────────────────────┐
+// │ Key:    e/a7c3f9b2e8d14a6f                      │
+// │ Size:   156,821 bytes (ciphertext)             │
+// │ Type:   application/octet-stream               │
+// │ Data:   [encrypted blob]                       │
+// └─────────────────────────────────────────────────┘
+
+// YOUR VIEW (Client):
+// ┌─────────────────────────────────────────────────┐
+// │ Key:    /finances/tax_2024.pdf                 │
+// │ Size:   156,789 bytes (original)               │
+// │ Type:   application/pdf                        │
+// │ Data:   [decrypted PDF document]               │
+// └─────────────────────────────────────────────────┘</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- File Manager API Section -->
+        <section id="file-manager" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>📁 File Manager API</h2>
+                    <p>Browse encrypted files <strong>without downloading content</strong>. Perfect for file managers, sync tools, and directory browsers.</p>
+                    
+                    <h3>Key Benefits</h3>
+                    <ul>
+                        <li><strong>Bandwidth Efficient</strong> - Only ~1-2KB per file (headers only)</li>
+                        <li><strong>Fast Browsing</strong> - List 1000 files without downloading 1GB</li>
+                        <li><strong>Decrypted Names</strong> - See real filenames, not hashes</li>
+                        <li><strong>Full Metadata</strong> - Size, type, timestamps, custom fields</li>
+                    </ul>
+                    
+                    <h3>Operations</h3>
+                    <ul>
+                        <li><code>head_object_decrypted()</code> - Single file metadata</li>
+                        <li><code>list_objects_decrypted()</code> - All files with metadata</li>
+                        <li><code>list_directory()</code> - Tree structure view</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">List Files Without Downloading Content</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">use fula_client::{EncryptedClient, EncryptionConfig, Config};
+
+let client = EncryptedClient::new(config, EncryptionConfig::new())?;
+
+// List ALL files with decrypted metadata - NO content download!
+let files = client.list_objects_decrypted(bucket, None).await?;
+
+for file in &files {
+    println!("📄 {} ({}) - {}",
+        file.filename(),           // "report.pdf" (decrypted)
+        file.size_human(),         // "1.5 MB"
+        file.content_type.as_deref().unwrap_or("unknown")
+    );
+}
+
+// Total bandwidth: ~1KB per file (just headers)
+// NOT: downloading entire file content</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Get Single File Metadata (HEAD Request)</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">// Get metadata WITHOUT downloading content
+let metadata = client.head_object_decrypted(bucket, storage_key).await?;
+
+println!("Original name: {}", metadata.original_key);
+println!("Size: {} bytes", metadata.original_size);
+println!("Type: {:?}", metadata.content_type);
+println!("Created: {:?}", metadata.created_at);
+println!("Modified: {:?}", metadata.modified_at);
+
+// Only download content when user clicks "Open"
+if user_wants_to_open {
+    let content = client.get_object_decrypted_by_storage_key(
+        bucket, &metadata.storage_key
+    ).await?;
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Directory Tree View</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">// Get files grouped by directory
+let listing = client.list_directory(bucket, Some("/photos/")).await?;
+
+println!("📊 {} files, {} total", 
+    listing.file_count(), 
+    format_size(listing.total_size())
+);
+
+for dir in listing.get_directories() {
+    println!("\n📁 {}/", dir);
+    
+    if let Some(files) = listing.get_files(dir) {
+        for file in files {
+            let icon = match file.content_type.as_deref() {
+                Some(t) if t.starts_with("image/") => "🖼️",
+                Some(t) if t.starts_with("video/") => "🎬",
+                Some(t) if t.contains("pdf") => "📄",
+                _ => "📄",
+            };
+            println!("   {} {} ({})", icon, file.filename(), file.size_human());
+        }
+    }
+}</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- Secure Sharing Section -->
+        <section id="secure-sharing" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>🤝 Secure Sharing</h2>
+                    <p>Share files and folders with others without exposing your master key.</p>
+                    
+                    <h3>Features</h3>
+                    <ul>
+                        <li><strong>Path-Scoped</strong> - Share specific folders, not everything</li>
+                        <li><strong>Time-Limited</strong> - Set expiry for temporary access</li>
+                        <li><strong>Permissions</strong> - Read, write, delete controls</li>
+                        <li><strong>Revocable</strong> - Cancel access anytime</li>
+                        <li><strong>Zero Knowledge</strong> - Server can't read shared content</li>
+                    </ul>
+                    
+                    <h3>How It Works</h3>
+                    <ol>
+                        <li>Create share token with recipient's public key</li>
+                        <li>DEK is re-encrypted for recipient (not shared directly)</li>
+                        <li>Recipient decrypts with their private key</li>
+                        <li>Your master key is never exposed</li>
+                    </ol>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Share a File with Someone</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">use fula_crypto::{
+    KekKeyPair, DekKey,
+    sharing::{ShareBuilder, ShareToken, AcceptedShare},
+    hpke::SharePermissions,
+};
+
+// Alice (owner) wants to share with Bob
+let alice_keypair = KekKeyPair::generate();
+let bob_keypair = KekKeyPair::generate();
+let file_dek = DekKey::generate(); // File's encryption key
+
+// Create share token for Bob (expires in 7 days)
+let share_token = ShareBuilder::new(
+    &alice_keypair,
+    bob_keypair.public_key(),
+    &file_dek,
+)
+.with_path_scope("/photos/vacation/")  // Only this folder
+.with_expiry_days(7)                    // 7 days access
+.with_permissions(SharePermissions::read_only())
+.build()?;
+
+// Send token to Bob (via any channel)
+let token_json = serde_json::to_string(&share_token)?;</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Accept a Share (Recipient Side)</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">// Bob receives the share token
+let share_token: ShareToken = serde_json::from_str(&token_json)?;
+
+// Verify and accept
+let accepted = AcceptedShare::accept(&share_token, &bob_keypair)?;
+
+// Now Bob can decrypt files in /photos/vacation/
+let decrypted_dek = accepted.dek();
+
+// Check permissions
+if accepted.can_write() {
+    // Bob can modify files
+}
+
+if accepted.is_expired() {
+    // Access has expired
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Folder Sharing with Manager</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">use fula_crypto::sharing::FolderShareManager;
+
+// Create share manager for a folder
+let mut share_manager = FolderShareManager::new(
+    owner_keypair.clone(),
+    "/documents/project-x/".to_string(),
+);
+
+// Add multiple recipients
+share_manager.add_recipient(
+    "alice",
+    alice_public_key,
+    SharePermissions::read_write(),
+)?;
+
+share_manager.add_recipient(
+    "bob", 
+    bob_public_key,
+    SharePermissions::read_only(),
+)?;
+
+// Revoke access
+share_manager.revoke("bob")?;
+
+// Check who has access
+for (name, _) in share_manager.list_recipients() {
+    println!("Shared with: {}", name);
+}</code></pre>
                 </div>
             </div>
         </section>

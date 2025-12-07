@@ -100,6 +100,14 @@
                 <li><a href="#delete-tagging">Delete Object Tagging</a></li>
             </ul>
         </div>
+        <div class="nav-section">
+            <h3>Client-Side Encryption</h3>
+            <ul>
+                <li><a href="#encryption-headers">Encryption Headers</a></li>
+                <li><a href="#metadata-privacy">Metadata Privacy</a></li>
+                <li><a href="#secure-sharing-api">Secure Sharing</a></li>
+            </ul>
+        </div>
     </nav>
 
     <main class="content">
@@ -945,6 +953,216 @@ Content-Length: 0</code></pre>
                         <span class="status-badge success">204 No Content</span>
                     </div>
                     <pre><code class="language-http">HTTP/1.1 204 No Content</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- Client-Side Encryption -->
+        <section id="encryption-headers" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>🔐 Client-Side Encryption Headers</h2>
+                    <p>When using client-side encryption, Fula stores encryption metadata in custom headers.</p>
+                    
+                    <h3>Encryption Metadata Header</h3>
+                    <p>The <code>x-amz-meta-encryption</code> header contains JSON with encryption info:</p>
+                    
+                    <h3>Fields</h3>
+                    <ul>
+                        <li><strong>version</strong> - Encryption format version (currently 2)</li>
+                        <li><strong>algorithm</strong> - Cipher used (AES-256-GCM)</li>
+                        <li><strong>nonce</strong> - Base64-encoded nonce</li>
+                        <li><strong>wrapped_key</strong> - HPKE-encrypted DEK</li>
+                        <li><strong>metadata_privacy</strong> - Whether private metadata is included</li>
+                        <li><strong>private_metadata</strong> - Encrypted original filename, size, etc.</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Encryption Metadata Structure</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "version": 2,
+  "algorithm": "AES-256-GCM",
+  "nonce": "base64_encoded_nonce",
+  "wrapped_key": {
+    "encapsulated_key": "base64_hpke_encapsulated_key",
+    "ciphertext": "base64_encrypted_dek",
+    "nonce": "base64_inner_nonce"
+  },
+  "metadata_privacy": true,
+  "private_metadata": "{\"version\":1,\"ciphertext\":\"...\",\"nonce\":\"...\"}"
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Head Request to Get Metadata</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash"># Get metadata without downloading content
+curl -I "http://localhost:9000/my-bucket/e/a7c3f9b2e8d14a6f" \
+    -H "Authorization: Bearer $TOKEN"
+
+# Response headers include:
+# x-amz-meta-encrypted: true
+# x-amz-meta-encryption: {"version":2,"algorithm":"AES-256-GCM",...}
+# Content-Type: application/octet-stream
+# Content-Length: 156821 (ciphertext size)</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="metadata-privacy" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>🔒 Metadata Privacy</h2>
+                    <p>With metadata privacy enabled, the server never sees your real filenames, sizes, or content types.</p>
+                    
+                    <h3>What Gets Obfuscated</h3>
+                    <table style="width:100%; margin: 1rem 0; border-collapse: collapse;">
+                        <tr style="background: var(--bg-tertiary);">
+                            <th style="padding: 0.5rem; border: 1px solid var(--border-color);">Field</th>
+                            <th style="padding: 0.5rem; border: 1px solid var(--border-color);">Server Sees</th>
+                            <th style="padding: 0.5rem; border: 1px solid var(--border-color);">Client Decrypts</th>
+                        </tr>
+                        <tr>
+                            <td style="padding: 0.5rem; border: 1px solid var(--border-color);">Key (filename)</td>
+                            <td style="padding: 0.5rem; border: 1px solid var(--border-color);"><code>e/a7c3f9b2e8d14a6f</code></td>
+                            <td style="padding: 0.5rem; border: 1px solid var(--border-color);"><code>/finances/tax_2024.pdf</code></td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 0.5rem; border: 1px solid var(--border-color);">Size</td>
+                            <td style="padding: 0.5rem; border: 1px solid var(--border-color);">156,821 (ciphertext)</td>
+                            <td style="padding: 0.5rem; border: 1px solid var(--border-color);">156,789 (original)</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 0.5rem; border: 1px solid var(--border-color);">Content-Type</td>
+                            <td style="padding: 0.5rem; border: 1px solid var(--border-color);"><code>application/octet-stream</code></td>
+                            <td style="padding: 0.5rem; border: 1px solid var(--border-color);"><code>application/pdf</code></td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 0.5rem; border: 1px solid var(--border-color);">Timestamps</td>
+                            <td style="padding: 0.5rem; border: 1px solid var(--border-color);">Upload time only</td>
+                            <td style="padding: 0.5rem; border: 1px solid var(--border-color);">Original created/modified</td>
+                        </tr>
+                    </table>
+                    
+                    <h3>Private Metadata Structure</h3>
+                    <p>The <code>private_metadata</code> field, when decrypted, contains:</p>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Decrypted Private Metadata</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "original_key": "/finances/tax_returns_2024.pdf",
+  "actual_size": 156789,
+  "content_type": "application/pdf",
+  "created_at": 1701388800,
+  "modified_at": 1701475200,
+  "user_metadata": {
+    "author": "John Doe",
+    "department": "Accounting"
+  },
+  "content_hash": "blake3_hash_of_plaintext"
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Key Obfuscation Modes</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-plaintext"># DeterministicHash (default)
+# Same path → same storage key (allows retrieval)
+/photos/beach.jpg  →  e/a7c3f9b2e8d14a6f
+
+# RandomUuid  
+# Each upload gets random key (maximum privacy)
+/photos/beach.jpg  →  e/550e8400-e29b-41d4-a716-446655440000
+
+# PreserveStructure
+# Keep folder paths, hash only filenames
+/photos/beach.jpg  →  /photos/e_a7c3f9b2e8d1</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="secure-sharing-api" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>🤝 Secure Sharing API</h2>
+                    <p>Share encrypted files without exposing your master key. Uses HPKE to re-encrypt the DEK for each recipient.</p>
+                    
+                    <h3>Share Token Structure</h3>
+                    <p>A share token is a JSON object containing:</p>
+                    <ul>
+                        <li><strong>share_id</strong> - Unique identifier (random 16-byte hex)</li>
+                        <li><strong>path_scope</strong> - Folder path this share grants access to</li>
+                        <li><strong>expires_at</strong> - Unix timestamp when share expires (optional)</li>
+                        <li><strong>permissions</strong> - Read, write, delete flags</li>
+                        <li><strong>encrypted_dek</strong> - HPKE-encrypted DEK for recipient</li>
+                        <li><strong>owner_public_key</strong> - Owner's public key (for verification)</li>
+                    </ul>
+                    
+                    <h3>Permissions</h3>
+                    <ul>
+                        <li><code>read_only()</code> - Can decrypt and read files</li>
+                        <li><code>read_write()</code> - Can read and upload new files</li>
+                        <li><code>full_access()</code> - Can read, write, and delete</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Share Token JSON Structure</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "share_id": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+  "path_scope": "/photos/vacation/",
+  "created_at": 1701388800,
+  "expires_at": 1702252800,
+  "permissions": {
+    "read": true,
+    "write": false,
+    "delete": false
+  },
+  "encrypted_dek": {
+    "encapsulated_key": "base64...",
+    "ciphertext": "base64...",
+    "nonce": "base64..."
+  },
+  "owner_public_key": "base64_x25519_public_key"
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Sharing Workflow</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-plaintext">┌─────────────────────────────────────────────────────────────────┐
+│                     SECURE SHARING FLOW                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. OWNER creates share:                                         │
+│     • Specify path scope: /photos/vacation/                     │
+│     • Set expiry: 7 days                                        │
+│     • Set permissions: read-only                                │
+│     • Re-encrypt DEK for recipient's public key                 │
+│                                                                  │
+│  2. OWNER sends token to RECIPIENT:                              │
+│     • Via email, message, QR code, etc.                         │
+│     • Owner's private key never leaves device                   │
+│                                                                  │
+│  3. RECIPIENT accepts share:                                     │
+│     • Verify token signature                                    │
+│     • Check expiry                                              │
+│     • Decrypt DEK with own private key                          │
+│                                                                  │
+│  4. RECIPIENT accesses files:                                    │
+│     • Fetch encrypted files from server                         │
+│     • Decrypt with the shared DEK                               │
+│     • Path checked against scope                                │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘</code></pre>
                 </div>
             </div>
         </section>

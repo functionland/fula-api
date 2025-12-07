@@ -64,6 +64,13 @@
                 <li><a href="#kotlin">Kotlin / Android</a></li>
             </ul>
         </div>
+        <div class="nav-section">
+            <h3>Advanced Patterns</h3>
+            <ul>
+                <li><a href="#file-manager-pattern">File Manager Pattern</a></li>
+                <li><a href="#sharing-pattern">Secure Sharing</a></li>
+            </ul>
+        </div>
     </nav>
 
     <main class="content">
@@ -786,6 +793,330 @@ fun UploadScreen() {
     Button(onClick = { launcher.launch("image/*") }) {
         Text("Upload Image")
     }
+}</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- File Manager Pattern -->
+        <section id="file-manager-pattern" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>📁 File Manager Pattern</h2>
+                    <p>Build file browsers that work with encrypted storage <strong>without downloading all file content</strong>.</p>
+                    
+                    <h3>The Challenge</h3>
+                    <p>With encrypted storage, you might think you need to download and decrypt every file just to show a file list. That's expensive!</p>
+                    
+                    <h3>The Solution</h3>
+                    <p>Fula encrypts metadata separately, allowing you to:</p>
+                    <ul>
+                        <li><strong>List files</strong> - Get filenames without downloading content</li>
+                        <li><strong>Show details</strong> - Size, type, timestamps from metadata only</li>
+                        <li><strong>Lazy load</strong> - Download content only when user opens file</li>
+                    </ul>
+                    
+                    <h3>Bandwidth Comparison</h3>
+                    <table style="width:100%; margin: 1rem 0;">
+                        <tr style="background: var(--bg-tertiary);">
+                            <th style="padding: 0.5rem;">Operation</th>
+                            <th style="padding: 0.5rem;">Without Optimization</th>
+                            <th style="padding: 0.5rem;">With Metadata API</th>
+                        </tr>
+                        <tr>
+                            <td style="padding: 0.5rem;">List 100 files (1GB total)</td>
+                            <td style="padding: 0.5rem; color: #f85149;">Download 1GB</td>
+                            <td style="padding: 0.5rem; color: #3fb950;">~100KB (headers)</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 0.5rem;">Show file info</td>
+                            <td style="padding: 0.5rem; color: #f85149;">Full download</td>
+                            <td style="padding: 0.5rem; color: #3fb950;">HEAD request</td>
+                        </tr>
+                    </table>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Rust - File Manager</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">use fula_client::{EncryptedClient, EncryptionConfig, Config};
+
+async fn build_file_browser(client: &EncryptedClient, bucket: &str) {
+    // Step 1: List all files (metadata only - fast!)
+    let files = client.list_objects_decrypted(bucket, None).await?;
+    
+    // Step 2: Display in UI
+    for file in &files {
+        println!("📄 {} - {} - {:?}", 
+            file.original_key,      // Real filename (decrypted)
+            file.size_human(),      // "1.5 MB"  
+            file.content_type       // "application/pdf"
+        );
+    }
+    
+    // Step 3: User clicks a file - NOW download content
+    if let Some(selected) = user_selection {
+        let content = client.get_object_decrypted_by_storage_key(
+            bucket, 
+            &selected.storage_key
+        ).await?;
+        open_file(content);
+    }
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">TypeScript/React - File Browser Component</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-typescript">// For TypeScript/JavaScript apps, use the Rust SDK via WASM
+// or implement the metadata pattern with HEAD requests
+
+interface FileMetadata {
+  storageKey: string;
+  originalKey: string;
+  size: number;
+  contentType?: string;
+  createdAt?: number;
+}
+
+// Efficient: Only fetch metadata headers
+async function listFilesMetadataOnly(bucket: string): Promise<FileMetadata[]> {
+  // 1. List object keys (S3 ListObjectsV2)
+  const listResult = await s3.send(new ListObjectsV2Command({ Bucket: bucket }));
+  
+  // 2. HEAD each object to get metadata without content
+  const files = await Promise.all(
+    (listResult.Contents ?? []).map(async (obj) => {
+      const head = await s3.send(new HeadObjectCommand({
+        Bucket: bucket,
+        Key: obj.Key!
+      }));
+      
+      // Decrypt private metadata from x-amz-meta-encryption header
+      const encMeta = head.Metadata?.['encryption'];
+      const privateMeta = encMeta ? decryptMetadata(encMeta) : null;
+      
+      return {
+        storageKey: obj.Key!,
+        originalKey: privateMeta?.originalKey ?? obj.Key!,
+        size: privateMeta?.actualSize ?? obj.Size!,
+        contentType: privateMeta?.contentType,
+      };
+    })
+  );
+  
+  return files;
+}
+
+// React component
+function FileBrowser({ bucket }: { bucket: string }) {
+  const [files, setFiles] = useState<FileMetadata[]>([]);
+  
+  useEffect(() => {
+    listFilesMetadataOnly(bucket).then(setFiles);
+  }, [bucket]);
+  
+  return (
+    &lt;div className="file-grid"&gt;
+      {files.map(file => (
+        &lt;FileCard 
+          key={file.storageKey}
+          name={file.originalKey}
+          size={formatSize(file.size)}
+          type={file.contentType}
+          onClick={() => downloadFile(file.storageKey)}
+        /&gt;
+      ))}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Flutter - File List</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-dart">class FileMetadata {
+  final String storageKey;
+  final String originalKey;
+  final int size;
+  final String? contentType;
+  
+  FileMetadata({
+    required this.storageKey,
+    required this.originalKey,
+    required this.size,
+    this.contentType,
+  });
+}
+
+class FulaFileBrowser extends StatefulWidget {
+  @override
+  _FulaFileBrowserState createState() => _FulaFileBrowserState();
+}
+
+class _FulaFileBrowserState extends State<FulaFileBrowser> {
+  List<FileMetadata> files = [];
+  bool loading = true;
+  
+  @override
+  void initState() {
+    super.initState();
+    loadFileMetadata();
+  }
+  
+  Future<void> loadFileMetadata() async {
+    // Only fetch metadata, not file content
+    final objects = await fulaClient.listObjects(bucket);
+    
+    final metadata = await Future.wait(
+      objects.map((obj) => fulaClient.headObject(bucket, obj.key))
+    );
+    
+    setState(() {
+      files = metadata.map((m) => FileMetadata(
+        storageKey: m.key,
+        originalKey: decryptMetadata(m)?.originalKey ?? m.key,
+        size: decryptMetadata(m)?.actualSize ?? m.size,
+        contentType: decryptMetadata(m)?.contentType,
+      )).toList();
+      loading = false;
+    });
+  }
+  
+  @override
+  Widget build(BuildContext context) {
+    if (loading) return CircularProgressIndicator();
+    
+    return ListView.builder(
+      itemCount: files.length,
+      itemBuilder: (ctx, i) => ListTile(
+        leading: Icon(getFileIcon(files[i].contentType)),
+        title: Text(files[i].originalKey.split('/').last),
+        subtitle: Text(formatSize(files[i].size)),
+        onTap: () => downloadAndOpen(files[i].storageKey),
+      ),
+    );
+  }
+}</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- Secure Sharing Pattern -->
+        <section id="sharing-pattern" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>🔗 Secure Sharing Pattern</h2>
+                    <p>Share encrypted files without exposing your master key or giving permanent access.</p>
+                    
+                    <h3>Sharing Model</h3>
+                    <ul>
+                        <li><strong>Path-Scoped</strong> - Share only specific folders</li>
+                        <li><strong>Time-Limited</strong> - Access expires automatically</li>
+                        <li><strong>Permission-Based</strong> - Read-only, read-write, or full</li>
+                        <li><strong>Revocable</strong> - Cancel access at any time</li>
+                    </ul>
+                    
+                    <h3>How It Works</h3>
+                    <ol>
+                        <li>Owner creates a share token for recipient's public key</li>
+                        <li>DEK is re-encrypted for recipient (HPKE)</li>
+                        <li>Token sent via any channel (email, message, QR code)</li>
+                        <li>Recipient decrypts with their private key</li>
+                        <li>Owner's master key never exposed</li>
+                    </ol>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Share Flow - Owner Side</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">use fula_crypto::sharing::{ShareBuilder, SharePermissions};
+
+// Alice wants to share /photos/vacation with Bob
+let share_token = ShareBuilder::new(
+    &alice_keypair,         // Owner's keypair
+    &bob_public_key,        // Recipient's public key
+    &folder_dek,            // The folder's DEK
+)
+.with_path_scope("/photos/vacation/")
+.with_expiry_days(30)  // Expires in 30 days
+.with_permissions(SharePermissions::read_only())
+.build()?;
+
+// Send to Bob via any channel
+let share_link = format!(
+    "https://app.example.com/share?token={}", 
+    base64_encode(&share_token)
+);</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Accept Share - Recipient Side</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">use fula_crypto::sharing::AcceptedShare;
+
+// Bob receives the share token
+let share_token = decode_share_token(&received_token)?;
+
+// Verify and accept with Bob's private key
+let accepted = AcceptedShare::accept(&share_token, &bob_keypair)?;
+
+// Check access
+if accepted.is_expired() {
+    return Err("Share has expired");
+}
+
+if !accepted.has_access_to("/photos/vacation/beach.jpg") {
+    return Err("Path not in share scope");
+}
+
+// Get the DEK to decrypt files
+let dek = accepted.dek();
+
+// Now Bob can read files in /photos/vacation/
+let content = decrypt_file(&encrypted_data, &dek)?;</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Mobile Share UI (React Native)</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-typescript">import { Share } from 'react-native';
+
+async function shareFolder(folderPath: string, recipientPublicKey: string) {
+  // Create share token using Fula crypto
+  const shareToken = await fulaClient.createShareToken({
+    path: folderPath,
+    recipientKey: recipientPublicKey,
+    expiryDays: 7,
+    permissions: 'read',
+  });
+  
+  // Share via system share sheet
+  const shareUrl = `fula://share/${encodeURIComponent(shareToken)}`;
+  
+  await Share.share({
+    message: `I'm sharing "${folderPath}" with you!`,
+    url: shareUrl,
+  });
+}
+
+// Accept share from deep link
+async function handleShareLink(url: string) {
+  const token = extractToken(url);
+  
+  try {
+    const accepted = await fulaClient.acceptShare(token, myPrivateKey);
+    
+    Alert.alert(
+      'Share Accepted!',
+      `You now have ${accepted.permissions} access to ${accepted.pathScope}`,
+      [{ text: 'Browse Files', onPress: () => navigateToFolder(accepted.pathScope) }]
+    );
+  } catch (e) {
+    Alert.alert('Share Expired', 'This share link is no longer valid.');
+  }
 }</code></pre>
                 </div>
             </div>
