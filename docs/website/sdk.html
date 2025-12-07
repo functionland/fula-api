@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SDK Examples - Fula API Documentation</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="logo">
+            <h1>Fula API</h1>
+            <span class="version">v0.1.0</span>
+        </div>
+        <div class="nav-section">
+            <h3>Documentation</h3>
+            <ul>
+                <li><a href="index.html">API Reference</a></li>
+                <li><a href="sdk.html" class="active">SDK Examples</a></li>
+            </ul>
+        </div>
+        <div class="nav-section">
+            <h3>SDK Examples</h3>
+            <ul>
+                <li><a href="#rust-client">Rust Client</a></li>
+                <li><a href="#encryption">Encryption</a></li>
+                <li><a href="#multipart">Multipart Uploads</a></li>
+                <li><a href="#aws-cli">AWS CLI</a></li>
+                <li><a href="#python">Python (boto3)</a></li>
+                <li><a href="#javascript">JavaScript</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <main class="content">
+        <div class="section-header">
+            <h1>SDK Examples</h1>
+            <p>Code examples for integrating with the Fula API using various languages and tools.</p>
+        </div>
+
+        <section id="rust-client" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>Rust Client SDK</h2>
+                    <p>The official Rust client provides type-safe access to all Fula API operations with built-in encryption support.</p>
+                    
+                    <h3>Installation</h3>
+                    <p>Add to your <code>Cargo.toml</code>:</p>
+                    
+                    <h3>Features</h3>
+                    <ul>
+                        <li><strong>Type-safe</strong> - Compile-time guarantees</li>
+                        <li><strong>Async/await</strong> - Built on Tokio</li>
+                        <li><strong>Encryption</strong> - HPKE client-side encryption</li>
+                        <li><strong>Streaming</strong> - Efficient large file handling</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Cargo.toml</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-toml">[dependencies]
+fula-client = "0.1"
+tokio = { version = "1", features = ["full"] }</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Basic Usage</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">use fula_client::{FulaClient, ClientConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create client
+    let config = ClientConfig::new("http://localhost:9000")
+        .with_token("your-auth-token");
+    let client = FulaClient::new(config).await?;
+
+    // Create bucket
+    client.create_bucket("my-bucket").await?;
+
+    // Upload object
+    let data = b"Hello, Fula!";
+    let etag = client.put_object("my-bucket", "hello.txt", data).await?;
+    println!("Uploaded with ETag: {}", etag);
+
+    // Download object
+    let content = client.get_object("my-bucket", "hello.txt").await?;
+    println!("Content: {}", String::from_utf8_lossy(&content));
+
+    // List objects
+    let objects = client.list_objects("my-bucket", None).await?;
+    for obj in objects {
+        println!("  {} ({} bytes)", obj.key, obj.size);
+    }
+
+    // Delete object
+    client.delete_object("my-bucket", "hello.txt").await?;
+
+    Ok(())
+}</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="encryption" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>Client-Side Encryption</h2>
+                    <p>Fula supports transparent client-side encryption using HPKE (Hybrid Public Key Encryption).</p>
+                    
+                    <h3>How It Works</h3>
+                    <ol>
+                        <li>Generate or load a key pair</li>
+                        <li>Data is encrypted locally before upload</li>
+                        <li>Only you can decrypt the data</li>
+                        <li>Server never sees plaintext</li>
+                    </ol>
+                    
+                    <h3>Encryption Features</h3>
+                    <ul>
+                        <li><strong>HPKE</strong> - RFC 9180 compliant</li>
+                        <li><strong>BLAKE3</strong> - Fast, secure hashing</li>
+                        <li><strong>Bao</strong> - Verified streaming</li>
+                        <li><strong>X25519</strong> - Elliptic curve DH</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Encrypted Upload/Download</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">use fula_client::{FulaClient, ClientConfig, EncryptionConfig};
+use fula_crypto::keys::KekKeyPair;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Generate encryption keys
+    let keypair = KekKeyPair::generate();
+    
+    // Configure client with encryption
+    let config = ClientConfig::new("http://localhost:9000")
+        .with_token("your-auth-token")
+        .with_encryption(EncryptionConfig::new(keypair));
+    
+    let client = FulaClient::new(config).await?;
+
+    // Upload encrypted data
+    let sensitive_data = b"This is encrypted before upload";
+    client.put_object_encrypted(
+        "secure-bucket",
+        "secret.txt",
+        sensitive_data
+    ).await?;
+
+    // Download and decrypt
+    let decrypted = client.get_object_decrypted(
+        "secure-bucket",
+        "secret.txt"
+    ).await?;
+
+    assert_eq!(sensitive_data.as_slice(), decrypted.as_slice());
+    println!("Decrypted: {}", String::from_utf8_lossy(&decrypted));
+
+    Ok(())
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Key Management</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">use fula_crypto::keys::{KekKeyPair, KeyManager};
+
+// Generate new key pair
+let keypair = KekKeyPair::generate();
+
+// Export for backup (encrypt this!)
+let private_bytes = keypair.secret_key().to_bytes();
+let public_bytes = keypair.public_key().to_bytes();
+
+// Restore from bytes
+let restored = KekKeyPair::from_bytes(&private_bytes)?;
+
+// Key manager for multiple keys
+let mut manager = KeyManager::new(keypair);
+manager.add_recipient("alice", alice_public_key);
+manager.add_recipient("bob", bob_public_key);</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="multipart" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>Multipart Uploads</h2>
+                    <p>Upload large files efficiently using multipart uploads with progress tracking.</p>
+                    
+                    <h3>Benefits</h3>
+                    <ul>
+                        <li><strong>Resumable</strong> - Continue failed uploads</li>
+                        <li><strong>Parallel</strong> - Upload parts concurrently</li>
+                        <li><strong>Progress</strong> - Track upload progress</li>
+                        <li><strong>Large files</strong> - Up to 5TB per object</li>
+                    </ul>
+                    
+                    <h3>Part Size</h3>
+                    <p>Default: 5MB per part. Minimum: 5MB (except last part).</p>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Large File Upload with Progress</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">use fula_client::multipart::upload_large_file;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Arc::new(FulaClient::new(config).await?);
+    
+    // Read large file
+    let data = std::fs::read("large-video.mp4")?;
+    
+    // Upload with progress callback
+    let etag = upload_large_file(
+        client,
+        "media-bucket",
+        "videos/large-video.mp4",
+        data.into(),
+        Some(Box::new(|progress| {
+            println!(
+                "Uploading: {:.1}% ({}/{} bytes) - Part {}/{}",
+                progress.percentage(),
+                progress.bytes_uploaded,
+                progress.total_bytes,
+                progress.current_part,
+                progress.total_parts
+            );
+        })),
+    ).await?;
+
+    println!("Upload complete! ETag: {}", etag);
+    Ok(())
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Manual Multipart Control</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">use fula_client::multipart::MultipartUpload;
+
+// Start multipart upload
+let mut upload = MultipartUpload::start(
+    client.clone(),
+    "bucket",
+    "large-file.zip"
+).await?;
+
+println!("Upload ID: {}", upload.upload_id());
+
+// Upload parts
+for (i, chunk) in data.chunks(5 * 1024 * 1024).enumerate() {
+    let etag = upload.upload_part((i + 1) as u32, chunk).await?;
+    println!("Part {} uploaded: {}", i + 1, etag);
+}
+
+// Complete upload
+let final_etag = upload.complete().await?;
+println!("Complete: {}", final_etag);</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="aws-cli" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>AWS CLI</h2>
+                    <p>Use the standard AWS CLI with Fula's S3-compatible endpoint.</p>
+                    
+                    <h3>Configuration</h3>
+                    <p>Configure AWS CLI to use the Fula endpoint:</p>
+                    
+                    <h3>Supported Commands</h3>
+                    <ul>
+                        <li><code>aws s3 ls</code> - List buckets/objects</li>
+                        <li><code>aws s3 cp</code> - Upload/download</li>
+                        <li><code>aws s3 rm</code> - Delete objects</li>
+                        <li><code>aws s3 mb</code> - Create bucket</li>
+                        <li><code>aws s3 rb</code> - Remove bucket</li>
+                        <li><code>aws s3 sync</code> - Sync directories</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Configuration</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash"># Configure credentials
+aws configure set aws_access_key_id YOUR_ACCESS_KEY
+aws configure set aws_secret_access_key YOUR_SECRET_KEY
+
+# Set endpoint alias
+alias fula='aws --endpoint-url http://localhost:9000'</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Common Operations</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash"># List all buckets
+fula s3 ls
+
+# Create bucket
+fula s3 mb s3://my-bucket
+
+# Upload file
+fula s3 cp ./local-file.txt s3://my-bucket/remote-file.txt
+
+# Upload directory
+fula s3 cp ./my-folder s3://my-bucket/folder/ --recursive
+
+# Download file
+fula s3 cp s3://my-bucket/remote-file.txt ./downloaded.txt
+
+# List objects with prefix
+fula s3 ls s3://my-bucket/prefix/
+
+# Delete object
+fula s3 rm s3://my-bucket/old-file.txt
+
+# Sync local to remote
+fula s3 sync ./local-dir s3://my-bucket/backup/
+
+# Delete bucket (must be empty)
+fula s3 rb s3://my-bucket</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="python" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>Python (boto3)</h2>
+                    <p>Use the official AWS SDK for Python with Fula's S3-compatible API.</p>
+                    
+                    <h3>Installation</h3>
+                    <code class="inline-code">pip install boto3</code>
+                    
+                    <h3>Features</h3>
+                    <ul>
+                        <li>Full S3 API compatibility</li>
+                        <li>Automatic retries</li>
+                        <li>Multipart upload support</li>
+                        <li>Streaming transfers</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Python Example</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-python">import boto3
+from botocore.config import Config
+
+# Create client
+s3 = boto3.client(
+    's3',
+    endpoint_url='http://localhost:9000',
+    aws_access_key_id='YOUR_ACCESS_KEY',
+    aws_secret_access_key='YOUR_SECRET_KEY',
+    config=Config(signature_version='s3v4')
+)
+
+# Create bucket
+s3.create_bucket(Bucket='my-bucket')
+
+# Upload file
+s3.upload_file('local-file.txt', 'my-bucket', 'remote-file.txt')
+
+# Upload with metadata
+s3.put_object(
+    Bucket='my-bucket',
+    Key='document.pdf',
+    Body=open('document.pdf', 'rb'),
+    ContentType='application/pdf',
+    Metadata={'author': 'John Doe'}
+)
+
+# Download file
+s3.download_file('my-bucket', 'remote-file.txt', 'downloaded.txt')
+
+# List objects
+response = s3.list_objects_v2(Bucket='my-bucket', Prefix='docs/')
+for obj in response.get('Contents', []):
+    print(f"{obj['Key']} - {obj['Size']} bytes")
+
+# Delete object
+s3.delete_object(Bucket='my-bucket', Key='old-file.txt')
+
+# Presigned URL (for sharing)
+url = s3.generate_presigned_url(
+    'get_object',
+    Params={'Bucket': 'my-bucket', 'Key': 'file.txt'},
+    ExpiresIn=3600  # 1 hour
+)
+print(f"Share URL: {url}")</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="javascript" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>JavaScript / TypeScript</h2>
+                    <p>Use the AWS SDK for JavaScript with Fula's S3-compatible endpoint.</p>
+                    
+                    <h3>Installation</h3>
+                    <code class="inline-code">npm install @aws-sdk/client-s3</code>
+                    
+                    <h3>Browser Support</h3>
+                    <p>Works in Node.js and browsers with proper CORS configuration.</p>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">TypeScript Example</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-typescript">import {
+  S3Client,
+  CreateBucketCommand,
+  PutObjectCommand,
+  GetObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectCommand,
+} from '@aws-sdk/client-s3';
+
+// Create client
+const s3 = new S3Client({
+  endpoint: 'http://localhost:9000',
+  region: 'us-east-1',
+  credentials: {
+    accessKeyId: 'YOUR_ACCESS_KEY',
+    secretAccessKey: 'YOUR_SECRET_KEY',
+  },
+  forcePathStyle: true, // Required for S3-compatible services
+});
+
+async function main() {
+  // Create bucket
+  await s3.send(new CreateBucketCommand({
+    Bucket: 'my-bucket',
+  }));
+
+  // Upload object
+  await s3.send(new PutObjectCommand({
+    Bucket: 'my-bucket',
+    Key: 'hello.txt',
+    Body: 'Hello, Fula!',
+    ContentType: 'text/plain',
+  }));
+
+  // Download object
+  const response = await s3.send(new GetObjectCommand({
+    Bucket: 'my-bucket',
+    Key: 'hello.txt',
+  }));
+  const content = await response.Body?.transformToString();
+  console.log('Content:', content);
+
+  // List objects
+  const list = await s3.send(new ListObjectsV2Command({
+    Bucket: 'my-bucket',
+    Prefix: 'docs/',
+  }));
+  for (const obj of list.Contents ?? []) {
+    console.log(`${obj.Key} - ${obj.Size} bytes`);
+  }
+
+  // Delete object
+  await s3.send(new DeleteObjectCommand({
+    Bucket: 'my-bucket',
+    Key: 'hello.txt',
+  }));
+}
+
+main().catch(console.error);</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <footer>
+            <p>Fula API Documentation • Built with ❤️ for decentralized storage</p>
+        </footer>
+    </main>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/rust.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/typescript.min.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>

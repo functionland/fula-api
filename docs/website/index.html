@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fula API Documentation</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="logo">
+            <h1>Fula API</h1>
+            <span class="version">v0.1.0</span>
+        </div>
+        <div class="nav-section">
+            <h3>Documentation</h3>
+            <ul>
+                <li><a href="index.html">API Reference</a></li>
+                <li><a href="sdk.html">SDK Examples</a></li>
+            </ul>
+        </div>
+        <div class="nav-section">
+            <h3>Getting Started</h3>
+            <ul>
+                <li><a href="#introduction">Introduction</a></li>
+                <li><a href="#authentication">Authentication</a></li>
+                <li><a href="#errors">Error Handling</a></li>
+            </ul>
+        </div>
+        <div class="nav-section">
+            <h3>Buckets</h3>
+            <ul>
+                <li><a href="#list-buckets">List Buckets</a></li>
+                <li><a href="#create-bucket">Create Bucket</a></li>
+                <li><a href="#delete-bucket">Delete Bucket</a></li>
+                <li><a href="#head-bucket">Head Bucket</a></li>
+            </ul>
+        </div>
+        <div class="nav-section">
+            <h3>Objects</h3>
+            <ul>
+                <li><a href="#list-objects">List Objects</a></li>
+                <li><a href="#get-object">Get Object</a></li>
+                <li><a href="#put-object">Put Object</a></li>
+                <li><a href="#delete-object">Delete Object</a></li>
+                <li><a href="#copy-object">Copy Object</a></li>
+                <li><a href="#head-object">Head Object</a></li>
+            </ul>
+        </div>
+        <div class="nav-section">
+            <h3>Multipart Upload</h3>
+            <ul>
+                <li><a href="#initiate-multipart">Initiate Upload</a></li>
+                <li><a href="#upload-part">Upload Part</a></li>
+                <li><a href="#complete-multipart">Complete Upload</a></li>
+                <li><a href="#abort-multipart">Abort Upload</a></li>
+            </ul>
+        </div>
+        <div class="nav-section">
+            <h3>Tagging</h3>
+            <ul>
+                <li><a href="#get-tagging">Get Object Tagging</a></li>
+                <li><a href="#put-tagging">Put Object Tagging</a></li>
+                <li><a href="#delete-tagging">Delete Object Tagging</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <main class="content">
+        <section id="introduction" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>Introduction</h2>
+                    <p>The Fula API provides S3-compatible endpoints for decentralized object storage. Built on IPFS with client-side encryption using HPKE and BLAKE3.</p>
+                    
+                    <h3>Base URL</h3>
+                    <p>All API requests should be made to:</p>
+                    <code class="inline-code">https://your-gateway.example.com</code>
+                    
+                    <h3>Features</h3>
+                    <ul>
+                        <li><strong>S3 Compatible</strong> - Use existing S3 tools and SDKs</li>
+                        <li><strong>Decentralized</strong> - Data stored across IPFS network</li>
+                        <li><strong>Encrypted</strong> - Client-side encryption with HPKE</li>
+                        <li><strong>Verifiable</strong> - BLAKE3 hashes and Bao streaming verification</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">cURL</span>
+                    </div>
+                    <pre><code class="language-bash"># Using AWS CLI
+aws --endpoint-url http://localhost:9000 \
+    s3 ls
+
+# Using cURL
+curl -X GET http://localhost:9000/ \
+    -H "Authorization: Bearer YOUR_TOKEN"</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="authentication" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>Authentication</h2>
+                    <p>All API requests require authentication using a Bearer token in the Authorization header.</p>
+                    
+                    <h3>Request Headers</h3>
+                    <table class="params-table">
+                        <thead>
+                            <tr><th>Header</th><th>Required</th><th>Description</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>Authorization</code></td>
+                                <td><span class="badge required">Required</span></td>
+                                <td>Bearer token: <code>Bearer &lt;token&gt;</code></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    
+                    <h3>Permissions</h3>
+                    <p>Tokens include permissions that control access:</p>
+                    <ul>
+                        <li><code>read</code> - Read objects and list buckets</li>
+                        <li><code>write</code> - Create and modify objects</li>
+                        <li><code>delete</code> - Delete objects and buckets</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                    </div>
+                    <pre><code class="language-bash">curl -X GET http://localhost:9000/my-bucket/file.txt \
+    -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">401 Unauthorized</span>
+                    </div>
+                    <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;Error&gt;
+    &lt;Code&gt;AccessDenied&lt;/Code&gt;
+    &lt;Message&gt;Invalid or missing token&lt;/Message&gt;
+    &lt;RequestId&gt;abc123&lt;/RequestId&gt;
+&lt;/Error&gt;</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="errors" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>Error Handling</h2>
+                    <p>Errors are returned as XML responses following S3 conventions.</p>
+                    
+                    <h3>Error Codes</h3>
+                    <table class="params-table">
+                        <thead>
+                            <tr><th>Code</th><th>HTTP Status</th><th>Description</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>NoSuchBucket</code></td><td>404</td><td>Bucket does not exist</td></tr>
+                            <tr><td><code>NoSuchKey</code></td><td>404</td><td>Object does not exist</td></tr>
+                            <tr><td><code>BucketAlreadyExists</code></td><td>409</td><td>Bucket name taken</td></tr>
+                            <tr><td><code>AccessDenied</code></td><td>403</td><td>Permission denied</td></tr>
+                            <tr><td><code>InvalidArgument</code></td><td>400</td><td>Invalid request parameter</td></tr>
+                            <tr><td><code>InternalError</code></td><td>500</td><td>Server error</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Error Response</span>
+                    </div>
+                    <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;Error&gt;
+    &lt;Code&gt;NoSuchBucket&lt;/Code&gt;
+    &lt;Message&gt;The specified bucket does not exist&lt;/Message&gt;
+    &lt;BucketName&gt;my-bucket&lt;/BucketName&gt;
+    &lt;RequestId&gt;4442587FB7D0A2F9&lt;/RequestId&gt;
+&lt;/Error&gt;</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- Buckets Section -->
+        <div class="section-header">
+            <h1>Buckets</h1>
+        </div>
+
+        <section id="list-buckets" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge get">GET</div>
+                    <h2>List Buckets</h2>
+                    <p>Returns a list of all buckets owned by the authenticated user.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">GET /</code>
+                    
+                    <h3>Response</h3>
+                    <table class="params-table">
+                        <thead>
+                            <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>Buckets</code></td><td>Array</td><td>List of bucket objects</td></tr>
+                            <tr><td><code>Bucket.Name</code></td><td>String</td><td>Bucket name</td></tr>
+                            <tr><td><code>Bucket.CreationDate</code></td><td>DateTime</td><td>ISO 8601 creation time</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X GET http://localhost:9000/ \
+    -H "Authorization: Bearer $TOKEN"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">200 OK</span>
+                    </div>
+                    <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;ListAllMyBucketsResult&gt;
+    &lt;Owner&gt;
+        &lt;ID&gt;user123&lt;/ID&gt;
+        &lt;DisplayName&gt;John Doe&lt;/DisplayName&gt;
+    &lt;/Owner&gt;
+    &lt;Buckets&gt;
+        &lt;Bucket&gt;
+            &lt;Name&gt;my-documents&lt;/Name&gt;
+            &lt;CreationDate&gt;2024-01-15T10:30:00Z&lt;/CreationDate&gt;
+        &lt;/Bucket&gt;
+        &lt;Bucket&gt;
+            &lt;Name&gt;backups&lt;/Name&gt;
+            &lt;CreationDate&gt;2024-02-20T14:45:00Z&lt;/CreationDate&gt;
+        &lt;/Bucket&gt;
+    &lt;/Buckets&gt;
+&lt;/ListAllMyBucketsResult&gt;</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="create-bucket" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge put">PUT</div>
+                    <h2>Create Bucket</h2>
+                    <p>Creates a new bucket with the specified name.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">PUT /{bucket}</code>
+                    
+                    <h3>Path Parameters</h3>
+                    <table class="params-table">
+                        <thead>
+                            <tr><th>Parameter</th><th>Required</th><th>Description</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>bucket</code></td>
+                                <td><span class="badge required">Required</span></td>
+                                <td>Bucket name (3-63 chars, lowercase, no spaces)</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    
+                    <h3>Response Codes</h3>
+                    <ul>
+                        <li><code>200 OK</code> - Bucket created successfully</li>
+                        <li><code>409 Conflict</code> - Bucket already exists</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X PUT http://localhost:9000/my-new-bucket \
+    -H "Authorization: Bearer $TOKEN"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">200 OK</span>
+                    </div>
+                    <pre><code class="language-http">HTTP/1.1 200 OK
+Location: /my-new-bucket
+Content-Length: 0</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="delete-bucket" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge delete">DELETE</div>
+                    <h2>Delete Bucket</h2>
+                    <p>Deletes an empty bucket. The bucket must be empty before deletion.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">DELETE /{bucket}</code>
+                    
+                    <h3>Path Parameters</h3>
+                    <table class="params-table">
+                        <thead>
+                            <tr><th>Parameter</th><th>Required</th><th>Description</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>bucket</code></td>
+                                <td><span class="badge required">Required</span></td>
+                                <td>Name of the bucket to delete</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X DELETE http://localhost:9000/my-bucket \
+    -H "Authorization: Bearer $TOKEN"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">204 No Content</span>
+                    </div>
+                    <pre><code class="language-http">HTTP/1.1 204 No Content</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="head-bucket" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge head">HEAD</div>
+                    <h2>Head Bucket</h2>
+                    <p>Check if a bucket exists and you have permission to access it.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">HEAD /{bucket}</code>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -I http://localhost:9000/my-bucket \
+    -H "Authorization: Bearer $TOKEN"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">200 OK</span>
+                    </div>
+                    <pre><code class="language-http">HTTP/1.1 200 OK
+x-amz-bucket-region: us-east-1
+Content-Length: 0</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- Objects Section -->
+        <div class="section-header">
+            <h1>Objects</h1>
+        </div>
+
+        <section id="list-objects" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge get">GET</div>
+                    <h2>List Objects (v2)</h2>
+                    <p>Returns objects in a bucket. Supports pagination and prefix filtering.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">GET /{bucket}?list-type=2</code>
+                    
+                    <h3>Query Parameters</h3>
+                    <table class="params-table">
+                        <thead>
+                            <tr><th>Parameter</th><th>Required</th><th>Description</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>list-type</code></td><td>Optional</td><td>Use <code>2</code> for ListObjectsV2</td></tr>
+                            <tr><td><code>prefix</code></td><td>Optional</td><td>Filter by key prefix</td></tr>
+                            <tr><td><code>delimiter</code></td><td>Optional</td><td>Group keys by delimiter</td></tr>
+                            <tr><td><code>max-keys</code></td><td>Optional</td><td>Max results (default: 1000)</td></tr>
+                            <tr><td><code>continuation-token</code></td><td>Optional</td><td>Pagination token</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X GET "http://localhost:9000/my-bucket?list-type=2&prefix=docs/&max-keys=10" \
+    -H "Authorization: Bearer $TOKEN"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">200 OK</span>
+                    </div>
+                    <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;ListBucketResult&gt;
+    &lt;Name&gt;my-bucket&lt;/Name&gt;
+    &lt;Prefix&gt;docs/&lt;/Prefix&gt;
+    &lt;MaxKeys&gt;10&lt;/MaxKeys&gt;
+    &lt;IsTruncated&gt;false&lt;/IsTruncated&gt;
+    &lt;Contents&gt;
+        &lt;Key&gt;docs/readme.md&lt;/Key&gt;
+        &lt;LastModified&gt;2024-03-15T10:30:00Z&lt;/LastModified&gt;
+        &lt;ETag&gt;"d41d8cd98f00b204e9800998ecf8427e"&lt;/ETag&gt;
+        &lt;Size&gt;1024&lt;/Size&gt;
+        &lt;StorageClass&gt;STANDARD&lt;/StorageClass&gt;
+    &lt;/Contents&gt;
+    &lt;Contents&gt;
+        &lt;Key&gt;docs/api.md&lt;/Key&gt;
+        &lt;LastModified&gt;2024-03-16T14:20:00Z&lt;/LastModified&gt;
+        &lt;ETag&gt;"098f6bcd4621d373cade4e832627b4f6"&lt;/ETag&gt;
+        &lt;Size&gt;2048&lt;/Size&gt;
+        &lt;StorageClass&gt;STANDARD&lt;/StorageClass&gt;
+    &lt;/Contents&gt;
+&lt;/ListBucketResult&gt;</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="get-object" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge get">GET</div>
+                    <h2>Get Object</h2>
+                    <p>Retrieves an object from a bucket. Supports range requests and conditional headers.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">GET /{bucket}/{key}</code>
+                    
+                    <h3>Request Headers</h3>
+                    <table class="params-table">
+                        <thead>
+                            <tr><th>Header</th><th>Description</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>Range</code></td><td>Byte range (e.g., <code>bytes=0-1023</code>)</td></tr>
+                            <tr><td><code>If-None-Match</code></td><td>Return 304 if ETag matches</td></tr>
+                            <tr><td><code>If-Modified-Since</code></td><td>Return 304 if not modified</td></tr>
+                        </tbody>
+                    </table>
+                    
+                    <h3>Response Headers</h3>
+                    <table class="params-table">
+                        <thead>
+                            <tr><th>Header</th><th>Description</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>ETag</code></td><td>Object's MD5 hash</td></tr>
+                            <tr><td><code>Content-Length</code></td><td>Size in bytes</td></tr>
+                            <tr><td><code>Content-Type</code></td><td>MIME type</td></tr>
+                            <tr><td><code>Last-Modified</code></td><td>Last modification time</td></tr>
+                            <tr><td><code>x-amz-meta-*</code></td><td>Custom metadata</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash"># Full object
+curl -X GET http://localhost:9000/my-bucket/file.txt \
+    -H "Authorization: Bearer $TOKEN" \
+    -o file.txt
+
+# Range request (first 1KB)
+curl -X GET http://localhost:9000/my-bucket/large-file.bin \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Range: bytes=0-1023"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">200 OK</span>
+                    </div>
+                    <pre><code class="language-http">HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: 1024
+ETag: "d41d8cd98f00b204e9800998ecf8427e"
+Last-Modified: Sat, 15 Mar 2024 10:30:00 GMT
+x-amz-meta-custom: my-value
+
+[file contents]</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="put-object" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge put">PUT</div>
+                    <h2>Put Object</h2>
+                    <p>Uploads an object to a bucket. Objects are content-addressed using BLAKE3.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">PUT /{bucket}/{key}</code>
+                    
+                    <h3>Request Headers</h3>
+                    <table class="params-table">
+                        <thead>
+                            <tr><th>Header</th><th>Description</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>Content-Type</code></td><td>MIME type of the object</td></tr>
+                            <tr><td><code>Content-Length</code></td><td>Size in bytes</td></tr>
+                            <tr><td><code>Content-MD5</code></td><td>Base64 MD5 for verification</td></tr>
+                            <tr><td><code>x-amz-meta-*</code></td><td>Custom metadata headers</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash"># Upload a file
+curl -X PUT http://localhost:9000/my-bucket/document.pdf \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/pdf" \
+    -H "x-amz-meta-author: John Doe" \
+    --data-binary @document.pdf
+
+# Upload text content
+curl -X PUT http://localhost:9000/my-bucket/hello.txt \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: text/plain" \
+    -d "Hello, World!"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">200 OK</span>
+                    </div>
+                    <pre><code class="language-http">HTTP/1.1 200 OK
+ETag: "098f6bcd4621d373cade4e832627b4f6"
+x-amz-version-id: v1.0</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="delete-object" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge delete">DELETE</div>
+                    <h2>Delete Object</h2>
+                    <p>Removes an object from a bucket.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">DELETE /{bucket}/{key}</code>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X DELETE http://localhost:9000/my-bucket/old-file.txt \
+    -H "Authorization: Bearer $TOKEN"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">204 No Content</span>
+                    </div>
+                    <pre><code class="language-http">HTTP/1.1 204 No Content
+x-amz-delete-marker: true</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="copy-object" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge put">PUT</div>
+                    <h2>Copy Object</h2>
+                    <p>Creates a copy of an object. Can copy within or across buckets.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">PUT /{bucket}/{key}</code>
+                    
+                    <h3>Request Headers</h3>
+                    <table class="params-table">
+                        <thead>
+                            <tr><th>Header</th><th>Required</th><th>Description</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>x-amz-copy-source</code></td>
+                                <td><span class="badge required">Required</span></td>
+                                <td>Source: <code>/bucket/key</code></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X PUT http://localhost:9000/backup-bucket/file-copy.txt \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "x-amz-copy-source: /my-bucket/original-file.txt"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">200 OK</span>
+                    </div>
+                    <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;CopyObjectResult&gt;
+    &lt;LastModified&gt;2024-03-20T15:30:00Z&lt;/LastModified&gt;
+    &lt;ETag&gt;"098f6bcd4621d373cade4e832627b4f6"&lt;/ETag&gt;
+&lt;/CopyObjectResult&gt;</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="head-object" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge head">HEAD</div>
+                    <h2>Head Object</h2>
+                    <p>Retrieves metadata without the object body.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">HEAD /{bucket}/{key}</code>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -I http://localhost:9000/my-bucket/file.txt \
+    -H "Authorization: Bearer $TOKEN"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">200 OK</span>
+                    </div>
+                    <pre><code class="language-http">HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: 1024
+ETag: "d41d8cd98f00b204e9800998ecf8427e"
+Last-Modified: Sat, 15 Mar 2024 10:30:00 GMT
+x-amz-meta-author: John Doe</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- Multipart Section -->
+        <div class="section-header">
+            <h1>Multipart Upload</h1>
+            <p>Upload large files in parts for improved reliability and performance.</p>
+        </div>
+
+        <section id="initiate-multipart" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge post">POST</div>
+                    <h2>Initiate Multipart Upload</h2>
+                    <p>Starts a multipart upload and returns an upload ID.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">POST /{bucket}/{key}?uploads</code>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X POST "http://localhost:9000/my-bucket/large-file.zip?uploads" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/zip"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">200 OK</span>
+                    </div>
+                    <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;InitiateMultipartUploadResult&gt;
+    &lt;Bucket&gt;my-bucket&lt;/Bucket&gt;
+    &lt;Key&gt;large-file.zip&lt;/Key&gt;
+    &lt;UploadId&gt;VXBsb2FkIElE-abc123xyz&lt;/UploadId&gt;
+&lt;/InitiateMultipartUploadResult&gt;</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="upload-part" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge put">PUT</div>
+                    <h2>Upload Part</h2>
+                    <p>Uploads a part of a multipart upload. Parts must be at least 5MB (except last).</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">PUT /{bucket}/{key}?partNumber={n}&uploadId={id}</code>
+                    
+                    <h3>Query Parameters</h3>
+                    <table class="params-table">
+                        <thead>
+                            <tr><th>Parameter</th><th>Required</th><th>Description</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>partNumber</code></td><td><span class="badge required">Required</span></td><td>Part number (1-10000)</td></tr>
+                            <tr><td><code>uploadId</code></td><td><span class="badge required">Required</span></td><td>Upload ID from initiate</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash"># Upload part 1
+curl -X PUT "http://localhost:9000/my-bucket/large-file.zip?partNumber=1&uploadId=VXBsb2FkIElE-abc123xyz" \
+    -H "Authorization: Bearer $TOKEN" \
+    --data-binary @part1.bin</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">200 OK</span>
+                    </div>
+                    <pre><code class="language-http">HTTP/1.1 200 OK
+ETag: "a54357aff0632cce46d942af68356b38"</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="complete-multipart" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge post">POST</div>
+                    <h2>Complete Multipart Upload</h2>
+                    <p>Completes a multipart upload by assembling uploaded parts.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">POST /{bucket}/{key}?uploadId={id}</code>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X POST "http://localhost:9000/my-bucket/large-file.zip?uploadId=VXBsb2FkIElE-abc123xyz" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/xml" \
+    -d '&lt;CompleteMultipartUpload&gt;
+    &lt;Part&gt;&lt;PartNumber&gt;1&lt;/PartNumber&gt;&lt;ETag&gt;"a54357aff0632cce46d942af68356b38"&lt;/ETag&gt;&lt;/Part&gt;
+    &lt;Part&gt;&lt;PartNumber&gt;2&lt;/PartNumber&gt;&lt;ETag&gt;"0dc9f8eb2b9d9a6d8f8c7e5b4a3c2d1e"&lt;/ETag&gt;&lt;/Part&gt;
+&lt;/CompleteMultipartUpload&gt;'</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">200 OK</span>
+                    </div>
+                    <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;CompleteMultipartUploadResult&gt;
+    &lt;Location&gt;http://localhost:9000/my-bucket/large-file.zip&lt;/Location&gt;
+    &lt;Bucket&gt;my-bucket&lt;/Bucket&gt;
+    &lt;Key&gt;large-file.zip&lt;/Key&gt;
+    &lt;ETag&gt;"17fbc0a106abbb6f381aac6e331f2a19-2"&lt;/ETag&gt;
+&lt;/CompleteMultipartUploadResult&gt;</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="abort-multipart" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge delete">DELETE</div>
+                    <h2>Abort Multipart Upload</h2>
+                    <p>Aborts a multipart upload and frees associated resources.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">DELETE /{bucket}/{key}?uploadId={id}</code>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X DELETE "http://localhost:9000/my-bucket/large-file.zip?uploadId=VXBsb2FkIElE-abc123xyz" \
+    -H "Authorization: Bearer $TOKEN"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">204 No Content</span>
+                    </div>
+                    <pre><code class="language-http">HTTP/1.1 204 No Content</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- Tagging Section -->
+        <div class="section-header">
+            <h1>Object Tagging</h1>
+            <p>Add key-value metadata tags to objects for categorization and lifecycle management.</p>
+        </div>
+
+        <section id="get-tagging" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge get">GET</div>
+                    <h2>Get Object Tagging</h2>
+                    <p>Returns the tag set associated with an object.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">GET /{bucket}/{key}?tagging</code>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X GET "http://localhost:9000/my-bucket/file.txt?tagging" \
+    -H "Authorization: Bearer $TOKEN"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">200 OK</span>
+                    </div>
+                    <pre><code class="language-xml">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;Tagging&gt;
+    &lt;TagSet&gt;
+        &lt;Tag&gt;
+            &lt;Key&gt;environment&lt;/Key&gt;
+            &lt;Value&gt;production&lt;/Value&gt;
+        &lt;/Tag&gt;
+        &lt;Tag&gt;
+            &lt;Key&gt;project&lt;/Key&gt;
+            &lt;Value&gt;website&lt;/Value&gt;
+        &lt;/Tag&gt;
+    &lt;/TagSet&gt;
+&lt;/Tagging&gt;</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="put-tagging" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge put">PUT</div>
+                    <h2>Put Object Tagging</h2>
+                    <p>Sets tags on an object. Replaces all existing tags.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">PUT /{bucket}/{key}?tagging</code>
+                    
+                    <h3>Limits</h3>
+                    <ul>
+                        <li>Maximum 10 tags per object</li>
+                        <li>Key: 1-128 Unicode characters</li>
+                        <li>Value: 0-256 Unicode characters</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X PUT "http://localhost:9000/my-bucket/file.txt?tagging" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/xml" \
+    -d '&lt;Tagging&gt;
+    &lt;TagSet&gt;
+        &lt;Tag&gt;&lt;Key&gt;status&lt;/Key&gt;&lt;Value&gt;approved&lt;/Value&gt;&lt;/Tag&gt;
+        &lt;Tag&gt;&lt;Key&gt;owner&lt;/Key&gt;&lt;Value&gt;alice&lt;/Value&gt;&lt;/Tag&gt;
+    &lt;/TagSet&gt;
+&lt;/Tagging&gt;'</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">200 OK</span>
+                    </div>
+                    <pre><code class="language-http">HTTP/1.1 200 OK
+Content-Length: 0</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="delete-tagging" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <div class="method-badge delete">DELETE</div>
+                    <h2>Delete Object Tagging</h2>
+                    <p>Removes all tags from an object.</p>
+                    
+                    <h3>Endpoint</h3>
+                    <code class="endpoint-url">DELETE /{bucket}/{key}?tagging</code>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Request</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">curl -X DELETE "http://localhost:9000/my-bucket/file.txt?tagging" \
+    -H "Authorization: Bearer $TOKEN"</code></pre>
+                    
+                    <div class="example-header">
+                        <span class="lang-label">Response</span>
+                        <span class="status-badge success">204 No Content</span>
+                    </div>
+                    <pre><code class="language-http">HTTP/1.1 204 No Content</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <footer>
+            <p>Fula API Documentation • Built with ❤️ for decentralized storage</p>
+        </footer>
+    </main>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>

@@ -15,6 +15,11 @@ Fula Storage provides an Amazon S3-compatible API backed by a decentralized netw
 - **🔄 Conflict-Free Sync**: CRDT-based metadata for distributed updates
 - **📈 Efficient Indexing**: Prolly Trees for O(log n) bucket operations
 
+## 📖 Documentation
+
+- **[API Reference](https://functionland.github.io/fula-api/)** - Complete API documentation with examples
+- **[SDK Examples](https://functionland.github.io/fula-api/sdk.html)** - Code examples for Rust, Python, JavaScript
+
 ## Architecture
 
 ```
