@@ -646,8 +646,42 @@ footer {
     line-height: 1.5;
 }
 
+/* Light Theme Adjustments for Intro */
+[data-theme="light"] .hero {
+    background: linear-gradient(135deg, #f6f8fa 0%, #ffffff 50%, #f0f3f6 100%);
+}
+
+[data-theme="light"] .hero h1 {
+    background: linear-gradient(135deg, #1f2328 0%, #0969da 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+[data-theme="light"] .badge-item {
+    background: rgba(9, 105, 218, 0.1);
+    border-color: rgba(9, 105, 218, 0.3);
+}
+
+[data-theme="light"] .code-comment {
+    color: #6a737d;
+}
+
+[data-theme="light"] .code-output {
+    background: #f6f8fa;
+}
+
+[data-theme="light"] .ds-diagram pre,
+[data-theme="light"] .step-content code {
+    color: var(--accent-green);
+}
+
 /* Responsive */
 @media (max-width: 768px) {
+    .intro-content {
+        padding-top: 60px;
+    }
+    
     .hero {
         padding: 40px 24px;
     }
@@ -657,11 +691,19 @@ footer {
     }
 
     .hero h1 {
-        font-size: 2rem;
+        font-size: 1.8rem;
+    }
+    
+    .hero-subtitle {
+        font-size: 1rem;
     }
 
     .intro-section {
-        padding: 40px 24px;
+        padding: 40px 16px;
+    }
+    
+    .intro-section h2 {
+        font-size: 1.5rem;
     }
 
     .layer-components {
@@ -671,5 +713,103 @@ footer {
     .hero-badges {
         flex-direction: column;
         align-items: center;
+    }
+    
+    .hero-actions {
+        flex-direction: column;
+        width: 100%;
+    }
+    
+    .hero-actions .btn {
+        width: 100%;
+        text-align: center;
+    }
+    
+    .overview-features {
+        grid-template-columns: 1fr;
+    }
+    
+    .encryption-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .ds-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .getting-started-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .next-links {
+        grid-template-columns: 1fr;
+    }
+    
+    .comparison-table th,
+    .comparison-table td {
+        padding: 12px 8px;
+        font-size: 0.85rem;
+    }
+    
+    .quickstart-code .code-block.large {
+        padding: 16px;
+        max-height: 400px;
+    }
+    
+    .quickstart-code .code-block.large pre {
+        font-size: 0.7rem;
+    }
+    
+    .code-header {
+        flex-direction: column;
+        gap: 8px;
+        text-align: center;
+    }
+    
+    .flow-step {
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+    }
+    
+    .step-content code {
+        font-size: 0.75rem;
+    }
+    
+    footer {
+        padding: 24px 16px;
+    }
+}
+
+@media (max-width: 480px) {
+    .hero h1 {
+        font-size: 1.5rem;
+    }
+    
+    .intro-section {
+        padding: 32px 12px;
+    }
+    
+    .feature-card,
+    .encryption-card,
+    .ds-card,
+    .gs-card {
+        padding: 16px;
+    }
+    
+    .arch-layer {
+        padding: 12px;
+    }
+    
+    .component {
+        padding: 8px;
+    }
+    
+    .component strong {
+        font-size: 0.8rem;
+    }
+    
+    .component span {
+        font-size: 0.65rem;
     }
 }

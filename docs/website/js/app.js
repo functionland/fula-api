@@ -1,8 +1,13 @@
 // Fula API Documentation - Interactive Features
 
 document.addEventListener('DOMContentLoaded', () => {
+    // Initialize theme
+    initTheme();
+    
     // Initialize syntax highlighting
-    hljs.highlightAll();
+    if (typeof hljs !== 'undefined') {
+        hljs.highlightAll();
+    }
     
     // Initialize navigation highlighting
     initNavHighlight();
@@ -13,6 +18,53 @@ document.addEventListener('DOMContentLoaded', () => {
     // Initialize mobile menu
     initMobileMenu();
 });
+
+/**
+ * Theme Toggle Functionality
+ */
+function initTheme() {
+    // Get saved theme or default to dark
+    const savedTheme = localStorage.getItem('fula-docs-theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', savedTheme);
+    
+    // Apply code theme on load
+    updateCodeTheme(savedTheme);
+    
+    // Add click handlers to all theme toggles
+    document.querySelectorAll('.theme-toggle').forEach(toggle => {
+        toggle.addEventListener('click', toggleTheme);
+    });
+}
+
+function toggleTheme() {
+    const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+    const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+    
+    document.documentElement.setAttribute('data-theme', newTheme);
+    localStorage.setItem('fula-docs-theme', newTheme);
+    
+    // Update highlight.js theme
+    updateCodeTheme(newTheme);
+}
+
+function updateCodeTheme(theme) {
+    // Update highlight.js stylesheet
+    const hljsLink = document.querySelector('link[href*="highlight.js"]');
+    if (hljsLink) {
+        if (theme === 'light') {
+            hljsLink.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css';
+        } else {
+            hljsLink.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css';
+        }
+    }
+    
+    // Re-highlight code blocks when theme changes
+    if (typeof hljs !== 'undefined') {
+        document.querySelectorAll('pre code').forEach(block => {
+            hljs.highlightElement(block);
+        });
+    }
+}
 
 /**
  * Highlight current section in navigation
@@ -78,51 +130,50 @@ function copyCode(button) {
  * Mobile menu toggle
  */
 function initMobileMenu() {
-    // Create mobile menu button
-    const menuBtn = document.createElement('button');
-    menuBtn.className = 'mobile-menu-btn';
-    menuBtn.innerHTML = '☰';
-    menuBtn.style.cssText = `
-        display: none;
-        position: fixed;
-        top: 20px;
-        left: 20px;
-        z-index: 200;
-        background: var(--bg-sidebar);
-        border: 1px solid var(--border-color);
-        color: var(--text-primary);
-        padding: 10px 15px;
-        border-radius: 6px;
-        font-size: 1.2rem;
-        cursor: pointer;
-    `;
-    
-    document.body.appendChild(menuBtn);
-    
     const sidebar = document.querySelector('.sidebar');
+    const hamburger = document.querySelector('.hamburger');
+    const overlay = document.querySelector('.sidebar-overlay');
     
-    // Show menu button on mobile
-    const mediaQuery = window.matchMedia('(max-width: 768px)');
-    
-    function handleScreenChange(e) {
-        menuBtn.style.display = e.matches ? 'block' : 'none';
-    }
-    
-    mediaQuery.addListener(handleScreenChange);
-    handleScreenChange(mediaQuery);
+    if (!hamburger || !sidebar) return;
     
     // Toggle sidebar
-    menuBtn.addEventListener('click', () => {
+    hamburger.addEventListener('click', () => {
+        hamburger.classList.toggle('active');
         sidebar.classList.toggle('open');
+        if (overlay) overlay.classList.toggle('active');
+        document.body.style.overflow = sidebar.classList.contains('open') ? 'hidden' : '';
     });
+    
+    // Close sidebar when clicking overlay
+    if (overlay) {
+        overlay.addEventListener('click', () => {
+            hamburger.classList.remove('active');
+            sidebar.classList.remove('open');
+            overlay.classList.remove('active');
+            document.body.style.overflow = '';
+        });
+    }
     
     // Close sidebar when clicking a link on mobile
     sidebar.querySelectorAll('a').forEach(link => {
         link.addEventListener('click', () => {
-            if (mediaQuery.matches) {
+            if (window.innerWidth <= 768) {
+                hamburger.classList.remove('active');
                 sidebar.classList.remove('open');
+                if (overlay) overlay.classList.remove('active');
+                document.body.style.overflow = '';
             }
         });
+    });
+    
+    // Handle resize
+    window.addEventListener('resize', () => {
+        if (window.innerWidth > 768) {
+            hamburger.classList.remove('active');
+            sidebar.classList.remove('open');
+            if (overlay) overlay.classList.remove('active');
+            document.body.style.overflow = '';
+        }
     });
 }
 

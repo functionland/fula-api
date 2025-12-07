@@ -1,17 +1,47 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SDK Examples - Fula API Documentation</title>
     <link rel="stylesheet" href="css/styles.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script>
+        (function() {
+            const saved = localStorage.getItem('fula-docs-theme');
+            if (saved) document.documentElement.setAttribute('data-theme', saved);
+        })();
+    </script>
 </head>
 <body>
+    <!-- Mobile Header -->
+    <header class="mobile-header">
+        <button class="hamburger" aria-label="Toggle menu">
+            <span></span>
+            <span></span>
+            <span></span>
+        </button>
+        <span class="logo-text">Fula API</span>
+        <div class="mobile-header-actions">
+            <button class="theme-toggle" aria-label="Toggle theme">
+                <span class="icon-sun">☀️</span>
+                <span class="icon-moon">🌙</span>
+            </button>
+        </div>
+    </header>
+    
+    <div class="sidebar-overlay"></div>
+    
     <nav class="sidebar">
-        <div class="logo">
-            <h1>Fula API</h1>
-            <span class="version">v0.1.0</span>
+        <div class="sidebar-header">
+            <div class="logo">
+                <h1>Fula API</h1>
+                <span class="version">v0.1.0</span>
+            </div>
+            <button class="theme-toggle" aria-label="Toggle theme">
+                <span class="icon-sun">☀️</span>
+                <span class="icon-moon">🌙</span>
+            </button>
         </div>
         <div class="nav-section">
             <h3>Documentation</h3>
