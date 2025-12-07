@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Platform Integration - Fula API Documentation</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="logo">
+            <h1>Fula API</h1>
+            <span class="version">v0.1.0</span>
+        </div>
+        <div class="nav-section">
+            <h3>Documentation</h3>
+            <ul>
+                <li><a href="index.html">API Reference</a></li>
+                <li><a href="sdk.html">SDK Examples</a></li>
+                <li><a href="platforms.html" class="active">Platform Guides</a></li>
+            </ul>
+        </div>
+        <div class="nav-section">
+            <h3>Platforms</h3>
+            <ul>
+                <li><a href="#nextjs">Next.js</a></li>
+                <li><a href="#react-native">React Native</a></li>
+                <li><a href="#dotnet">.NET / C#</a></li>
+                <li><a href="#flutter">Flutter / Dart</a></li>
+                <li><a href="#swift">Swift / iOS</a></li>
+                <li><a href="#kotlin">Kotlin / Android</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <main class="content">
+        <div class="section-header">
+            <h1>Platform Integration Guides</h1>
+            <p>Fula is S3-compatible, so you can use any S3 SDK. Here's how to integrate with popular platforms.</p>
+        </div>
+
+        <!-- Next.js -->
+        <section id="nextjs" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>🌐 Next.js / React</h2>
+                    <p>Use the AWS SDK for JavaScript v3 in your Next.js application for both client and server components.</p>
+                    
+                    <h3>Installation</h3>
+                    <code class="inline-code">npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner</code>
+                    
+                    <h3>Use Cases</h3>
+                    <ul>
+                        <li><strong>Server Actions</strong> - Upload from API routes</li>
+                        <li><strong>Presigned URLs</strong> - Direct browser uploads</li>
+                        <li><strong>Server Components</strong> - Fetch files server-side</li>
+                        <li><strong>Edge Runtime</strong> - Works with Edge functions</li>
+                    </ul>
+                    
+                    <h3>Environment Variables</h3>
+                    <p>Add to <code>.env.local</code>:</p>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">.env.local</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-bash">FULA_ENDPOINT=http://localhost:9000
+FULA_ACCESS_KEY=your-access-key
+FULA_SECRET_KEY=your-secret-key
+FULA_BUCKET=my-bucket</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">lib/fula.ts - S3 Client</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-typescript">import { S3Client } from '@aws-sdk/client-s3';
+
+export const fulaClient = new S3Client({
+  endpoint: process.env.FULA_ENDPOINT,
+  region: 'us-east-1',
+  credentials: {
+    accessKeyId: process.env.FULA_ACCESS_KEY!,
+    secretAccessKey: process.env.FULA_SECRET_KEY!,
+  },
+  forcePathStyle: true,
+});</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">app/api/upload/route.ts - API Route</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-typescript">import { NextRequest, NextResponse } from 'next/server';
+import { PutObjectCommand } from '@aws-sdk/client-s3';
+import { fulaClient } from '@/lib/fula';
+
+export async function POST(request: NextRequest) {
+  const formData = await request.formData();
+  const file = formData.get('file') as File;
+  
+  const buffer = Buffer.from(await file.arrayBuffer());
+  
+  await fulaClient.send(new PutObjectCommand({
+    Bucket: process.env.FULA_BUCKET,
+    Key: `uploads/${file.name}`,
+    Body: buffer,
+    ContentType: file.type,
+  }));
+
+  return NextResponse.json({ 
+    success: true,
+    key: `uploads/${file.name}` 
+  });
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Presigned URL for Direct Upload</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-typescript">import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+
+// Generate upload URL (valid 1 hour)
+export async function getUploadUrl(key: string) {
+  const command = new PutObjectCommand({
+    Bucket: process.env.FULA_BUCKET,
+    Key: key,
+  });
+  return getSignedUrl(fulaClient, command, { expiresIn: 3600 });
+}
+
+// Generate download URL
+export async function getDownloadUrl(key: string) {
+  const command = new GetObjectCommand({
+    Bucket: process.env.FULA_BUCKET,
+    Key: key,
+  });
+  return getSignedUrl(fulaClient, command, { expiresIn: 3600 });
+}
+
+// Client-side: Upload directly to Fula
+const uploadUrl = await getUploadUrl('my-file.pdf');
+await fetch(uploadUrl, {
+  method: 'PUT',
+  body: file,
+  headers: { 'Content-Type': file.type },
+});</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- React Native -->
+        <section id="react-native" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>📱 React Native (iOS & Android)</h2>
+                    <p>Use react-native-blob-util for file handling with AWS SDK or direct HTTP calls.</p>
+                    
+                    <h3>Installation</h3>
+                    <code class="inline-code">npm install aws-sdk react-native-blob-util</code>
+                    
+                    <h3>Approaches</h3>
+                    <ul>
+                        <li><strong>Presigned URLs</strong> - Recommended for mobile</li>
+                        <li><strong>Backend Proxy</strong> - Upload via your server</li>
+                        <li><strong>Direct SDK</strong> - AWS SDK v2 works in RN</li>
+                    </ul>
+                    
+                    <h3>Note</h3>
+                    <p>AWS SDK v3 has issues with React Native. Use v2 or presigned URLs.</p>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">fulaClient.ts</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-typescript">import AWS from 'aws-sdk';
+
+const fulaS3 = new AWS.S3({
+  endpoint: 'https://your-fula-gateway.com',
+  accessKeyId: 'YOUR_ACCESS_KEY',
+  secretAccessKey: 'YOUR_SECRET_KEY',
+  s3ForcePathStyle: true,
+  signatureVersion: 'v4',
+});
+
+export default fulaS3;</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Upload with Presigned URL</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-typescript">import ReactNativeBlobUtil from 'react-native-blob-util';
+
+// Get presigned URL from your backend
+const response = await fetch('https://your-api.com/upload-url', {
+  method: 'POST',
+  body: JSON.stringify({ filename: 'photo.jpg' }),
+});
+const { uploadUrl } = await response.json();
+
+// Upload file directly to Fula
+const filePath = '/path/to/photo.jpg';
+await ReactNativeBlobUtil.fetch('PUT', uploadUrl, {
+  'Content-Type': 'image/jpeg',
+}, ReactNativeBlobUtil.wrap(filePath));
+
+console.log('Upload complete!');</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Upload Image from Camera</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-typescript">import { launchCamera } from 'react-native-image-picker';
+import fulaS3 from './fulaClient';
+
+async function uploadPhoto() {
+  const result = await launchCamera({ mediaType: 'photo' });
+  
+  if (result.assets?.[0]) {
+    const asset = result.assets[0];
+    const response = await fetch(asset.uri!);
+    const blob = await response.blob();
+    
+    await fulaS3.upload({
+      Bucket: 'photos',
+      Key: `camera/${Date.now()}.jpg`,
+      Body: blob,
+      ContentType: 'image/jpeg',
+    }).promise();
+    
+    console.log('Photo uploaded!');
+  }
+}
+
+// Download file
+async function downloadFile(key: string) {
+  const url = fulaS3.getSignedUrl('getObject', {
+    Bucket: 'photos',
+    Key: key,
+    Expires: 3600,
+  });
+  
+  const res = await ReactNativeBlobUtil.config({
+    fileCache: true,
+    appendExt: 'jpg',
+  }).fetch('GET', url);
+  
+  return res.path();
+}</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- .NET -->
+        <section id="dotnet" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>🪟 .NET / C# (Windows, MAUI, Blazor)</h2>
+                    <p>Use the official AWS SDK for .NET. Works with Windows apps, ASP.NET, MAUI, and Blazor.</p>
+                    
+                    <h3>Installation</h3>
+                    <code class="inline-code">dotnet add package AWSSDK.S3</code>
+                    
+                    <h3>Platforms</h3>
+                    <ul>
+                        <li><strong>ASP.NET Core</strong> - Web APIs and MVC</li>
+                        <li><strong>Blazor</strong> - Server and WASM</li>
+                        <li><strong>MAUI</strong> - Cross-platform mobile/desktop</li>
+                        <li><strong>WPF/WinForms</strong> - Windows desktop</li>
+                        <li><strong>Console</strong> - CLI tools</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">FulaClient.cs</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-csharp">using Amazon.S3;
+using Amazon.S3.Model;
+using Amazon.Runtime;
+
+public class FulaClient
+{
+    private readonly IAmazonS3 _s3Client;
+    private readonly string _bucketName;
+
+    public FulaClient(string endpoint, string accessKey, 
+                      string secretKey, string bucket)
+    {
+        var config = new AmazonS3Config
+        {
+            ServiceURL = endpoint,
+            ForcePathStyle = true,
+            SignatureVersion = "4"
+        };
+
+        var credentials = new BasicAWSCredentials(accessKey, secretKey);
+        _s3Client = new AmazonS3Client(credentials, config);
+        _bucketName = bucket;
+    }
+
+    public async Task UploadFileAsync(string key, Stream stream, 
+                                       string contentType)
+    {
+        var request = new PutObjectRequest
+        {
+            BucketName = _bucketName,
+            Key = key,
+            InputStream = stream,
+            ContentType = contentType
+        };
+
+        await _s3Client.PutObjectAsync(request);
+    }
+
+    public async Task&lt;Stream&gt; DownloadFileAsync(string key)
+    {
+        var response = await _s3Client.GetObjectAsync(_bucketName, key);
+        return response.ResponseStream;
+    }
+
+    public async Task&lt;List&lt;S3Object&gt;&gt; ListFilesAsync(string prefix = "")
+    {
+        var request = new ListObjectsV2Request
+        {
+            BucketName = _bucketName,
+            Prefix = prefix
+        };
+
+        var response = await _s3Client.ListObjectsV2Async(request);
+        return response.S3Objects;
+    }
+
+    public string GetPresignedUrl(string key, TimeSpan expiry)
+    {
+        var request = new GetPreSignedUrlRequest
+        {
+            BucketName = _bucketName,
+            Key = key,
+            Expires = DateTime.UtcNow.Add(expiry)
+        };
+
+        return _s3Client.GetPreSignedURL(request);
+    }
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">ASP.NET Core Usage</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-csharp">// Program.cs - Dependency Injection
+builder.Services.AddSingleton&lt;FulaClient&gt;(sp => 
+    new FulaClient(
+        endpoint: "http://localhost:9000",
+        accessKey: builder.Configuration["Fula:AccessKey"]!,
+        secretKey: builder.Configuration["Fula:SecretKey"]!,
+        bucket: "my-bucket"
+    ));
+
+// Controller
+[ApiController]
+[Route("api/[controller]")]
+public class FilesController : ControllerBase
+{
+    private readonly FulaClient _fula;
+
+    public FilesController(FulaClient fula) => _fula = fula;
+
+    [HttpPost("upload")]
+    public async Task&lt;IActionResult&gt; Upload(IFormFile file)
+    {
+        var key = $"uploads/{Guid.NewGuid()}/{file.FileName}";
+        await _fula.UploadFileAsync(key, file.OpenReadStream(), 
+                                     file.ContentType);
+        return Ok(new { key });
+    }
+
+    [HttpGet("download/{*key}")]
+    public async Task&lt;IActionResult&gt; Download(string key)
+    {
+        var stream = await _fula.DownloadFileAsync(key);
+        return File(stream, "application/octet-stream");
+    }
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">MAUI Mobile App</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-csharp">// Upload photo from device
+public async Task UploadPhotoAsync()
+{
+    var result = await MediaPicker.CapturePhotoAsync();
+    if (result == null) return;
+
+    using var stream = await result.OpenReadAsync();
+    var key = $"photos/{DateTime.Now:yyyyMMdd}/{result.FileName}";
+    
+    await _fula.UploadFileAsync(key, stream, "image/jpeg");
+    
+    await DisplayAlert("Success", "Photo uploaded!", "OK");
+}</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- Flutter -->
+        <section id="flutter" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>🐦 Flutter / Dart</h2>
+                    <p>Use the minio package for S3-compatible storage in Flutter apps.</p>
+                    
+                    <h3>Installation</h3>
+                    <code class="inline-code">flutter pub add minio</code>
+                    
+                    <h3>Platforms</h3>
+                    <p>Works on iOS, Android, Web, Windows, macOS, and Linux.</p>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">fula_client.dart</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-dart">import 'package:minio/minio.dart';
+import 'dart:io';
+
+class FulaClient {
+  late final Minio _minio;
+  final String bucket;
+
+  FulaClient({
+    required String endpoint,
+    required String accessKey,
+    required String secretKey,
+    required this.bucket,
+  }) {
+    _minio = Minio(
+      endPoint: endpoint,
+      accessKey: accessKey,
+      secretKey: secretKey,
+      useSSL: endpoint.startsWith('https'),
+    );
+  }
+
+  Future&lt;void&gt; uploadFile(String key, File file) async {
+    await _minio.fPutObject(bucket, key, file.path);
+  }
+
+  Future&lt;void&gt; uploadBytes(String key, List&lt;int&gt; data, 
+                            String contentType) async {
+    await _minio.putObject(
+      bucket,
+      key,
+      Stream.value(data),
+      size: data.length,
+      metadata: {'Content-Type': contentType},
+    );
+  }
+
+  Future&lt;List&lt;int&gt;&gt; downloadFile(String key) async {
+    final stream = await _minio.getObject(bucket, key);
+    final chunks = &lt;int&gt;[];
+    await for (final chunk in stream) {
+      chunks.addAll(chunk);
+    }
+    return chunks;
+  }
+
+  Future&lt;List&lt;Object&gt;&gt; listFiles(String prefix) async {
+    final objects = &lt;Object&gt;[];
+    await for (final obj in _minio.listObjects(bucket, prefix: prefix)) {
+      objects.addAll(obj.objects);
+    }
+    return objects;
+  }
+
+  Future&lt;String&gt; getPresignedUrl(String key) async {
+    return await _minio.presignedGetObject(bucket, key);
+  }
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Usage in Flutter</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-dart">import 'package:image_picker/image_picker.dart';
+
+final fula = FulaClient(
+  endpoint: 'your-fula-gateway.com',
+  accessKey: 'YOUR_ACCESS_KEY',
+  secretKey: 'YOUR_SECRET_KEY',
+  bucket: 'my-bucket',
+);
+
+// Upload image from gallery
+Future&lt;void&gt; uploadImage() async {
+  final picker = ImagePicker();
+  final image = await picker.pickImage(source: ImageSource.gallery);
+  
+  if (image != null) {
+    final file = File(image.path);
+    final key = 'images/${DateTime.now().millisecondsSinceEpoch}.jpg';
+    
+    await fula.uploadFile(key, file);
+    print('Uploaded: $key');
+  }
+}
+
+// Display image from Fula
+Widget buildImage(String key) {
+  return FutureBuilder&lt;String&gt;(
+    future: fula.getPresignedUrl(key),
+    builder: (context, snapshot) {
+      if (snapshot.hasData) {
+        return Image.network(snapshot.data!);
+      }
+      return CircularProgressIndicator();
+    },
+  );
+}</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- Swift -->
+        <section id="swift" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>🍎 Swift / iOS</h2>
+                    <p>Use the AWS SDK for Swift or Soto (community SDK) for iOS/macOS apps.</p>
+                    
+                    <h3>Installation (SPM)</h3>
+                    <code class="inline-code">https://github.com/soto-project/soto.git</code>
+                    
+                    <h3>Recommended</h3>
+                    <p>Soto is lighter and more Swift-native than the official AWS SDK.</p>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">FulaClient.swift</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-swift">import SotoS3
+import NIO
+
+class FulaClient {
+    private let s3: S3
+    private let bucket: String
+    
+    init(endpoint: String, accessKey: String, 
+         secretKey: String, bucket: String) {
+        let client = AWSClient(
+            credentialProvider: .static(
+                accessKeyId: accessKey,
+                secretAccessKey: secretKey
+            ),
+            httpClientProvider: .createNew
+        )
+        
+        self.s3 = S3(
+            client: client,
+            endpoint: endpoint,
+            timeout: .seconds(30)
+        )
+        self.bucket = bucket
+    }
+    
+    func upload(key: String, data: Data, 
+                contentType: String) async throws {
+        let request = S3.PutObjectRequest(
+            body: .data(data),
+            bucket: bucket,
+            contentType: contentType,
+            key: key
+        )
+        _ = try await s3.putObject(request)
+    }
+    
+    func download(key: String) async throws -> Data {
+        let request = S3.GetObjectRequest(bucket: bucket, key: key)
+        let response = try await s3.getObject(request)
+        
+        guard let body = response.body?.asData() else {
+            throw NSError(domain: "FulaError", code: 1)
+        }
+        return body
+    }
+    
+    func listObjects(prefix: String) async throws -> [S3.Object] {
+        let request = S3.ListObjectsV2Request(
+            bucket: bucket,
+            prefix: prefix
+        )
+        let response = try await s3.listObjectsV2(request)
+        return response.contents ?? []
+    }
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">SwiftUI Usage</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-swift">import SwiftUI
+import PhotosUI
+
+struct ContentView: View {
+    @State private var selectedImage: PhotosPickerItem?
+    let fula = FulaClient(
+        endpoint: "https://your-fula-gateway.com",
+        accessKey: "YOUR_KEY",
+        secretKey: "YOUR_SECRET",
+        bucket: "photos"
+    )
+    
+    var body: some View {
+        PhotosPicker(selection: $selectedImage, matching: .images) {
+            Text("Upload Photo")
+        }
+        .onChange(of: selectedImage) { item in
+            Task {
+                if let data = try? await item?.loadTransferable(
+                    type: Data.self
+                ) {
+                    let key = "photos/\(UUID().uuidString).jpg"
+                    try? await fula.upload(
+                        key: key,
+                        data: data,
+                        contentType: "image/jpeg"
+                    )
+                }
+            }
+        }
+    }
+}</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- Kotlin -->
+        <section id="kotlin" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>🤖 Kotlin / Android</h2>
+                    <p>Use the AWS SDK for Kotlin or MinIO Java SDK for Android apps.</p>
+                    
+                    <h3>Gradle Dependency</h3>
+                    <code class="inline-code">implementation("io.minio:minio:8.5.7")</code>
+                    
+                    <h3>Note</h3>
+                    <p>MinIO SDK is lighter than AWS SDK for mobile use.</p>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">FulaClient.kt</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-kotlin">import io.minio.MinioClient
+import io.minio.PutObjectArgs
+import io.minio.GetObjectArgs
+import io.minio.ListObjectsArgs
+import java.io.InputStream
+
+class FulaClient(
+    endpoint: String,
+    accessKey: String,
+    secretKey: String,
+    private val bucket: String
+) {
+    private val client = MinioClient.builder()
+        .endpoint(endpoint)
+        .credentials(accessKey, secretKey)
+        .build()
+
+    suspend fun upload(
+        key: String, 
+        stream: InputStream, 
+        size: Long,
+        contentType: String
+    ) {
+        withContext(Dispatchers.IO) {
+            client.putObject(
+                PutObjectArgs.builder()
+                    .bucket(bucket)
+                    .`object`(key)
+                    .stream(stream, size, -1)
+                    .contentType(contentType)
+                    .build()
+            )
+        }
+    }
+
+    suspend fun download(key: String): InputStream {
+        return withContext(Dispatchers.IO) {
+            client.getObject(
+                GetObjectArgs.builder()
+                    .bucket(bucket)
+                    .`object`(key)
+                    .build()
+            )
+        }
+    }
+
+    suspend fun listObjects(prefix: String): List&lt;String&gt; {
+        return withContext(Dispatchers.IO) {
+            client.listObjects(
+                ListObjectsArgs.builder()
+                    .bucket(bucket)
+                    .prefix(prefix)
+                    .build()
+            ).map { it.get().objectName() }
+        }
+    }
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Android Compose Usage</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-kotlin">@Composable
+fun UploadScreen() {
+    val context = LocalContext.current
+    val fula = remember {
+        FulaClient(
+            endpoint = "https://your-fula-gateway.com",
+            accessKey = "YOUR_KEY",
+            secretKey = "YOUR_SECRET",
+            bucket = "uploads"
+        )
+    }
+
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri ->
+        uri?.let {
+            lifecycleScope.launch {
+                val stream = context.contentResolver.openInputStream(uri)
+                val key = "uploads/${System.currentTimeMillis()}.jpg"
+                
+                stream?.use { input ->
+                    fula.upload(
+                        key = key,
+                        stream = input,
+                        size = input.available().toLong(),
+                        contentType = "image/jpeg"
+                    )
+                }
+            }
+        }
+    }
+
+    Button(onClick = { launcher.launch("image/*") }) {
+        Text("Upload Image")
+    }
+}</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <footer>
+            <p>Fula API Documentation • Built with ❤️ for decentralized storage</p>
+        </footer>
+    </main>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/kotlin.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/swift.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/dart.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/csharp.min.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
