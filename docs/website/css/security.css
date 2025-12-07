@@ -1072,6 +1072,76 @@
     color: var(--accent-color);
 }
 
+/* Metadata Privacy Section */
+.privacy-details {
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+}
+
+.privacy-overview,
+.privacy-how,
+.privacy-modes,
+.privacy-code {
+    background: var(--bg-tertiary);
+    padding: 1.5rem;
+    border-radius: 10px;
+}
+
+.privacy-overview ul {
+    list-style: none;
+    padding: 0;
+    margin-top: 1rem;
+}
+
+.privacy-overview li {
+    margin-bottom: 0.75rem;
+    padding: 0.5rem;
+    background: var(--bg-primary);
+    border-radius: 6px;
+}
+
+.privacy-diagram {
+    background: var(--bg-primary);
+    border-radius: 8px;
+    overflow-x: auto;
+    margin-top: 1rem;
+}
+
+.modes-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1rem;
+    margin-top: 1rem;
+}
+
+.mode-card {
+    background: var(--bg-primary);
+    padding: 1rem;
+    border-radius: 8px;
+    border-left: 3px solid var(--accent-color);
+}
+
+.mode-card h4 {
+    margin-bottom: 0.5rem;
+    color: var(--accent-color);
+}
+
+.mode-card p {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.5rem;
+}
+
+.mode-card code {
+    display: block;
+    background: var(--bg-tertiary);
+    padding: 0.5rem;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    margin-top: 0.5rem;
+}
+
 /* Footer */
 footer {
     text-align: center;

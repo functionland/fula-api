@@ -66,6 +66,7 @@
                 <li><a href="#key-management">Key Management</a></li>
                 <li><a href="#sharing">Secure Sharing</a></li>
                 <li><a href="#key-rotation-detail">Key Rotation</a></li>
+                <li><a href="#metadata-privacy">Metadata Privacy</a></li>
                 <li><a href="#security-guarantees">Security Guarantees</a></li>
                 <li><a href="#threat-model">Threat Model</a></li>
                 <li><a href="#best-practices">Best Practices</a></li>
@@ -1066,8 +1067,113 @@ while !fs.is_rotation_complete() {
             </div>
         </section>
 
+        <!-- Metadata Privacy -->
+        <section id="metadata-privacy" class="security-section alt-bg">
+            <h2>Metadata Privacy</h2>
+            <p class="section-intro">Protect not just your data, but also your file names, sizes, and timestamps.</p>
+
+            <div class="privacy-details">
+                <div class="privacy-overview">
+                    <h3>Why Metadata Privacy Matters</h3>
+                    <p>Even with encrypted content, metadata can reveal sensitive information:</p>
+                    <ul>
+                        <li><strong>File names</strong> like "tax_returns_2024.pdf" or "medical_records.docx" reveal intent</li>
+                        <li><strong>File sizes</strong> can identify document types or media content</li>
+                        <li><strong>Timestamps</strong> show when you accessed or modified files</li>
+                        <li><strong>Content types</strong> indicate what kind of data you're storing</li>
+                    </ul>
+                </div>
+
+                <div class="privacy-how">
+                    <h3>How It Works</h3>
+                    <div class="privacy-diagram">
+                        <pre class="diagram-ascii">
+┌─────────────────────────────────────────────────────────────────┐
+│                   METADATA PRIVACY FLOW                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  CLIENT SIDE (Original Metadata):                                │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Key:        /finances/investment_portfolio_2024.xlsx       │ │
+│  │ Size:       156,789 bytes                                  │ │
+│  │ Type:       application/vnd.openxmlformats...              │ │
+│  │ Modified:   2024-12-07T15:30:00Z                           │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                           │                                      │
+│                           ▼                                      │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │              METADATA ENCRYPTION                           │ │
+│  │  1. Create PrivateMetadata struct with original values    │ │
+│  │  2. Encrypt with file's DEK using AES-256-GCM             │ │
+│  │  3. Generate obfuscated storage key via BLAKE3            │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                           │                                      │
+│                           ▼                                      │
+│  SERVER SIDE (What storage nodes see):                           │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Key:        e/a7c3f9b2e8d14a6f (obfuscated hash)          │ │
+│  │ Size:       156,821 bytes (ciphertext size)               │ │
+│  │ Type:       application/octet-stream (generic)            │ │
+│  │ Metadata:   [encrypted blob]                              │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘</pre>
+                    </div>
+                </div>
+
+                <div class="privacy-modes">
+                    <h3>Key Obfuscation Modes</h3>
+                    <div class="modes-grid">
+                        <div class="mode-card">
+                            <h4>DeterministicHash (Default)</h4>
+                            <p>Same file path → Same storage key. Allows retrieval without local index.</p>
+                            <code>/photos/beach.jpg → e/a7c3f9b2e8d14a6f</code>
+                        </div>
+                        <div class="mode-card">
+                            <h4>RandomUuid</h4>
+                            <p>Each upload gets a random key. Maximum privacy but requires local mapping.</p>
+                            <code>/photos/beach.jpg → e/random-uuid-here</code>
+                        </div>
+                        <div class="mode-card">
+                            <h4>PreserveStructure</h4>
+                            <p>Keep directory paths, hash only filenames. Allows folder browsing.</p>
+                            <code>/photos/beach.jpg → /photos/e_a7c3f9b2</code>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="privacy-code">
+                    <h3>Code Example</h3>
+                    <div class="code-snippet">
+                        <pre>use fula_client::{EncryptedClient, EncryptionConfig, KeyObfuscation};
+
+// Default: metadata privacy enabled with deterministic hashing
+let config = EncryptionConfig::new();
+
+// Or customize the obfuscation mode
+let config = EncryptionConfig::new()
+    .with_obfuscation_mode(KeyObfuscation::PreserveStructure);
+
+// Disable metadata privacy if not needed
+let config = EncryptionConfig::new_without_privacy();
+
+// Upload with privacy - server sees obfuscated key
+client.put_object_encrypted(bucket, "/secret/file.txt", data).await?;
+
+// Retrieve using original path - client computes storage key
+let data = client.get_object_decrypted(bucket, "/secret/file.txt").await?;
+
+// Get full metadata including original filename
+let info = client.get_object_with_private_metadata(bucket, storage_key).await?;
+println!("Original name: {}", info.original_key);
+println!("Original size: {}", info.original_size);</pre>
+                    </div>
+                </div>
+            </div>
+        </section>
+
         <!-- Security Guarantees -->
-        <section id="security-guarantees" class="security-section alt-bg">
+        <section id="security-guarantees" class="security-section">
             <h2>Security Guarantees</h2>
             <p class="section-intro">What the current implementation provides and its limitations.</p>
 
@@ -1082,6 +1188,7 @@ while !fs.is_rotation_complete() {
                         <li><strong>Key Isolation:</strong> Each file has unique DEK; compromise affects only that file</li>
                         <li><strong>Semantic Security:</strong> Same plaintext encrypts to different ciphertext each time</li>
                         <li><strong>Ciphertext Indistinguishability:</strong> Encrypted data appears random</li>
+                        <li><strong>Metadata Privacy:</strong> File names, sizes, timestamps encrypted (optional, enabled by default)</li>
                     </ul>
                 </div>
 
@@ -1090,7 +1197,6 @@ while !fs.is_rotation_complete() {
                     <ul>
                         <li><strong>Sender Authentication:</strong> Recipients can't verify who encrypted the data</li>
                         <li><strong>Deniability:</strong> Encryption proves you had the key</li>
-                        <li><strong>Metadata Privacy:</strong> File names, sizes, timestamps are not encrypted</li>
                         <li><strong>Traffic Analysis Resistance:</strong> Access patterns may be observable</li>
                         <li><strong>Post-Quantum Security:</strong> X25519 vulnerable to quantum computers</li>
                     </ul>

@@ -46,7 +46,10 @@ mod types;
 
 pub use client::FulaClient;
 pub use config::Config;
-pub use encryption::{EncryptedClient, EncryptionConfig};
+pub use encryption::{EncryptedClient, EncryptionConfig, DecryptedObjectInfo};
 pub use error::{ClientError, Result};
 pub use multipart::{MultipartUpload, UploadProgress, ProgressCallback, upload_large_file};
 pub use types::*;
+
+// Re-export useful crypto types for encryption configuration
+pub use fula_crypto::private_metadata::KeyObfuscation;

@@ -233,6 +233,9 @@ cargo run --example security_verification
 # Sharing Demo
 cargo run --example sharing_demo
 
+# Metadata Privacy
+cargo run --example metadata_privacy
+
 ```
 
 ## Security
