@@ -1,0 +1,1020 @@
+openapi: 3.0.3
+info:
+  title: Decentralized S3-Compatible Storage Gateway API
+  version: 1.0.0
+  description: |
+    S3-compatible API for decentralized storage on IPFS with client-side encryption.
+    
+    This API provides full S3 compatibility while leveraging:
+    - IPFS Cluster for distributed persistence
+    - Prolly Trees for efficient indexing
+    - Client-side HPKE encryption (keys never leave client devices)
+    - BLAKE3/Bao for verified streaming
+    - CRDTs for conflict-free collaboration
+    
+    **Authentication**: OAuth 2.0 with JWT Bearer tokens
+    
+    **Key Features**:
+    - Zero-knowledge storage (gateway sees only encrypted blocks)
+    - Automatic deduplication via content-addressing
+    - Real-time collaboration with CRDTs
+    - Versioning and immutable history
+    
+  contact:
+    name: API Support
+    url: https://github.com/functionland/dsn-gateway
+    email: hi@fx.land
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+
+servers:
+  - url: https://gateway.fx.land
+    description: Production Gateway
+  - url: https://staging.gateway.fx.land
+    description: Staging Environment
+  - url: http://localhost:9000
+    description: Local Development
+
+tags:
+  - name: Bucket Operations
+    description: Operations on S3 buckets
+  - name: Object Operations
+    description: Operations on S3 objects
+  - name: Multipart Upload
+    description: Large file upload operations
+  - name: Metadata Operations
+    description: Object metadata and tagging
+  - name: Control Plane
+    description: Gateway control and IPFS pinning APIs
+
+security:
+  - oauth2: [storage:read, storage:write]
+  - bearerAuth: []
+
+paths:
+  # ============================================================================
+  # BUCKET OPERATIONS
+  # ============================================================================
+  
+  /:
+    get:
+      tags:
+        - Bucket Operations
+      summary: ListBuckets
+      operationId: listBuckets
+      description: Returns a list of all buckets owned by the authenticated user
+      security:
+        - oauth2: [storage:read]
+      responses:
+        '200':
+          description: Successfully retrieved bucket list
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/ListAllMyBucketsResult'
+              example: |
+                <?xml version="1.0" encoding="UTF-8"?>
+                <ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <Owner>
+                    <ID>79a59df900b949e55d96a1e698fbacedfd6e09d98eacf8f8d5218e7cd47ef2be</ID>
+                    <DisplayName>user@example.com</DisplayName>
+                  </Owner>
+                  <Buckets>
+                    <Bucket>
+                      <Name>my-bucket</Name>
+                      <CreationDate>2025-12-01T12:00:00.000Z</CreationDate>
+                    </Bucket>
+                    <Bucket>
+                      <Name>photos-2025</Name>
+                      <CreationDate>2025-12-05T08:30:00.000Z</CreationDate>
+                    </Bucket>
+                  </Buckets>
+                </ListAllMyBucketsResult>
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /{bucket}:
+    parameters:
+      - $ref: '#/components/parameters/BucketName'
+    
+    put:
+      tags:
+        - Bucket Operations
+      summary: CreateBucket
+      operationId: createBucket
+      description: Creates a new bucket with the specified name
+      security:
+        - oauth2: [storage:write]
+      parameters:
+        - name: x-amz-acl
+          in: header
+          description: Canned ACL to apply to the bucket
+          schema:
+            type: string
+            enum: [private, public-read, public-read-write, authenticated-read]
+            default: private
+      responses:
+        '200':
+          description: Bucket created successfully
+          headers:
+            Location:
+              schema:
+                type: string
+              description: URI of the created bucket
+        '409':
+          $ref: '#/components/responses/BucketAlreadyExists'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    
+    head:
+      tags:
+        - Bucket Operations
+      summary: HeadBucket
+      operationId: headBucket
+      description: Determines if a bucket exists and the user has permission to access it
+      security:
+        - oauth2: [storage:read]
+      responses:
+        '200':
+          description: Bucket exists and user has access
+        '404':
+          $ref: '#/components/responses/NoSuchBucket'
+        '403':
+          $ref: '#/components/responses/AccessDenied'
+    
+    delete:
+      tags:
+        - Bucket Operations
+      summary: DeleteBucket
+      operationId: deleteBucket
+      description: Deletes an empty bucket
+      security:
+        - oauth2: [storage:write]
+      responses:
+        '204':
+          description: Bucket deleted successfully
+        '404':
+          $ref: '#/components/responses/NoSuchBucket'
+        '409':
+          description: Bucket not empty
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: |
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Error>
+                  <Code>BucketNotEmpty</Code>
+                  <Message>The bucket you tried to delete is not empty</Message>
+                  <BucketName>my-bucket</BucketName>
+                </Error>
+    
+    get:
+      tags:
+        - Object Operations
+      summary: ListObjectsV2
+      operationId: listObjectsV2
+      description: |
+        Returns objects in a bucket. Uses Prolly Tree indexing for O(log n) performance.
+        
+        **Performance**: Returns 1,000 keys in <200ms via efficient tree traversal.
+      security:
+        - oauth2: [storage:read]
+      parameters:
+        - name: list-type
+          in: query
+          description: Version of list operation (must be 2 for ListObjectsV2)
+          required: true
+          schema:
+            type: integer
+            enum: [2]
+        - name: prefix
+          in: query
+          description: Limits response to keys beginning with the specified prefix
+          schema:
+            type: string
+          example: "photos/2025/"
+        - name: delimiter
+          in: query
+          description: Character used to group keys (typically "/")
+          schema:
+            type: string
+          example: "/"
+        - name: max-keys
+          in: query
+          description: Maximum number of keys to return
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 1000
+        - name: continuation-token
+          in: query
+          description: Token for paginated results (from previous response)
+          schema:
+            type: string
+        - name: start-after
+          in: query
+          description: Start listing after this specified key
+          schema:
+            type: string
+        - name: fetch-owner
+          in: query
+          description: Include owner information in response
+          schema:
+            type: boolean
+            default: false
+        - name: encoding-type
+          in: query
+          description: Encoding type for keys in the response
+          schema:
+            type: string
+            enum: [url]
+      responses:
+        '200':
+          description: Successfully retrieved object list
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/ListBucketResult'
+              example: |
+                <?xml version="1.0" encoding="UTF-8"?>
+                <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <Name>my-bucket</Name>
+                  <Prefix>photos/</Prefix>
+                  <KeyCount>3</KeyCount>
+                  <MaxKeys>1000</MaxKeys>
+                  <IsTruncated>false</IsTruncated>
+                  <Contents>
+                    <Key>photos/beach.jpg</Key>
+                    <LastModified>2025-12-07T01:42:00.000Z</LastModified>
+                    <ETag>"b2419b1e3fd45d596ee22bdf62aaaa2f"</ETag>
+                    <Size>2048576</Size>
+                    <StorageClass>STANDARD</StorageClass>
+                  </Contents>
+                  <Contents>
+                    <Key>photos/sunset.png</Key>
+                    <LastModified>2025-12-07T03:15:00.000Z</LastModified>
+                    <ETag>"8f47e10b6a3c9d2e5f1a4b7c3d8e6f9a"</ETag>
+                    <Size>1536000</Size>
+                    <StorageClass>STANDARD</StorageClass>
+                  </Contents>
+                  <CommonPrefixes>
+                    <Prefix>photos/2024/</Prefix>
+                  </CommonPrefixes>
+                  <CommonPrefixes>
+                    <Prefix>photos/2025/</Prefix>
+                  </CommonPrefixes>
+                </ListBucketResult>
+        '404':
+          $ref: '#/components/responses/NoSuchBucket'
+
+  # ============================================================================
+  # OBJECT OPERATIONS
+  # ============================================================================
+
+  /{bucket}/{key+}:
+    parameters:
+      - $ref: '#/components/parameters/BucketName'
+      - $ref: '#/components/parameters/ObjectKey'
+    
+    put:
+      tags:
+        - Object Operations
+      summary: PutObject
+      operationId: putObject
+      description: |
+        Uploads an object to the specified bucket. Client-side encryption recommended.
+        
+        **Encryption Flow**:
+        1. Client encrypts data with HPKE (keys never sent to server)
+        2. Client chunks encrypted data (256KB blocks)
+        3. Client uploads blocks to gateway
+        4. Gateway pins to IPFS Cluster
+        5. Gateway updates Prolly Tree index
+        
+        **Max Size**: 5GB for single PUT (use multipart for larger files)
+      security:
+        - oauth2: [storage:write]
+      parameters:
+        - name: Content-Type
+          in: header
+          description: MIME type of the object
+          schema:
+            type: string
+          example: "image/jpeg"
+        - name: Content-Length
+          in: header
+          required: true
+          description: Size of the object in bytes
+          schema:
+            type: integer
+            format: int64
+        - name: Content-MD5
+          in: header
+          description: Base64-encoded MD5 digest for integrity verification
+          schema:
+            type: string
+        - name: x-amz-meta-*
+          in: header
+          description: User-defined metadata (prefix with x-amz-meta-)
+          schema:
+            type: string
+          example: "x-amz-meta-author: John Doe"
+        - name: x-amz-meta-hpke-enc
+          in: header
+          description: |
+            HPKE encapsulated key (client-side encryption).
+            Contains the wrapped Data Encryption Key (DEK).
+          schema:
+            type: string
+            format: base64
+        - name: x-amz-storage-class
+          in: header
+          description: Storage class for the object
+          schema:
+            type: string
+            enum: [STANDARD, REDUCED_REDUNDANCY, GLACIER]
+            default: STANDARD
+        - name: x-amz-server-side-encryption
+          in: header
+          description: Server-side encryption (not used in client-side encryption mode)
+          schema:
+            type: string
+            enum: [AES256]
+        - name: Cache-Control
+          in: header
+          schema:
+            type: string
+        - name: Expires
+          in: header
+          schema:
+            type: string
+            format: date-time
+      requestBody:
+        required: true
+        description: Object data (encrypted by client if using HPKE)
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Object uploaded successfully
+          headers:
+            ETag:
+              description: MD5 hash of the object or IPFS CID
+              schema:
+                type: string
+              example: '"b2419b1e3fd45d596ee22bdf62aaaa2f"'
+            x-amz-version-id:
+              description: Version ID (if versioning enabled)
+              schema:
+                type: string
+        '400':
+          description: Bad Request (e.g., EntityTooLarge)
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: |
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Error>
+                  <Code>EntityTooLarge</Code>
+                  <Message>Your proposed upload exceeds the maximum allowed size</Message>
+                  <ProposedSize>6442450944</ProposedSize>
+                  <MaxSizeAllowed>5368709120</MaxSizeAllowed>
+                </Error>
+        '507':
+          description: Insufficient Storage (quota exceeded)
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: |
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Error>
+                  <Code>InsufficientStorage</Code>
+                  <Message>User quota exceeded</Message>
+                </Error>
+    
+    get:
+      tags:
+        - Object Operations
+      summary: GetObject
+      operationId: getObject
+      description: |
+        Retrieves an object from the bucket. Supports range requests for streaming.
+        
+        **Verified Streaming**: Uses BLAKE3/Bao for integrity verification during download.
+      security:
+        - oauth2: [storage:read]
+      parameters:
+        - name: Range
+          in: header
+          description: |
+            Byte range to retrieve (e.g., "bytes=0-1023").
+            Enables video streaming and partial downloads.
+          schema:
+            type: string
+          example: "bytes=0-1048575"
+        - name: If-Modified-Since
+          in: header
+          description: Return object only if modified since specified time
+          schema:
+            type: string
+            format: date-time
+        - name: If-None-Match
+          in: header
+          description: Return object only if ETag differs
+          schema:
+            type: string
+        - name: versionId
+          in: query
+          description: Specific version to retrieve (if versioning enabled)
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Full object content
+          headers:
+            Content-Type:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: integer
+                format: int64
+            ETag:
+              schema:
+                type: string
+            Last-Modified:
+              schema:
+                type: string
+                format: date-time
+            x-amz-meta-*:
+              description: User-defined metadata
+              schema:
+                type: string
+            x-amz-meta-hpke-enc:
+              description: HPKE encapsulated key (for client-side decryption)
+              schema:
+                type: string
+            x-amz-version-id:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '206':
+          description: Partial content (range request)
+          headers:
+            Content-Range:
+              description: Byte range of the content
+              schema:
+                type: string
+              example: "bytes 0-1048575/5242880"
+            Content-Length:
+              schema:
+                type: integer
+            ETag:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '304':
+          description: Not Modified (conditional request)
+        '404':
+          $ref: '#/components/responses/NoSuchKey'
+        '416':
+          description: Requested Range Not Satisfiable
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/Error'
+    
+    head:
+      tags:
+        - Object Operations
+      summary: HeadObject
+      operationId: headObject
+      description: Retrieves metadata for an object without downloading content
+      security:
+        - oauth2: [storage:read]
+      parameters:
+        - name: versionId
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Object metadata retrieved
+          headers:
+            Content-Type:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: integer
+                format: int64
+            ETag:
+              schema:
+                type: string
+            Last-Modified:
+              schema:
+                type: string
+                format: date-time
+            x-amz-meta-*:
+              schema:
+                type: string
+            x-amz-version-id:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NoSuchKey'
+    
+    delete:
+      tags:
+        - Object Operations
+      summary: DeleteObject
+      operationId: deleteObject
+      description: |
+        Deletes an object from the bucket. 
+        
+        **Note**: Removes key from Prolly Tree index; IPFS blocks are unpinned 
+        and garbage collected asynchronously.
+      security:
+        - oauth2: [storage:write]
+      parameters:
+        - name: versionId
+          in: query
+          description: Specific version to delete
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Object deleted successfully
+          headers:
+            x-amz-version-id:
+              schema:
+                type: string
+            x-amz-delete-marker:
+              description: Whether a delete marker was created
+              schema:
+                type: boolean
+        '404':
+          $ref: '#/components/responses/NoSuchKey'
+
+  /{bucket}?delete:
+    parameters:
+      - $ref: '#/components/parameters/BucketName'
+    
+    post:
+      tags:
+        - Object Operations
+      summary: DeleteObjects (Batch Delete)
+      operationId: deleteObjects
+      description: Deletes multiple objects in a single request (max 1000)
+      security:
+        - oauth2: [storage:write]
+      requestBody:
+        required: true
+        content:
+          application/xml:
+            schema:
+              type: object
+              xml:
+                name: Delete
+              properties:
+                Quiet:
+                  type: boolean
+                  description: Enable quiet mode (return only errors)
+                Object:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      Key:
+                        type: string
+                      VersionId:
+                        type: string
+            example: |
+              <?xml version="1.0" encoding="UTF-8"?>
+              <Delete>
+                <Quiet>false</Quiet>
+                <Object>
+                  <Key>sample1.txt</Key>
+                </Object>
+                <Object>
+                  <Key>sample2.txt</Key>
+                </Object>
+              </Delete>
+      responses:
+        '200':
+          description: Batch delete completed
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/DeleteResult'
+              example: |
+                <?xml version="1.0" encoding="UTF-8"?>
+                <DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <Deleted>
+                    <Key>sample1.txt</Key>
+                  </Deleted>
+                  <Error>
+                    <Key>sample2.txt</Key>
+                    <Code>AccessDenied</Code>
+                    <Message>Access Denied</Message>
+                  </Error>
+                </DeleteResult>
+
+  # ============================================================================
+  # MULTIPART UPLOAD
+  # ============================================================================
+
+  /{bucket}/{key+}?uploads:
+    parameters:
+      - $ref: '#/components/parameters/BucketName'
+      - $ref: '#/components/parameters/ObjectKey'
+    
+    post:
+      tags:
+        - Multipart Upload
+      summary: CreateMultipartUpload
+      operationId: createMultipartUpload
+      description: |
+        Initiates a multipart upload for large files (>5GB).
+        
+        **Process**:
+        1. Client calls CreateMultipartUpload → receives UploadId
+        2. Client uploads parts (UploadPart) with part numbers
+        3. Client calls CompleteMultipartUpload with all part ETags
+        4. Gateway creates IPLD DAG linking all parts (instant, no concatenation)
+      security:
+        - oauth2: [storage:write]
+      parameters:
+        - name: Content-Type
+          in: header
+          schema:
+            type: string
+        - name: x-amz-meta-*
+          in: header
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Multipart upload initiated
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/InitiateMultipartUploadResult'
+              example: |
+                <?xml version="1.0" encoding="UTF-8"?>
+                <InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <Bucket>my-bucket</Bucket>
+                  <Key>large-file.bin</Key>
+                  <UploadId>VXBsb2FkIElEIGZvciBpbGx1c3RyYXRpb24</UploadId>
+                </InitiateMultipartUploadResult>
+
+  /{bucket}/{key+}?uploadId={uploadId}&partNumber={partNumber}:
+    parameters:
+      - $ref: '#/components/parameters/BucketName'
+      - $ref: '#/components/parameters/ObjectKey'
+      - name: uploadId
+        in: query
+        required: true
+        description: Upload ID from CreateMultipartUpload
+        schema:
+          type: string
+      - name: partNumber
+        in: query
+        required: true
+        description: Part number (1-10000)
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 10000
+    
+    put:
+      tags:
+        - Multipart Upload
+      summary: UploadPart
+      operationId: uploadPart
+      description: |
+        Uploads a part in a multipart upload. Parts can be uploaded in any order.
+        
+        **Note**: Each part generates a unique IPFS CID for deduplication.
+      security:
+        - oauth2: [storage:write]
+      parameters:
+        - name: Content-Length
+          in: header
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 5242880  # 5MB minimum except last part
+        - name: Content-MD5
+          in: header
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Part uploaded successfully
+          headers:
+            ETag:
+              description: |
+                ETag of the uploaded part (IPFS CID).
+                **Important**: Save this for CompleteMultipartUpload.
+              schema:
+                type: string
+              example: '"a54357aff0632cce46d942af68356b38"'
+        '400':
+          description: Bad Request (part too small, invalid upload ID)
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /{bucket}/{key+}?uploadId={uploadId}:
+    parameters:
+      - $ref: '#/components/parameters/BucketName'
+      - $ref: '#/components/parameters/ObjectKey'
+      - name: uploadId
+        in: query
+        required: true
+        schema:
+          type: string
+    
+    post:
+      tags:
+        - Multipart Upload
+      summary: CompleteMultipartUpload
+      operationId: completeMultipartUpload
+      description: |
+        Completes a multipart upload by assembling uploaded parts.
+        
+        **Gateway Operation**: Creates IPLD DAG node linking to part CIDs (no data copying).
+      security:
+        - oauth2: [storage:write]
+      requestBody:
+        required: true
+        content:
+          application/xml:
+            schema:
+              type: object
+              xml:
+                name: CompleteMultipartUpload
+              properties:
+                Part:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      PartNumber:
+                        type: integer
+                      ETag:
+                        type: string
+            example: |
+              <?xml version="1.0" encoding="UTF-8"?>
+              <CompleteMultipartUpload>
+                <Part>
+                  <PartNumber>1</PartNumber>
+                  <ETag>"a54357aff0632cce46d942af68356b38"</ETag>
+                </Part>
+                <Part>
+                  <PartNumber>2</PartNumber>
+                  <ETag>"0c78aef83f66abc1fa1e8477f296d394"</ETag>
+                </Part>
+              </CompleteMultipartUpload>
+      responses:
+        '200':
+          description: Multipart upload completed
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/CompleteMultipartUploadResult'
+              example: |
+                <?xml version="1.0" encoding="UTF-8"?>
+                <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <Location>https://gateway.example.com/my-bucket/large-file.bin</Location>
+                  <Bucket>my-bucket</Bucket>
+                  <Key>large-file.bin</Key>
+                  <ETag>"3858f62230ac3c915f300c664312c11f-2"</ETag>
+                </CompleteMultipartUploadResult>
+        '400':
+          description: Invalid part list or missing parts
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/Error'
+    
+    delete:
+      tags:
+        - Multipart Upload
+      summary: AbortMultipartUpload
+      operationId: abortMultipartUpload
+      description: Aborts a multipart upload and unpins uploaded parts
+      security:
+        - oauth2: [storage:write]
+      responses:
+        '204':
+          description: Multipart upload aborted
+
+  /{bucket}?uploads:
+    parameters:
+      - $ref: '#/components/parameters/BucketName'
+    
+    get:
+      tags:
+        - Multipart Upload
+      summary: ListMultipartUploads
+      operationId: listMultipartUploads
+      description: Lists in-progress multipart uploads for a bucket
+      security:
+        - oauth2: [storage:read]
+      parameters:
+        - name: max-uploads
+          in: query
+          schema:
+            type: integer
+            default: 1000
+        - name: key-marker
+          in: query
+          schema:
+            type: string
+        - name: upload-id-marker
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of multipart uploads
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/ListMultipartUploadsResult'
+
+  /{bucket}/{key+}?uploadId={uploadId2}:
+    parameters:
+      - $ref: '#/components/parameters/BucketName'
+      - $ref: '#/components/parameters/ObjectKey'
+      - name: uploadId2
+        in: query
+        required: true
+        schema:
+          type: string
+    
+    get:
+      tags:
+        - Multipart Upload
+      summary: ListParts
+      operationId: listParts
+      description: Lists parts already uploaded for a specific multipart upload
+      security:
+        - oauth2: [storage:read]
+      parameters:
+        - name: max-parts
+          in: query
+          schema:
+            type: integer
+            default: 1000
+        - name: part-number-marker
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: List of uploaded parts
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/ListPartsResult'
+
+  # ============================================================================
+  # METADATA & TAGGING
+  # ============================================================================
+
+  /{bucket}/{key+}?tagging:
+    parameters:
+      - $ref: '#/components/parameters/BucketName'
+      - $ref: '#/components/parameters/ObjectKey'
+    
+    get:
+      tags:
+        - Metadata Operations
+      summary: GetObjectTagging
+      operationId: getObjectTagging
+      description: Returns the tag set for an object
+      security:
+        - oauth2: [storage:read]
+      responses:
+        '200':
+          description: Object tags retrieved
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/Tagging'
+    
+    put:
+      tags:
+        - Metadata Operations
+      summary: PutObjectTagging
+      operationId: putObjectTagging
+      description: Sets the tag set for an object (replaces existing tags)
+      security:
+        - oauth2: [storage:write]
+      requestBody:
+        required: true
+        content:
+          application/xml:
+            schema:
+              $ref: '#/components/schemas/Tagging'
+            example: |
+              <?xml version="1.0" encoding="UTF-8"?>
+              <Tagging>
+                <TagSet>
+                  <Tag>
+                    <Key>Project</Key>
+                    <Value>Research</Value>
+                  </Tag>
+                  <Tag>
+                    <Key>Status</Key>
+                    <Value>Active</Value>
+                  </Tag>
+                </TagSet>
+              </Tagging>
+      responses:
+        '200':
+          description: Tags updated successfully
+    
+    delete:
+      tags:
+        - Metadata Operations
+      summary: DeleteObjectTagging
+      operationId: deleteObjectTagging
+      description: Removes all tags from an object
+      security:
+        - oauth2: [storage:write]
+      responses:
+        '204':
+          description: Tags deleted successfully
+
+  /{bucket}/{destinationKey+}?x-amz-copy-source={sourceBucket}/{sourceKey}:
+    parameters:
+      - $ref: '#/components/parameters/BucketName'
+      - name: destinationKey
+        in: path
+        required: true
+        description: Destination object key
+        schema:
+          type: string
+      - name: sourceBucket
+        in: query
+        required: true
+        description: Source bucket name
+        schema:
+          type: string
+      - name: sourceKey
+        in: query
+        required: true
+        description: Source object key
+        schema:
+          type: string
+    
+    put:
+      tags:
+        - Object Operations
+      summary: CopyObject
+      operationId: copyObject
+      description: |
+        Creates a copy of an object. Efficient in content-addressed storage:
+        new key points to same IPFS CID (no data duplication).
+      security:
+        - oauth2: [storage:write]
+      parameters:
+        - name: x-amz-copy-source
+          in: header
+          required: true
+          description: Source bucket and key (/{bucket}/{key})
+          schema:
+            type: string
+          example: "/source-bucket/original.txt"
+        - name: x-amz-metadata-

@@ -1,0 +1,118 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fula-crypto",
+    "crates/fula-blockstore",
+    "crates/fula-core",
+    "crates/fula-cli",
+    "crates/fula-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/functionland/fula-api"
+authors = ["Functionland <contact@functionland.com>"]
+rust-version = "1.83"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Cryptography
+blake3 = "1.5"
+bao-tree = "0.13"
+hpke = "0.13"
+rand = "0.8"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+ed25519-dalek = { version = "2.1", features = ["serde"] }
+
+# IPFS/IPLD
+cid = "0.11"
+multihash = "0.19"
+multihash-codetable = { version = "0.1", features = ["blake3", "sha2", "sha3"] }
+libipld = "0.16"
+ipld-core = "0.4"
+serde_ipld_dagcbor = "0.6"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_bytes = "0.11"
+quick-xml = { version = "0.37", features = ["serialize"] }
+base64 = "0.22"
+hex = "0.4"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+# Web framework
+axum = { version = "0.8", features = ["multipart", "tokio"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-full", "limit"] }
+hyper = { version = "1.5", features = ["full"] }
+
+# Rate limiting
+governor = "0.8"
+
+# Database/Storage
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono", "uuid"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+# HTTP client for IPFS
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+
+# Authentication
+jsonwebtoken = "9.3"
+oauth2 = "5.0"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+time = "0.3"
+
+# Logging/Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Configuration
+config = "0.14"
+dotenvy = "0.15"
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Utilities
+bytes = "1.9"
+pin-project-lite = "0.2"
+parking_lot = "0.12"
+dashmap = "6.1"
+lru = "0.12"
+semver = "1.0"
+bitvec = "1.0"
+
+# Testing
+criterion = "0.5"
+proptest = "1.5"
+test-log = "0.2"
+wiremock = "0.6"
+tempfile = "3.14"
+rstest = "0.23"
+mockall = "0.13"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

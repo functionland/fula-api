@@ -1,0 +1,52 @@
+[package]
+name = "fula-client"
+description = "Client SDK for Fula decentralized storage - S3-compatible with client-side encryption"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Internal
+fula-crypto = { path = "../fula-crypto" }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+quick-xml = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+url = "2.5"
+base64 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+mime_guess = "2.0"
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+default = []
+# Enable client-side encryption
+encryption = []
+# Enable WASM support for web browsers
+wasm = ["reqwest/rustls-tls"]

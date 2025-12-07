@@ -1,0 +1,79 @@
+[package]
+name = "fula-cli"
+description = "S3-compatible gateway server for Fula decentralized storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "fula-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# Internal
+fula-crypto = { path = "../fula-crypto" }
+fula-blockstore = { path = "../fula-blockstore" }
+fula-core = { path = "../fula-core" }
+
+# Web framework
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+
+# Rate limiting
+governor = { workspace = true }
+
+# Authentication
+jsonwebtoken = { workspace = true }
+oauth2 = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+quick-xml = { workspace = true }
+
+# IPFS/IPLD
+cid = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+urlencoding = "2.1"
+mime = "0.3"
+mime_guess = "2.0"
+
+# Configuration
+config = { workspace = true }
+dotenvy = { workspace = true }
+clap = { workspace = true }
+
+# Storage
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+test-log = { workspace = true }
+tempfile = { workspace = true }
+rstest = { workspace = true }
+tokio-test = "0.4"
+reqwest = { workspace = true }

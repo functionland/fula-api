@@ -1,0 +1,11 @@
+E:\GitHub\fula-api\target\release\deps\pest_generator-33db9f2ffa7da9d2.d: C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\lib.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\macros.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\docs.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\generator.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\parse_derive.rs
+
+E:\GitHub\fula-api\target\release\deps\libpest_generator-33db9f2ffa7da9d2.rlib: C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\lib.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\macros.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\docs.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\generator.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\parse_derive.rs
+
+E:\GitHub\fula-api\target\release\deps\libpest_generator-33db9f2ffa7da9d2.rmeta: C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\lib.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\macros.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\docs.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\generator.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\parse_derive.rs
+
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\lib.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\macros.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\docs.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\generator.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pest_generator-2.8.4\src\parse_derive.rs:

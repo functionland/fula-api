@@ -1,0 +1,1 @@
+cargo:rustc-env=MIME_TYPES_GENERATED_PATH=E:\GitHub\fula-api\target\release\build\mime_guess-4dd63babd2688685\out\mime_types_generated.rs

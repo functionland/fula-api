@@ -1,0 +1,12 @@
+E:\GitHub\fula-api\target\release\deps\base16ct-1012871dc84de454.d: C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\lib.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\lower.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\mixed.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\upper.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\display.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\error.rs
+
+E:\GitHub\fula-api\target\release\deps\libbase16ct-1012871dc84de454.rlib: C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\lib.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\lower.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\mixed.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\upper.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\display.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\error.rs
+
+E:\GitHub\fula-api\target\release\deps\libbase16ct-1012871dc84de454.rmeta: C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\lib.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\lower.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\mixed.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\upper.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\display.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\error.rs
+
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\lib.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\lower.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\mixed.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\upper.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\display.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\base16ct-0.2.0\src\error.rs:

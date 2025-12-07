@@ -1,0 +1,155 @@
+# Fula Storage - Complete Development Stack
+# Run with: docker-compose up -d
+
+version: "3.8"
+
+services:
+  # ============================================
+  # Fula Gateway - S3-Compatible API
+  # ============================================
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9000:9000"
+    environment:
+      - FULA_HOST=0.0.0.0
+      - FULA_PORT=9000
+      - IPFS_API_URL=http://ipfs:5001
+      - CLUSTER_API_URL=http://cluster:9094
+      - JWT_SECRET=${JWT_SECRET:-development-secret-change-in-production}
+      - FULA_NO_AUTH=${FULA_NO_AUTH:-false}
+      - RUST_LOG=info,fula_cli=debug
+    depends_on:
+      - ipfs
+      - cluster
+    restart: unless-stopped
+    networks:
+      - fula-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ============================================
+  # IPFS Node
+  # ============================================
+  ipfs:
+    image: ipfs/kubo:latest
+    ports:
+      - "4001:4001"     # Swarm
+      - "5001:5001"     # API
+      - "8080:8080"     # Gateway
+    volumes:
+      - ipfs-data:/data/ipfs
+      - ipfs-staging:/export
+    environment:
+      - IPFS_PROFILE=server
+    restart: unless-stopped
+    networks:
+      - fula-network
+    healthcheck:
+      test: ["CMD-SHELL", "ipfs dag stat /ipfs/QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================
+  # IPFS Cluster
+  # ============================================
+  cluster:
+    image: ipfs/ipfs-cluster:latest
+    ports:
+      - "9094:9094"     # API
+      - "9095:9095"     # Proxy
+      - "9096:9096"     # Cluster swarm
+    volumes:
+      - cluster-data:/data/ipfs-cluster
+    environment:
+      - CLUSTER_PEERNAME=master
+      - CLUSTER_SECRET=${CLUSTER_SECRET:-}
+      - CLUSTER_IPFSHTTP_NODEMULTIADDRESS=/dns4/ipfs/tcp/5001
+      - CLUSTER_CRDT_TRUSTEDPEERS=*
+      - CLUSTER_REPLICATIONFACTORMIN=1
+      - CLUSTER_REPLICATIONFACTORMAX=3
+      - CLUSTER_MONITORPINGINTERVAL=15s
+    depends_on:
+      - ipfs
+    restart: unless-stopped
+    networks:
+      - fula-network
+
+  # ============================================
+  # Redis (optional - for multi-gateway sync)
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - fula-network
+    profiles:
+      - full
+
+  # ============================================
+  # Prometheus (optional - monitoring)
+  # ============================================
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    networks:
+      - fula-network
+    profiles:
+      - monitoring
+
+  # ============================================
+  # Grafana (optional - dashboards)
+  # ============================================
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - fula-network
+    profiles:
+      - monitoring
+
+# ============================================
+# Networks
+# ============================================
+networks:
+  fula-network:
+    driver: bridge
+
+# ============================================
+# Volumes
+# ============================================
+volumes:
+  ipfs-data:
+  ipfs-staging:
+  cluster-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:

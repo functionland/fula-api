@@ -1,0 +1,15 @@
+E:\GitHub\fula-api\target\release\deps\thiserror-5c00cb128e4a57ca.d: C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\lib.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\aserror.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\display.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\provide.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\var.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\private.rs E:\GitHub\fula-api\target\release\build\thiserror-d33b25df23228355\out/private.rs
+
+E:\GitHub\fula-api\target\release\deps\libthiserror-5c00cb128e4a57ca.rlib: C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\lib.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\aserror.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\display.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\provide.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\var.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\private.rs E:\GitHub\fula-api\target\release\build\thiserror-d33b25df23228355\out/private.rs
+
+E:\GitHub\fula-api\target\release\deps\libthiserror-5c00cb128e4a57ca.rmeta: C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\lib.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\aserror.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\display.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\provide.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\var.rs C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\private.rs E:\GitHub\fula-api\target\release\build\thiserror-d33b25df23228355\out/private.rs
+
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\lib.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\aserror.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\display.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\provide.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\var.rs:
+C:\Users\ehsan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.17\src\private.rs:
+E:\GitHub\fula-api\target\release\build\thiserror-d33b25df23228355\out/private.rs:
+
+# env-dep:OUT_DIR=E:\\GitHub\\fula-api\\target\\release\\build\\thiserror-d33b25df23228355\\out

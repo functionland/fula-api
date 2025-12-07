@@ -1,0 +1,56 @@
+[package]
+name = "fula-crypto"
+description = "Cryptographic primitives for Fula decentralized storage - HPKE encryption, BLAKE3 hashing, and Bao verified streaming"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Core crypto
+blake3 = { workspace = true }
+bao-tree = { workspace = true }
+hpke = { workspace = true }
+rand = { workspace = true }
+aes-gcm = { workspace = true }
+chacha20poly1305 = { workspace = true }
+sha2 = { workspace = true }
+md-5 = { workspace = true }
+x25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# IPLD/CID
+cid = { workspace = true }
+multihash = { workspace = true }
+multihash-codetable = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+test-log = { workspace = true }
+tempfile = { workspace = true }
+rstest = { workspace = true }
+tokio-test = "0.4"
+
+[[bench]]
+name = "crypto_benchmarks"
+harness = false

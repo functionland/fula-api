@@ -1,0 +1,61 @@
+[package]
+name = "fula-blockstore"
+description = "IPFS block storage layer for Fula - chunking, CID generation, and cluster pinning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Internal
+fula-crypto = { path = "../fula-crypto" }
+
+# IPFS/IPLD
+cid = { workspace = true }
+multihash = { workspace = true }
+multihash-codetable = { workspace = true }
+libipld = { workspace = true }
+ipld-core = { workspace = true }
+serde_ipld_dagcbor = { workspace = true }
+
+# Hashing
+blake3 = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_bytes = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+lru = { workspace = true }
+url = "2.5"
+urlencoding = "2.1"
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+test-log = { workspace = true }
+tempfile = { workspace = true }
+rstest = { workspace = true }
+tokio-test = "0.4"
+wiremock = { workspace = true }
+
+[[bench]]
+name = "blockstore_benchmarks"
+harness = false
