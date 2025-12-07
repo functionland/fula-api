@@ -64,6 +64,8 @@
                 <li><a href="#symmetric">Symmetric Encryption</a></li>
                 <li><a href="#integrity">Data Integrity</a></li>
                 <li><a href="#key-management">Key Management</a></li>
+                <li><a href="#sharing">Secure Sharing</a></li>
+                <li><a href="#key-rotation-detail">Key Rotation</a></li>
                 <li><a href="#security-guarantees">Security Guarantees</a></li>
                 <li><a href="#threat-model">Threat Model</a></li>
                 <li><a href="#best-practices">Best Practices</a></li>
@@ -851,8 +853,221 @@ pub struct SecretKey {
             </div>
         </section>
 
+        <!-- Secure Sharing -->
+        <section id="sharing" class="security-section alt-bg">
+            <h2>Secure File & Folder Sharing</h2>
+            <p class="section-intro">Share files and folders with others without exposing your master key.</p>
+
+            <div class="sharing-details">
+                <div class="sharing-overview">
+                    <h3>How Sharing Works</h3>
+                    <p>Fula enables secure sharing through <strong>DEK-level access grants</strong>. When you share a file or folder, you encrypt only the relevant DEK for the recipient's public key - your master key (KEK) is never revealed.</p>
+                    
+                    <div class="sharing-diagram">
+                        <pre class="diagram-ascii">
+┌─────────────────────────────────────────────────────────────────┐
+│                    SHARE TOKEN CREATION                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Owner has:                    Recipient has:                    │
+│  ┌──────────────┐              ┌──────────────┐                 │
+│  │ KEK (secret) │              │ KEK (secret) │                 │
+│  │ File DEK     │              │ Public Key   │                 │
+│  └──────────────┘              └──────────────┘                 │
+│         │                              │                         │
+│         │ Owner encrypts DEK           │                         │
+│         │ for recipient's public key   │                         │
+│         ▼                              │                         │
+│  ┌─────────────────────────────────────┴──────────────────────┐ │
+│  │                    SHARE TOKEN                              │ │
+│  │  • wrapped_dek: HPKE.encrypt(recipient_pub, file_DEK)      │ │
+│  │  • path_scope: "/photos/vacation/"                         │ │
+│  │  • expires_at: 1735084800 (optional)                       │ │
+│  │  • permissions: { read: true, write: false }               │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                              │                                   │
+│                              ▼                                   │
+│  Recipient decrypts wrapped_dek using their secret key          │
+│  → Gets access to file_DEK only, NOT owner's KEK                │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘</pre>
+                    </div>
+                </div>
+
+                <div class="sharing-features">
+                    <h3>Sharing Features</h3>
+                    <div class="features-grid">
+                        <div class="feature-item">
+                            <strong>📁 Folder-Level Sharing</strong>
+                            <p>Share entire folders by path prefix (e.g., <code>/photos/2024/</code>). Recipients can access all files in that path.</p>
+                        </div>
+                        <div class="feature-item">
+                            <strong>⏰ Time-Limited Access</strong>
+                            <p>Set expiration timestamps on shares. After expiry, the share token is rejected automatically.</p>
+                        </div>
+                        <div class="feature-item">
+                            <strong>🔐 Permission Control</strong>
+                            <p>Grant read-only, read-write, or full access. Permissions are enforced at share validation.</p>
+                        </div>
+                        <div class="feature-item">
+                            <strong>🚫 Revocation</strong>
+                            <p>Revoke shares at any time by removing them from your share list. Revoked tokens are rejected.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="sharing-code">
+                    <h3>Code Example</h3>
+                    <div class="code-snippet">
+                        <pre>use fula_crypto::{KekKeyPair, DekKey, ShareBuilder, ShareRecipient};
+
+// Owner creates a share for a folder
+let owner = KekKeyPair::generate();
+let recipient = KekKeyPair::generate();
+let folder_dek = DekKey::generate();
+
+let share = ShareBuilder::new(&owner, recipient.public_key(), &folder_dek)
+    .path_scope("/photos/vacation/")
+    .expires_in(7 * 24 * 60 * 60)  // 1 week
+    .read_only()
+    .build()?;
+
+// Recipient accepts and uses the share
+let handler = ShareRecipient::new(&recipient);
+let access = handler.accept_share(&share)?;
+
+// access.dek can now decrypt files in /photos/vacation/
+// access.is_path_allowed("/photos/vacation/beach.jpg") == true
+// access.is_path_allowed("/documents/secret.pdf") == false</pre>
+                    </div>
+                </div>
+
+                <div class="sharing-security">
+                    <h3>Security Properties</h3>
+                    <ul>
+                        <li><strong>Master Key Isolation:</strong> Owner's KEK is never transmitted or revealed</li>
+                        <li><strong>Cryptographic Enforcement:</strong> Only intended recipient can decrypt the DEK</li>
+                        <li><strong>Time-Bound Access:</strong> Expired tokens are cryptographically validated and rejected</li>
+                        <li><strong>Path Scoping:</strong> Recipients cannot access files outside their granted scope</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- Key Rotation Details -->
+        <section id="key-rotation-detail" class="security-section">
+            <h2>Full Filesystem Key Rotation</h2>
+            <p class="section-intro">Rotate your KEK without re-encrypting file content.</p>
+
+            <div class="rotation-details">
+                <div class="rotation-overview">
+                    <h3>Why Rotate Keys?</h3>
+                    <ul>
+                        <li><strong>Suspected Compromise:</strong> If you think your key might be exposed</li>
+                        <li><strong>Regular Security Hygiene:</strong> Periodic rotation limits exposure window</li>
+                        <li><strong>Personnel Changes:</strong> When someone with key access leaves</li>
+                        <li><strong>Compliance Requirements:</strong> Some regulations mandate key rotation</li>
+                    </ul>
+                </div>
+
+                <div class="rotation-diagram">
+                    <h3>Rotation Process</h3>
+                    <div class="diagram-box">
+                        <pre class="diagram-ascii">
+┌─────────────────────────────────────────────────────────────────┐
+│                      KEY ROTATION FLOW                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  BEFORE ROTATION:                                                │
+│  ┌─────────────┐     wraps      ┌────────────┐                  │
+│  │  KEK v1     │ ──────────────→│   DEK A    │──→ File A        │
+│  │ (current)   │                └────────────┘                  │
+│  │             │     wraps      ┌────────────┐                  │
+│  │             │ ──────────────→│   DEK B    │──→ File B        │
+│  └─────────────┘                └────────────┘                  │
+│                                                                  │
+│  ROTATION STEP 1: Generate new KEK                               │
+│  ┌─────────────┐                ┌─────────────┐                 │
+│  │  KEK v1     │                │  KEK v2     │                 │
+│  │ (previous)  │                │ (current)   │                 │
+│  └─────────────┘                └─────────────┘                 │
+│                                                                  │
+│  ROTATION STEP 2: Re-wrap each DEK                               │
+│                                                                  │
+│  For each file:                                                  │
+│    1. Decrypt DEK with KEK v1                                    │
+│    2. Re-encrypt DEK with KEK v2                                 │
+│    3. Update wrapped DEK in metadata                             │
+│                                                                  │
+│  AFTER ROTATION:                                                 │
+│  ┌─────────────┐     wraps      ┌────────────┐                  │
+│  │  KEK v2     │ ──────────────→│   DEK A    │──→ File A        │
+│  │ (current)   │                └────────────┘   (unchanged)    │
+│  │             │     wraps      ┌────────────┐                  │
+│  │             │ ──────────────→│   DEK B    │──→ File B        │
+│  └─────────────┘                └────────────┘   (unchanged)    │
+│                                                                  │
+│  Note: File content is NEVER re-encrypted!                       │
+│        Only the DEK wrappers are updated.                        │
+└─────────────────────────────────────────────────────────────────┘</pre>
+                    </div>
+                </div>
+
+                <div class="rotation-code">
+                    <h3>Code Example</h3>
+                    <div class="code-snippet">
+                        <pre>use fula_crypto::{KekKeyPair, DekKey, FileSystemRotation};
+
+// Initialize with current keypair
+let keypair = KekKeyPair::generate();
+let mut fs = FileSystemRotation::new(keypair)
+    .with_batch_size(100);  // Process 100 files per batch
+
+// Register existing files
+for file in files {
+    fs.wrap_new_file(&file.path, &file.dek)?;
+}
+
+// Initiate rotation (generates new KEK)
+let new_public_key = fs.rotate();
+
+// Rotate in batches (for large filesystems)
+while !fs.is_rotation_complete() {
+    let result = fs.rotate_batch();
+    println!("Rotated {} files", result.rotated_count);
+}
+
+// All files now use KEK v2
+// Old KEK is automatically cleared</pre>
+                    </div>
+                </div>
+
+                <div class="rotation-benefits">
+                    <h3>Key Benefits</h3>
+                    <div class="benefits-grid">
+                        <div class="benefit-card">
+                            <strong>⚡ Efficient</strong>
+                            <p>Only re-wraps DEKs (32 bytes each), never re-encrypts file content</p>
+                        </div>
+                        <div class="benefit-card">
+                            <strong>📦 Incremental</strong>
+                            <p>Process files in batches to avoid overwhelming large systems</p>
+                        </div>
+                        <div class="benefit-card">
+                            <strong>🔄 Backward Compatible</strong>
+                            <p>Old wrapped keys still work during transition period</p>
+                        </div>
+                        <div class="benefit-card">
+                            <strong>✅ Verified</strong>
+                            <p>Track rotation progress and verify completion</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
         <!-- Security Guarantees -->
-        <section id="security-guarantees" class="security-section">
+        <section id="security-guarantees" class="security-section alt-bg">
             <h2>Security Guarantees</h2>
             <p class="section-intro">What the current implementation provides and its limitations.</p>
 

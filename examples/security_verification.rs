@@ -490,29 +490,45 @@ fn test_10_ciphertext_indistinguishability() -> anyhow::Result<()> {
     );
 
     // Messages of different lengths should not be distinguishable by content analysis
-    let short_msg = b"Hi";
-    let long_msg = b"This is a much longer message with more content";
+    // Use messages long enough to have meaningful entropy measurement
+    let msg_a = b"This is message A with some reasonable length for entropy testing!!!";
+    let msg_b = b"This is message B with some reasonable length for entropy testing!!!";
 
-    let enc_short = encryptor.encrypt(short_msg)?;
-    let enc_long = encryptor.encrypt(long_msg)?;
+    let enc_a = encryptor.encrypt(msg_a)?;
+    let enc_b = encryptor.encrypt(msg_b)?;
 
-    // Both ciphertexts should look random (high entropy)
-    fn entropy_ratio(data: &[u8]) -> f64 {
+    // Both ciphertexts should look random (high byte diversity relative to length)
+    fn byte_diversity(data: &[u8]) -> f64 {
+        if data.is_empty() {
+            return 0.0;
+        }
         let unique: std::collections::HashSet<_> = data.iter().collect();
-        unique.len() as f64 / 256.0
+        // For random data, we expect ~63% unique bytes for length >= 256
+        // For shorter data, unique/len should be high (close to 1.0 for very short)
+        unique.len() as f64 / data.len().min(256) as f64
     }
 
-    let short_entropy = entropy_ratio(&enc_short.ciphertext);
-    let long_entropy = entropy_ratio(&enc_long.ciphertext);
+    let diversity_a = byte_diversity(&enc_a.ciphertext);
+    let diversity_b = byte_diversity(&enc_b.ciphertext);
 
-    // Both should have reasonable entropy (not biased)
+    // Both should have good byte diversity (random-looking)
+    // For AES-GCM output, we expect high diversity
     assert!(
-        short_entropy > 0.1,
-        "SECURITY FAILURE: Short message ciphertext has low entropy!"
+        diversity_a > 0.3,
+        "SECURITY FAILURE: Ciphertext A has low byte diversity: {:.2}",
+        diversity_a
     );
     assert!(
-        long_entropy > 0.1,
-        "SECURITY FAILURE: Long message ciphertext has low entropy!"
+        diversity_b > 0.3,
+        "SECURITY FAILURE: Ciphertext B has low byte diversity: {:.2}",
+        diversity_b
+    );
+
+    // Ciphertexts of same-length plaintexts should have same length
+    assert_eq!(
+        enc_a.ciphertext.len(),
+        enc_b.ciphertext.len(),
+        "Same-length messages should produce same-length ciphertexts"
     );
 
     println!("   ✅ PASSED: Ciphertexts are indistinguishable");

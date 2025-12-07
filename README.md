@@ -226,6 +226,13 @@ cargo run --example multipart_upload
 
 # S3 compatibility guide
 cargo run --example s3_compatible
+
+# Security verification
+cargo run --example security_verification
+
+# Sharing Demo
+cargo run --example sharing_demo
+
 ```
 
 ## Security

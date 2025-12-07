@@ -67,4 +67,12 @@ pub enum CryptoError {
     /// Hex decode error
     #[error("hex decode error: {0}")]
     HexDecode(#[from] hex::FromHexError),
+
+    /// Share token expired
+    #[error("share token expired")]
+    ShareExpired,
+
+    /// Access denied
+    #[error("access denied: {0}")]
+    AccessDenied(String),
 }

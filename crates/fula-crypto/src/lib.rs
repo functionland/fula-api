@@ -7,6 +7,8 @@
 //! - **BLAKE3**: Fast cryptographic hashing
 //! - **Bao**: Verified streaming for integrity verification
 //! - **Key Management**: DEK/KEK architecture for efficient key rotation
+//! - **Sharing**: Secure file/folder sharing without exposing master keys
+//! - **Key Rotation**: Full filesystem key rotation with DEK re-wrapping
 //!
 //! ## Security Model
 //!
@@ -36,13 +38,17 @@ pub mod error;
 pub mod hashing;
 pub mod hpke;
 pub mod keys;
+pub mod rotation;
+pub mod sharing;
 pub mod streaming;
 pub mod symmetric;
 
 pub use error::{CryptoError, Result};
 pub use hashing::{Blake3Hash, Hasher, HashOutput};
-pub use hpke::{Decryptor, EncapsulatedKey, EncryptedData, Encryptor, HpkeConfig};
+pub use hpke::{Decryptor, EncapsulatedKey, EncryptedData, Encryptor, HpkeConfig, SharePermissions};
 pub use keys::{DekKey, KekKeyPair, KeyManager, PublicKey, SecretKey};
+pub use rotation::{KeyRotationManager, FileSystemRotation, WrappedKeyInfo, RotationResult};
+pub use sharing::{ShareToken, ShareBuilder, ShareRecipient, AcceptedShare, FolderShareManager, AccessValidation};
 pub use streaming::{BaoEncoder, BaoDecoder, BaoOutboard, VerifiedStream};
 pub use symmetric::{Aead, AeadCipher, Nonce};
 
