@@ -56,6 +56,7 @@
 
 html {
     scroll-behavior: smooth;
+    overflow-x: hidden;
 }
 
 body {
@@ -65,6 +66,8 @@ body {
     line-height: 1.6;
     display: flex;
     min-height: 100vh;
+    overflow-x: hidden;
+    width: 100%;
 }
 
 /* Sidebar Navigation */
@@ -550,6 +553,8 @@ footer {
         transition: transform 0.3s ease;
         top: 0;
         padding-top: 20px;
+        width: 280px;
+        max-width: 85vw;
     }
     
     .sidebar.open {
@@ -563,11 +568,15 @@ footer {
     .content {
         margin-left: 0;
         padding-top: 60px;
+        width: 100%;
+        max-width: 100vw;
     }
     
     .description,
     .example {
         padding: 24px 16px;
+        max-width: 100%;
+        overflow-x: auto;
     }
     
     .endpoint-row {
@@ -586,6 +595,7 @@ footer {
     
     .endpoint-header h3 {
         font-size: 1.1rem;
+        word-break: break-word;
     }
     
     .method-badge {
@@ -595,10 +605,17 @@ footer {
     table {
         display: block;
         overflow-x: auto;
+        max-width: 100%;
     }
     
     pre {
         font-size: 0.75rem;
+        max-width: 100%;
+        overflow-x: auto;
+    }
+    
+    code {
+        word-break: break-all;
     }
 }
 

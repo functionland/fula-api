@@ -2,6 +2,9 @@
 
 .intro-content {
     background: var(--bg-dark);
+    width: 100%;
+    max-width: 100vw;
+    overflow-x: hidden;
 }
 
 /* Hero Section */
@@ -680,10 +683,13 @@ footer {
 @media (max-width: 768px) {
     .intro-content {
         padding-top: 60px;
+        width: 100%;
+        max-width: 100vw;
     }
     
     .hero {
-        padding: 40px 24px;
+        padding: 40px 16px;
+        width: 100%;
     }
     
     .setup-row {
@@ -691,19 +697,22 @@ footer {
     }
 
     .hero h1 {
-        font-size: 1.8rem;
+        font-size: 1.6rem;
+        word-break: break-word;
     }
     
     .hero-subtitle {
-        font-size: 1rem;
+        font-size: 0.95rem;
     }
 
     .intro-section {
-        padding: 40px 16px;
+        padding: 32px 16px;
+        width: 100%;
+        max-width: 100%;
     }
     
     .intro-section h2 {
-        font-size: 1.5rem;
+        font-size: 1.4rem;
     }
 
     .layer-components {
@@ -713,16 +722,39 @@ footer {
     .hero-badges {
         flex-direction: column;
         align-items: center;
+        gap: 8px;
+    }
+    
+    .badge-item {
+        font-size: 0.8rem;
+        padding: 6px 12px;
     }
     
     .hero-actions {
         flex-direction: column;
         width: 100%;
+        padding: 0 16px;
     }
     
     .hero-actions .btn {
         width: 100%;
         text-align: center;
+    }
+    
+    .architecture-diagram {
+        width: 100%;
+        overflow-x: auto;
+    }
+    
+    .code-block {
+        max-width: 100%;
+        overflow-x: auto;
+    }
+    
+    .code-block pre {
+        font-size: 0.7rem;
+        white-space: pre-wrap;
+        word-break: break-all;
     }
     
     .overview-features {
