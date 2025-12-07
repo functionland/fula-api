@@ -336,10 +336,10 @@ mod tests {
         tree.set("photos/2025/c.jpg".to_string(), 3).await.unwrap();
         tree.set("docs/readme.md".to_string(), 4).await.unwrap();
 
-        let photos_2024 = tree.list_prefix("photos/2024/").await.unwrap();
+        let photos_2024 = tree.list_prefix(b"photos/2024/").await.unwrap();
         assert_eq!(photos_2024.len(), 2);
 
-        let all_photos = tree.list_prefix("photos/").await.unwrap();
+        let all_photos = tree.list_prefix(b"photos/").await.unwrap();
         assert_eq!(all_photos.len(), 3);
     }
 }

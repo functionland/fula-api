@@ -252,18 +252,18 @@
                 <div class="flow-step">
                     <div class="step-number">1</div>
                     <div class="step-content">
-                        <h3>Upload Request</h3>
-                        <p>Your app sends a standard S3 PUT request to the Fula gateway using any S3 SDK.</p>
-                        <code>PUT /my-bucket/photo.jpg</code>
+                        <h3>Client-Side Encryption (Optional)</h3>
+                        <p>If encryption is enabled, data is encrypted locally using HPKE <strong>before</strong> leaving your device. Only you hold the keys.</p>
+                        <code>encrypted_data = encrypt(plaintext, your_public_key)</code>
                     </div>
                 </div>
                 <div class="flow-connector"></div>
                 <div class="flow-step">
                     <div class="step-number">2</div>
                     <div class="step-content">
-                        <h3>Client-Side Encryption</h3>
-                        <p>Data is encrypted locally using HPKE before leaving your device. Only you hold the keys.</p>
-                        <code>encrypt(data, your_public_key)</code>
+                        <h3>Upload to Gateway</h3>
+                        <p>Your app sends a standard S3 PUT request to the Fula gateway. The gateway receives encrypted (or plain) bytes.</p>
+                        <code>PUT /my-bucket/photo.jpg → Gateway</code>
                     </div>
                 </div>
                 <div class="flow-connector"></div>
