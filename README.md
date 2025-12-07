@@ -17,7 +17,8 @@ Fula Storage provides an Amazon S3-compatible API backed by a decentralized netw
 
 ## 📖 Documentation
 
-- **[API Reference](https://functionland.github.io/fula-api/)** - Complete API documentation with examples
+- **[Introduction](https://functionland.github.io/fula-api/intro.html)** - Architecture, concepts, and how it works
+- **[API Reference](https://functionland.github.io/fula-api/)** - Complete endpoint documentation with examples
 - **[SDK Examples](https://functionland.github.io/fula-api/sdk.html)** - Code examples for Rust, Python, JavaScript
 - **[Platform Guides](https://functionland.github.io/fula-api/platforms.html)** - Next.js, React Native, .NET, Flutter, Swift, Kotlin
 
