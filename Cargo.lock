@@ -1234,6 +1234,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fula-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "fula-blockstore",
+ "fula-cli",
+ "fula-client",
+ "fula-core",
+ "fula-crypto",
+ "rand 0.8.5",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "fula-blockstore"
 version = "0.1.0"
 dependencies = [

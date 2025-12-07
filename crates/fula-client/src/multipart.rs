@@ -5,7 +5,6 @@ use bytes::Bytes;
 use std::sync::Arc;
 
 /// Progress callback type
-#[allow(dead_code)]
 pub type ProgressCallback = Box<dyn Fn(UploadProgress) + Send + Sync>;
 
 /// Upload progress information
@@ -112,7 +111,6 @@ impl MultipartUpload {
 }
 
 /// Upload a large file using multipart upload
-#[allow(dead_code)]
 pub async fn upload_large_file(
     client: Arc<FulaClient>,
     bucket: &str,

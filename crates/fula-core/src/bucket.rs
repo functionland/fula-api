@@ -41,6 +41,8 @@ pub struct Bucket<S: BlockStore> {
     index: ProllyTree<String, ObjectMetadata, S>,
     /// Configuration
     config: BucketConfig,
+    /// Reference to bucket metadata cache for updates
+    metadata_cache: Option<Arc<DashMap<String, BucketMetadata>>>,
 }
 
 impl<S: BlockStore> Bucket<S> {
@@ -66,6 +68,7 @@ impl<S: BlockStore> Bucket<S> {
             metadata,
             index: index_mut,
             config,
+            metadata_cache: None,
         })
     }
 
@@ -74,12 +77,14 @@ impl<S: BlockStore> Bucket<S> {
         metadata: BucketMetadata,
         store: Arc<S>,
         config: BucketConfig,
+        metadata_cache: Option<Arc<DashMap<String, BucketMetadata>>>,
     ) -> Result<Self> {
         let index = ProllyTree::load(store, metadata.root_cid).await?;
         Ok(Self {
             metadata,
             index,
             config,
+            metadata_cache,
         })
     }
 
@@ -224,6 +229,12 @@ impl<S: BlockStore> Bucket<S> {
     pub async fn flush(&mut self) -> Result<Cid> {
         let root_cid = self.index.flush().await?;
         self.metadata.root_cid = root_cid;
+        
+        // Update the metadata cache if we have a reference to it
+        if let Some(ref cache) = self.metadata_cache {
+            cache.insert(self.metadata.name.clone(), self.metadata.clone());
+        }
+        
         Ok(root_cid)
     }
 }
@@ -253,7 +264,7 @@ pub struct BucketManager<S: BlockStore> {
     /// Block store
     store: Arc<S>,
     /// Bucket metadata cache
-    buckets: DashMap<String, BucketMetadata>,
+    buckets: Arc<DashMap<String, BucketMetadata>>,
     /// Default configuration
     default_config: BucketConfig,
 }
@@ -263,7 +274,7 @@ impl<S: BlockStore> BucketManager<S> {
     pub fn new(store: Arc<S>) -> Self {
         Self {
             store,
-            buckets: DashMap::new(),
+            buckets: Arc::new(DashMap::new()),
             default_config: BucketConfig::default(),
         }
     }
@@ -304,7 +315,12 @@ impl<S: BlockStore> BucketManager<S> {
             .map(|r| r.clone())
             .ok_or_else(|| CoreError::BucketNotFound(name.to_string()))?;
 
-        Bucket::load(metadata, Arc::clone(&self.store), self.default_config.clone()).await
+        Bucket::load(
+            metadata,
+            Arc::clone(&self.store),
+            self.default_config.clone(),
+            Some(Arc::clone(&self.buckets)),
+        ).await
     }
 
     /// Delete a bucket

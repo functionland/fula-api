@@ -201,11 +201,14 @@ impl IntoResponse for ApiError {
             request_id
         );
 
+        // Include x-amz-error-code header for S3 compatibility
+        // This is especially important for HEAD requests which have no body
         (
             status,
             [
                 ("Content-Type", "application/xml"),
-                ("x-amz-request-id", &request_id),
+                ("x-amz-request-id", request_id.as_str()),
+                ("x-amz-error-code", code.as_str()),
             ],
             xml,
         )

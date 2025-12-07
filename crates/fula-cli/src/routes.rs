@@ -131,7 +131,7 @@ struct BucketQueryParams {
     fetch_owner: Option<bool>,
 }
 
-/// Handler that routes PUT to either copy_object, put_object, or put_object_tagging
+/// Handler that routes PUT to either copy_object, put_object, upload_part, or put_object_tagging
 async fn object_put_handler(
     state: axum::extract::State<Arc<AppState>>,
     session: axum::extract::Extension<crate::state::UserSession>,
@@ -140,7 +140,15 @@ async fn object_put_handler(
     headers: axum::http::HeaderMap,
     body: bytes::Bytes,
 ) -> Result<axum::response::Response, crate::ApiError> {
-    if query.tagging.is_some() {
+    if query.part_number.is_some() && query.upload_id.is_some() {
+        // Multipart upload part
+        let mp_params = handlers::MultipartParams {
+            upload_id: query.upload_id.clone(),
+            part_number: query.part_number,
+            uploads: query.uploads.clone(),
+        };
+        handlers::upload_part(state, session, path, axum::extract::Query(mp_params), body).await
+    } else if query.tagging.is_some() {
         handlers::put_object_tagging(state, session, path, body).await
     } else if headers.contains_key("x-amz-copy-source") {
         handlers::copy_object(state, session, path, headers).await

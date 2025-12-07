@@ -79,7 +79,8 @@ impl ClientError {
     /// Check if this is a "not found" error
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::NotFound { .. } | Self::BucketNotFound(_))
-            || matches!(self, Self::S3Error { code, .. } if code == "NoSuchKey" || code == "NoSuchBucket")
+            || matches!(self, Self::S3Error { code, .. } 
+                if code == "NoSuchKey" || code == "NoSuchBucket" || code == "HTTP404" || code == "404")
     }
 
     /// Check if this is an access denied error

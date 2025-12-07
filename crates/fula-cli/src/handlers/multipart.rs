@@ -42,25 +42,28 @@ pub async fn create_multipart_upload(
         return Err(ApiError::s3(S3ErrorCode::NoSuchBucket, "Bucket not found"));
     }
 
-    let mut upload = state.multipart_manager.create_upload(
-        bucket.clone(),
-        key.clone(),
-        session.user_id.clone(),
-    );
-
     // Extract content type
-    if let Some(ct) = headers.get("Content-Type").and_then(|v| v.to_str().ok()) {
-        upload.content_type = Some(ct.to_string());
-    }
+    let content_type = headers.get("Content-Type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     // Extract user metadata
+    let mut metadata = std::collections::BTreeMap::new();
     for (name, value) in headers.iter() {
         if let Some(key) = name.as_str().strip_prefix("x-amz-meta-") {
             if let Ok(v) = value.to_str() {
-                upload.metadata.insert(key.to_string(), v.to_string());
+                metadata.insert(key.to_string(), v.to_string());
             }
         }
     }
+
+    let upload = state.multipart_manager.create_upload_with_metadata(
+        bucket.clone(),
+        key.clone(),
+        session.user_id.clone(),
+        content_type,
+        metadata,
+    );
 
     let xml_response = xml::initiate_multipart_upload_result(
         &bucket,

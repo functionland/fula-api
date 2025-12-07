@@ -10,8 +10,6 @@
 //!
 //! Run with: cargo run --example s3_compatible
 
-use std::process::Command;
-
 fn main() {
     println!("🔌 Fula Storage - S3 Compatibility Guide\n");
 

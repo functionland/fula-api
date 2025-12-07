@@ -80,7 +80,7 @@ impl FulaClient {
         let path = format!("/{}", bucket);
         match self.request("HEAD", &path, None, None, None).await {
             Ok(_) => Ok(true),
-            Err(ClientError::S3Error { code, .. }) if code == "NoSuchBucket" => Ok(false),
+            Err(ref e) if e.is_not_found() => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -228,7 +228,7 @@ impl FulaClient {
     pub async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool> {
         match self.head_object(bucket, key).await {
             Ok(_) => Ok(true),
-            Err(ClientError::S3Error { code, .. }) if code == "NoSuchKey" => Ok(false),
+            Err(ref e) if e.is_not_found() => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -352,7 +352,25 @@ impl FulaClient {
         // Check for errors
         let status = response.status();
         if !status.is_success() {
+            // For HEAD requests, S3 returns error code in x-amz-error-code header
+            // since there's no response body
+            let error_code = response
+                .headers()
+                .get("x-amz-error-code")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            
             let text = response.text().await.unwrap_or_default();
+            
+            // If we have an error code header, use it; otherwise parse XML or use status
+            if let Some(code) = error_code {
+                return Err(ClientError::S3Error {
+                    code,
+                    message: "Object not found".to_string(),
+                    request_id: None,
+                });
+            }
+            
             return Err(ClientError::from_s3_xml(&text, status.as_u16()));
         }
 

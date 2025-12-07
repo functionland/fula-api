@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc, Duration};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Multipart upload state
@@ -119,8 +120,24 @@ impl MultipartManager {
 
     /// Create a new multipart upload
     pub fn create_upload(&self, bucket: String, key: String, owner_id: String) -> MultipartUpload {
-        let upload = MultipartUpload::new(bucket, key, owner_id);
+        self.create_upload_with_metadata(bucket, key, owner_id, None, BTreeMap::new())
+    }
+
+    /// Create a new multipart upload with metadata
+    pub fn create_upload_with_metadata(
+        &self,
+        bucket: String,
+        key: String,
+        owner_id: String,
+        content_type: Option<String>,
+        metadata: BTreeMap<String, String>,
+    ) -> MultipartUpload {
+        let mut upload = MultipartUpload::new(bucket, key, owner_id);
+        upload.content_type = content_type;
+        upload.metadata = metadata;
+        debug!(upload_id = %upload.upload_id, bucket = %upload.bucket, key = %upload.key, "Creating multipart upload");
         self.uploads.insert(upload.upload_id.clone(), upload.clone());
+        debug!(total_uploads = self.uploads.len(), "Upload inserted into manager");
         upload
     }
 
@@ -131,14 +148,28 @@ impl MultipartManager {
 
     /// Add a part to an upload
     pub fn add_part(&self, upload_id: &str, part: UploadPart) -> Option<()> {
-        self.uploads.get_mut(upload_id).map(|mut upload| {
+        debug!(upload_id = %upload_id, part_number = part.part_number, "Adding part to upload");
+        let result = self.uploads.get_mut(upload_id).map(|mut upload| {
             upload.add_part(part);
-        })
+            debug!(upload_id = %upload_id, total_parts = upload.parts.len(), "Part added to upload");
+        });
+        if result.is_none() {
+            warn!(upload_id = %upload_id, "Upload not found when adding part");
+        }
+        result
     }
 
     /// Complete an upload (remove from manager)
     pub fn complete_upload(&self, upload_id: &str) -> Option<MultipartUpload> {
-        self.uploads.remove(upload_id).map(|(_, upload)| upload)
+        debug!(upload_id = %upload_id, total_uploads = self.uploads.len(), "Completing multipart upload");
+        let result = self.uploads.remove(upload_id).map(|(_, upload)| {
+            debug!(upload_id = %upload_id, parts_count = upload.parts.len(), "Upload removed from manager");
+            upload
+        });
+        if result.is_none() {
+            warn!(upload_id = %upload_id, "Upload not found when completing");
+        }
+        result
     }
 
     /// Abort an upload

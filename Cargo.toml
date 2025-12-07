@@ -8,6 +8,49 @@ members = [
     "crates/fula-client",
 ]
 
+# Root package for examples
+[package]
+name = "fula-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+fula-client = { path = "crates/fula-client" }
+fula-crypto = { path = "crates/fula-crypto" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+fula-blockstore = { path = "crates/fula-blockstore" }
+fula-core = { path = "crates/fula-core" }
+fula-cli = { path = "crates/fula-cli" }
+chrono = { workspace = true }
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
+
+[[example]]
+name = "encrypted_storage"
+path = "examples/encrypted_storage.rs"
+
+[[example]]
+name = "multipart_upload"
+path = "examples/multipart_upload.rs"
+
+[[example]]
+name = "s3_compatible"
+path = "examples/s3_compatible.rs"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

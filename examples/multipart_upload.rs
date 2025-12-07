@@ -7,7 +7,8 @@
 //!
 //! Run with: cargo run --example multipart_upload
 
-use fula_client::{FulaClient, Config, MultipartUpload, UploadProgress};
+use bytes::Bytes;
+use fula_client::{FulaClient, Config, MultipartUpload, UploadProgress, upload_large_file};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -51,11 +52,11 @@ async fn main() -> anyhow::Result<()> {
         );
     });
 
-    let etag = fula_client::multipart::upload_large_file(
+    let etag = upload_large_file(
         Arc::clone(&client),
         "large-files",
         "big-data.bin",
-        bytes::Bytes::from(large_data),
+        Bytes::from(large_data),
         Some(progress_callback),
     ).await?;
     
@@ -76,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     
     // Upload parts manually (could be done in parallel)
     let chunk_size = 8 * 1024 * 1024; // 8MB chunks
-    let total_size = 24 * 1024 * 1024; // 24MB total
+    let _total_size = 24 * 1024 * 1024; // 24MB total
     
     for part_num in 1..=3 {
         let chunk_data: Vec<u8> = (0..chunk_size)
@@ -84,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
             .collect();
         
         println!("   Uploading part {}...", part_num);
-        upload.upload_part(part_num as u32, bytes::Bytes::from(chunk_data)).await?;
+        upload.upload_part(part_num as u32, Bytes::from(chunk_data)).await?;
         println!("   ✅ Part {} uploaded", part_num);
         
         // Simulate potential interruption point

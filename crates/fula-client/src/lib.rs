@@ -48,5 +48,5 @@ pub use client::FulaClient;
 pub use config::Config;
 pub use encryption::{EncryptedClient, EncryptionConfig};
 pub use error::{ClientError, Result};
-pub use multipart::{MultipartUpload, UploadProgress};
+pub use multipart::{MultipartUpload, UploadProgress, ProgressCallback, upload_large_file};
 pub use types::*;
