@@ -463,6 +463,60 @@ Scores are **1–10**, where 10 is best given typical modern requirements. Score
 - Fula has a modest advantage in future‑proofing due to its **HPKE centric** design and simpler key hierarchies.
 - WNFS is still upgradable but will need carefully planned migrations for accumulators and RSA components.
 
+### 3.6 Encrypted Folder Listing for File Managers
+
+This section focuses on the common "file manager" use case: **listing files in an encrypted folder with names, sizes, timestamps, and content types, without reading or decrypting full file contents.**
+
+#### Fula
+
+- **PrivateForest as a pre‑computed index**
+  - `PrivateForest` stores a per‑bucket index of files and directories:
+    - `ForestFileEntry` contains original path, storage key, size, content type, timestamps, user metadata, and optional content hash.
+  - The entire forest is wrapped in `EncryptedForest` and encrypted once with a forest DEK derived from `KeyManager::derive_path_key("forest:<bucket>")`.
+  - The server sees only an opaque forest object (`x-fula-forest: true`) and flat storage keys; all human‑readable paths live inside the encrypted forest.
+- **Listing behavior**
+  - `EncryptedClient::load_forest` downloads and decrypts the forest index **once** per bucket.
+  - `list_directory_from_forest` and `list_files_from_forest` then perform **in‑memory lookups** to produce `DirectoryListing` and `FileMetadata` structs:
+    - `original_key`, `original_size`, `content_type`, `created_at`, `modified_at`, `user_metadata`, `is_encrypted`.
+  - To render a file manager view (names, icons, sizes, dates), the client only needs to:
+    1. Fetch and decrypt the forest index object.
+    2. Never touch individual file ciphertexts until the user actually opens a file.
+- **Implications**
+  - **Pros:**
+    - Very fast after the first forest load; directory listings are just hash‑map lookups.
+    - Ideal for UI patterns like "load all files in this bucket and sort/filter client‑side".
+  - **Cons:**
+    - For extremely large buckets (millions of files), the forest index itself can become large; listing any directory requires fetching and decrypting the entire index.
+
+#### WNFS
+
+- **Per‑node metadata and forest indirection**
+  - WNFS separates **metadata nodes** from content blocks:
+    - Private directories and files are represented as `PrivateNode`s with headers encrypted under `TemporalKey` (AES‑KWP) and content under `SnapshotKey` (XChaCha20‑Poly1305).
+    - The `HamtForest` maps name accumulators to ciphertext CIDs for these private nodes.
+  - To list a directory, the client:
+    1. Uses `HamtForest` to resolve the directory's name accumulator into one or more CIDs.
+    2. Fetches and AES‑KWP decrypts the directory node header to obtain child entries (names → `PrivateRef`s).
+    3. Optionally fetches child file headers to obtain per‑file metadata (size, timestamps, etc.), **without decrypting file content blocks**.
+- **Listing behavior**
+  - Listing is localized: only the directory node and relevant HAMT nodes (and perhaps child headers) are loaded and decrypted.
+  - For very large trees, this avoids loading a global index; the amount of data touched is proportional to the size of the directory subtree being viewed.
+- **Implications**
+  - **Pros:**
+    - Scales well to very large forests; listing a small directory only touches a small subset of the tree.
+    - Clean separation between metadata nodes and content blocks ensures file content is never decrypted during pure listing.
+  - **Cons:**
+    - Listing a large directory can require multiple blockstore fetches and many small decryption operations (one per node/header).
+    - More complex data structures (HAMT + accumulators + ratchets) make implementation and caching more involved.
+
+**Verdict:**
+
+- Both Fula and WNFS support **metadata‑only listing of encrypted folders** suitable for file‑manager‑style UIs, without decrypting file contents.
+- **Fula** optimizes for the gateway/object‑storage model:
+  - A single encrypted `PrivateForest` index per bucket gives very fast listings after an initial download/decrypt, especially for small–medium buckets.
+- **WNFS** optimizes for very large, evolving private filesystems:
+  - `HamtForest` and per‑node headers let you list only the subtrees you care about, with work proportional to directory size rather than global tree size.
+
 ---
 
 ## 4. Missing or Weaker Features in Fula Compared to WNFS
