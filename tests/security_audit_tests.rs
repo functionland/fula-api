@@ -324,3 +324,224 @@ mod hashed_user_id {
         assert_ne!(hash1, hash2);
     }
 }
+
+/// Test module for sharing integration (Audit finding: sharing not fully integrated)
+mod sharing_integration {
+    use fula_crypto::{
+        KekKeyPair, DekKey,
+        sharing::{ShareBuilder, ShareRecipient},
+    };
+    
+    #[test]
+    fn test_share_token_creation_and_acceptance() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+        
+        // Owner creates a share token for recipient
+        let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .path_scope("/photos/vacation/")
+            .expires_in(3600)
+            .read_only()
+            .build()
+            .unwrap();
+        
+        // Recipient accepts the share
+        let share_recipient = ShareRecipient::new(&recipient);
+        let accepted = share_recipient.accept_share(&token).unwrap();
+        
+        // Verify the accepted share has correct properties
+        assert_eq!(accepted.path_scope, "/photos/vacation/");
+        assert!(accepted.permissions.can_read);
+        assert!(!accepted.permissions.can_write);
+        assert!(accepted.is_valid());
+        
+        // Verify DEK matches
+        assert_eq!(accepted.dek.as_bytes(), dek.as_bytes());
+    }
+    
+    #[test]
+    fn test_share_path_scope_validation() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+        
+        let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .path_scope("/photos/")
+            .build()
+            .unwrap();
+        
+        let share_recipient = ShareRecipient::new(&recipient);
+        let accepted = share_recipient.accept_share(&token).unwrap();
+        
+        // Path within scope
+        assert!(accepted.is_path_allowed("/photos/beach.jpg"));
+        assert!(accepted.is_path_allowed("/photos/vacation/sunset.jpg"));
+        
+        // Path outside scope
+        assert!(!accepted.is_path_allowed("/documents/secret.pdf"));
+        assert!(!accepted.is_path_allowed("/photo")); // Prefix mismatch
+    }
+    
+    #[test]
+    fn test_share_permissions() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+        
+        // Read-only share
+        let read_token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .read_only()
+            .build()
+            .unwrap();
+        assert!(read_token.can_read());
+        assert!(!read_token.can_write());
+        assert!(!read_token.can_delete());
+        
+        // Read-write share
+        let rw_token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .read_write()
+            .build()
+            .unwrap();
+        assert!(rw_token.can_read());
+        assert!(rw_token.can_write());
+        assert!(!rw_token.can_delete());
+        
+        // Full access share
+        let full_token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .full_access()
+            .build()
+            .unwrap();
+        assert!(full_token.can_read());
+        assert!(full_token.can_write());
+        assert!(full_token.can_delete());
+    }
+    
+    #[test]
+    fn test_wrong_recipient_cannot_accept() {
+        let owner = KekKeyPair::generate();
+        let intended_recipient = KekKeyPair::generate();
+        let wrong_recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+        
+        // Token encrypted for intended_recipient
+        let token = ShareBuilder::new(&owner, intended_recipient.public_key(), &dek)
+            .build()
+            .unwrap();
+        
+        // Wrong recipient tries to accept
+        let wrong_share_recipient = ShareRecipient::new(&wrong_recipient);
+        let result = wrong_share_recipient.accept_share(&token);
+        
+        // Should fail because wrong key
+        assert!(result.is_err());
+    }
+}
+
+/// Test module for key rotation integration (Audit finding: rotation not fully wired)
+mod rotation_integration {
+    use fula_crypto::{
+        KekKeyPair, DekKey,
+        rotation::KeyRotationManager,
+    };
+    
+    #[test]
+    fn test_kek_version_tracking() {
+        let keypair = KekKeyPair::generate();
+        let manager = KeyRotationManager::new(keypair);
+        
+        assert_eq!(manager.current_version(), 1);
+    }
+    
+    #[test]
+    fn test_rotation_increments_version() {
+        let keypair = KekKeyPair::generate();
+        let mut manager = KeyRotationManager::new(keypair);
+        
+        assert_eq!(manager.current_version(), 1);
+        
+        manager.rotate_kek();
+        assert_eq!(manager.current_version(), 2);
+        
+        manager.rotate_kek();
+        assert_eq!(manager.current_version(), 3);
+    }
+    
+    #[test]
+    fn test_wrap_dek_includes_version() {
+        let keypair = KekKeyPair::generate();
+        let manager = KeyRotationManager::new(keypair);
+        let dek = DekKey::generate();
+        
+        let wrapped = manager.wrap_dek(&dek, "/test/file.txt").unwrap();
+        
+        assert_eq!(wrapped.kek_version, 1);
+        assert_eq!(wrapped.object_path, "/test/file.txt");
+    }
+    
+    #[test]
+    fn test_rewrap_dek_after_rotation() {
+        let keypair = KekKeyPair::generate();
+        let mut manager = KeyRotationManager::new(keypair);
+        let dek = DekKey::generate();
+        
+        // Wrap with v1
+        let wrapped_v1 = manager.wrap_dek(&dek, "/test/file.txt").unwrap();
+        assert_eq!(wrapped_v1.kek_version, 1);
+        
+        // Rotate to v2
+        manager.rotate_kek();
+        assert_eq!(manager.current_version(), 2);
+        
+        // Rewrap the DEK
+        let wrapped_v2 = manager.rewrap_dek(&wrapped_v1).unwrap();
+        assert_eq!(wrapped_v2.kek_version, 2);
+        
+        // Verify DEK can still be unwrapped
+        let unwrapped = manager.unwrap_dek(&wrapped_v2).unwrap();
+        assert_eq!(unwrapped.as_bytes(), dek.as_bytes());
+    }
+    
+    #[test]
+    fn test_can_unwrap_current_and_previous_version() {
+        let keypair = KekKeyPair::generate();
+        let mut manager = KeyRotationManager::new(keypair);
+        let dek = DekKey::generate();
+        
+        // Wrap with v1
+        let wrapped_v1 = manager.wrap_dek(&dek, "/file.txt").unwrap();
+        
+        // Rotate to v2
+        manager.rotate_kek();
+        
+        // Should still be able to unwrap v1 (previous version)
+        let unwrapped_v1 = manager.unwrap_dek(&wrapped_v1).unwrap();
+        assert_eq!(unwrapped_v1.as_bytes(), dek.as_bytes());
+        
+        // Wrap a new DEK with v2
+        let dek2 = DekKey::generate();
+        let wrapped_v2 = manager.wrap_dek(&dek2, "/file2.txt").unwrap();
+        
+        // Should be able to unwrap v2 (current version)
+        let unwrapped_v2 = manager.unwrap_dek(&wrapped_v2).unwrap();
+        assert_eq!(unwrapped_v2.as_bytes(), dek2.as_bytes());
+    }
+    
+    #[test]
+    fn test_clear_previous_prevents_old_unwrap() {
+        let keypair = KekKeyPair::generate();
+        let mut manager = KeyRotationManager::new(keypair);
+        let dek = DekKey::generate();
+        
+        // Wrap with v1
+        let wrapped_v1 = manager.wrap_dek(&dek, "/file.txt").unwrap();
+        
+        // Rotate and clear previous
+        manager.rotate_kek();
+        manager.clear_previous();
+        
+        // Should NOT be able to unwrap v1 anymore
+        let result = manager.unwrap_dek(&wrapped_v1);
+        assert!(result.is_err());
+    }
+}

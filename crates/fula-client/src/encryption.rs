@@ -14,6 +14,8 @@ use fula_crypto::{
     symmetric::{Aead, Nonce},
     private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, KeyObfuscation, obfuscate_key},
     private_forest::{PrivateForest, EncryptedForest, ForestFileEntry, derive_index_key},
+    sharing::{ShareToken, AcceptedShare, ShareRecipient},
+    rotation::{KeyRotationManager, WrappedKeyInfo},
 };
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
@@ -235,12 +237,14 @@ impl EncryptedClient {
             (key.to_string(), None)
         };
 
-        // Serialize encryption metadata
+        // Serialize encryption metadata with KEK version
+        let kek_version = self.encryption.key_manager.version();
         let mut enc_metadata = serde_json::json!({
             "version": 2,
             "algorithm": "AES-256-GCM",
             "nonce": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce.as_bytes()),
             "wrapped_key": serde_json::to_value(&wrapped_dek).unwrap(),
+            "kek_version": kek_version,
             "metadata_privacy": self.encryption.metadata_privacy,
         });
 
@@ -833,12 +837,14 @@ impl EncryptedClient {
         let entry = ForestFileEntry::from_metadata(&private_meta, storage_key.clone());
         forest.upsert_file(entry);
 
-        // Serialize encryption metadata
+        // Serialize encryption metadata with KEK version
+        let kek_version = self.encryption.key_manager.version();
         let enc_metadata = serde_json::json!({
             "version": 2,
             "algorithm": "AES-256-GCM",
             "nonce": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce.as_bytes()),
             "wrapped_key": serde_json::to_value(&wrapped_dek).unwrap(),
+            "kek_version": kek_version,
             "metadata_privacy": true,
             "obfuscation_mode": "flat",
             "private_metadata": encrypted_meta.to_json().map_err(ClientError::Encryption)?,
@@ -987,6 +993,284 @@ impl EncryptedClient {
         let forest = self.load_forest(bucket).await?;
         Ok(forest.extract_subtree(prefix))
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SHARING INTEGRATION
+    // Read objects using ShareToken - fully wired into gateway flows
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Get and decrypt an object using a ShareToken
+    /// 
+    /// This allows recipients of a share to read encrypted objects without
+    /// having the owner's keys. The ShareToken contains a wrapped DEK that
+    /// was encrypted for the recipient's public key.
+    /// 
+    /// # Arguments
+    /// * `bucket` - The bucket containing the object
+    /// * `storage_key` - The storage key of the object
+    /// * `accepted_share` - An accepted share containing the DEK
+    /// 
+    /// # Returns
+    /// The decrypted object data
+    pub async fn get_object_with_share(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        accepted_share: &AcceptedShare,
+    ) -> Result<Bytes> {
+        // Validate the share is still valid
+        if !accepted_share.is_valid() {
+            return Err(ClientError::Encryption(
+                fula_crypto::CryptoError::ShareExpired
+            ));
+        }
+
+        // Validate path scope
+        if !accepted_share.is_path_allowed(storage_key) {
+            return Err(ClientError::Encryption(
+                fula_crypto::CryptoError::AccessDenied(
+                    format!("Path {} is outside share scope {}", storage_key, accepted_share.path_scope)
+                )
+            ));
+        }
+
+        // Check read permission
+        if !accepted_share.permissions.can_read {
+            return Err(ClientError::Encryption(
+                fula_crypto::CryptoError::AccessDenied("Share does not grant read permission".to_string())
+            ));
+        }
+
+        // Fetch the object
+        let result = self.inner.get_object_with_metadata(bucket, storage_key).await?;
+        
+        // Check if encrypted
+        let is_encrypted = result.metadata
+            .get("x-fula-encrypted")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        if !is_encrypted {
+            return Ok(result.data);
+        }
+
+        // Parse encryption metadata
+        let enc_metadata_str = result.metadata
+            .get("x-fula-encryption")
+            .ok_or_else(|| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption("Missing encryption metadata".to_string())
+            ))?;
+
+        let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(e.to_string())
+            ))?;
+
+        // Extract nonce
+        let nonce_b64 = enc_metadata["nonce"].as_str()
+            .ok_or_else(|| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption("Missing nonce".to_string())
+            ))?;
+        let nonce_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            nonce_b64,
+        ).map_err(|e| ClientError::Encryption(
+            fula_crypto::CryptoError::Decryption(e.to_string())
+        ))?;
+        let nonce = Nonce::from_bytes(&nonce_bytes)
+            .map_err(ClientError::Encryption)?;
+
+        // Use the DEK from the accepted share (already decrypted for recipient)
+        let aead = Aead::new_default(&accepted_share.dek);
+        let plaintext = aead.decrypt(&nonce, &result.data)
+            .map_err(ClientError::Encryption)?;
+
+        Ok(Bytes::from(plaintext))
+    }
+
+    /// Accept a ShareToken and get an AcceptedShare for reading objects
+    /// 
+    /// This is a convenience method that combines ShareRecipient::accept_share
+    /// with our encryption config's secret key.
+    pub fn accept_share(&self, token: &ShareToken) -> Result<AcceptedShare> {
+        let recipient = ShareRecipient::new(self.encryption.key_manager.keypair());
+        recipient.accept_share(token)
+            .map_err(ClientError::Encryption)
+    }
+
+    /// Get object using a raw ShareToken (convenience method)
+    /// 
+    /// Combines accept_share + get_object_with_share in one call.
+    pub async fn get_object_with_token(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        token: &ShareToken,
+    ) -> Result<Bytes> {
+        let accepted = self.accept_share(token)?;
+        self.get_object_with_share(bucket, storage_key, &accepted).await
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // KEY ROTATION INTEGRATION
+    // Re-wrap DEKs without re-encrypting content
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Create a KeyRotationManager from this client's encryption config
+    pub fn create_rotation_manager(&self) -> KeyRotationManager {
+        KeyRotationManager::new(self.encryption.key_manager.keypair().clone())
+    }
+
+    /// Get the KEK version stored in an object's metadata
+    /// 
+    /// Returns None if the object doesn't have version info (legacy objects).
+    pub async fn get_object_kek_version(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+    ) -> Result<Option<u32>> {
+        let head_result = self.inner.head_object(bucket, storage_key).await?;
+        
+        let enc_metadata_str = match head_result.metadata.get("x-fula-encryption") {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(e.to_string())
+            ))?;
+
+        Ok(enc_metadata["kek_version"].as_u64().map(|v| v as u32))
+    }
+
+    /// Re-wrap an object's DEK with the current KEK
+    /// 
+    /// This updates the object's encryption metadata without re-encrypting
+    /// the content. Used during key rotation.
+    /// 
+    /// # Arguments
+    /// * `bucket` - The bucket containing the object
+    /// * `storage_key` - The storage key of the object  
+    /// * `rotation_manager` - The rotation manager with old and new KEKs
+    /// 
+    /// # Returns
+    /// The new KEK version after re-wrapping
+    pub async fn rewrap_object_dek(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        rotation_manager: &KeyRotationManager,
+    ) -> Result<u32> {
+        // Get the object with metadata
+        let result = self.inner.get_object_with_metadata(bucket, storage_key).await?;
+        
+        let enc_metadata_str = result.metadata
+            .get("x-fula-encryption")
+            .ok_or_else(|| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption("Missing encryption metadata".to_string())
+            ))?;
+
+        let mut enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(e.to_string())
+            ))?;
+
+        // Get the wrapped key and version
+        let wrapped_dek: EncryptedData = serde_json::from_value(
+            enc_metadata["wrapped_key"].clone()
+        ).map_err(|e| ClientError::Encryption(
+            fula_crypto::CryptoError::Decryption(e.to_string())
+        ))?;
+
+        // Get the KEK version (default to 1 for legacy objects)
+        let kek_version = enc_metadata["kek_version"]
+            .as_u64()
+            .map(|v| v as u32)
+            .unwrap_or(1);
+
+        // Create a WrappedKeyInfo for the rotation manager
+        let wrapped_info = WrappedKeyInfo {
+            wrapped_dek,
+            kek_version,
+            object_path: storage_key.to_string(),
+        };
+
+        // Unwrap with old KEK and rewrap with new KEK
+        let new_wrapped = rotation_manager.rewrap_dek(&wrapped_info)
+            .map_err(ClientError::Encryption)?;
+
+        // Update metadata
+        enc_metadata["wrapped_key"] = serde_json::to_value(&new_wrapped.wrapped_dek)
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Encryption(e.to_string())
+            ))?;
+        enc_metadata["kek_version"] = serde_json::Value::Number(
+            new_wrapped.kek_version.into()
+        );
+
+        // Re-upload with updated metadata (same ciphertext)
+        let metadata = ObjectMetadata::new()
+            .with_content_type(
+                result.metadata.get("content-type")
+                    .map(|s| s.as_str())
+                    .unwrap_or("application/octet-stream")
+            )
+            .with_metadata("x-fula-encrypted", "true")
+            .with_metadata("x-fula-encryption", &enc_metadata.to_string());
+
+        self.inner.put_object_with_metadata(
+            bucket,
+            storage_key,
+            result.data,
+            Some(metadata),
+        ).await?;
+
+        Ok(rotation_manager.current_version())
+    }
+
+    /// Rotate all objects in a bucket to use the new KEK
+    /// 
+    /// Returns the number of objects successfully rotated and any failures.
+    pub async fn rotate_bucket(
+        &self,
+        bucket: &str,
+        rotation_manager: &KeyRotationManager,
+    ) -> Result<RotationReport> {
+        let objects = self.inner.list_objects(bucket, None).await?;
+        
+        let mut report = RotationReport {
+            total: objects.objects.len(),
+            rotated: 0,
+            skipped: 0,
+            failed: 0,
+            failures: Vec::new(),
+        };
+
+        for obj in objects.objects {
+            // Skip forest index
+            if obj.key.starts_with("Qm") && obj.key.len() > 40 {
+                // Check if it's the forest index
+                let head = self.inner.head_object(bucket, &obj.key).await;
+                if let Ok(h) = head {
+                    if h.metadata.get("x-fula-forest").is_some() {
+                        report.skipped += 1;
+                        continue;
+                    }
+                }
+            }
+
+            match self.rewrap_object_dek(bucket, &obj.key, rotation_manager).await {
+                Ok(_) => report.rotated += 1,
+                Err(e) => {
+                    report.failed += 1;
+                    report.failures.push((obj.key, e.to_string()));
+                }
+            }
+        }
+
+        Ok(report)
+    }
 }
 
 /// File metadata (without file content) - optimized for file managers
@@ -1092,6 +1376,37 @@ pub struct DecryptedObjectInfo {
     pub content_type: Option<String>,
     /// User-defined metadata
     pub user_metadata: HashMap<String, String>,
+}
+
+/// Report from a bucket key rotation operation
+#[derive(Debug, Clone)]
+pub struct RotationReport {
+    /// Total number of objects in the bucket
+    pub total: usize,
+    /// Number of objects successfully rotated
+    pub rotated: usize,
+    /// Number of objects skipped (e.g., forest index)
+    pub skipped: usize,
+    /// Number of objects that failed to rotate
+    pub failed: usize,
+    /// Details of failed rotations (path, error message)
+    pub failures: Vec<(String, String)>,
+}
+
+impl RotationReport {
+    /// Check if rotation was fully successful
+    pub fn is_success(&self) -> bool {
+        self.failed == 0
+    }
+
+    /// Get success rate as a percentage
+    pub fn success_rate(&self) -> f64 {
+        if self.total == 0 {
+            100.0
+        } else {
+            (self.rotated as f64 / (self.total - self.skipped) as f64) * 100.0
+        }
+    }
 }
 
 #[cfg(test)]
