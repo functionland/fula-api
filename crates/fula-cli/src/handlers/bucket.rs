@@ -22,8 +22,9 @@ pub async fn create_bucket(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
 
-    let owner = Owner::new(&session.user_id)
-        .with_display_name(session.display_name.unwrap_or_default());
+    // Security audit fix A3: Use hashed user ID for privacy
+    let owner = Owner::new(&session.hashed_user_id)
+        .with_display_name(session.display_name.clone().unwrap_or_default());
 
     state.bucket_manager.create_bucket(bucket.clone(), owner).await?;
 
@@ -44,11 +45,11 @@ pub async fn delete_bucket(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
 
-    // Check ownership
+    // Check ownership (Security audit fix A3: compare hashed IDs)
     let metadata = state.bucket_manager.get_bucket_metadata(&bucket)
         .ok_or_else(|| ApiError::s3(S3ErrorCode::NoSuchBucket, "Bucket not found"))?;
     
-    if metadata.owner_id != session.user_id && !session.has_scope("admin") {
+    if !session.can_access_bucket(&metadata.owner_id) {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Not bucket owner"));
     }
 

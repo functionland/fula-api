@@ -18,15 +18,17 @@ pub async fn list_buckets(
     let buckets = state.bucket_manager.list_buckets();
     
     // Filter to buckets owned by this user (or show all for admin)
+    // Security audit fix A3: Compare using hashed user IDs
     let user_buckets: Vec<_> = buckets
         .into_iter()
-        .filter(|b| b.owner_id == session.user_id || session.has_scope("admin"))
+        .filter(|b| session.can_access_bucket(&b.owner_id))
         .map(|b| (b.name, b.created_at))
         .collect();
 
+    // Return hashed user ID in XML for privacy (Security audit fix A3)
     let xml_response = xml::list_all_my_buckets_result(
-        &session.user_id,
-        session.display_name.as_deref().unwrap_or(&session.user_id),
+        &session.hashed_user_id,
+        session.display_name.as_deref().unwrap_or("User"),
         &user_buckets,
     );
 

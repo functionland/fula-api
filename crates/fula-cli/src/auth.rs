@@ -99,13 +99,11 @@ pub fn claims_to_session(claims: Claims) -> UserSession {
         .map(|s| s.to_string())
         .collect();
 
-    UserSession {
-        user_id: claims.sub,
-        display_name: claims.name,
-        scopes,
-        expires_at: DateTime::from_timestamp(claims.exp, 0)
-            .unwrap_or_else(|| Utc::now() + Duration::hours(1)),
-    }
+    let expires_at = DateTime::from_timestamp(claims.exp, 0)
+        .unwrap_or_else(|| Utc::now() + Duration::hours(1));
+
+    // Security audit fix A3: Use UserSession::new() to auto-hash user ID
+    UserSession::new(claims.sub, claims.name, scopes, expires_at)
 }
 
 /// Extract bearer token from Authorization header
@@ -129,12 +127,13 @@ pub fn anonymous_user_id() -> String {
 
 /// Create a development/test session
 pub fn dev_session() -> UserSession {
-    UserSession {
-        user_id: "dev-user".to_string(),
-        display_name: Some("Development User".to_string()),
-        scopes: vec!["storage:*".to_string()],
-        expires_at: Utc::now() + Duration::days(365),
-    }
+    // Security audit fix A3: Use UserSession::new() to auto-hash user ID
+    UserSession::new(
+        "dev-user".to_string(),
+        Some("Development User".to_string()),
+        vec!["storage:*".to_string()],
+        Utc::now() + Duration::days(365),
+    )
 }
 
 #[cfg(test)]

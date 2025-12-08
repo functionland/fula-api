@@ -378,9 +378,10 @@ pub async fn copy_object(
         ))?;
 
     // Copy to destination
+    // Security audit fix A3: Use hashed user ID
     let mut dest_metadata = source_metadata.clone();
     dest_metadata.last_modified = chrono::Utc::now();
-    dest_metadata.owner_id = Some(session.user_id.clone());
+    dest_metadata.owner_id = Some(session.hashed_user_id.clone());
 
     let mut dest_bucket_handle = state.bucket_manager.open_bucket(&dest_bucket).await?;
     

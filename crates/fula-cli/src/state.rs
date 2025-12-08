@@ -2,6 +2,7 @@
 
 use crate::config::GatewayConfig;
 use crate::multipart::MultipartManager;
+use blake3::Hasher;
 use dashmap::DashMap;
 use fula_blockstore::{
     FlexibleBlockStore, IpfsPinningBlockStore, IpfsPinningConfig, MemoryBlockStore,
@@ -9,6 +10,17 @@ use fula_blockstore::{
 use fula_core::BucketManager;
 use std::sync::Arc;
 use tracing::{info, warn};
+
+/// Hash a user ID for privacy (Security audit fix A3)
+/// This prevents exposing raw user IDs (e.g., email addresses) in stored metadata
+pub fn hash_user_id(user_id: &str) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(b"fula:user_id:");  // Domain separation
+    hasher.update(user_id.as_bytes());
+    let hash = hasher.finalize();
+    // Use first 16 bytes (128 bits) encoded as hex for reasonable uniqueness
+    hex::encode(&hash.as_bytes()[..16])
+}
 
 /// Application state shared across handlers
 pub struct AppState {
@@ -95,6 +107,8 @@ impl AppState {
 pub struct UserSession {
     /// User ID (from JWT sub claim)
     pub user_id: String,
+    /// Hashed user ID for storage (Security audit fix A3)
+    pub hashed_user_id: String,
     /// Display name
     pub display_name: Option<String>,
     /// Scopes
@@ -104,6 +118,18 @@ pub struct UserSession {
 }
 
 impl UserSession {
+    /// Create a new user session with automatic ID hashing
+    pub fn new(user_id: String, display_name: Option<String>, scopes: Vec<String>, expires_at: chrono::DateTime<chrono::Utc>) -> Self {
+        let hashed_user_id = hash_user_id(&user_id);
+        Self {
+            user_id,
+            hashed_user_id,
+            display_name,
+            scopes,
+            expires_at,
+        }
+    }
+
     /// Check if the session has expired
     pub fn is_expired(&self) -> bool {
         chrono::Utc::now() > self.expires_at
@@ -130,7 +156,8 @@ impl UserSession {
     }
 
     /// Check if user can access a bucket (owner or admin)
+    /// Security audit fix A3: Uses hashed user ID for comparison
     pub fn can_access_bucket(&self, bucket_owner_id: &str) -> bool {
-        self.user_id == bucket_owner_id || self.is_admin()
+        self.hashed_user_id == bucket_owner_id || self.is_admin()
     }
 }

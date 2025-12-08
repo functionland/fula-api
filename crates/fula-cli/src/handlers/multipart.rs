@@ -57,10 +57,11 @@ pub async fn create_multipart_upload(
         }
     }
 
+    // Security audit fix A3: Use hashed user ID
     let upload = state.multipart_manager.create_upload_with_metadata(
         bucket.clone(),
         key.clone(),
-        session.user_id.clone(),
+        session.hashed_user_id.clone(),
         content_type,
         metadata,
     );

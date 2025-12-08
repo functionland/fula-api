@@ -262,6 +262,44 @@ cargo run --example flat_namespace_demo
 - Export/backup secret keys securely
 - Lost keys = lost data (no recovery possible)
 
+### Privacy Notice
+
+⚠️ **Important**: For private data, always use the **Encrypted Client SDK** (`EncryptedClient`).
+
+Raw S3 tools (AWS CLI, boto3) do NOT encrypt data - they upload plaintext that gateway operators can see.
+
+**What's encrypted** (with EncryptedClient):
+- ✅ File content
+- ✅ File names (FlatNamespace mode)
+- ✅ Directory structure
+- ✅ User IDs (hashed)
+
+**What remains visible**:
+- ⚠️ Bucket names
+- ⚠️ Approximate file sizes
+- ⚠️ Request timestamps
+
+See [docs/PRIVACY.md](docs/PRIVACY.md) for full privacy policy.
+
+## Production Deployment
+
+For production Ubuntu deployments with security hardening:
+
+```bash
+# Download and run the installer
+curl -fsSL https://raw.githubusercontent.com/functionland/fula-api/main/install.sh | sudo bash
+```
+
+The installer will:
+- Install Docker and dependencies
+- Configure nginx with TLS (Let's Encrypt)
+- Set up rate limiting and fail2ban
+- Configure firewall (UFW)
+- Create systemd service
+- Optionally set up local IPFS node
+
+See [install.sh](install.sh) for details.
+
 ## License
 
 Licensed under either of:

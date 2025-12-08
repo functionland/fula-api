@@ -278,3 +278,49 @@ mod aad_binding {
         assert_eq!(dek.as_bytes(), unwrapped.as_bytes());
     }
 }
+
+/// Test module for hashed user IDs (Finding A3)
+mod hashed_user_id {
+    /// Simulate the hash_user_id function from fula-cli
+    fn hash_user_id(user_id: &str) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"fula:user_id:");
+        hasher.update(user_id.as_bytes());
+        let hash = hasher.finalize();
+        hex::encode(&hash.as_bytes()[..16])
+    }
+    
+    #[test]
+    fn test_user_id_is_hashed() {
+        let user_id = "john.doe@example.com";
+        let hashed = hash_user_id(user_id);
+        
+        // Hashed ID should not contain the email
+        assert!(!hashed.contains("john"));
+        assert!(!hashed.contains("@"));
+        assert!(!hashed.contains("example.com"));
+        
+        // Should be 32 hex characters (16 bytes)
+        assert_eq!(hashed.len(), 32);
+    }
+    
+    #[test]
+    fn test_hash_is_deterministic() {
+        let user_id = "test-user-123";
+        let hash1 = hash_user_id(user_id);
+        let hash2 = hash_user_id(user_id);
+        
+        assert_eq!(hash1, hash2);
+    }
+    
+    #[test]
+    fn test_different_users_have_different_hashes() {
+        let user1 = "user1@example.com";
+        let user2 = "user2@example.com";
+        
+        let hash1 = hash_user_id(user1);
+        let hash2 = hash_user_id(user2);
+        
+        assert_ne!(hash1, hash2);
+    }
+}

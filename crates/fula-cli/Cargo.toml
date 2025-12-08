@@ -57,6 +57,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
+blake3 = { workspace = true }
 urlencoding = "2.1"
 url = "2.5"
 mime = "0.3"
