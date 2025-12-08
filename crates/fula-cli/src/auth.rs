@@ -26,11 +26,63 @@ pub struct Claims {
     pub name: Option<String>,
 }
 
+/// JWT validation configuration
+#[derive(Debug, Clone, Default)]
+pub struct JwtValidationConfig {
+    /// Expected issuer (if set, tokens must have matching iss claim)
+    pub issuer: Option<String>,
+    /// Expected audience (if set, tokens must have matching aud claim)
+    pub audience: Option<String>,
+    /// Clock skew tolerance in seconds (default: 60)
+    pub leeway_secs: u64,
+}
+
+impl JwtValidationConfig {
+    pub fn new() -> Self {
+        Self {
+            issuer: None,
+            audience: None,
+            leeway_secs: 60,
+        }
+    }
+    
+    pub fn with_issuer(mut self, issuer: impl Into<String>) -> Self {
+        self.issuer = Some(issuer.into());
+        self
+    }
+    
+    pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
+        self.audience = Some(audience.into());
+        self
+    }
+}
+
 /// Validate a JWT token and extract claims
+/// Security audit fix #6: Validates issuer and audience when configured
 pub fn validate_token(token: &str, secret: &str) -> Result<Claims, ApiError> {
+    validate_token_with_config(token, secret, &JwtValidationConfig::default())
+}
+
+/// Validate a JWT token with full configuration
+pub fn validate_token_with_config(
+    token: &str, 
+    secret: &str,
+    config: &JwtValidationConfig,
+) -> Result<Claims, ApiError> {
     let key = DecodingKey::from_secret(secret.as_bytes());
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
+    validation.leeway = config.leeway_secs;
+    
+    // Security audit fix #6: Set issuer validation if configured
+    if let Some(ref iss) = config.issuer {
+        validation.set_issuer(&[iss]);
+    }
+    
+    // Security audit fix #6: Set audience validation if configured
+    if let Some(ref aud) = config.audience {
+        validation.set_audience(&[aud]);
+    }
     
     decode::<Claims>(token, &key, &validation)
         .map(|data| data.claims)

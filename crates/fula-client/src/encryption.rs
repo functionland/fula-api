@@ -533,9 +533,10 @@ impl EncryptedClient {
         // HEAD request - only gets headers, NOT file content
         let head_result = self.inner.head_object(bucket, storage_key).await?;
         
-        // Check if encrypted
+        // Security audit fix #9: Check correct metadata keys (x-fula-encrypted, x-fula-encryption)
+        // The upload code uses x-amz-meta-x-fula-* which becomes x-fula-* in user_metadata
         let is_encrypted = head_result.metadata
-            .get("encrypted")
+            .get("x-fula-encrypted")
             .map(|v| v == "true")
             .unwrap_or(false);
 
@@ -554,7 +555,7 @@ impl EncryptedClient {
 
         // Parse encryption metadata from headers
         let enc_metadata_str = head_result.metadata
-            .get("encryption")
+            .get("x-fula-encryption")
             .ok_or_else(|| ClientError::Encryption(
                 fula_crypto::CryptoError::Decryption("Missing encryption metadata".to_string())
             ))?;
@@ -717,9 +718,11 @@ impl EncryptedClient {
             }
         }
 
-        // Derive the index key deterministically
-        let path_dek = self.encryption.key_manager.generate_dek();
-        let index_key = derive_index_key(&path_dek, bucket);
+        // Security audit fix #8: Use DETERMINISTIC key derivation for forest index
+        // This ensures we can find the same forest across sessions
+        // The key is derived from: master_key + "forest:" + bucket_name
+        let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+        let index_key = derive_index_key(&forest_dek, bucket);
 
         // Try to load from storage
         match self.inner.get_object_with_metadata(bucket, &index_key).await {
@@ -727,7 +730,7 @@ impl EncryptedClient {
                 // Decrypt the forest
                 let encrypted = EncryptedForest::from_bytes(&result.data)
                     .map_err(ClientError::Encryption)?;
-                let forest = encrypted.decrypt(&path_dek)
+                let forest = encrypted.decrypt(&forest_dek)
                     .map_err(ClientError::Encryption)?;
                 
                 // Cache it
@@ -755,11 +758,12 @@ impl EncryptedClient {
 
     /// Save the private forest index for a bucket
     pub async fn save_forest(&self, bucket: &str, forest: &PrivateForest) -> Result<()> {
-        let path_dek = self.encryption.key_manager.generate_dek();
-        let index_key = derive_index_key(&path_dek, bucket);
+        // Security audit fix #8: Use DETERMINISTIC key derivation (same as load_forest)
+        let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+        let index_key = derive_index_key(&forest_dek, bucket);
 
         // Encrypt the forest
-        let encrypted = EncryptedForest::encrypt(forest, &path_dek)
+        let encrypted = EncryptedForest::encrypt(forest, &forest_dek)
             .map_err(ClientError::Encryption)?;
         let data = encrypted.to_bytes()
             .map_err(ClientError::Encryption)?;

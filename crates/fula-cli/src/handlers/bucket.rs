@@ -100,6 +100,11 @@ pub async fn list_objects(
 
     let bucket = state.bucket_manager.open_bucket(&bucket_name).await?;
     
+    // Verify bucket ownership (security audit fix #1)
+    if !session.can_access_bucket(&bucket.metadata().owner_id) {
+        return Err(ApiError::s3(S3ErrorCode::AccessDenied, "You do not have access to this bucket"));
+    }
+    
     let result = bucket.list_objects(
         params.prefix.as_deref(),
         params.delimiter.as_deref(),

@@ -13,18 +13,15 @@ use tower_http::{
     trace::TraceLayer,
     compression::CompressionLayer,
 };
+use axum::http::{Method, header, HeaderValue};
 
 /// Create the main router
 pub fn create_router(state: Arc<AppState>) -> Router {
     // Create rate limiter
     let rate_limiter = middleware::create_rate_limiter(state.config.rate_limit_rps);
 
-    // CORS configuration
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .expose_headers(Any);
+    // Security audit fix #7: Configurable CORS
+    let cors = create_cors_layer(&state.config.cors_origins);
 
     // Build the router
     Router::new()
@@ -229,5 +226,64 @@ async fn object_post_handler(
             crate::S3ErrorCode::InvalidRequest,
             "Invalid POST request",
         ))
+    }
+}
+
+/// Security audit fix #7: Create configurable CORS layer
+/// If origins contains "*", allows any origin (development mode)
+/// Otherwise, only allows specified origins
+fn create_cors_layer(origins: &[String]) -> CorsLayer {
+    // Standard S3-compatible headers we need to expose
+    let expose_headers = vec![
+        header::ETAG,
+        header::CONTENT_LENGTH,
+        header::CONTENT_TYPE,
+        header::LAST_MODIFIED,
+    ];
+    
+    // S3-compatible methods
+    let methods = vec![
+        Method::GET,
+        Method::PUT,
+        Method::POST,
+        Method::DELETE,
+        Method::HEAD,
+        Method::OPTIONS,
+    ];
+    
+    // Headers we allow
+    let allow_headers = vec![
+        header::AUTHORIZATION,
+        header::CONTENT_TYPE,
+        header::CONTENT_LENGTH,
+        header::HeaderName::from_static("content-md5"),
+        header::HeaderName::from_static("x-amz-content-sha256"),
+        header::HeaderName::from_static("x-amz-date"),
+        header::HeaderName::from_static("x-amz-copy-source"),
+        header::HeaderName::from_static("x-pinning-service"),
+        header::HeaderName::from_static("x-pinning-token"),
+    ];
+    
+    let cors = CorsLayer::new()
+        .allow_methods(methods)
+        .allow_headers(allow_headers)
+        .expose_headers(expose_headers);
+    
+    // Check if wildcard is in origins (development mode)
+    if origins.iter().any(|o| o == "*") {
+        tracing::warn!("CORS: Allowing all origins (development mode)");
+        cors.allow_origin(Any)
+    } else if origins.is_empty() {
+        tracing::info!("CORS: No origins configured, rejecting all cross-origin requests");
+        cors // No allow_origin = reject all
+    } else {
+        // Parse specific origins
+        let parsed_origins: Vec<HeaderValue> = origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        
+        tracing::info!("CORS: Allowing {} specific origins", parsed_origins.len());
+        cors.allow_origin(parsed_origins)
     }
 }

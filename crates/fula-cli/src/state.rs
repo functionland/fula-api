@@ -123,4 +123,14 @@ impl UserSession {
     pub fn can_write(&self) -> bool {
         self.has_scope("storage:write") || self.has_scope("storage:*")
     }
+
+    /// Check if user is admin
+    pub fn is_admin(&self) -> bool {
+        self.has_scope("admin") || self.has_scope("*")
+    }
+
+    /// Check if user can access a bucket (owner or admin)
+    pub fn can_access_bucket(&self, bucket_owner_id: &str) -> bool {
+        self.user_id == bucket_owner_id || self.is_admin()
+    }
 }
