@@ -57,7 +57,9 @@ pub use streaming::{BaoEncoder, BaoDecoder, BaoOutboard, VerifiedStream};
 pub use symmetric::{Aead, AeadCipher, Nonce};
 
 /// The version of the cryptographic format
-pub const CRYPTO_VERSION: u8 = 1;
+/// Version 1: Custom HPKE (X25519 + BLAKE3 + AEAD)
+/// Version 2: RFC 9180 HPKE (X25519HkdfSha256 + HkdfSha256 + ChaCha20Poly1305)
+pub const CRYPTO_VERSION: u8 = 2;
 
 /// Default chunk size for streaming encryption (256 KB)
 pub const DEFAULT_CHUNK_SIZE: usize = 256 * 1024;

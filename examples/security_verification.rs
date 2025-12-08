@@ -189,18 +189,16 @@ fn test_3_tampered_ciphertext_detected() -> anyhow::Result<()> {
     let decrypted = decryptor.decrypt(&encrypted)?;
     assert_eq!(plaintext.as_slice(), decrypted.as_slice());
 
-    // Test tampering with nonce
+    // Test tampering with encapsulated key (RFC 9180 HPKE handles nonce internally)
     let mut encrypted2 = encryptor.encrypt(plaintext)?;
     
-    // Tamper with nonce
-    let mut nonce_bytes = encrypted2.nonce.as_bytes().to_vec();
-    nonce_bytes[0] ^= 0x01;
-    encrypted2.nonce = Nonce::from_bytes(&nonce_bytes)?;
+    // Tamper with encapsulated key
+    encrypted2.encapsulated_key.ephemeral_public[0] ^= 0x01;
 
     let result2 = decryptor.decrypt(&encrypted2);
     assert!(
         result2.is_err(),
-        "SECURITY FAILURE: Tampered nonce was accepted!"
+        "SECURITY FAILURE: Tampered encapsulated key was accepted!"
     );
 
     println!("   ✅ PASSED: Tampered ciphertext correctly rejected");

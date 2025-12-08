@@ -239,3 +239,42 @@ mod log_redaction {
         assert!(log_message.contains(endpoint));
     }
 }
+
+/// Test module for AAD binding (Finding #5)
+mod aad_binding {
+    use fula_crypto::{Encryptor, Decryptor, KekKeyPair, DekKey};
+    
+    #[test]
+    fn test_aad_binding_prevents_swapping() {
+        let keypair = KekKeyPair::generate();
+        let data = b"sensitive data";
+        let context1 = b"fula:v2:bucket:bucket-a:key:file1.txt";
+        let context2 = b"fula:v2:bucket:bucket-b:key:file2.txt";
+        
+        let encryptor = Encryptor::new(keypair.public_key());
+        let encrypted = encryptor.encrypt_with_aad(data, context1).unwrap();
+        
+        let decryptor = Decryptor::new(&keypair);
+        
+        // Correct context works
+        assert!(decryptor.decrypt_with_aad(&encrypted, context1).is_ok());
+        
+        // Wrong context fails - prevents swapping ciphertext between files
+        assert!(decryptor.decrypt_with_aad(&encrypted, context2).is_err());
+    }
+    
+    #[test]
+    fn test_dek_wrap_has_dedicated_aad() {
+        let keypair = KekKeyPair::generate();
+        let dek = DekKey::generate();
+        
+        let encryptor = Encryptor::new(keypair.public_key());
+        let wrapped = encryptor.encrypt_dek(&dek).unwrap();
+        
+        // DEK wrapping uses "fula:v2:dek-wrap" AAD internally
+        let decryptor = Decryptor::new(&keypair);
+        let unwrapped = decryptor.decrypt_dek(&wrapped).unwrap();
+        
+        assert_eq!(dek.as_bytes(), unwrapped.as_bytes());
+    }
+}

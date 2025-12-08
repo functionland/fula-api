@@ -4,21 +4,55 @@
 //! - Encrypt files for recipients without prior key exchange
 //! - Enable the "Inbox Pattern" for decentralized file drops
 //! - Support key encapsulation for DEK wrapping
+//!
+//! This module uses the standard RFC 9180 HPKE implementation with:
+//! - KEM: X25519-HKDF-SHA256 (DHKEM)
+//! - KDF: HKDF-SHA256
+//! - AEAD: ChaCha20Poly1305 (default) or AES-256-GCM
 
 use crate::{
-    CryptoError, Result, CRYPTO_VERSION,
+    CryptoError, Result,
     keys::{DekKey, KekKeyPair, PublicKey, SecretKey},
-    symmetric::{Aead, AeadCipher, Nonce},
+    symmetric::AeadCipher,
 };
-use rand::rngs::OsRng;
-use serde::{Deserialize, Serialize};
-use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
+use hpke::{
+    Deserializable, Kem, Serializable,
+    aead::ChaCha20Poly1305,
+    kdf::HkdfSha256,
+    kem::X25519HkdfSha256,
+    OpModeR, OpModeS,
+    rand_core::{CryptoRng, RngCore},
+};
+use serde::{Deserialize as SerdeDeserialize, Serialize};
+
+/// Adapter to bridge getrandom to hpke's rand_core 0.9
+struct HpkeRng;
+
+impl RngCore for HpkeRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut buf = [0u8; 4];
+        getrandom::getrandom(&mut buf).expect("getrandom failed");
+        u32::from_le_bytes(buf)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut buf = [0u8; 8];
+        getrandom::getrandom(&mut buf).expect("getrandom failed");
+        u64::from_le_bytes(buf)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        getrandom::getrandom(dest).expect("getrandom failed");
+    }
+}
+
+impl CryptoRng for HpkeRng {}
 
 /// Size of encapsulated key
 pub const ENCAPSULATED_KEY_SIZE: usize = 32;
 
 /// HPKE configuration
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, SerdeDeserialize)]
 pub struct HpkeConfig {
     /// The AEAD cipher to use
     pub aead: AeadCipher,
@@ -35,10 +69,10 @@ impl Default for HpkeConfig {
     }
 }
 
-/// Encapsulated key from HPKE encryption
-#[derive(Clone, Serialize, Deserialize)]
+/// Encapsulated key from RFC 9180 HPKE encryption
+#[derive(Clone, Serialize, SerdeDeserialize)]
 pub struct EncapsulatedKey {
-    /// The ephemeral public key
+    /// The encapsulated key bytes (from RFC 9180 KEM)
     #[serde(with = "base64_array_serde")]
     pub ephemeral_public: [u8; 32],
 }
@@ -123,18 +157,16 @@ impl std::fmt::Debug for EncapsulatedKey {
     }
 }
 
-/// Encrypted data with all metadata needed for decryption
-#[derive(Clone, Serialize, Deserialize, Debug)]
+/// Encrypted data with all metadata needed for decryption (RFC 9180 HPKE format)
+#[derive(Clone, Serialize, SerdeDeserialize, Debug)]
 pub struct EncryptedData {
-    /// Version of the encryption format
+    /// Version of the encryption format (2 = RFC 9180 HPKE)
     pub version: u8,
-    /// The encapsulated key
+    /// The encapsulated key from HPKE KEM
     pub encapsulated_key: EncapsulatedKey,
-    /// The nonce used for AEAD
-    pub nonce: Nonce,
-    /// The AEAD cipher used
+    /// The AEAD cipher used (for display/logging only, RFC 9180 uses fixed suite)
     pub cipher: AeadCipher,
-    /// The encrypted ciphertext
+    /// The encrypted ciphertext (includes AEAD auth tag)
     #[serde(with = "base64_vec_serde")]
     pub ciphertext: Vec<u8>,
 }
@@ -146,10 +178,14 @@ impl EncryptedData {
     }
 }
 
-/// Encryptor for HPKE-based encryption
+/// Domain separation info for HPKE context binding (RFC 9180 info parameter)
+const HPKE_INFO: &[u8] = b"fula-storage-v2";
+
+/// Encryptor for RFC 9180 HPKE-based encryption
 pub struct Encryptor {
     recipient_public: PublicKey,
-    config: HpkeConfig,
+    #[allow(dead_code)]
+    config: HpkeConfig,  // Reserved for future cipher suite options
 }
 
 impl Encryptor {
@@ -169,45 +205,63 @@ impl Encryptor {
         }
     }
 
-    /// Encrypt data for the recipient
+    /// Encrypt data for the recipient using RFC 9180 HPKE
+    /// Uses default AAD context "fula:v2:default"
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<EncryptedData> {
-        // Generate ephemeral key pair
-        let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
-        let ephemeral_public = X25519Public::from(&ephemeral_secret);
+        self.encrypt_with_aad(plaintext, b"fula:v2:default")
+    }
 
-        // Perform X25519 key exchange
-        let recipient_x25519 = X25519Public::from(*self.recipient_public.as_bytes());
-        let shared_secret = ephemeral_secret.diffie_hellman(&recipient_x25519);
+    /// Encrypt data with custom AAD (Additional Authenticated Data)
+    /// Security audit fix #5: AAD binds ciphertext to context, preventing swapping attacks
+    pub fn encrypt_with_aad(&self, plaintext: &[u8], aad: &[u8]) -> Result<EncryptedData> {
+        // Parse recipient's public key into HPKE format
+        let pk_recip = <X25519HkdfSha256 as Kem>::PublicKey::from_bytes(
+            self.recipient_public.as_bytes()
+        ).map_err(|e| CryptoError::Encryption(format!("Invalid recipient public key: {:?}", e)))?;
 
-        // Derive the DEK from shared secret using BLAKE3
-        let dek = derive_dek(shared_secret.as_bytes(), &self.config.context);
+        // Use RFC 9180 single-shot seal (Base mode - no sender authentication)
+        let mut csprng = HpkeRng;
+        let (encapped_key, ciphertext) = hpke::single_shot_seal::<
+            ChaCha20Poly1305,
+            HkdfSha256,
+            X25519HkdfSha256,
+            _
+        >(
+            &OpModeS::Base,
+            &pk_recip,
+            HPKE_INFO,
+            plaintext,
+            aad,  // Security audit fix #5: AAD binding
+            &mut csprng,
+        ).map_err(|e| CryptoError::Encryption(format!("HPKE encryption failed: {:?}", e)))?;
 
-        // Encrypt the data
-        let nonce = Nonce::generate();
-        let aead = Aead::new(&dek, self.config.aead);
-        let ciphertext = aead.encrypt(&nonce, plaintext)?;
+        // Serialize encapsulated key
+        let enc_bytes = encapped_key.to_bytes();
+        let mut enc_array = [0u8; 32];
+        enc_array.copy_from_slice(&enc_bytes);
 
         Ok(EncryptedData {
-            version: CRYPTO_VERSION,
+            version: 2,  // Version 2 = RFC 9180 HPKE
             encapsulated_key: EncapsulatedKey {
-                ephemeral_public: *ephemeral_public.as_bytes(),
+                ephemeral_public: enc_array,
             },
-            nonce,
-            cipher: self.config.aead,
+            cipher: AeadCipher::ChaCha20Poly1305,
             ciphertext,
         })
     }
 
     /// Encrypt a DEK for the recipient (for key wrapping)
+    /// Uses AAD context "fula:v2:dek-wrap" to bind DEK to its purpose
     pub fn encrypt_dek(&self, dek: &DekKey) -> Result<EncryptedData> {
-        self.encrypt(dek.as_bytes())
+        self.encrypt_with_aad(dek.as_bytes(), b"fula:v2:dek-wrap")
     }
 }
 
-/// Decryptor for HPKE-based decryption
+/// Decryptor for RFC 9180 HPKE-based decryption
 pub struct Decryptor {
     secret: SecretKey,
-    config: HpkeConfig,
+    #[allow(dead_code)]
+    config: HpkeConfig,  // Reserved for future cipher suite options
 }
 
 impl Decryptor {
@@ -235,33 +289,48 @@ impl Decryptor {
         }
     }
 
-    /// Decrypt data
+    /// Decrypt data using RFC 9180 HPKE
+    /// Uses default AAD context "fula:v2:default" (must match encryption)
     pub fn decrypt(&self, encrypted: &EncryptedData) -> Result<Vec<u8>> {
-        // Recreate the shared secret from the encapsulated key
-        let recipient_secret = StaticSecret::from(*self.secret.as_bytes());
-        let ephemeral_public = X25519Public::from(encrypted.encapsulated_key.ephemeral_public);
-        let shared_secret = recipient_secret.diffie_hellman(&ephemeral_public);
+        self.decrypt_with_aad(encrypted, b"fula:v2:default")
+    }
 
-        // Derive the DEK from shared secret
-        let dek = derive_dek(shared_secret.as_bytes(), &self.config.context);
+    /// Decrypt data with custom AAD (must match the AAD used during encryption)
+    /// Security audit fix #5: AAD binding verification
+    pub fn decrypt_with_aad(&self, encrypted: &EncryptedData, aad: &[u8]) -> Result<Vec<u8>> {
+        // Parse secret key into HPKE format
+        let sk_recip = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(
+            self.secret.as_bytes()
+        ).map_err(|e| CryptoError::Decryption(format!("Invalid secret key: {:?}", e)))?;
 
-        // Decrypt the data
-        let aead = Aead::new(&dek, encrypted.cipher);
-        aead.decrypt(&encrypted.nonce, &encrypted.ciphertext)
+        // Parse encapsulated key
+        let enc_key = <X25519HkdfSha256 as Kem>::EncappedKey::from_bytes(
+            encrypted.encapsulated_key.as_bytes()
+        ).map_err(|e| CryptoError::Decryption(format!("Invalid encapsulated key: {:?}", e)))?;
+
+        // Use RFC 9180 single-shot open (Base mode)
+        let plaintext = hpke::single_shot_open::<
+            ChaCha20Poly1305,
+            HkdfSha256,
+            X25519HkdfSha256,
+        >(
+            &OpModeR::Base,
+            &sk_recip,
+            &enc_key,
+            HPKE_INFO,
+            &encrypted.ciphertext,
+            aad,  // Security audit fix #5: AAD binding verification
+        ).map_err(|e| CryptoError::Decryption(format!("HPKE decryption failed: {:?}", e)))?;
+
+        Ok(plaintext)
     }
 
     /// Decrypt a wrapped DEK
+    /// Uses AAD context "fula:v2:dek-wrap" (must match encryption)
     pub fn decrypt_dek(&self, encrypted: &EncryptedData) -> Result<DekKey> {
-        let bytes = self.decrypt(encrypted)?;
+        let bytes = self.decrypt_with_aad(encrypted, b"fula:v2:dek-wrap")?;
         DekKey::from_bytes(&bytes)
     }
-}
-
-/// Derive a DEK from a shared secret
-fn derive_dek(shared_secret: &[u8], context: &str) -> DekKey {
-    use crate::hashing::derive_key;
-    let derived = derive_key(context, shared_secret);
-    DekKey::from_bytes(derived.as_bytes()).expect("derived key has correct length")
 }
 
 /// Encrypt data for multiple recipients
@@ -284,7 +353,7 @@ pub fn encrypt_for_multiple(
 }
 
 /// Create a time-limited sharing link
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, SerdeDeserialize, Debug)]
 pub struct ShareLink {
     /// The wrapped DEK
     pub wrapped_key: EncryptedData,
@@ -295,7 +364,7 @@ pub struct ShareLink {
 }
 
 /// Permissions for a share link
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default)]
+#[derive(Clone, Copy, Serialize, SerdeDeserialize, Debug, Default)]
 pub struct SharePermissions {
     pub can_read: bool,
     pub can_write: bool,
@@ -426,23 +495,8 @@ mod tests {
         assert!(decryptor.decrypt(&encrypted).is_err(), "Tampered ciphertext should fail");
     }
 
-    /// Test that tampering with nonce is detected
-    #[test]
-    fn test_nonce_tampering_detected() {
-        let keypair = KekKeyPair::generate();
-        let plaintext = b"Message with nonce integrity";
-
-        let encryptor = Encryptor::new(keypair.public_key());
-        let mut encrypted = encryptor.encrypt(plaintext).unwrap();
-
-        // Tamper with nonce
-        let mut nonce_bytes = encrypted.nonce.as_bytes().to_vec();
-        nonce_bytes[0] ^= 0x01;
-        encrypted.nonce = Nonce::from_bytes(&nonce_bytes).unwrap();
-
-        let decryptor = Decryptor::new(&keypair);
-        assert!(decryptor.decrypt(&encrypted).is_err(), "Tampered nonce should fail");
-    }
+    // Note: RFC 9180 HPKE handles nonce internally, so no separate nonce tampering test needed
+    // The nonce is derived from the key schedule and ciphertext sequence number
 
     /// Test that tampering with encapsulated key is detected
     #[test]
@@ -472,19 +526,19 @@ mod tests {
         let encrypted2 = encryptor.encrypt(plaintext).unwrap();
         let encrypted3 = encryptor.encrypt(plaintext).unwrap();
 
-        // All ciphertexts should be different
+        // All ciphertexts should be different (RFC 9180 uses ephemeral keys)
         assert_ne!(encrypted1.ciphertext, encrypted2.ciphertext);
         assert_ne!(encrypted2.ciphertext, encrypted3.ciphertext);
         assert_ne!(encrypted1.ciphertext, encrypted3.ciphertext);
 
-        // All nonces should be different
-        assert_ne!(encrypted1.nonce.as_bytes(), encrypted2.nonce.as_bytes());
-        assert_ne!(encrypted2.nonce.as_bytes(), encrypted3.nonce.as_bytes());
-
-        // All encapsulated keys should be different (ephemeral keys)
+        // All encapsulated keys should be different (ephemeral keys from KEM)
         assert_ne!(
             encrypted1.encapsulated_key.as_bytes(),
             encrypted2.encapsulated_key.as_bytes()
+        );
+        assert_ne!(
+            encrypted2.encapsulated_key.as_bytes(),
+            encrypted3.encapsulated_key.as_bytes()
         );
     }
 
@@ -629,5 +683,75 @@ mod tests {
 
         let decryptor = Decryptor::new(&keypair);
         assert!(decryptor.decrypt(&encrypted).is_err(), "Appended data should fail");
+    }
+
+    // ==================== AAD Binding Tests (Security Audit Fix #5) ====================
+
+    /// Test that AAD binding works correctly
+    #[test]
+    fn test_aad_binding_roundtrip() {
+        let keypair = KekKeyPair::generate();
+        let plaintext = b"Data with AAD binding";
+        let aad = b"fula:v2:bucket:my-bucket:key:my-file.txt";
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let encrypted = encryptor.encrypt_with_aad(plaintext, aad).unwrap();
+
+        let decryptor = Decryptor::new(&keypair);
+        let decrypted = decryptor.decrypt_with_aad(&encrypted, aad).unwrap();
+
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+    }
+
+    /// Test that wrong AAD fails decryption
+    #[test]
+    fn test_wrong_aad_fails() {
+        let keypair = KekKeyPair::generate();
+        let plaintext = b"Data with AAD binding";
+        let correct_aad = b"fula:v2:bucket:my-bucket:key:my-file.txt";
+        let wrong_aad = b"fula:v2:bucket:other-bucket:key:other-file.txt";
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let encrypted = encryptor.encrypt_with_aad(plaintext, correct_aad).unwrap();
+
+        let decryptor = Decryptor::new(&keypair);
+        
+        // Correct AAD should work
+        assert!(decryptor.decrypt_with_aad(&encrypted, correct_aad).is_ok());
+        
+        // Wrong AAD should fail
+        let result = decryptor.decrypt_with_aad(&encrypted, wrong_aad);
+        assert!(result.is_err(), "Wrong AAD should fail decryption");
+    }
+
+    /// Test that empty AAD differs from non-empty AAD
+    #[test]
+    fn test_empty_vs_nonempty_aad() {
+        let keypair = KekKeyPair::generate();
+        let plaintext = b"Test data";
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let encrypted = encryptor.encrypt_with_aad(plaintext, b"some-context").unwrap();
+
+        let decryptor = Decryptor::new(&keypair);
+        
+        // Empty AAD should fail
+        let result = decryptor.decrypt_with_aad(&encrypted, b"");
+        assert!(result.is_err(), "Empty AAD should fail when non-empty was used");
+    }
+
+    /// Test DEK wrapping uses correct AAD
+    #[test]
+    fn test_dek_wrap_aad() {
+        let keypair = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let encryptor = Encryptor::new(keypair.public_key());
+        let wrapped = encryptor.encrypt_dek(&dek).unwrap();
+
+        let decryptor = Decryptor::new(&keypair);
+        let unwrapped = decryptor.decrypt_dek(&wrapped).unwrap();
+
+        assert_eq!(dek.as_bytes(), unwrapped.as_bytes());
     }
 }
