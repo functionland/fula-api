@@ -208,6 +208,53 @@ impl FulaClient {
         })
     }
 
+    /// Put an object with metadata AND pinning credentials
+    /// 
+    /// Combines encrypted metadata with remote pinning support.
+    #[instrument(skip(self, data, pinning_token))]
+    pub async fn put_object_with_metadata_and_pinning(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        metadata: Option<ObjectMetadata>,
+        pinning_service: &str,
+        pinning_token: &str,
+    ) -> Result<PutObjectResult> {
+        let path = format!("/{}/{}", bucket, key);
+        let data = data.into();
+
+        let mut headers = HashMap::new();
+        
+        // Add metadata headers
+        if let Some(meta) = metadata {
+            if let Some(ct) = meta.content_type {
+                headers.insert("Content-Type".to_string(), ct);
+            }
+            for (k, v) in meta.user_metadata {
+                headers.insert(format!("x-amz-meta-{}", k), v);
+            }
+        }
+        
+        // Add pinning headers
+        headers.insert("X-Pinning-Service".to_string(), pinning_service.to_string());
+        headers.insert("X-Pinning-Token".to_string(), pinning_token.to_string());
+
+        let response = self.request("PUT", &path, None, Some(headers), Some(data)).await?;
+        
+        let etag = response
+            .headers()
+            .get("ETag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_matches('"').to_string())
+            .unwrap_or_default();
+
+        Ok(PutObjectResult {
+            etag,
+            version_id: None,
+        })
+    }
+
     /// Get an object
     #[instrument(skip(self))]
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Bytes> {

@@ -118,12 +118,33 @@ impl Default for EncryptionConfig {
     }
 }
 
+/// Pinning credentials for remote pinning services
+#[derive(Clone, Debug)]
+pub struct PinningCredentials {
+    /// Pinning service endpoint URL
+    pub endpoint: String,
+    /// Bearer token for authentication
+    pub token: String,
+}
+
+impl PinningCredentials {
+    /// Create new pinning credentials
+    pub fn new(endpoint: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            token: token.into(),
+        }
+    }
+}
+
 /// Client with client-side encryption enabled
 pub struct EncryptedClient {
     inner: FulaClient,
     encryption: EncryptionConfig,
     /// Private forest index for FlatNamespace mode (cached)
     forest_cache: RwLock<HashMap<String, PrivateForest>>,
+    /// Optional pinning credentials for remote pinning
+    pinning: Option<PinningCredentials>,
 }
 
 impl EncryptedClient {
@@ -134,12 +155,34 @@ impl EncryptedClient {
             inner, 
             encryption,
             forest_cache: RwLock::new(HashMap::new()),
+            pinning: None,
         })
     }
 
     /// Get the underlying client
     pub fn inner(&self) -> &FulaClient {
         &self.inner
+    }
+
+    /// Create a new encrypted client with pinning credentials
+    pub fn new_with_pinning(
+        config: Config, 
+        encryption: EncryptionConfig,
+        pinning: PinningCredentials,
+    ) -> Result<Self> {
+        let inner = FulaClient::new(config)?;
+        Ok(Self { 
+            inner, 
+            encryption,
+            forest_cache: RwLock::new(HashMap::new()),
+            pinning: Some(pinning),
+        })
+    }
+
+    /// Set pinning credentials (builder pattern)
+    pub fn with_pinning(mut self, pinning: PinningCredentials) -> Self {
+        self.pinning = Some(pinning);
+        self
     }
 
     /// Get the encryption config
@@ -212,12 +255,24 @@ impl EncryptedClient {
             .with_metadata("x-fula-encrypted", "true")
             .with_metadata("x-fula-encryption", &enc_metadata.to_string());
 
-        self.inner.put_object_with_metadata(
-            bucket,
-            &storage_key,
-            Bytes::from(ciphertext),
-            Some(metadata),
-        ).await
+        // Use pinning if credentials are configured
+        if let Some(ref pinning) = self.pinning {
+            self.inner.put_object_with_metadata_and_pinning(
+                bucket,
+                &storage_key,
+                Bytes::from(ciphertext),
+                Some(metadata),
+                &pinning.endpoint,
+                &pinning.token,
+            ).await
+        } else {
+            self.inner.put_object_with_metadata(
+                bucket,
+                &storage_key,
+                Bytes::from(ciphertext),
+                Some(metadata),
+            ).await
+        }
     }
 
     /// Put an encrypted object (convenience method)

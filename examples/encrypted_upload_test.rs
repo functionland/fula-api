@@ -13,7 +13,7 @@
 //! - All uploads are automatically pinned to local IPFS (built-in)
 //! - If pinning credentials are provided, also pins to remote service (Pinata, etc.)
 
-use fula_client::{Config, FulaClient, EncryptedClient, EncryptionConfig, KeyObfuscation};
+use fula_client::{Config, FulaClient, EncryptedClient, EncryptionConfig, KeyObfuscation, PinningCredentials};
 use std::env;
 
 #[tokio::main]
@@ -94,9 +94,9 @@ async fn main() -> anyhow::Result<()> {
         println!("   cargo run --example encrypted_upload_test");
     }
 
-    // ==================== Part 3: Encrypted Upload ====================
+    // ==================== Part 3: Encrypted Upload WITH Remote Pinning ====================
     
-    println!("\n=== Part 3: Encrypted Upload (Maximum Privacy) ===\n");
+    println!("\n=== Part 3: Encrypted Upload with Remote Pinning ===\n");
     
     let config = Config::new(gateway_url);
     let encryption_config = EncryptionConfig::new()
@@ -107,7 +107,15 @@ async fn main() -> anyhow::Result<()> {
     println!("   - Content is encrypted client-side");
     println!("   - Server sees only random CIDs\n");
 
-    let encrypted_client = EncryptedClient::new(config, encryption_config)?;
+    // Create encrypted client WITH pinning if credentials available
+    let encrypted_client = if let (Some(service), Some(token)) = (&pinning_service, &pinning_token) {
+        println!("[PINNING] Remote pinning enabled for encrypted uploads");
+        let pinning = PinningCredentials::new(service, token);
+        EncryptedClient::new_with_pinning(config, encryption_config, pinning)?
+    } else {
+        println!("[PINNING] Local IPFS only (no remote credentials)");
+        EncryptedClient::new(config, encryption_config)?
+    };
     
     // Create encrypted bucket
     let enc_bucket = "encrypted-pinning-test";
@@ -129,7 +137,11 @@ async fn main() -> anyhow::Result<()> {
     
     println!("   [OK] Encrypted and uploaded!");
     println!("   ETag: {}", result.etag);
-    println!("   [INFO] Encrypted blob is pinned to local IPFS");
+    if pinning_service.is_some() && pinning_token.is_some() {
+        println!("   [OK] Encrypted blob pinned to REMOTE service!");
+    } else {
+        println!("   [INFO] Encrypted blob pinned to local IPFS");
+    }
 
     // Retrieve and decrypt
     println!("\n[DOWNLOAD] Retrieving and decrypting...");
