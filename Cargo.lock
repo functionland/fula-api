@@ -1238,6 +1238,8 @@ name = "fula-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "fula-blockstore",
@@ -1245,7 +1247,9 @@ dependencies = [
  "fula-client",
  "fula-core",
  "fula-crypto",
+ "md-5",
  "rand 0.8.5",
+ "reqwest",
  "serde_json",
  "tokio",
  "tracing-subscriber",

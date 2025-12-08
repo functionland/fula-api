@@ -173,6 +173,7 @@ impl ApiError {
                 fula_core::CoreError::ObjectNotFound { .. } => S3ErrorCode::NoSuchKey,
                 fula_core::CoreError::InvalidBucketName(_) => S3ErrorCode::InvalidBucketName,
                 fula_core::CoreError::AccessDenied(_) => S3ErrorCode::AccessDenied,
+                fula_core::CoreError::PreconditionFailed(_) => S3ErrorCode::BucketNotEmpty,
                 _ => S3ErrorCode::InternalError,
             },
             Self::BlockStore(_) | Self::Crypto(_) => S3ErrorCode::InternalError,

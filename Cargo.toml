@@ -33,7 +33,12 @@ bytes = { workspace = true }
 fula-blockstore = { path = "crates/fula-blockstore" }
 fula-core = { path = "crates/fula-core" }
 fula-cli = { path = "crates/fula-cli" }
+fula-crypto = { path = "crates/fula-crypto" }
 chrono = { workspace = true }
+reqwest = { workspace = true, features = ["json", "multipart"] }
+axum = { workspace = true }
+base64 = { workspace = true }
+md-5 = { workspace = true }
 
 [[example]]
 name = "basic_usage"

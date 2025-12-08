@@ -15,6 +15,7 @@ use fula_core::metadata::ObjectMetadata;
 use fula_crypto::hashing::md5_hash;
 use serde::Deserialize;
 use std::sync::Arc;
+use base64::{Engine as _, engine::general_purpose};
 
 /// PUT /{bucket}/{key} - Put object
 pub async fn put_object(
@@ -33,6 +34,18 @@ pub async fn put_object(
     
     // Calculate ETag (MD5)
     let etag = md5_hash(&body);
+
+    // Verify Content-MD5 if present
+    if let Some(md5_header) = headers.get("Content-MD5").and_then(|v| v.to_str().ok()) {
+        if let Ok(expected_bytes) = general_purpose::STANDARD.decode(md5_header) {
+            let expected_hex = hex::encode(expected_bytes);
+            if etag != expected_hex {
+                return Err(ApiError::s3(S3ErrorCode::InvalidDigest, "The Content-MD5 you specified did not match what we received."));
+            }
+        } else {
+            return Err(ApiError::s3(S3ErrorCode::InvalidDigest, "Invalid Content-MD5"));
+        }
+    }
 
     // Extract metadata from headers
     let content_type = headers
@@ -250,6 +263,11 @@ pub async fn head_object(
 
     if let Some(ref ct) = metadata.content_type {
         response = response.header("Content-Type", ct);
+    }
+
+    // Add user metadata
+    for (k, v) in &metadata.user_metadata {
+        response = response.header(format!("x-amz-meta-{}", k), v);
     }
 
     Ok(response.body(Body::empty()).unwrap())
