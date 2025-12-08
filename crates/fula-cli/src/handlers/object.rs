@@ -1,5 +1,6 @@
 //! Object operation handlers
 
+use crate::pinning::pin_for_user;
 use crate::{AppState, ApiError, S3ErrorCode};
 use crate::state::UserSession;
 use crate::xml;
@@ -70,9 +71,30 @@ pub async fn put_object(
     }
 
     // Store in bucket
-    let mut bucket = state.bucket_manager.open_bucket(&bucket_name).await?;
-    bucket.put_object(key, metadata).await?;
-    bucket.flush().await?;
+    tracing::debug!(bucket = %bucket_name, "Opening bucket");
+    let mut bucket = state.bucket_manager.open_bucket(&bucket_name).await
+        .map_err(|e| {
+            tracing::error!(error = %e, bucket = %bucket_name, "Failed to open bucket");
+            e
+        })?;
+    
+    tracing::debug!(key = %key, "Storing object metadata");
+    bucket.put_object(key.clone(), metadata).await
+        .map_err(|e| {
+            tracing::error!(error = %e, key = %key, "Failed to put object");
+            e
+        })?;
+    
+    tracing::debug!("Flushing bucket");
+    bucket.flush().await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to flush bucket");
+            e
+        })?;
+
+    // Pin to user's pinning service if credentials provided
+    // Headers: X-Pinning-Service, X-Pinning-Token
+    pin_for_user(&headers, &cid, Some(&key)).await;
 
     Ok((
         StatusCode::OK,

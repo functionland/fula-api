@@ -33,7 +33,7 @@ impl Default for Config {
             user_agent: format!("fula-client/{}", env!("CARGO_PKG_VERSION")),
             max_retries: 3,
             multipart_threshold: 100 * 1024 * 1024, // 100 MB
-            multipart_chunk_size: 8 * 1024 * 1024,  // 8 MB
+            multipart_chunk_size: 256 * 1024,       // 256 KB (must be < 1MB for IPFS)
         }
     }
 }

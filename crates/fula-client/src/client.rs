@@ -167,6 +167,47 @@ impl FulaClient {
         })
     }
 
+    /// Put an object with pinning credentials
+    /// 
+    /// This uploads the object and also pins it to a remote pinning service.
+    /// 
+    /// # Arguments
+    /// * `bucket` - Bucket name
+    /// * `key` - Object key
+    /// * `data` - Object data
+    /// * `pinning_service` - Pinning service endpoint (e.g., "https://api.pinata.cloud/psa")
+    /// * `pinning_token` - JWT token for the pinning service
+    #[instrument(skip(self, data, pinning_token))]
+    pub async fn put_object_with_pinning(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        pinning_service: &str,
+        pinning_token: &str,
+    ) -> Result<PutObjectResult> {
+        let path = format!("/{}/{}", bucket, key);
+        let data = data.into();
+
+        let mut headers = HashMap::new();
+        headers.insert("X-Pinning-Service".to_string(), pinning_service.to_string());
+        headers.insert("X-Pinning-Token".to_string(), pinning_token.to_string());
+
+        let response = self.request("PUT", &path, None, Some(headers), Some(data)).await?;
+        
+        let etag = response
+            .headers()
+            .get("ETag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_matches('"').to_string())
+            .unwrap_or_default();
+
+        Ok(PutObjectResult {
+            etag,
+            version_id: None,
+        })
+    }
+
     /// Get an object
     #[instrument(skip(self))]
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Bytes> {

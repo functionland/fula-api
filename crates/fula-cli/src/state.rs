@@ -3,18 +3,21 @@
 use crate::config::GatewayConfig;
 use crate::multipart::MultipartManager;
 use dashmap::DashMap;
-use fula_blockstore::MemoryBlockStore;
+use fula_blockstore::{
+    FlexibleBlockStore, IpfsPinningBlockStore, IpfsPinningConfig, MemoryBlockStore,
+};
 use fula_core::BucketManager;
 use std::sync::Arc;
+use tracing::{info, warn};
 
 /// Application state shared across handlers
 pub struct AppState {
     /// Gateway configuration
     pub config: GatewayConfig,
-    /// Block store (IPFS)
-    pub block_store: Arc<MemoryBlockStore>, // Use MemoryBlockStore for now, can swap to IpfsBlockStore
+    /// Block store (IPFS with pinning or memory fallback)
+    pub block_store: Arc<FlexibleBlockStore>,
     /// Bucket manager
-    pub bucket_manager: Arc<BucketManager<MemoryBlockStore>>,
+    pub bucket_manager: Arc<BucketManager<FlexibleBlockStore>>,
     /// Multipart upload manager
     pub multipart_manager: Arc<MultipartManager>,
     /// User session cache
@@ -24,17 +27,42 @@ pub struct AppState {
 impl AppState {
     /// Create a new application state
     pub async fn new(config: GatewayConfig) -> anyhow::Result<Self> {
-        // Initialize block store
-        // In production, use IpfsBlockStore::from_url(&config.ipfs_url).await?
-        let block_store = Arc::new(MemoryBlockStore::new());
-        
+        // Initialize block store based on configuration
+        let block_store = if config.use_memory_store {
+            info!("Using in-memory block store (data will not persist)");
+            Arc::new(FlexibleBlockStore::Memory(MemoryBlockStore::new()))
+        } else {
+            // Try to connect to IPFS with optional pinning service
+            match Self::create_ipfs_store(&config).await {
+                Ok(store) => {
+                    info!("Connected to IPFS at {}", config.ipfs_url);
+                    if config.pinning_service_endpoint.is_some() {
+                        info!("Pinning service configured");
+                    }
+                    Arc::new(FlexibleBlockStore::IpfsPinning(store))
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to IPFS ({}), falling back to in-memory storage",
+                        e
+                    );
+                    Arc::new(FlexibleBlockStore::Memory(MemoryBlockStore::new()))
+                }
+            }
+        };
+
+        // Log storage mode
+        if block_store.is_persistent() {
+            info!("✓ Storage mode: IPFS (persistent)");
+        } else {
+            warn!("⚠ Storage mode: In-memory (NOT persistent - for development only)");
+        }
+
         // Initialize bucket manager
         let bucket_manager = Arc::new(BucketManager::new(Arc::clone(&block_store)));
-        
+
         // Initialize multipart manager
-        let multipart_manager = Arc::new(MultipartManager::new(
-            config.multipart_expiry_secs,
-        ));
+        let multipart_manager = Arc::new(MultipartManager::new(config.multipart_expiry_secs));
 
         Ok(Self {
             config,
@@ -43,6 +71,22 @@ impl AppState {
             multipart_manager,
             sessions: Arc::new(DashMap::new()),
         })
+    }
+
+    /// Create IPFS block store with optional pinning service
+    async fn create_ipfs_store(config: &GatewayConfig) -> anyhow::Result<IpfsPinningBlockStore> {
+        let mut ipfs_config = IpfsPinningConfig::with_ipfs(&config.ipfs_url);
+
+        // Add pinning service if configured
+        if let (Some(endpoint), Some(token)) = (
+            &config.pinning_service_endpoint,
+            &config.pinning_service_token,
+        ) {
+            ipfs_config = ipfs_config.with_pinning_service(endpoint, token);
+        }
+
+        let store = IpfsPinningBlockStore::new(ipfs_config).await?;
+        Ok(store)
     }
 }
 

@@ -368,6 +368,31 @@ paths:
           schema:
             type: string
             enum: ["true"]
+        - name: x-pinning-service
+          in: header
+          description: |
+            User's IPFS Pinning Service endpoint URL.
+            Each user provides their own pinning credentials per-request.
+            Examples:
+            - Pinata: https://api.pinata.cloud/psa
+            - Web3.Storage: https://api.web3.storage
+            - NFT.Storage: https://nft.storage/api
+          schema:
+            type: string
+            format: uri
+          example: "https://api.pinata.cloud/psa"
+        - name: x-pinning-token
+          in: header
+          description: |
+            User's IPFS Pinning Service access token (Bearer token).
+            This is the user's own credential - NOT stored by the gateway.
+          schema:
+            type: string
+        - name: x-pinning-name
+          in: header
+          description: Optional name for the pin in the pinning service
+          schema:
+            type: string
         - name: x-amz-storage-class
           in: header
           description: Storage class for the object

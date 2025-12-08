@@ -22,12 +22,15 @@ publish = false
 [dependencies]
 fula-client = { path = "crates/fula-client" }
 fula-crypto = { path = "crates/fula-crypto" }
+fula-blockstore = { path = "crates/fula-blockstore" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 fula-blockstore = { path = "crates/fula-blockstore" }
@@ -55,6 +58,14 @@ path = "examples/multipart_upload.rs"
 [[example]]
 name = "s3_compatible"
 path = "examples/s3_compatible.rs"
+
+[[example]]
+name = "ipfs_pinning_test"
+path = "examples/ipfs_pinning_test.rs"
+
+[[example]]
+name = "encrypted_upload_test"
+path = "examples/encrypted_upload_test.rs"
 
 [workspace.package]
 version = "0.1.0"

@@ -1250,6 +1250,7 @@ dependencies = [
  "md-5",
  "rand 0.8.5",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tracing-subscriber",

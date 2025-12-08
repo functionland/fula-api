@@ -11,8 +11,14 @@ pub struct GatewayConfig {
     pub port: u16,
     /// IPFS API URL
     pub ipfs_url: String,
-    /// IPFS Cluster API URL
+    /// IPFS Cluster API URL (legacy, prefer pinning_service_endpoint)
     pub cluster_url: String,
+    /// IPFS Pinning Service API endpoint (standard spec)
+    pub pinning_service_endpoint: Option<String>,
+    /// IPFS Pinning Service access token
+    pub pinning_service_token: Option<String>,
+    /// Use in-memory storage (for testing/development)
+    pub use_memory_store: bool,
     /// JWT secret for authentication
     pub jwt_secret: Option<String>,
     /// Enable authentication
@@ -38,6 +44,9 @@ impl Default for GatewayConfig {
             port: 9000,
             ipfs_url: "http://localhost:5001".to_string(),
             cluster_url: "http://localhost:9094".to_string(),
+            pinning_service_endpoint: None,
+            pinning_service_token: None,
+            use_memory_store: false,
             jwt_secret: None,
             auth_enabled: true,
             rate_limit_rps: 100,

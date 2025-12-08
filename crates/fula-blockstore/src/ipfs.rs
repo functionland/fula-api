@@ -260,9 +260,12 @@ impl BlockStore for IpfsBlockStore {
         Ok(stat.size)
     }
 
+    #[instrument(skip(self, data))]
     async fn put_ipld<T: serde::Serialize + Send + Sync>(&self, data: &T) -> Result<Cid> {
         let bytes = serde_ipld_dagcbor::to_vec(data)
             .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
+        
+        tracing::debug!(bytes_len = bytes.len(), "Serialized IPLD data to CBOR");
         
         let url = format!(
             "{}/api/v0/dag/put?store-codec=dag-cbor&input-codec=dag-cbor",
@@ -276,10 +279,15 @@ impl BlockStore for IpfsBlockStore {
 
         let form = multipart::Form::new().part("file", part);
 
+        tracing::debug!(url = %url, "Sending dag/put request to IPFS");
+        
         let response = self.client.post(&url).multipart(form).send().await?;
+        
+        tracing::debug!(status = %response.status(), "Received response from IPFS");
 
         if !response.status().is_success() {
             let error = response.text().await.unwrap_or_default();
+            tracing::error!(error = %error, "IPFS dag/put failed");
             return Err(BlockStoreError::IpfsApi(format!(
                 "Failed to put DAG: {}",
                 error
@@ -291,13 +299,22 @@ impl BlockStore for IpfsBlockStore {
             .await
             .map_err(|e| BlockStoreError::IpfsApi(e.to_string()))?;
 
+        tracing::debug!(cid = %result.cid.root_cid, "DAG stored successfully");
+        
         result.cid.root_cid.parse().map_err(|e: cid::Error| {
             BlockStoreError::InvalidCid(e.to_string())
         })
     }
 
+    #[instrument(skip(self))]
     async fn get_ipld<T: serde::de::DeserializeOwned>(&self, cid: &Cid) -> Result<T> {
-        let url = format!("{}/api/v0/dag/get?arg={}", self.config.api_url, cid);
+        // Request CBOR output to match what we stored
+        let url = format!(
+            "{}/api/v0/block/get?arg={}",
+            self.config.api_url, cid
+        );
+        
+        tracing::debug!(url = %url, cid = %cid, "Fetching IPLD block");
         
         let response = self.client.post(&url).send().await?;
 
@@ -306,16 +323,24 @@ impl BlockStore for IpfsBlockStore {
                 return Err(BlockStoreError::NotFound(*cid));
             }
             let error = response.text().await.unwrap_or_default();
+            tracing::error!(error = %error, "Failed to get IPLD block");
             return Err(BlockStoreError::IpfsApi(format!(
                 "Failed to get DAG: {}",
                 error
             )));
         }
 
-        response
-            .json()
-            .await
-            .map_err(|e| BlockStoreError::Deserialization(e.to_string()))
+        let bytes = response.bytes().await
+            .map_err(|e| BlockStoreError::IpfsApi(e.to_string()))?;
+        
+        tracing::debug!(bytes_len = bytes.len(), "Retrieved IPLD block, deserializing from CBOR");
+        
+        // Deserialize from DAG-CBOR (matches what we stored)
+        serde_ipld_dagcbor::from_slice(&bytes)
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to deserialize CBOR");
+                BlockStoreError::Deserialization(e.to_string())
+            })
     }
 }
 

@@ -29,10 +29,11 @@ async fn main() -> anyhow::Result<()> {
 
     // ==================== Simple Large File Upload ====================
     
-    println!("\n📤 Uploading a large file (simulated 50MB)...");
+    println!("\n📤 Uploading a large file (simulated 2MB)...");
     
-    // Create simulated large data (50MB of random-ish data)
-    let large_data: Vec<u8> = (0..50 * 1024 * 1024)
+    // Create simulated large data (2MB of random-ish data)
+    // Note: Each chunk must be < 1MB for IPFS compatibility
+    let large_data: Vec<u8> = (0..2 * 1024 * 1024)
         .map(|i| (i % 256) as u8)
         .collect();
     
@@ -76,10 +77,11 @@ async fn main() -> anyhow::Result<()> {
     println!("   Upload ID: {}", upload.upload_id());
     
     // Upload parts manually (could be done in parallel)
-    let chunk_size = 8 * 1024 * 1024; // 8MB chunks
-    let _total_size = 24 * 1024 * 1024; // 24MB total
+    // Note: chunks must be < 1MB for IPFS compatibility
+    let chunk_size = 256 * 1024; // 256KB chunks (IPFS compatible)
+    let num_parts = 3;
     
-    for part_num in 1..=3 {
+    for part_num in 1..=num_parts {
         let chunk_data: Vec<u8> = (0..chunk_size)
             .map(|i| ((i + part_num as usize * chunk_size) % 256) as u8)
             .collect();

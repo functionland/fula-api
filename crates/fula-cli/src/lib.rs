@@ -38,6 +38,7 @@ pub mod error;
 pub mod handlers;
 pub mod middleware;
 pub mod multipart;
+pub mod pinning;
 pub mod routes;
 pub mod server;
 pub mod state;
@@ -45,5 +46,6 @@ pub mod xml;
 
 pub use config::GatewayConfig;
 pub use error::{ApiError, S3ErrorCode};
+pub use pinning::{pin_for_user, unpin_for_user, PinningCredentials};
 pub use server::run_server;
 pub use state::AppState;

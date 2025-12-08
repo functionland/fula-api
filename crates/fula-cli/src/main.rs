@@ -21,9 +21,21 @@ struct Args {
     #[arg(long, default_value = "http://localhost:5001", env = "IPFS_API_URL")]
     ipfs_url: String,
 
-    /// IPFS Cluster API URL
+    /// IPFS Cluster API URL (legacy)
     #[arg(long, default_value = "http://localhost:9094", env = "CLUSTER_API_URL")]
     cluster_url: String,
+
+    /// IPFS Pinning Service API endpoint (e.g., https://api.pinata.cloud/psa)
+    #[arg(long, env = "PINNING_SERVICE_ENDPOINT")]
+    pinning_service_endpoint: Option<String>,
+
+    /// IPFS Pinning Service access token
+    #[arg(long, env = "PINNING_SERVICE_TOKEN")]
+    pinning_service_token: Option<String>,
+
+    /// Use in-memory storage (for testing, data will not persist)
+    #[arg(long, env = "FULA_MEMORY_STORE")]
+    memory_store: bool,
 
     /// Enable debug logging
     #[arg(short, long, env = "FULA_DEBUG")]
@@ -60,7 +72,16 @@ async fn main() -> anyhow::Result<()> {
         args.port
     );
     tracing::info!("IPFS API: {}", args.ipfs_url);
-    tracing::info!("Cluster API: {}", args.cluster_url);
+    
+    if let Some(ref endpoint) = args.pinning_service_endpoint {
+        tracing::info!("Pinning Service: {}", endpoint);
+    } else {
+        tracing::info!("Cluster API: {}", args.cluster_url);
+    }
+
+    if args.memory_store {
+        tracing::warn!("⚠️  Using in-memory storage - data will NOT persist!");
+    }
 
     if args.no_auth {
         tracing::warn!("⚠️  Authentication is DISABLED - for development only!");
@@ -72,6 +93,9 @@ async fn main() -> anyhow::Result<()> {
         port: args.port,
         ipfs_url: args.ipfs_url,
         cluster_url: args.cluster_url,
+        pinning_service_endpoint: args.pinning_service_endpoint,
+        pinning_service_token: args.pinning_service_token,
+        use_memory_store: args.memory_store,
         jwt_secret: args.jwt_secret,
         auth_enabled: !args.no_auth,
         ..Default::default()

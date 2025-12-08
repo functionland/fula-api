@@ -39,7 +39,9 @@ pub mod cid_utils;
 pub mod cluster;
 pub mod error;
 pub mod ipfs;
+pub mod ipfs_pinning;
 pub mod memory;
+pub mod pinning_service;
 
 pub use block::{Block, BlockData, BlockRef};
 pub use chunker::{Chunker, ChunkerConfig, ChunkResult};
@@ -47,7 +49,12 @@ pub use cid_utils::{create_cid, CidCodec};
 pub use cluster::{ClusterClient, ClusterConfig, PinStatus, ReplicationFactor};
 pub use error::{BlockStoreError, Result};
 pub use ipfs::{IpfsBlockStore, IpfsConfig};
+pub use ipfs_pinning::{FlexibleBlockStore, IpfsPinningBlockStore, IpfsPinningConfig};
 pub use memory::MemoryBlockStore;
+pub use pinning_service::{
+    ListPinsQuery, Pin, PinningServiceClient, PinningServiceConfig, PinningStatus,
+    PinStatusResponse,
+};
 
 use async_trait::async_trait;
 use cid::Cid;
