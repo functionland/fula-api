@@ -574,3 +574,94 @@ For your **encrypted IPFS pinning gateway**, I would recommend **keep Fula as th
 | **Performance – large / deep trees** | Single encrypted `PrivateForest` JSON per bucket; simple but may be heavy for millions of entries. | HAMT‑based `HamtForest`; scales well to very large private trees and sync scenarios. | For huge multi‑tenant trees, borrow HAMT ideas from **WNFS**; Fula is adequate for moderate scales. |
 | **Future‑proofing** | HPKE, BLAKE3, explicit versioning; easier migration to new suites and formats. | DSIs and traits help, but accumulators and RSA exchange keys are heavier to migrate. | **Fula** has a slight future‑proofing edge. |
 | **Overall security score (this audit)** | ~**9.0 / 10** – strong primitives and design; sharing and rotation now **fully integrated**. | ~**9.2 / 10** – very complete private filesystem model, especially for sharing and revisions. | For a **pinning gateway**, use **Fula** + selectively adopt WNFS design patterns. |
+
+---
+
+## 8. Central Authority Reliance for Encryption
+
+This section focuses **only on encryption, decryption, and cryptographic features** — not on IPFS or pinning service availability. The question is: **which features break if a central authority (server, gateway, or trusted third party) is unavailable or compromised?**
+
+### 8.1 Fula
+
+| Feature | Central Authority Required? | Notes |
+| --- | --- | --- |
+| **Key generation** | ❌ No | `KeyManager::new()` generates keys locally using OS randomness. No server involved. |
+| **Content encryption** | ❌ No | AES‑GCM / ChaCha20‑Poly1305 encryption happens entirely on the client. |
+| **DEK wrapping (HPKE)** | ❌ No | HPKE wrapping uses local X25519 keys; no trusted third party needed. |
+| **Metadata encryption** | ❌ No | `PrivateMetadata` is encrypted locally with the per‑file DEK. |
+| **PrivateForest index** | ❌ No | The forest is encrypted locally and stored as a normal object; no special server logic. |
+| **Decryption (owner)** | ❌ No | Owner uses local `SecretKey` to HPKE‑unwrap DEK and decrypt content. |
+| **Sharing (create ShareToken)** | ❌ No | Sharer wraps DEK for recipient's public key locally; no server mediation. |
+| **Sharing (accept ShareToken)** | ❌ No | Recipient decrypts `ShareToken.wrapped_key` locally with own private key. |
+| **Share validation (expiry, scope, permissions)** | ⚠️ Partial | If enforced at gateway, relies on gateway; if enforced in client, no central authority. Current implementation enforces in `EncryptedClient` (client‑side). |
+| **Share revocation** | ⚠️ Partial | `FolderShareManager::revoke_share()` removes share from local state. If shares are distributed (e.g., via URL), revocation requires re‑keying the folder to truly prevent access. |
+| **Key rotation** | ❌ No | `KeyRotationManager` and `rotate_bucket()` operate locally; no trusted server. |
+| **Key escrow / recovery** | N/A | Not implemented. User is responsible for backing up `SecretKey`. |
+| **Trust assumptions** | Client device | Assumes the client device is not compromised. No trust required in storage provider or gateway for confidentiality. |
+
+**Summary for Fula:**
+
+- **All encryption, decryption, and key management are fully client‑side.** No central authority is required for core crypto operations.
+- Share revocation is **weak** without re‑keying: revoking a share from `FolderShareManager` only affects local state. A recipient who already has the `ShareToken` can continue to decrypt unless the folder's DEK is rotated.
+- The gateway is only a transport layer for encrypted blobs; it never sees plaintext keys or data.
+
+---
+
+### 8.2 WNFS
+
+| Feature | Central Authority Required? | Notes |
+| --- | --- | --- |
+| **Key generation** | ❌ No | Keys are generated locally (per‑node ratchets, `TemporalKey`, `SnapshotKey`). |
+| **Content encryption** | ❌ No | XChaCha20‑Poly1305 encryption is client‑side. |
+| **Key wrapping (AES‑KWP)** | ❌ No | AES key wrap uses local `TemporalKey`; no server involved. |
+| **Name accumulator** | ⚠️ Setup | The `AccumulatorSetup` (RSA modulus) must be generated once, ideally via trusted setup or MPC. After setup, no central authority is needed for accumulation. |
+| **HamtForest storage** | ❌ No | HAMT nodes are stored as CIDs in a content‑addressed blockstore; no server logic. |
+| **Decryption (owner)** | ❌ No | Owner derives keys from ratchet state and decrypts locally. |
+| **Sharing (sharer side)** | ❌ No | Sharer encrypts `AccessKey` with recipient's RSA public key locally and stores in own private forest. |
+| **Sharing (recipient side)** | ❌ No | Recipient scans sharer's forest for share labels and decrypts with own RSA private key locally. |
+| **Share revocation** | ⚠️ Weak | Similar to Fula: once an `AccessKey` is shared, the recipient can access the data. Revocation requires re‑keying (ratchet advancement) and re‑encrypting affected nodes. |
+| **Exchange key discovery** | ⚠️ Public directory | Recipients' RSA public keys are stored in public exchange directories. These directories must be accessible, but are not a trusted authority — they are content‑addressed. |
+| **Key rotation (ratchet)** | ❌ No | Ratchet advancement is local; no server involvement. |
+| **Trust assumptions** | Client device + initial accumulator setup | Assumes client device is not compromised. Accumulator setup requires a one‑time trusted process. |
+
+**Summary for WNFS:**
+
+- **All encryption, decryption, and key management are fully client‑side.** No ongoing central authority is required.
+- **Accumulator setup** is a one‑time trust requirement: the RSA modulus must be generated securely (e.g., via MPC or trusted party). After setup, the system is decentralized.
+- **Exchange key discovery** uses public directories (content‑addressed), not a trusted server.
+- Share revocation is **weak** without ratchet advancement: once an `AccessKey` is shared, revocation requires re‑keying.
+
+---
+
+### 8.3 Comparison Table
+
+| Aspect | Fula | WNFS | Notes |
+| --- | --- | --- | --- |
+| **Key generation** | Fully local | Fully local | Both use local randomness. |
+| **Encryption / decryption** | Fully local | Fully local | No server sees plaintext. |
+| **Key wrapping** | HPKE (local) | AES‑KWP (local) | Both client‑side. |
+| **Sharing (create)** | HPKE for recipient (local) | RSA OAEP for recipient (local) | Both client‑side. |
+| **Sharing (accept)** | Recipient decrypts locally | Recipient decrypts locally | No server mediation. |
+| **Share revocation** | Weak (re‑key folder DEK) | Weak (ratchet advancement) | Both require re‑keying to truly revoke. |
+| **Key rotation** | `rotate_bucket()` (local) | Ratchet advancement (local) | Both client‑side. |
+| **Trust setup** | None | One‑time accumulator setup | WNFS requires trusted RSA modulus generation. |
+| **Exchange key discovery** | Out of scope (bring your own) | Public directories (content‑addressed) | WNFS has a specified mechanism. |
+| **Features that break without authority** | None (for encryption) | None (for encryption, post‑setup) | Both are fully decentralized for core crypto. |
+
+---
+
+### 8.4 Verdict on Central Authority Reliance
+
+**Both Fula and WNFS are designed for decentralized, client‑side encryption with no ongoing reliance on a central authority for core cryptographic operations.**
+
+Key differences:
+
+- **WNFS** requires a **one‑time trusted accumulator setup** (RSA modulus generation). After that, all operations are decentralized.
+- **Fula** has **no trusted setup requirement** — keys are generated locally with no special ceremony.
+- Both systems have **weak revocation semantics**: once a share is granted, true revocation requires re‑keying the shared data. This is inherent to capability‑based systems.
+- **Exchange key discovery** is explicitly specified in WNFS (via public directories); Fula leaves this to the integrator.
+
+For an IPFS pinning gateway use case:
+
+- **Fula's simpler model** (no trusted setup, HPKE for sharing) is easier to deploy in a decentralized manner.
+- If asynchronous offline sharing with public exchange directories is needed, **borrow the WNFS model** for discovery while keeping Fula's HPKE wrapping for the actual key exchange.
