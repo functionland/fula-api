@@ -48,9 +48,25 @@ use crate::{
     keys::DekKey,
     symmetric::{Aead, Nonce},
     private_metadata::PrivateMetadata,
+    hamt_index::HamtIndex,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Forest format version
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForestFormat {
+    /// Original flat HashMap (version 1)
+    FlatMapV1,
+    /// HAMT-backed index (version 2) for large forests
+    HamtV2,
+}
+
+impl Default for ForestFormat {
+    fn default() -> Self {
+        ForestFormat::FlatMapV1
+    }
+}
 
 /// The forest index key derivation domain
 const INDEX_KEY_DOMAIN: &str = "fula/private-forest/index/v1";
@@ -154,15 +170,26 @@ pub struct ForestDirectoryEntry {
 }
 
 /// The private forest - an encrypted index of the entire file system
+/// 
+/// Supports two internal formats:
+/// - **FlatMapV1**: Original HashMap-based storage (default)
+/// - **HamtV2**: HAMT-backed storage for large forests (1000+ files)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrivateForest {
     /// Version of the forest format
     pub version: u8,
+    /// Storage format (FlatMapV1 or HamtV2)
+    #[serde(default)]
+    pub format: ForestFormat,
     /// Salt used for key derivation (random per forest)
     #[serde(with = "hex_serde")]
     pub salt: Vec<u8>,
-    /// All files indexed by their original path
+    /// All files indexed by their original path (FlatMapV1)
+    #[serde(default)]
     pub files: HashMap<String, ForestFileEntry>,
+    /// HAMT-backed file index (HamtV2) - only populated when format is HamtV2
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_hamt: Option<HamtIndex<ForestFileEntry>>,
     /// Directory structure (path -> directory info)
     pub directories: HashMap<String, ForestDirectoryEntry>,
     /// Root directory path (usually "/")
@@ -186,9 +213,22 @@ mod hex_serde {
     }
 }
 
+/// Threshold for automatic migration to HAMT format
+const HAMT_MIGRATION_THRESHOLD: usize = 1000;
+
 impl PrivateForest {
-    /// Create a new empty private forest
+    /// Create a new empty private forest (FlatMapV1 format)
     pub fn new() -> Self {
+        Self::with_format(ForestFormat::FlatMapV1)
+    }
+
+    /// Create a new empty private forest with HAMT format
+    pub fn new_hamt() -> Self {
+        Self::with_format(ForestFormat::HamtV2)
+    }
+
+    /// Create a new empty private forest with specified format
+    pub fn with_format(format: ForestFormat) -> Self {
         use rand::RngCore;
         let mut salt = vec![0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut salt);
@@ -206,15 +246,74 @@ impl PrivateForest {
             metadata: None,
         });
 
+        let (files, files_hamt) = match format {
+            ForestFormat::FlatMapV1 => (HashMap::new(), None),
+            ForestFormat::HamtV2 => (HashMap::new(), Some(HamtIndex::new())),
+        };
+
         Self {
-            version: 1,
+            version: 2,
+            format,
             salt,
-            files: HashMap::new(),
+            files,
+            files_hamt,
             directories,
             root: "/".to_string(),
             created_at: now,
             modified_at: now,
         }
+    }
+
+    /// Get the current format
+    pub fn format(&self) -> &ForestFormat {
+        &self.format
+    }
+
+    /// Migrate from FlatMapV1 to HamtV2 format
+    /// 
+    /// This is useful when the forest grows beyond the HAMT threshold.
+    pub fn migrate_to_hamt(&mut self) {
+        if self.format == ForestFormat::HamtV2 {
+            return; // Already HAMT
+        }
+
+        let mut hamt = HamtIndex::new();
+        for (path, entry) in self.files.drain() {
+            hamt.insert(path, entry);
+        }
+
+        self.files_hamt = Some(hamt);
+        self.format = ForestFormat::HamtV2;
+        self.version = 2;
+        self.touch();
+    }
+
+    /// Migrate from HamtV2 back to FlatMapV1 format (for small forests)
+    pub fn migrate_to_flat(&mut self) {
+        if self.format == ForestFormat::FlatMapV1 {
+            return; // Already flat
+        }
+
+        if let Some(hamt) = self.files_hamt.take() {
+            self.files = hamt.to_hashmap();
+        }
+
+        self.format = ForestFormat::FlatMapV1;
+        self.version = 1;
+        self.touch();
+    }
+
+    /// Check if migration to HAMT is recommended
+    pub fn should_migrate_to_hamt(&self) -> bool {
+        self.format == ForestFormat::FlatMapV1 && self.file_count() >= HAMT_MIGRATION_THRESHOLD
+    }
+
+    /// Update the modified timestamp
+    fn touch(&mut self) {
+        self.modified_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
     }
 
     /// Generate a storage key for a new file
@@ -223,6 +322,8 @@ impl PrivateForest {
     }
 
     /// Add or update a file in the forest
+    /// 
+    /// Works with both FlatMapV1 and HamtV2 formats.
     pub fn upsert_file(&mut self, entry: ForestFileEntry) {
         let path = entry.path.clone();
         let parent = entry.parent_dir().to_string();
@@ -237,13 +338,24 @@ impl PrivateForest {
             }
         }
         
-        // Update timestamps
-        self.modified_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        self.touch();
         
-        self.files.insert(path, entry);
+        // Insert into the appropriate storage
+        match self.format {
+            ForestFormat::FlatMapV1 => {
+                self.files.insert(path, entry);
+                
+                // Auto-migrate to HAMT if we've grown past the threshold
+                if self.should_migrate_to_hamt() {
+                    self.migrate_to_hamt();
+                }
+            }
+            ForestFormat::HamtV2 => {
+                if let Some(ref mut hamt) = self.files_hamt {
+                    hamt.insert(path, entry);
+                }
+            }
+        }
     }
 
     /// Ensure a directory and all parent directories exist
@@ -289,31 +401,47 @@ impl PrivateForest {
     }
 
     /// Remove a file from the forest
+    /// 
+    /// Works with both FlatMapV1 and HamtV2 formats.
     pub fn remove_file(&mut self, path: &str) -> Option<ForestFileEntry> {
-        if let Some(entry) = self.files.remove(path) {
-            let parent = entry.parent_dir().to_string();
+        let entry = match self.format {
+            ForestFormat::FlatMapV1 => self.files.remove(path),
+            ForestFormat::HamtV2 => self.files_hamt.as_mut().and_then(|h| h.remove(path)),
+        };
+
+        if let Some(ref e) = entry {
+            let parent = e.parent_dir().to_string();
             if let Some(dir) = self.directories.get_mut(&parent) {
                 dir.files.retain(|f| f != path);
             }
-            Some(entry)
-        } else {
-            None
+            self.touch();
         }
+        entry
     }
 
     /// Get a file by path
+    /// 
+    /// Works with both FlatMapV1 and HamtV2 formats.
     pub fn get_file(&self, path: &str) -> Option<&ForestFileEntry> {
-        self.files.get(path)
+        match self.format {
+            ForestFormat::FlatMapV1 => self.files.get(path),
+            ForestFormat::HamtV2 => self.files_hamt.as_ref().and_then(|h| h.get(path)),
+        }
     }
 
     /// Get storage key for a path
     pub fn get_storage_key(&self, path: &str) -> Option<&str> {
-        self.files.get(path).map(|f| f.storage_key.as_str())
+        self.get_file(path).map(|f| f.storage_key.as_str())
     }
 
-    /// List all files
-    pub fn list_all_files(&self) -> impl Iterator<Item = &ForestFileEntry> {
-        self.files.values()
+    /// List all files as a Vec (works with both formats)
+    pub fn list_all_files(&self) -> Vec<&ForestFileEntry> {
+        match self.format {
+            ForestFormat::FlatMapV1 => self.files.values().collect(),
+            ForestFormat::HamtV2 => self.files_hamt.as_ref()
+                .map(|h| h.iter().map(|(_, v)| v).collect())
+                .unwrap_or_default(),
+        }
     }
 
     /// List files in a directory (non-recursive)
@@ -328,7 +456,7 @@ impl PrivateForest {
 
         if let Some(dir) = self.directories.get(&normalized) {
             dir.files.iter()
-                .filter_map(|path| self.files.get(path))
+                .filter_map(|path| self.get_file(path))
                 .collect()
         } else {
             Vec::new()
@@ -353,6 +481,8 @@ impl PrivateForest {
     }
 
     /// List files recursively under a path
+    /// 
+    /// Works with both FlatMapV1 and HamtV2 formats.
     pub fn list_recursive(&self, prefix: &str) -> Vec<&ForestFileEntry> {
         let normalized = if prefix.is_empty() {
             "/".to_string()
@@ -362,37 +492,45 @@ impl PrivateForest {
             format!("/{}", prefix)
         };
 
-        self.files.values()
+        // For both formats, filter all files by prefix
+        // This is still efficient as list_all_files uses the right storage
+        self.list_all_files()
+            .into_iter()
             .filter(|f| f.path.starts_with(&normalized))
             .collect()
     }
 
     /// Get total file count
     pub fn file_count(&self) -> usize {
-        self.files.len()
+        match self.format {
+            ForestFormat::FlatMapV1 => self.files.len(),
+            ForestFormat::HamtV2 => self.files_hamt.as_ref().map(|h| h.len()).unwrap_or(0),
+        }
     }
 
     /// Get total size of all files
     pub fn total_size(&self) -> u64 {
-        self.files.values().map(|f| f.size).sum()
+        self.list_all_files().iter().map(|f| f.size).sum()
     }
 
     /// Find file by storage key (reverse lookup)
+    /// 
+    /// Works with both FlatMapV1 and HamtV2 formats.
     pub fn find_by_storage_key(&self, storage_key: &str) -> Option<&ForestFileEntry> {
-        self.files.values().find(|f| f.storage_key == storage_key)
+        self.list_all_files().into_iter().find(|f| f.storage_key == storage_key)
     }
 
     /// Extract a subtree for sharing
+    /// 
+    /// Works with both FlatMapV1 and HamtV2 formats.
     pub fn extract_subtree(&self, prefix: &str) -> PrivateForest {
         let mut subtree = PrivateForest::new();
         subtree.salt = self.salt.clone();
         subtree.root = prefix.to_string();
         
-        // Copy matching files
-        for (path, entry) in &self.files {
-            if path.starts_with(prefix) {
-                subtree.files.insert(path.clone(), entry.clone());
-            }
+        // Copy matching files using format-aware iteration
+        for entry in self.list_recursive(prefix) {
+            subtree.files.insert(entry.path.clone(), entry.clone());
         }
         
         // Copy matching directories
@@ -642,5 +780,103 @@ mod tests {
         let found = forest.find_by_storage_key(&storage_key);
         assert!(found.is_some());
         assert_eq!(found.unwrap().path, "/test.txt");
+    }
+
+    #[test]
+    fn test_hamt_forest_basic() {
+        let dek = DekKey::generate();
+        let mut forest = PrivateForest::new_hamt();
+        
+        assert_eq!(forest.format(), &ForestFormat::HamtV2);
+        
+        // Add files
+        for i in 0..10 {
+            let path = format!("/file_{}.txt", i);
+            let metadata = PrivateMetadata::new(&path, 100);
+            let storage_key = forest.generate_key(&path, &dek);
+            let entry = ForestFileEntry::from_metadata(&metadata, storage_key);
+            forest.upsert_file(entry);
+        }
+        
+        assert_eq!(forest.file_count(), 10);
+        assert!(forest.get_file("/file_5.txt").is_some());
+    }
+
+    #[test]
+    fn test_hamt_migration() {
+        let dek = DekKey::generate();
+        let mut forest = PrivateForest::new();
+        
+        assert_eq!(forest.format(), &ForestFormat::FlatMapV1);
+        
+        // Add files
+        for i in 0..50 {
+            let path = format!("/file_{}.txt", i);
+            let metadata = PrivateMetadata::new(&path, 100);
+            let storage_key = forest.generate_key(&path, &dek);
+            let entry = ForestFileEntry::from_metadata(&metadata, storage_key);
+            forest.upsert_file(entry);
+        }
+        
+        // Manually migrate to HAMT
+        forest.migrate_to_hamt();
+        
+        assert_eq!(forest.format(), &ForestFormat::HamtV2);
+        assert_eq!(forest.file_count(), 50);
+        assert!(forest.get_file("/file_25.txt").is_some());
+        
+        // Migrate back to flat
+        forest.migrate_to_flat();
+        
+        assert_eq!(forest.format(), &ForestFormat::FlatMapV1);
+        assert_eq!(forest.file_count(), 50);
+        assert!(forest.get_file("/file_25.txt").is_some());
+    }
+
+    #[test]
+    fn test_hamt_operations() {
+        let dek = DekKey::generate();
+        let mut forest = PrivateForest::new_hamt();
+        
+        // Add files
+        let metadata = PrivateMetadata::new("/photos/beach.jpg", 1024);
+        let storage_key = forest.generate_key("/photos/beach.jpg", &dek);
+        let entry = ForestFileEntry::from_metadata(&metadata, storage_key.clone());
+        forest.upsert_file(entry);
+        
+        // Get
+        assert!(forest.get_file("/photos/beach.jpg").is_some());
+        assert_eq!(forest.get_storage_key("/photos/beach.jpg"), Some(storage_key.as_str()));
+        
+        // Remove
+        let removed = forest.remove_file("/photos/beach.jpg");
+        assert!(removed.is_some());
+        assert!(forest.get_file("/photos/beach.jpg").is_none());
+        assert_eq!(forest.file_count(), 0);
+    }
+
+    #[test]
+    fn test_hamt_serialization_roundtrip() {
+        let dek = DekKey::generate();
+        let mut forest = PrivateForest::new_hamt();
+        
+        // Add files
+        for i in 0..20 {
+            let path = format!("/files/doc_{}.txt", i);
+            let metadata = PrivateMetadata::new(&path, 100 + i as u64);
+            let storage_key = forest.generate_key(&path, &dek);
+            let entry = ForestFileEntry::from_metadata(&metadata, storage_key);
+            forest.upsert_file(entry);
+        }
+        
+        // Encrypt
+        let encrypted = EncryptedForest::encrypt(&forest, &dek).unwrap();
+        
+        // Decrypt
+        let decrypted = encrypted.decrypt(&dek).unwrap();
+        
+        assert_eq!(decrypted.format(), &ForestFormat::HamtV2);
+        assert_eq!(decrypted.file_count(), 20);
+        assert!(decrypted.get_file("/files/doc_10.txt").is_some());
     }
 }

@@ -940,6 +940,7 @@ impl EncryptedClient {
         let forest = self.load_forest(bucket).await?;
         
         let files: Vec<FileMetadata> = forest.list_all_files()
+            .into_iter()
             .map(|entry| FileMetadata {
                 storage_key: entry.storage_key.clone(),
                 original_key: entry.path.clone(),
@@ -1270,6 +1271,314 @@ impl EncryptedClient {
         }
 
         Ok(report)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STREAMING ENCRYPTION FOR LARGE FILES (WNFS-inspired)
+    // Block-level encryption with index object pattern
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Upload a large file using chunked/streaming encryption
+    /// 
+    /// This method splits large files into encrypted chunks, uploads each
+    /// chunk as a separate object, and creates an index object with metadata.
+    /// Inspired by WNFS's "file = encrypted blocks + index" pattern.
+    /// 
+    /// # Arguments
+    /// * `bucket` - Target bucket
+    /// * `key` - Original file path/key
+    /// * `data` - File content
+    /// * `chunk_size` - Size of each chunk (default 256KB)
+    /// 
+    /// # Returns
+    /// Result with the storage key for the index object
+    pub async fn put_object_chunked(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        chunk_size: Option<usize>,
+    ) -> Result<PutObjectResult> {
+        use fula_crypto::chunked::{ChunkedEncoder, ChunkedFileMetadata, DEFAULT_CHUNK_SIZE};
+        
+        let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
+        let dek = self.encryption.key_manager.generate_dek();
+        
+        // Generate storage key using obfuscation (same as put_object_encrypted)
+        let storage_key = if self.encryption.metadata_privacy {
+            let path_dek = self.encryption.key_manager.derive_path_key(key);
+            obfuscate_key(key, &path_dek, self.encryption.obfuscation_mode.clone())
+        } else {
+            key.to_string()
+        };
+        
+        // Create chunked encoder
+        let mut encoder = ChunkedEncoder::with_chunk_size(dek.clone(), chunk_size);
+        
+        // Process all data and collect chunks
+        let mut chunks = encoder.update(data)?;
+        let (final_chunk, mut metadata, outboard) = encoder.finalize()?;
+        
+        if let Some(chunk) = final_chunk {
+            chunks.push(chunk);
+        }
+        
+        // Upload each chunk as a separate object
+        for chunk in &chunks {
+            let chunk_key = ChunkedFileMetadata::chunk_key(&storage_key, chunk.index);
+            
+            self.inner.put_object_with_metadata(
+                bucket,
+                &chunk_key,
+                chunk.ciphertext.clone(),
+                Some(ObjectMetadata::new()
+                    .with_content_type("application/octet-stream")
+                    .with_metadata("x-fula-chunk", "true")
+                    .with_metadata("x-fula-chunk-index", &chunk.index.to_string())),
+            ).await?;
+        }
+        
+        // Update metadata with content type detection
+        metadata.content_type = Some(
+            mime_guess::from_path(key)
+                .first_or_octet_stream()
+                .to_string()
+        );
+        
+        // Wrap the DEK with HPKE
+        let encryptor = Encryptor::new(self.encryption.key_manager.public_key());
+        let wrapped_dek = encryptor.encrypt_dek(&dek)?;
+        
+        // Create index object metadata
+        let kek_version = self.encryption.key_manager.version();
+        let enc_metadata = serde_json::json!({
+            "version": 3,
+            "format": "streaming-v1",
+            "algorithm": "AES-256-GCM",
+            "wrapped_key": serde_json::to_value(&wrapped_dek).unwrap(),
+            "kek_version": kek_version,
+            "chunked": metadata,
+            "bao_outboard": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, outboard.to_bytes()),
+        });
+        
+        // Upload index object (small, contains metadata only)
+        let index_metadata = ObjectMetadata::new()
+            .with_content_type("application/json")
+            .with_metadata("x-fula-encrypted", "true")
+            .with_metadata("x-fula-chunked", "true")
+            .with_metadata("x-fula-encryption", &enc_metadata.to_string());
+        
+        let result = self.inner.put_object_with_metadata(
+            bucket,
+            &storage_key,
+            Bytes::from(b"CHUNKED".to_vec()), // Marker content
+            Some(index_metadata),
+        ).await?;
+        
+        // Update forest cache if we have one
+        if let Ok(mut cache) = self.forest_cache.write() {
+            if let Some(forest) = cache.get_mut(bucket) {
+                let now = chrono::Utc::now().timestamp();
+                forest.upsert_file(ForestFileEntry {
+                    path: key.to_string(),
+                    storage_key: storage_key.clone(),
+                    size: data.len() as u64,
+                    content_type: metadata.content_type.clone(),
+                    created_at: now,
+                    modified_at: now,
+                    user_metadata: HashMap::new(),
+                    content_hash: None,
+                });
+            }
+        }
+        
+        Ok(result)
+    }
+
+    /// Download and decrypt a chunked file
+    /// 
+    /// Fetches the index object, then downloads and decrypts chunks as needed.
+    pub async fn get_object_chunked(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Bytes> {
+        use fula_crypto::chunked::{ChunkedDecoder, ChunkedFileMetadata};
+        
+        // Resolve path to storage key (same as get_object_decrypted)
+        let storage_key = if self.encryption.metadata_privacy {
+            let path_dek = self.encryption.key_manager.derive_path_key(key);
+            obfuscate_key(key, &path_dek, self.encryption.obfuscation_mode.clone())
+        } else {
+            key.to_string()
+        };
+        
+        // Fetch index object
+        let index_result = self.inner.get_object_with_metadata(bucket, &storage_key).await?;
+        
+        // Check if chunked
+        let is_chunked = index_result.metadata
+            .get("x-fula-chunked")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        
+        if !is_chunked {
+            // Fall back to regular decryption
+            return self.get_object_decrypted(bucket, key).await;
+        }
+        
+        // Parse encryption metadata
+        let enc_metadata_str = index_result.metadata
+            .get("x-fula-encryption")
+            .ok_or_else(|| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption("Missing encryption metadata".to_string())
+            ))?;
+        
+        let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(e.to_string())
+            ))?;
+        
+        // Unwrap DEK
+        let wrapped_dek: EncryptedData = serde_json::from_value(enc_metadata["wrapped_key"].clone())
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(e.to_string())
+            ))?;
+        
+        let decryptor = Decryptor::new(self.encryption.key_manager.keypair());
+        let dek = decryptor.decrypt_dek(&wrapped_dek)?;
+        
+        // Parse chunked metadata
+        let chunked_meta: ChunkedFileMetadata = serde_json::from_value(enc_metadata["chunked"].clone())
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(e.to_string())
+            ))?;
+        
+        // Create decoder
+        let mut decoder = ChunkedDecoder::new(dek, chunked_meta.clone());
+        
+        // Download and decrypt each chunk
+        for chunk_idx in 0..chunked_meta.num_chunks {
+            let chunk_key = ChunkedFileMetadata::chunk_key(&storage_key, chunk_idx);
+            let chunk_data = self.inner.get_object(bucket, &chunk_key).await?;
+            decoder.decrypt_chunk(chunk_idx, &chunk_data)?;
+        }
+        
+        // Finalize and return
+        decoder.finalize()
+            .map_err(ClientError::Encryption)
+    }
+
+    /// Download a byte range from a chunked file (partial read)
+    /// 
+    /// Only downloads the chunks needed for the requested range.
+    pub async fn get_object_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Bytes> {
+        use fula_crypto::chunked::ChunkedFileMetadata;
+        
+        // Resolve path to storage key
+        let storage_key = if self.encryption.metadata_privacy {
+            let path_dek = self.encryption.key_manager.derive_path_key(key);
+            obfuscate_key(key, &path_dek, self.encryption.obfuscation_mode.clone())
+        } else {
+            key.to_string()
+        };
+        
+        // Fetch index object
+        let index_result = self.inner.get_object_with_metadata(bucket, &storage_key).await?;
+        
+        // Check if chunked
+        let is_chunked = index_result.metadata
+            .get("x-fula-chunked")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        
+        if !is_chunked {
+            // Fall back to full download and slice
+            let full = self.get_object_decrypted(bucket, key).await?;
+            let start = offset as usize;
+            let end = (offset + length) as usize;
+            return Ok(full.slice(start.min(full.len())..end.min(full.len())));
+        }
+        
+        // Parse encryption metadata
+        let enc_metadata_str = index_result.metadata
+            .get("x-fula-encryption")
+            .ok_or_else(|| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption("Missing encryption metadata".to_string())
+            ))?;
+        
+        let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(e.to_string())
+            ))?;
+        
+        // Unwrap DEK
+        let wrapped_dek: EncryptedData = serde_json::from_value(enc_metadata["wrapped_key"].clone())
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(e.to_string())
+            ))?;
+        
+        let decryptor = Decryptor::new(self.encryption.key_manager.keypair());
+        let dek = decryptor.decrypt_dek(&wrapped_dek)?;
+        
+        // Parse chunked metadata
+        let chunked_meta: ChunkedFileMetadata = serde_json::from_value(enc_metadata["chunked"].clone())
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(e.to_string())
+            ))?;
+        
+        // Determine which chunks we need
+        let needed_chunks = chunked_meta.chunks_for_range(offset, length);
+        
+        // Download and decrypt only needed chunks
+        let mut decrypted_chunks = Vec::new();
+        
+        for chunk_idx in needed_chunks {
+            let chunk_key = ChunkedFileMetadata::chunk_key(&storage_key, chunk_idx);
+            let chunk_data = self.inner.get_object(bucket, &chunk_key).await?;
+            
+            let nonce = chunked_meta.get_chunk_nonce(chunk_idx)
+                .map_err(ClientError::Encryption)?;
+            
+            // Decrypt this chunk with the DEK
+            let aead = Aead::new_default(&dek);
+            let plaintext = aead.decrypt(&nonce, &chunk_data)
+                .map_err(ClientError::Encryption)?;
+            
+            decrypted_chunks.push((chunk_idx, plaintext));
+        }
+        
+        // Extract the requested range from decrypted chunks
+        let chunk_size = chunked_meta.chunk_size as u64;
+        let mut result = Vec::with_capacity(length as usize);
+        
+        for (chunk_idx, chunk_data) in decrypted_chunks {
+            let chunk_start = chunk_idx as u64 * chunk_size;
+            let chunk_end = chunk_start + chunk_data.len() as u64;
+            
+            // Calculate overlap with requested range
+            let range_start = offset.max(chunk_start);
+            let range_end = (offset + length).min(chunk_end);
+            
+            if range_start < range_end {
+                let local_start = (range_start - chunk_start) as usize;
+                let local_end = (range_end - chunk_start) as usize;
+                result.extend_from_slice(&chunk_data[local_start..local_end]);
+            }
+        }
+        
+        Ok(Bytes::from(result))
+    }
+
+    /// Check if a file should use chunked upload based on size
+    pub fn should_use_chunked(size: usize) -> bool {
+        fula_crypto::should_use_chunked(size)
     }
 }
 

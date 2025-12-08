@@ -64,9 +64,11 @@ All observations and examples below are based on *current code* in these repos, 
 - `private_forest.rs`
   - Implements **PrivateForest**: an encrypted directory/index structure:
     - `PrivateForest` holds:
-      - `files: HashMap<String, ForestFileEntry>` with original path → (storage key, size, content type, timestamps, metadata, hash).
+      - Either a flat `files: HashMap<String, ForestFileEntry>` (small forests) or a HAMT‑backed `files_hamt: HamtIndex<ForestFileEntry>` for large forests.
       - `directories: HashMap<String, ForestDirectoryEntry>` with direct children.
       - Random `salt` used when generating flat storage keys.
+    - Format versioning via `ForestFormat`:
+      - `FlatMapV1` (original) and `HamtV2` (HAMT with auto‑migration past a file‑count threshold).
     - `ForestFileEntry::from_metadata` is derived from `PrivateMetadata` and `storage_key`.
   - Storage keys:
     - `generate_flat_key(original_path, dek, salt)` → CID‑like `Qm…` string (no `/` or plaintext hints).
@@ -102,10 +104,10 @@ All observations and examples below are based on *current code* in these repos, 
     - `rotate_bucket()` rotates all objects in a bucket, returning a `RotationReport`.
     - Key rotation is **fully integrated into the live object metadata and gateway workflows**.
 
-- `streaming.rs` / `hashing.rs`
-  - BLAKE3 based hashing, incremental hashing.
-  - Bao‑style verified streaming: `BaoEncoder`, `BaoDecoder`, `BaoOutboard`, `VerifiedStream`.
-  - Allows integrity‑checked streaming and partial reads, but **is not yet wired into the main `EncryptedClient` encryption path**.
+- `streaming.rs` / `hashing.rs` / `chunked.rs`
+  - BLAKE3 based hashing and Bao‑style verified streaming: `BaoEncoder`, `BaoDecoder`, `BaoOutboard`.
+  - `chunked.rs` implements chunked file encryption metadata (`ChunkedFileMetadata`), `ChunkedEncoder`, `ChunkedDecoder`, and verified streaming decoders.
+  - Provides integrity‑checked streaming, chunked upload, and partial reads, and is **now integrated into `EncryptedClient`'s large‑file path**.
 
 - `crates/fula-client/src/encryption.rs`
   - `EncryptionConfig`:
@@ -128,8 +130,12 @@ All observations and examples below are based on *current code* in these repos, 
       - If metadata privacy: recompute storage key from original path using `derive_path_key + obfuscate_key` or via `PrivateForest` in FlatNamespace mode.
       - Fetch object, parse `x-fula-encryption` JSON, HPKE‑unwrap DEK, AES‑GCM decrypt data.
       - Optionally decrypt `EncryptedPrivateMetadata` for original path, size, timestamps, and user metadata.
+    - Streaming path for large files (`put_object_chunked`, `get_object_chunked`, `get_object_range`):
+      - Splits large files into AES‑GCM‑encrypted chunks uploaded as separate objects under `<storage_key>.chunks/<index>`.
+      - Uses an HPKE‑wrapped DEK stored in a small index object under the obfuscated storage key with `x-fula-chunked: true` and version 3 metadata.
+      - Supports partial reads and Bao‑verified streaming via chunked metadata and `ChunkedDecoder`/`VerifiedStreamingDecoder`.
     - PrivateForest integration:
-      - `load_forest` / `save_forest` transparently maintain a per‑bucket encrypted index object (`x-fula-forest: true`).
+      - `load_forest` / `save_forest` transparently maintain a per‑bucket encrypted index object (`x-fula-forest: true`) storing either a flat map or a HAMT‑backed index (with automatic migration for large forests).
       - `put_object_flat`, `list_directory_from_forest`, `get_forest_subtree`, `delete_object_flat` provide complete structure hiding at the server.
 
 **Summary:**
@@ -139,7 +145,7 @@ All observations and examples below are based on *current code* in these repos, 
 - PrivateForest + FlatNamespace already closely mirrors WNFS‑style structure hiding.
 - **Sharing is fully integrated** into `EncryptedClient` with path‑scoped, permission‑checked, expiry‑validated access via `ShareToken`.
 - **Key rotation is fully integrated** with `kek_version` in object metadata and `rotate_bucket()` for bulk re‑wrapping.
-- Bao‑based verified streaming exists but is **not yet wired into the main encryption path** for very large files.
+- **Streaming encryption for large files is now integrated** via chunked uploads, partial reads, and Bao‑verified streaming, while preserving S3/IPFS compatibility.
 
 ---
 
@@ -274,8 +280,8 @@ Scores are **1–10**, where 10 is best given typical modern requirements. Score
 | **Key rotation – mechanism** | `KeyRotationManager` + `FileSystemRotation` support KEK rotation and DEK re‑wrapping without re‑encrypting content. **Fully integrated**: object metadata includes `kek_version`, and `EncryptedClient` provides `rewrap_object_dek()` and `rotate_bucket()` for live rotation. | **9** | Ratchet progression inherently provides forward secrecy and "rotation" at node‑revision granularity; there is no central KEK to rotate, but you can rotate private roots and re‑derive structures. Rotation is per‑node/per‑revision, not via a single KEK, which is good for compromise isolation but heavier to orchestrate for "all data" rotations. | **8–9** |
 | **Security & privacy against storage provider** | With FlatNamespace + PrivateForest, provider sees: random‑looking keys, ciphertext sizes, and encrypted index objects flagged only by metadata. AAD usage in HPKE and optional AAD in AEADs defend against context‑swap attacks. Very strong metadata privacy; main leakage is access pattern and ciphertext length. | **9** | WNFS was designed specifically against a very strong storage adversary: accumulators, ratchets, per‑revision labels, HAMT, etc. The provider sees only HAMT nodes and CIDs; neither structure nor evolution of revisions is easy to infer beyond coarse access patterns and object sizes. | **9–10** |
 | **Security & privacy in multi‑user sharing** | Multi‑recipient HPKE wrapping and `ShareToken`s with path scopes and permissions. `EncryptedClient` now enforces these via `get_object_with_share()`. Asynchronous sharing protocol (store‑and‑forward) not yet implemented; could borrow from WNFS. | **9** | Multi‑user sharing protocol is **explicitly specified** (shared‑private‑data extension): sharer and recipient roles, exchange directories, share counters, and how `AccessKey`s are created and consumed. Semantics and limitations are clearly laid out in code and spec. | **9** |
-| **Performance – large files** | Encryption path in `EncryptedClient` is currently single‑shot (reads whole `Bytes` into memory, encrypts, uploads). `streaming.rs` exists for Bao‑verified streaming but is not wired into object encryption. For very large objects, this is less ideal; chunked upload + streaming AEAD integration would be needed. | **7** | WNFS stores file content as blocks in the blockstore and encrypts them with `SnapshotKey`. Block‑level encryption + blockstore streaming scales well to large files, though it adds overhead in many small encrypted blocks. The design is more naturally suited to very big files. | **8–9** |
-| **Performance – deep / wide trees** | FlatNamespace + `PrivateForest` uses a single encrypted JSON structure containing `files` and `directories` maps. This is simple and sufficiently fast for moderate trees, but listing or traversing a huge tree requires fetching and decrypting the entire forest index. | **7** | `HamtForest` is explicitly designed for large forests: HAMT structure, accumulator caching, and streaming store operations. Tree operations scale roughly `O(log N)` in number of nodes, and the forest can be diffed and merged efficiently. | **9** |
+| **Performance – large files** | Chunked/streaming encryption via `put_object_chunked`, `get_object_chunked`, and `get_object_range`. Large files are split into AES‑GCM‑encrypted chunks with a small index object, supporting partial reads and Bao‑verified streaming with O(chunk_size) memory and S3/IPFS‑compatible layout. | **9** | WNFS stores file content as blocks in the blockstore and encrypts them with `SnapshotKey`. Block‑level encryption + blockstore streaming scales well to large files, though it adds overhead in many small encrypted blocks. The design is more naturally suited to very big files. | **8–9** |
+| **Performance – deep / wide trees** | FlatNamespace + `PrivateForest` now support `ForestFormat::HamtV2` with a HAMT‑backed file index and automatic migration past a file‑count threshold. Tree operations (lookup/insert/remove) scale roughly O(log N), but the forest is still stored as a single encrypted index object per bucket, so very large forests still require fetching that object. | **8** | `HamtForest` is explicitly designed for large forests: HAMT structure, accumulator caching, and streaming store operations. Tree operations scale roughly `O(log N)` in number of nodes, and the forest can be diffed and merged efficiently. | **9** |
 | **Implementation complexity** | Fewer moving parts: single `PrivateForest` structure, straightforward KEK/DEK separation, HPKE, and AES‑GCM. Easier to reason about and integrate into an IPFS gateway. | **8** | Significantly more complex: accumulators, ratchets, HAMT, multivalue heads, async sharing, etc. Very powerful but harder to integrate correctly without following the spec very closely. | **7** |
 | **Future‑proofing (algorithm agility, extensibility)** | HPKE and BLAKE3 are **very modern** choices. The design already abstracts AEAD algorithm (`AeadCipher`) and HPKE config. PrivateForest and rotation modules leave room for upgrading algorithms and formats by bumping version fields. | **9** | WNFS uses robust primitives (XChaCha20‑Poly1305, BLAKE3, AES‑KWP) and separates many concerns cleanly (forest traits, key derivation DSIs). However, some pieces (RSA‑2048 accumulators, RSA OAEP for sharing) are not as flexible/modern as HPKE. Upgrading those would require protocol migrations. | **8** |
 
@@ -286,7 +292,7 @@ Scores are **1–10**, where 10 is best given typical modern requirements. Score
   - Metadata privacy and structure hiding excellent in FlatNamespace mode.
   - Sharing is now **fully integrated** with permission‑checked, expiry‑validated, path‑scoped access.
   - Key rotation is now **fully integrated** with `kek_version` in object metadata and bulk rotation via `rotate_bucket()`.
-  - Remaining gap: Bao‑based streaming not yet wired into encryption path; asynchronous offline sharing protocol not yet implemented.
+  - Remaining gap: asynchronous offline sharing protocol and per‑node ratchet‑style forward secrecy; streaming and HAMT‑style indexing are now implemented.
 
 - **WNFS private filesystem:** **9.2 / 10**
   - Extremely strong model for a general private filesystem, with rich sharing and revision semantics.
@@ -420,13 +426,13 @@ Scores are **1–10**, where 10 is best given typical modern requirements. Score
 #### Fula
 
 - **Large files:**
-  - `EncryptedClient` currently encrypts an entire `Bytes` payload per object in one AEAD operation.
-  - `MAX_SINGLE_PART_SIZE` is 5 GB, so very large files are supported in principle, but memory usage and upload latency may be high for large objects.
-  - `streaming.rs` (Bao) could support chunked/streaming encryption, but there is no integrated “streaming encrypted upload” path yet.
+  - `EncryptedClient` now supports chunked/streaming encryption via `put_object_chunked`, `get_object_chunked`, and `get_object_range`.
+  - Large files are split into AES‑GCM‑encrypted chunks (default 256KB), each stored as a separate object; a small index object under the obfuscated storage key contains HPKE‑wrapped DEK, chunk metadata, and Bao root hash.
+  - Memory usage is O(chunk_size) and partial reads only download needed chunks; Bao‑based streaming verification detects corruption during download.
 - **Deep/wide trees:**
-  - In FlatNamespace mode, **one encrypted PrivateForest object per bucket** holds all path and directory metadata.
-  - Listing or walking the tree requires fetching and decrypting that entire index, but thereafter lookups are O(1) hash‑map lookups in memory.
-  - This is efficient for small–medium trees and simple gateway workloads, but may become a bottleneck if the bucket holds millions of files.
+  - In FlatNamespace mode, **one encrypted PrivateForest object per bucket** still holds all path and directory metadata, but the internal file index can now be HAMT‑backed (`ForestFormat::HamtV2`) for large forests.
+  - Listing or walking the tree still requires fetching and decrypting the index object, but internal operations (upserts/lookups) scale better for very large file sets.
+  - For huge, multi‑tenant deployments, sharding forests across buckets or further splitting index objects may still be desirable.
 
 #### WNFS
 
@@ -440,8 +446,8 @@ Scores are **1–10**, where 10 is best given typical modern requirements. Score
 
 **Verdict:**
 
-- For a **gateway that mainly deals with object‑level put/get** operations, Fula’s approach is simpler and likely faster to implement; performance is dominated by underlying object storage and network.
-- For **very large, deeply nested private filesystems**, WNFS has a more scalable indexing structure and a more streaming‑friendly content model.
+- For a **gateway that mainly deals with object‑level put/get** operations, Fula’s chunked/streaming support and HPKE‑centric design are now very competitive with WNFS for large files, while keeping S3/IPFS semantics simple.
+- For **very large, deeply nested private filesystems** with many concurrent writers and revisions, WNFS still has a more scalable and flexible indexing structure (diff/merge, per‑node ratchets) than Fula’s single‑index‑per‑bucket forest.
 
 ### 3.5 Future‑Proofing
 
@@ -533,20 +539,18 @@ From a security & feature perspective, the following WNFS capabilities are not (
 
 - **3. Scalable forest structure for extremely large trees**
   - WNFS: HAMT forest scales gracefully to millions of entries, with diff/merge operations.
-  - Fula: `PrivateForest` is a single encrypted JSON map; simple and fine for many use cases, but not as scalable for huge trees.
+  - Fula: `PrivateForest` now supports a HAMT‑backed index (`ForestFormat::HamtV2`) with O(log N) operations, but is still stored as a single encrypted index object per bucket. For extremely large, multi‑tenant trees, WNFS’s fully sharded `HamtForest` remains more scalable.
 
 - **4. Snapshot vs temporal access semantics**
   - WNFS: explicit distinction between `TemporalAccessKey` (future revisions) and `SnapshotAccessKey` (current revision only).
   - Fula: no built‑in notion of "snapshot" vs "temporal" access; the semantics of shares are primarily path‑scoped, not revision‑scoped.
 
-- **5. Streaming encryption for very large files**
-  - WNFS: block‑level encryption + blockstore streaming scales well to very large files.
-  - Fula: `streaming.rs` (Bao) exists but is not yet wired into `EncryptedClient`; encryption currently happens in one shot.
-
 **Previously missing, now addressed:**
 
 - ✅ **Sharing integration**: `get_object_with_share()`, `accept_share()`, and `get_object_with_token()` now fully enforce expiry, path scope, and permissions.
 - ✅ **Key rotation integration**: object metadata now includes `kek_version`; `rewrap_object_dek()` and `rotate_bucket()` provide complete rotation workflows.
+- ✅ **Streaming encryption for large files**: `put_object_chunked`, `get_object_chunked`, and `get_object_range` implement chunked uploads, partial reads, and Bao‑verified streaming.
+- ✅ **HAMT‑backed forest index**: `PrivateForest` now supports `ForestFormat::HamtV2` with `HamtIndex`, auto‑migrated for large forests.
 
 ---
 
@@ -563,10 +567,8 @@ From a security‑auditor perspective, the following steps would close most of t
    - `accept_share()` and `get_object_with_token()` provide convenience methods.
    - Permissions (`can_read`, `can_write`, `can_delete`) are now enforced at gateway level.
 
-3. **Expose a streaming encrypted upload/download API** (remaining)
-   - Use `streaming.rs` (Bao) together with chunked AEAD encryption.
-   - For very large files, avoid holding the whole file in memory; encrypt in chunks and upload via multi‑part S3/IPFS APIs.
-   - Optionally integrate streaming verification for download, so clients can detect corruption early.
+3. ✅ **~~Expose a streaming encrypted upload/download API~~** — **DONE**
+   - `put_object_chunked`, `get_object_chunked`, and `get_object_range` provide chunked encryption, partial reads, and Bao‑verified streaming for large files.
 
 4. **Implement asynchronous offline sharing protocol** (remaining)
    - Borrow from WNFS's shared‑private‑data extension for store‑and‑forward sharing semantics.
@@ -576,11 +578,9 @@ From a security‑auditor perspective, the following steps would close most of t
    - Decide how device keys, user KEKs, and rotation are managed (e.g. one `KeyManager` per user identity, separate keys per device, etc.).
    - Provide a stable format for exporting/importing the `SecretKey` that backs `KeyManager::from_secret_key`.
 
-6. **Scale PrivateForest for large deployments** (optional)
-   - For extremely large buckets, consider either:
-     - Sharding the forest index by prefix, or
-     - Migrating to a HAMT‑like structure similar to WNFS.
-   - This is not strictly necessary for smaller deployments but becomes important for massive multi‑tenant gateways.
+6. ✅ **~~Scale PrivateForest for large deployments~~** (partially DONE)
+   - `ForestFormat::HamtV2` and `HamtIndex` provide a HAMT‑backed file index with automatic migration for large forests.
+   - Further improvements (e.g., sharding the forest index across multiple objects) can be explored for extreme multi‑tenant scales.
 
 7. **Document threat models and guarantees explicitly** (optional)
    - Borrow from WNFS documentation style: specify attacker models (malicious storage, malicious peer, compromised client), and list what each feature guarantees (and what it doesn't).
@@ -624,8 +624,8 @@ For your **encrypted IPFS pinning gateway**, I would recommend **keep Fula as th
 | **Metadata & structure privacy** | Encrypted `PrivateMetadata` + `KeyObfuscation`; FlatNamespace + `PrivateForest` hides folder structure from server. | Name accumulators + HAMT; per‑node headers encrypted with AES‑KWP; directory structure fully hidden. | Roughly **tied** on privacy; Fula’s FlatNamespace is already very strong. |
 | **Sharing** | HPKE‑wrapped `ShareToken`s, folder‑scoped, with expiry & permissions; **fully integrated** via `get_object_with_share()`. Asynchronous offline sharing not yet implemented. | `AccessKey` + RSA exchange keys + shared‑private‑data extension for asynchronous, offline sharing. | For **gateway sharing**, **Fula** is now complete; for **async/offline sharing**, borrow from **WNFS**. |
 | **Key rotation / forward secrecy** | KEK/DEK with `KeyRotationManager` and `FileSystemRotation`; **fully integrated** with `kek_version` in metadata and `rotate_bucket()`. | Per‑node ratchet → `TemporalKey` → `SnapshotKey`; strong forward secrecy at node/revision level. | For **global KEK rotation**, **Fula** is now complete; for **per‑node forward secrecy**, **WNFS**. |
-| **Performance – large files** | Encrypts whole object at once; streaming primitives exist but not integrated. Good for typical object sizes, less ideal for huge files. | Block‑level encrypted content; better for very large files and partial reads at cost of more complexity. | For gateway workloads, **Fula** is simpler and fine; add streaming later if needed. |
-| **Performance – large / deep trees** | Single encrypted `PrivateForest` JSON per bucket; simple but may be heavy for millions of entries. | HAMT‑based `HamtForest`; scales well to very large private trees and sync scenarios. | For huge multi‑tenant trees, borrow HAMT ideas from **WNFS**; Fula is adequate for moderate scales. |
+| **Performance – large files** | Chunked/streaming encryption with `put_object_chunked`, `get_object_chunked`, and `get_object_range`; memory usage is O(chunk_size) and partial reads only download needed chunks. | Block‑level encrypted content; better for very large files and partial reads at cost of more complexity. | For gateway workloads, **Fula** is now comparable to WNFS on large‑file handling while keeping a simpler object API. |
+| **Performance – large / deep trees** | Single encrypted `PrivateForest` index per bucket, but with optional HAMT‑backed file index (`ForestFormat::HamtV2`) for large forests. | HAMT‑based `HamtForest`; scales well to very large private trees and sync scenarios. | For huge multi‑tenant trees, borrow HAMT ideas from **WNFS**; Fula’s HAMT‑backed forest improves scaling but still uses a single index object. |
 | **Future‑proofing** | HPKE, BLAKE3, explicit versioning; easier migration to new suites and formats. | DSIs and traits help, but accumulators and RSA exchange keys are heavier to migrate. | **Fula** has a slight future‑proofing edge. |
 | **Overall security score (this audit)** | ~**9.0 / 10** – strong primitives and design; sharing and rotation now **fully integrated**. | ~**9.2 / 10** – very complete private filesystem model, especially for sharing and revisions. | For a **pinning gateway**, use **Fula** + selectively adopt WNFS design patterns. |
 

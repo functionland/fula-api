@@ -281,6 +281,41 @@ Raw S3 tools (AWS CLI, boto3) do NOT encrypt data - they upload plaintext that g
 
 See [docs/PRIVACY.md](docs/PRIVACY.md) for full privacy policy.
 
+### Large File Support (WNFS-inspired)
+
+For files larger than 5MB, use chunked upload for better memory efficiency and partial read support:
+
+```rust
+use fula_client::EncryptedClient;
+
+// Large file - use chunked upload
+let large_data = std::fs::read("movie.mp4")?;
+if EncryptedClient::should_use_chunked(large_data.len()) {
+    client.put_object_chunked(
+        "my-bucket",
+        "/videos/movie.mp4",
+        &large_data,
+        Some(512 * 1024), // 512KB chunks (optional)
+    ).await?;
+}
+
+// Partial read - only downloads needed chunks
+let partial = client.get_object_range(
+    "my-bucket",
+    "/videos/movie.mp4",
+    1024 * 1024,  // offset: 1MB
+    1024 * 1024,  // length: 1MB
+).await?;
+```
+
+**Benefits:**
+- Memory efficient: processes one chunk at a time
+- Partial reads: download only the bytes you need
+- Resumable: failed uploads can restart from last chunk
+- Integrity: Bao hash tree for verified streaming
+
+See [docs/wnfs-borrowed-features.md](docs/wnfs-borrowed-features.md) for implementation details.
+
 ## Production Deployment
 
 For production Ubuntu deployments with security hardening:

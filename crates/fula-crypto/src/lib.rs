@@ -34,7 +34,9 @@
 //!     .decrypt(&encrypted)?;
 //! ```
 
+pub mod chunked;
 pub mod error;
+pub mod hamt_index;
 pub mod hashing;
 pub mod hpke;
 pub mod keys;
@@ -45,11 +47,14 @@ pub mod sharing;
 pub mod streaming;
 pub mod symmetric;
 
+pub use chunked::{ChunkedEncoder, ChunkedDecoder, ChunkedFileMetadata, EncryptedChunk, should_use_chunked, CHUNKED_THRESHOLD, AsyncStreamingEncoder, VerifiedStreamingDecoder};
+pub use chunked::DEFAULT_CHUNK_SIZE as CHUNKED_DEFAULT_SIZE;
 pub use error::{CryptoError, Result};
+pub use hamt_index::{HamtIndex, HamtNode, ShardedIndex};
 pub use hashing::{Blake3Hash, Hasher, HashOutput};
 pub use hpke::{Decryptor, EncapsulatedKey, EncryptedData, Encryptor, HpkeConfig, SharePermissions};
 pub use keys::{DekKey, KekKeyPair, KeyManager, PublicKey, SecretKey};
-pub use private_forest::{PrivateForest, EncryptedForest, ForestFileEntry, ForestDirectoryEntry, derive_index_key, generate_flat_key};
+pub use private_forest::{PrivateForest, EncryptedForest, ForestFileEntry, ForestDirectoryEntry, ForestFormat, derive_index_key, generate_flat_key};
 pub use private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, PublicMetadata, KeyObfuscation, obfuscate_key};
 pub use rotation::{KeyRotationManager, FileSystemRotation, WrappedKeyInfo, RotationResult};
 pub use sharing::{ShareToken, ShareBuilder, ShareRecipient, AcceptedShare, FolderShareManager, AccessValidation};
