@@ -13,8 +13,9 @@ use fula_crypto::{
     hpke::{Encryptor, Decryptor, EncryptedData},
     symmetric::{Aead, Nonce},
     private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, KeyObfuscation, obfuscate_key},
+    private_forest::{PrivateForest, EncryptedForest, ForestFileEntry, derive_index_key},
 };
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 
 /// Configuration for client-side encryption
@@ -43,6 +44,23 @@ impl EncryptionConfig {
             key_manager: Arc::new(KeyManager::new()),
             metadata_privacy: false,
             obfuscation_mode: KeyObfuscation::DeterministicHash,
+        }
+    }
+
+    /// Create with FlatNamespace mode - RECOMMENDED for maximum privacy
+    /// 
+    /// This mode provides complete structure hiding:
+    /// - Storage keys look like random CID-style hashes (e.g., `QmX7a8f3...`)
+    /// - No prefixes or structure hints visible to server
+    /// - Server cannot determine folder structure or parent/child relationships
+    /// - File tree is stored in an encrypted PrivateForest index
+    /// 
+    /// Inspired by WNFS (WebNative File System) and Peergos.
+    pub fn new_flat_namespace() -> Self {
+        Self {
+            key_manager: Arc::new(KeyManager::new()),
+            metadata_privacy: true,
+            obfuscation_mode: KeyObfuscation::FlatNamespace,
         }
     }
 
@@ -98,13 +116,19 @@ impl Default for EncryptionConfig {
 pub struct EncryptedClient {
     inner: FulaClient,
     encryption: EncryptionConfig,
+    /// Private forest index for FlatNamespace mode (cached)
+    forest_cache: RwLock<HashMap<String, PrivateForest>>,
 }
 
 impl EncryptedClient {
     /// Create a new encrypted client
     pub fn new(config: Config, encryption: EncryptionConfig) -> Result<Self> {
         let inner = FulaClient::new(config)?;
-        Ok(Self { inner, encryption })
+        Ok(Self { 
+            inner, 
+            encryption,
+            forest_cache: RwLock::new(HashMap::new()),
+        })
     }
 
     /// Get the underlying client
@@ -578,6 +602,11 @@ impl EncryptedClient {
         bucket: &str,
         prefix: Option<&str>,
     ) -> Result<DirectoryListing> {
+        // For FlatNamespace, use the forest directly
+        if self.encryption.obfuscation_mode == KeyObfuscation::FlatNamespace {
+            return self.list_directory_from_forest(bucket, prefix).await;
+        }
+
         let options = prefix.map(|p| ListObjectsOptions {
             prefix: Some(p.to_string()),
             ..Default::default()
@@ -602,6 +631,296 @@ impl EncryptedClient {
             prefix: prefix.map(|s| s.to_string()),
             directories,
         })
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // FLATNAMESPACE / PRIVATE FOREST SUPPORT
+    // Complete structure hiding - server sees only random CID-like hashes
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Check if FlatNamespace mode is enabled
+    pub fn is_flat_namespace(&self) -> bool {
+        self.encryption.obfuscation_mode == KeyObfuscation::FlatNamespace
+    }
+
+    /// Load the private forest index for a bucket
+    /// 
+    /// The forest contains the encrypted directory structure and path→storage_key mapping.
+    /// This is only used in FlatNamespace mode.
+    pub async fn load_forest(&self, bucket: &str) -> Result<PrivateForest> {
+        // Check cache first
+        {
+            let cache = self.forest_cache.read().unwrap();
+            if let Some(forest) = cache.get(bucket) {
+                return Ok(forest.clone());
+            }
+        }
+
+        // Derive the index key deterministically
+        let path_dek = self.encryption.key_manager.generate_dek();
+        let index_key = derive_index_key(&path_dek, bucket);
+
+        // Try to load from storage
+        match self.inner.get_object_with_metadata(bucket, &index_key).await {
+            Ok(result) => {
+                // Decrypt the forest
+                let encrypted = EncryptedForest::from_bytes(&result.data)
+                    .map_err(ClientError::Encryption)?;
+                let forest = encrypted.decrypt(&path_dek)
+                    .map_err(ClientError::Encryption)?;
+                
+                // Cache it
+                {
+                    let mut cache = self.forest_cache.write().unwrap();
+                    cache.insert(bucket.to_string(), forest.clone());
+                }
+                
+                Ok(forest)
+            }
+            Err(_) => {
+                // No forest exists yet - create empty one
+                let forest = PrivateForest::new();
+                
+                // Cache it
+                {
+                    let mut cache = self.forest_cache.write().unwrap();
+                    cache.insert(bucket.to_string(), forest.clone());
+                }
+                
+                Ok(forest)
+            }
+        }
+    }
+
+    /// Save the private forest index for a bucket
+    pub async fn save_forest(&self, bucket: &str, forest: &PrivateForest) -> Result<()> {
+        let path_dek = self.encryption.key_manager.generate_dek();
+        let index_key = derive_index_key(&path_dek, bucket);
+
+        // Encrypt the forest
+        let encrypted = EncryptedForest::encrypt(forest, &path_dek)
+            .map_err(ClientError::Encryption)?;
+        let data = encrypted.to_bytes()
+            .map_err(ClientError::Encryption)?;
+
+        // Upload (the index looks like any other encrypted blob)
+        let metadata = ObjectMetadata::new()
+            .with_content_type("application/octet-stream")
+            .with_metadata("x-fula-forest", "true");
+
+        self.inner.put_object_with_metadata(
+            bucket,
+            &index_key,
+            Bytes::from(data),
+            Some(metadata),
+        ).await?;
+
+        // Update cache
+        {
+            let mut cache = self.forest_cache.write().unwrap();
+            cache.insert(bucket.to_string(), forest.clone());
+        }
+
+        Ok(())
+    }
+
+    /// Put an encrypted object using FlatNamespace mode
+    /// 
+    /// This automatically updates the forest index.
+    pub async fn put_object_flat(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        content_type: Option<&str>,
+    ) -> Result<PutObjectResult> {
+        let data = data.into();
+        let original_size = data.len() as u64;
+        
+        // Load or create forest
+        let mut forest = self.load_forest(bucket).await?;
+        
+        // Generate a DEK for this object
+        let dek = self.encryption.key_manager.generate_dek();
+        
+        // Encrypt the data
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(&dek);
+        let ciphertext = aead.encrypt(&nonce, &data)
+            .map_err(ClientError::Encryption)?;
+
+        // Generate flat storage key (no structure hints!)
+        let storage_key = forest.generate_key(key, &dek);
+
+        // Encrypt the DEK with HPKE
+        let encryptor = Encryptor::new(self.encryption.public_key());
+        let wrapped_dek = encryptor.encrypt_dek(&dek)
+            .map_err(ClientError::Encryption)?;
+
+        // Create private metadata
+        let private_meta = PrivateMetadata::new(key, original_size)
+            .with_content_type(content_type.unwrap_or("application/octet-stream"));
+        
+        let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
+            .map_err(ClientError::Encryption)?;
+
+        // Add to forest index
+        let entry = ForestFileEntry::from_metadata(&private_meta, storage_key.clone());
+        forest.upsert_file(entry);
+
+        // Serialize encryption metadata
+        let enc_metadata = serde_json::json!({
+            "version": 2,
+            "algorithm": "AES-256-GCM",
+            "nonce": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce.as_bytes()),
+            "wrapped_key": serde_json::to_value(&wrapped_dek).unwrap(),
+            "metadata_privacy": true,
+            "obfuscation_mode": "flat",
+            "private_metadata": encrypted_meta.to_json().map_err(ClientError::Encryption)?,
+        });
+
+        // Upload the file (server sees only QmX7a8f3...)
+        let metadata = ObjectMetadata::new()
+            .with_content_type("application/octet-stream")
+            .with_metadata("x-fula-encrypted", "true")
+            .with_metadata("x-fula-encryption", &enc_metadata.to_string());
+
+        let result = self.inner.put_object_with_metadata(
+            bucket,
+            &storage_key,
+            Bytes::from(ciphertext),
+            Some(metadata),
+        ).await?;
+
+        // Save updated forest
+        self.save_forest(bucket, &forest).await?;
+
+        Ok(result)
+    }
+
+    /// Get an object using FlatNamespace mode
+    /// 
+    /// Uses the forest index to resolve original path → storage key.
+    pub async fn get_object_flat(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Bytes> {
+        // Load forest to get the storage key
+        let forest = self.load_forest(bucket).await?;
+        
+        let storage_key = forest.get_storage_key(key)
+            .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?;
+
+        self.get_object_decrypted_by_storage_key(bucket, storage_key).await
+    }
+
+    /// List directory from forest index (FlatNamespace mode)
+    /// 
+    /// This is much faster than HEAD requests because the forest already
+    /// contains all metadata.
+    async fn list_directory_from_forest(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<DirectoryListing> {
+        let forest = self.load_forest(bucket).await?;
+        
+        let prefix_str = prefix.unwrap_or("/");
+        let files = forest.list_recursive(prefix_str);
+        
+        let mut directories: HashMap<String, Vec<FileMetadata>> = HashMap::new();
+        
+        for entry in files {
+            let dir = if let Some(last_slash) = entry.path.rfind('/') {
+                entry.path[..last_slash].to_string()
+            } else {
+                "/".to_string()
+            };
+            
+            let metadata = FileMetadata {
+                storage_key: entry.storage_key.clone(),
+                original_key: entry.path.clone(),
+                original_size: entry.size,
+                content_type: entry.content_type.clone(),
+                created_at: Some(entry.created_at),
+                modified_at: Some(entry.modified_at),
+                user_metadata: entry.user_metadata.clone(),
+                is_encrypted: true,
+            };
+            
+            directories.entry(dir).or_default().push(metadata);
+        }
+        
+        Ok(DirectoryListing {
+            bucket: bucket.to_string(),
+            prefix: prefix.map(|s| s.to_string()),
+            directories,
+        })
+    }
+
+    /// List all files from forest (FlatNamespace mode)
+    /// 
+    /// No network requests needed - uses cached/loaded forest index.
+    pub async fn list_files_from_forest(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<FileMetadata>> {
+        let forest = self.load_forest(bucket).await?;
+        
+        let files: Vec<FileMetadata> = forest.list_all_files()
+            .map(|entry| FileMetadata {
+                storage_key: entry.storage_key.clone(),
+                original_key: entry.path.clone(),
+                original_size: entry.size,
+                content_type: entry.content_type.clone(),
+                created_at: Some(entry.created_at),
+                modified_at: Some(entry.modified_at),
+                user_metadata: entry.user_metadata.clone(),
+                is_encrypted: true,
+            })
+            .collect();
+        
+        Ok(files)
+    }
+
+    /// Delete a file in FlatNamespace mode
+    /// 
+    /// Removes from storage and updates forest index.
+    pub async fn delete_object_flat(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<()> {
+        let mut forest = self.load_forest(bucket).await?;
+        
+        // Get storage key before removing from forest
+        let storage_key = forest.get_storage_key(key)
+            .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?
+            .to_string();
+
+        // Remove from storage
+        self.inner.delete_object(bucket, &storage_key).await?;
+
+        // Remove from forest
+        forest.remove_file(key);
+
+        // Save updated forest
+        self.save_forest(bucket, &forest).await?;
+
+        Ok(())
+    }
+
+    /// Get the private forest for sharing (extract subtree)
+    /// 
+    /// This allows sharing a portion of your file tree with someone else.
+    pub async fn get_forest_subtree(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<PrivateForest> {
+        let forest = self.load_forest(bucket).await?;
+        Ok(forest.extract_subtree(prefix))
     }
 }
 

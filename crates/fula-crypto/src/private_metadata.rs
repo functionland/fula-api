@@ -166,18 +166,31 @@ impl EncryptedPrivateMetadata {
 }
 
 /// Options for key obfuscation
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyObfuscation {
     /// Hash the key with a secret prefix (deterministic - same key = same hash)
     /// Allows server-side deduplication but reveals if same file uploaded twice
+    /// Server sees: `e/a7c3f9b2e8d14a6f` (reveals "e/" prefix)
     DeterministicHash,
     /// Random UUID for each upload (non-deterministic)
     /// Maximum privacy but no dedup
+    /// Server sees: `e/random-uuid-here`
     RandomUuid,
     /// Preserve path structure but hash filenames
     /// e.g., "/photos/vacation/" + hash(filename)
     /// Allows folder-like organization while hiding filenames
+    /// Server sees: `/photos/vacation/e_a7c3f9b2`
     PreserveStructure,
+    /// Flat namespace - complete structure hiding (RECOMMENDED)
+    /// 
+    /// Inspired by WNFS and Peergos:
+    /// - All keys look like random CID-style hashes
+    /// - No prefixes or structure hints
+    /// - File tree stored in encrypted index (PrivateForest)
+    /// - Server cannot determine folder structure, parent/child relationships
+    /// 
+    /// Server sees: `QmX7a8f3e2d1c9b4a5e6f7d8c9a0b1e2f3a4b5c6d7e8f9`
+    FlatNamespace,
 }
 
 /// Generate an obfuscated storage key
@@ -216,6 +229,11 @@ pub fn obfuscate_key(original_key: &str, dek: &DekKey, mode: KeyObfuscation) -> 
                 let hash = hasher.finalize();
                 format!("e_{}", hex::encode(&hash.as_bytes()[..12]))
             }
+        }
+        KeyObfuscation::FlatNamespace => {
+            // Completely flat - no prefixes, looks like a CID
+            // Uses PrivateForest module for key generation
+            crate::private_forest::generate_flat_key(original_key, dek, &[])
         }
     }
 }
@@ -263,6 +281,7 @@ impl PublicMetadata {
             KeyObfuscation::DeterministicHash => "hash",
             KeyObfuscation::RandomUuid => "uuid",
             KeyObfuscation::PreserveStructure => "structure",
+            KeyObfuscation::FlatNamespace => "flat",
         };
 
         Ok(Self {

@@ -246,8 +246,9 @@ manager.add_recipient("bob", bob_public_key);</code></pre>
                     <h3>Obfuscation Modes</h3>
                     <ul>
                         <li><strong>DeterministicHash</strong> - Same path → same key (default)</li>
-                        <li><strong>RandomUuid</strong> - Maximum privacy, random keys</li>
+                        <li><strong>RandomUuid</strong> - Random key per upload</li>
                         <li><strong>PreserveStructure</strong> - Keep folders, hash filenames</li>
+                        <li><strong>FlatNamespace</strong> - Complete structure hiding (RECOMMENDED)</li>
                     </ul>
                 </div>
                 <div class="example">
@@ -296,6 +297,35 @@ let data = client.get_object_decrypted(bucket, "/finances/tax_2024.pdf").await?;
 // │ Type:   application/pdf                        │
 // │ Data:   [decrypted PDF document]               │
 // └─────────────────────────────────────────────────┘</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">FlatNamespace Mode (RECOMMENDED)</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-rust">use fula_client::{EncryptedClient, EncryptionConfig, Config};
+
+// FlatNamespace provides COMPLETE structure hiding
+// Inspired by WNFS and Peergos
+let encryption = EncryptionConfig::new_flat_namespace();
+
+let config = Config::new("http://localhost:9000").with_token("token");
+let client = EncryptedClient::new(config, encryption)?;
+
+// Upload - server sees: "QmX7a8f3e2d1c9b4a5e6f7d8c9a0b1e2f3"
+// NO prefix, NO structure hints!
+client.put_object_flat(bucket, "/photos/vacation/beach.jpg", data, None).await?;
+
+// Server CANNOT determine:
+// • Which objects are files vs folders
+// • Parent/child relationships
+// • How many files in each "folder"
+// • Any directory structure
+
+// List files from encrypted PrivateForest index
+let files = client.list_files_from_forest(bucket).await?;
+for file in files {
+    println!("{} - {}", file.original_key, file.size_human());
+}</code></pre>
                 </div>
             </div>
         </section>

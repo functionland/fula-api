@@ -239,6 +239,9 @@ cargo run --example metadata_privacy
 # Metadata fetch only
 cargo run --example file_manager_demo
 
+# FlatNamespace (maximum privacy - complete structure hiding)
+cargo run --example flat_namespace_demo
+
 
 ```
 

@@ -1142,6 +1142,23 @@
     margin-top: 0.5rem;
 }
 
+.mode-card.recommended {
+    border-left: 3px solid #3fb950;
+    background: linear-gradient(135deg, var(--bg-primary), rgba(63, 185, 80, 0.1));
+}
+
+.mode-card.recommended h4 {
+    color: #3fb950;
+}
+
+.mode-card.recommended small {
+    display: block;
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
 /* Footer */
 footer {
     text-align: center;

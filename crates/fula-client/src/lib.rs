@@ -53,3 +53,4 @@ pub use types::*;
 
 // Re-export useful crypto types for encryption configuration
 pub use fula_crypto::private_metadata::KeyObfuscation;
+pub use fula_crypto::private_forest::{PrivateForest, ForestFileEntry, ForestDirectoryEntry};

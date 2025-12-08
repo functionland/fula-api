@@ -1124,6 +1124,12 @@ while !fs.is_rotation_complete() {
                 <div class="privacy-modes">
                     <h3>Key Obfuscation Modes</h3>
                     <div class="modes-grid">
+                        <div class="mode-card recommended">
+                            <h4>🌟 FlatNamespace (RECOMMENDED)</h4>
+                            <p>Complete structure hiding. Server sees only random CID-like hashes. Inspired by WNFS and Peergos.</p>
+                            <code>/photos/beach.jpg → QmX7a8f3e2d1c9b4a5</code>
+                            <small>No prefixes, no structure hints. Directory tree stored in encrypted PrivateForest index.</small>
+                        </div>
                         <div class="mode-card">
                             <h4>DeterministicHash (Default)</h4>
                             <p>Same file path → Same storage key. Allows retrieval without local index.</p>
@@ -1147,21 +1153,31 @@ while !fs.is_rotation_complete() {
                     <div class="code-snippet">
                         <pre>use fula_client::{EncryptedClient, EncryptionConfig, KeyObfuscation};
 
-// Default: metadata privacy enabled with deterministic hashing
+// RECOMMENDED: FlatNamespace for complete structure hiding
+let config = EncryptionConfig::new_flat_namespace();
+let client = EncryptedClient::new(config, encryption)?;
+
+// Upload - server sees: QmX7a8f3e2d1c9b4a5e6f7d8...
+client.put_object_flat(bucket, "/secret/file.txt", data, None).await?;
+
+// List files from encrypted PrivateForest index
+let files = client.list_files_from_forest(bucket).await?;
+
+// Server sees NOTHING about your folder structure!
+
+// ─────────────────────────────────────────────────────────
+// Alternative modes:
+// ─────────────────────────────────────────────────────────
+
+// Default: deterministic hashing (reveals 'e/' prefix)
 let config = EncryptionConfig::new();
 
-// Or customize the obfuscation mode
+// Customize obfuscation mode
 let config = EncryptionConfig::new()
     .with_obfuscation_mode(KeyObfuscation::PreserveStructure);
 
-// Disable metadata privacy if not needed
+// Disable metadata privacy (not recommended)
 let config = EncryptionConfig::new_without_privacy();
-
-// Upload with privacy - server sees obfuscated key
-client.put_object_encrypted(bucket, "/secret/file.txt", data).await?;
-
-// Retrieve using original path - client computes storage key
-let data = client.get_object_decrypted(bucket, "/secret/file.txt").await?;
 
 // Get full metadata including original filename
 let info = client.get_object_with_private_metadata(bucket, storage_key).await?;
