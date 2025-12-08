@@ -20,6 +20,12 @@ info:
     - Real-time collaboration with CRDTs
     - Versioning and immutable history
     
+    **Client-Side Encryption (FlatNamespace Mode)**:
+    - Complete structure hiding - server sees only random CID-like hashes
+    - Inspired by WNFS (WebNative File System) and Peergos
+    - File tree stored in encrypted PrivateForest index
+    - Server cannot determine folder structure or parent/child relationships
+    
   contact:
     name: API Support
     url: https://github.com/functionland/dsn-gateway
@@ -332,6 +338,36 @@ paths:
           schema:
             type: string
             format: base64
+        - name: x-fula-encrypted
+          in: header
+          description: |
+            Indicates the object is client-side encrypted.
+            Value: "true"
+          schema:
+            type: string
+            enum: ["true"]
+        - name: x-fula-encryption
+          in: header
+          description: |
+            JSON metadata for client-side encryption containing:
+            - version: Encryption format version (currently 2)
+            - algorithm: "AES-256-GCM"
+            - nonce: Base64-encoded nonce
+            - wrapped_key: HPKE-wrapped DEK
+            - metadata_privacy: true if filename/metadata encrypted
+            - obfuscation_mode: "flat" (FlatNamespace), "hash", "uuid", or "structure"
+            - private_metadata: Encrypted original filename, size, content-type
+          schema:
+            type: string
+            format: json
+        - name: x-fula-forest
+          in: header
+          description: |
+            Indicates this object is a PrivateForest index (encrypted directory tree).
+            Used in FlatNamespace mode to store path-to-storage-key mappings.
+          schema:
+            type: string
+            enum: ["true"]
         - name: x-amz-storage-class
           in: header
           description: Storage class for the object
@@ -465,6 +501,14 @@ paths:
               schema:
                 type: string
             x-amz-version-id:
+              schema:
+                type: string
+            x-fula-encrypted:
+              description: "true" if object is client-side encrypted
+              schema:
+                type: string
+            x-fula-encryption:
+              description: JSON encryption metadata (algorithm, nonce, wrapped_key, private_metadata)
               schema:
                 type: string
           content:
@@ -1017,4 +1061,378 @@ paths:
           schema:
             type: string
           example: "/source-bucket/original.txt"
-        - name: x-amz-metadata-
+        - name: x-amz-metadata-directive
+          in: header
+          description: Whether to copy metadata from source or replace
+          schema:
+            type: string
+            enum: [COPY, REPLACE]
+            default: COPY
+      responses:
+        '200':
+          description: Object copied successfully
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/CopyObjectResult'
+              example: |
+                <?xml version="1.0" encoding="UTF-8"?>
+                <CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <LastModified>2025-12-07T12:00:00.000Z</LastModified>
+                  <ETag>"b2419b1e3fd45d596ee22bdf62aaaa2f"</ETag>
+                </CopyObjectResult>
+        '404':
+          $ref: '#/components/responses/NoSuchKey'
+
+# ============================================================================
+# COMPONENTS
+# ============================================================================
+
+components:
+  parameters:
+    BucketName:
+      name: bucket
+      in: path
+      required: true
+      description: Name of the S3 bucket
+      schema:
+        type: string
+        pattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+      example: "my-bucket"
+    
+    ObjectKey:
+      name: key+
+      in: path
+      required: true
+      description: Object key (path within bucket)
+      schema:
+        type: string
+      example: "photos/vacation/beach.jpg"
+
+  securitySchemes:
+    oauth2:
+      type: oauth2
+      flows:
+        authorizationCode:
+          authorizationUrl: https://auth.fx.land/authorize
+          tokenUrl: https://auth.fx.land/token
+          scopes:
+            storage:read: Read access to storage
+            storage:write: Write access to storage
+    
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT token from OAuth2 flow
+
+  responses:
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/xml:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: |
+            <?xml version="1.0" encoding="UTF-8"?>
+            <Error>
+              <Code>AccessDenied</Code>
+              <Message>Access Denied</Message>
+            </Error>
+    
+    AccessDenied:
+      description: Access denied to resource
+      content:
+        application/xml:
+          schema:
+            $ref: '#/components/schemas/Error'
+    
+    NoSuchBucket:
+      description: Bucket does not exist
+      content:
+        application/xml:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: |
+            <?xml version="1.0" encoding="UTF-8"?>
+            <Error>
+              <Code>NoSuchBucket</Code>
+              <Message>The specified bucket does not exist</Message>
+              <BucketName>non-existent-bucket</BucketName>
+            </Error>
+    
+    NoSuchKey:
+      description: Object does not exist
+      content:
+        application/xml:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: |
+            <?xml version="1.0" encoding="UTF-8"?>
+            <Error>
+              <Code>NoSuchKey</Code>
+              <Message>The specified key does not exist</Message>
+              <Key>non-existent-key</Key>
+            </Error>
+    
+    BucketAlreadyExists:
+      description: Bucket already exists
+      content:
+        application/xml:
+          schema:
+            $ref: '#/components/schemas/Error'
+    
+    InternalError:
+      description: Internal server error
+      content:
+        application/xml:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      xml:
+        name: Error
+      properties:
+        Code:
+          type: string
+          description: S3 error code
+        Message:
+          type: string
+          description: Human-readable error message
+        Resource:
+          type: string
+        RequestId:
+          type: string
+
+    ListAllMyBucketsResult:
+      type: object
+      xml:
+        name: ListAllMyBucketsResult
+        namespace: http://s3.amazonaws.com/doc/2006-03-01/
+      properties:
+        Owner:
+          $ref: '#/components/schemas/Owner'
+        Buckets:
+          type: array
+          items:
+            $ref: '#/components/schemas/Bucket'
+
+    Owner:
+      type: object
+      properties:
+        ID:
+          type: string
+        DisplayName:
+          type: string
+
+    Bucket:
+      type: object
+      properties:
+        Name:
+          type: string
+        CreationDate:
+          type: string
+          format: date-time
+
+    ListBucketResult:
+      type: object
+      xml:
+        name: ListBucketResult
+        namespace: http://s3.amazonaws.com/doc/2006-03-01/
+      properties:
+        Name:
+          type: string
+        Prefix:
+          type: string
+        KeyCount:
+          type: integer
+        MaxKeys:
+          type: integer
+        IsTruncated:
+          type: boolean
+        ContinuationToken:
+          type: string
+        NextContinuationToken:
+          type: string
+        Contents:
+          type: array
+          items:
+            $ref: '#/components/schemas/Object'
+        CommonPrefixes:
+          type: array
+          items:
+            type: object
+            properties:
+              Prefix:
+                type: string
+
+    Object:
+      type: object
+      properties:
+        Key:
+          type: string
+        LastModified:
+          type: string
+          format: date-time
+        ETag:
+          type: string
+        Size:
+          type: integer
+          format: int64
+        StorageClass:
+          type: string
+        Owner:
+          $ref: '#/components/schemas/Owner'
+
+    DeleteResult:
+      type: object
+      xml:
+        name: DeleteResult
+      properties:
+        Deleted:
+          type: array
+          items:
+            type: object
+            properties:
+              Key:
+                type: string
+              VersionId:
+                type: string
+        Error:
+          type: array
+          items:
+            type: object
+            properties:
+              Key:
+                type: string
+              Code:
+                type: string
+              Message:
+                type: string
+
+    InitiateMultipartUploadResult:
+      type: object
+      xml:
+        name: InitiateMultipartUploadResult
+      properties:
+        Bucket:
+          type: string
+        Key:
+          type: string
+        UploadId:
+          type: string
+
+    CompleteMultipartUploadResult:
+      type: object
+      xml:
+        name: CompleteMultipartUploadResult
+      properties:
+        Location:
+          type: string
+        Bucket:
+          type: string
+        Key:
+          type: string
+        ETag:
+          type: string
+
+    ListMultipartUploadsResult:
+      type: object
+      xml:
+        name: ListMultipartUploadsResult
+      properties:
+        Bucket:
+          type: string
+        KeyMarker:
+          type: string
+        UploadIdMarker:
+          type: string
+        NextKeyMarker:
+          type: string
+        NextUploadIdMarker:
+          type: string
+        MaxUploads:
+          type: integer
+        IsTruncated:
+          type: boolean
+        Upload:
+          type: array
+          items:
+            type: object
+            properties:
+              Key:
+                type: string
+              UploadId:
+                type: string
+              Initiator:
+                $ref: '#/components/schemas/Owner'
+              Owner:
+                $ref: '#/components/schemas/Owner'
+              StorageClass:
+                type: string
+              Initiated:
+                type: string
+                format: date-time
+
+    ListPartsResult:
+      type: object
+      xml:
+        name: ListPartsResult
+      properties:
+        Bucket:
+          type: string
+        Key:
+          type: string
+        UploadId:
+          type: string
+        PartNumberMarker:
+          type: integer
+        NextPartNumberMarker:
+          type: integer
+        MaxParts:
+          type: integer
+        IsTruncated:
+          type: boolean
+        Part:
+          type: array
+          items:
+            type: object
+            properties:
+              PartNumber:
+                type: integer
+              LastModified:
+                type: string
+                format: date-time
+              ETag:
+                type: string
+              Size:
+                type: integer
+                format: int64
+
+    Tagging:
+      type: object
+      xml:
+        name: Tagging
+      properties:
+        TagSet:
+          type: array
+          items:
+            type: object
+            properties:
+              Key:
+                type: string
+              Value:
+                type: string
+
+    CopyObjectResult:
+      type: object
+      xml:
+        name: CopyObjectResult
+      properties:
+        LastModified:
+          type: string
+          format: date-time
+        ETag:
+          type: string
