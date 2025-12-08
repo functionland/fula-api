@@ -245,10 +245,10 @@ manager.add_recipient("bob", bob_public_key);</code></pre>
                     
                     <h3>Obfuscation Modes</h3>
                     <ul>
-                        <li><strong>DeterministicHash</strong> - Same path → same key (default)</li>
+                        <li><strong>FlatNamespace (Default)</strong> - Complete structure hiding, maximum privacy</li>
+                        <li><strong>DeterministicHash</strong> - Same path → same key</li>
                         <li><strong>RandomUuid</strong> - Random key per upload</li>
                         <li><strong>PreserveStructure</strong> - Keep folders, hash filenames</li>
-                        <li><strong>FlatNamespace</strong> - Complete structure hiding (RECOMMENDED)</li>
                     </ul>
                 </div>
                 <div class="example">
@@ -258,7 +258,7 @@ manager.add_recipient("bob", bob_public_key);</code></pre>
                     </div>
                     <pre><code class="language-rust">use fula_client::{EncryptedClient, EncryptionConfig, KeyObfuscation, Config};
 
-// Metadata privacy is ENABLED by default
+// FlatNamespace (maximum privacy) is ENABLED by default
 let encryption = EncryptionConfig::new();
 
 // Or customize the obfuscation mode

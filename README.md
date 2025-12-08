@@ -136,17 +136,19 @@ async fn main() -> anyhow::Result<()> {
 ```rust
 use fula_client::{Config, EncryptedClient, EncryptionConfig};
 
+// FlatNamespace mode is default - complete structure hiding!
+// Server sees only random CID-like hashes (QmX7a8f3e2d1...)
 let encryption = EncryptionConfig::new();
 let client = EncryptedClient::new(
     Config::new("http://localhost:9000"),
     encryption,
 )?;
 
-// Data is encrypted before upload
-client.put_object_encrypted("bucket", "secret.txt", b"sensitive data").await?;
+// Data encrypted with FlatNamespace - server cannot see folder structure
+client.put_object_flat("bucket", "/photos/vacation/beach.jpg", data, None).await?;
 
-// Data is decrypted after download
-let data = client.get_object_decrypted("bucket", "secret.txt").await?;
+// List files from encrypted PrivateForest index
+let files = client.list_files_from_forest("bucket").await?;
 ```
 
 ### Large File Uploads
@@ -255,7 +257,8 @@ cargo run --example flat_namespace_demo
 
 ### Key Management
 
-- Generate keys locally using `EncryptionConfig::new()`
+- Generate keys locally using `EncryptionConfig::new()` (uses FlatNamespace by default)
+- Complete structure hiding - server cannot see folder/file relationships
 - Export/backup secret keys securely
 - Lost keys = lost data (no recovery possible)
 

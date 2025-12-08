@@ -29,12 +29,18 @@ pub struct EncryptionConfig {
 }
 
 impl EncryptionConfig {
-    /// Create with a new random key (metadata privacy enabled by default)
+    /// Create a new encryption config with random keys
+    /// Metadata privacy is ENABLED by default with FlatNamespace mode (RECOMMENDED)
+    /// 
+    /// FlatNamespace provides complete structure hiding:
+    /// - Storage keys look like random CID-style hashes
+    /// - No prefixes or structure hints visible to server
+    /// - Server cannot determine folder structure or parent/child relationships
     pub fn new() -> Self {
         Self {
             key_manager: Arc::new(KeyManager::new()),
             metadata_privacy: true,
-            obfuscation_mode: KeyObfuscation::DeterministicHash,
+            obfuscation_mode: KeyObfuscation::FlatNamespace,
         }
     }
 
@@ -64,12 +70,12 @@ impl EncryptionConfig {
         }
     }
 
-    /// Create from an existing secret key
+    /// Create from an existing secret key (uses FlatNamespace by default)
     pub fn from_secret_key(secret: fula_crypto::keys::SecretKey) -> Self {
         Self {
             key_manager: Arc::new(KeyManager::from_secret_key(secret)),
             metadata_privacy: true,
-            obfuscation_mode: KeyObfuscation::DeterministicHash,
+            obfuscation_mode: KeyObfuscation::FlatNamespace,
         }
     }
 
