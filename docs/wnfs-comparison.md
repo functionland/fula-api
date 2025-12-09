@@ -143,9 +143,13 @@ All observations and examples below are based on *current code* in these repos, 
 - Strong, modern crypto primitives (AES‑GCM, ChaCha20‑Poly1305, HPKE over X25519, BLAKE3).
 - Object‑centric design well suited for gateways and IPFS pinning.
 - PrivateForest + FlatNamespace already closely mirrors WNFS‑style structure hiding.
-- **Sharing is fully integrated** into `EncryptedClient` with path‑scoped, permission‑checked, expiry‑validated access via `ShareToken`.
+- **Sharing is fully integrated** into `EncryptedClient` with path‑scoped, permission‑checked, expiry‑validated access via `ShareToken` and HPKE.
+- **Snapshot vs temporal share semantics** are implemented via `ShareMode` + `SnapshotBinding`, allowing shares bound to either evolving paths or fixed content.
+- **Subtree keys** (Cryptree‑inspired) allow localized sharing and revocation for directory subtrees via `SubtreeKeyManager` and `SubtreeShareToken`.
+- **Secret links** embed share credentials in URL fragments (`SecretLink`/`SecretLinkBuilder`), ensuring gateways never see key material.
+- **Async/offline sharing** is implemented via `ShareEnvelope`/`ShareInbox`, enabling store‑and‑forward inbox workflows inspired by WNFS shared‑private‑data.
 - **Key rotation is fully integrated** with `kek_version` in object metadata and `rotate_bucket()` for bulk re‑wrapping.
-- **Streaming encryption for large files is now integrated** via chunked uploads, partial reads, and Bao‑verified streaming, while preserving S3/IPFS compatibility.
+- **Streaming encryption for large files is integrated** via chunked uploads, partial reads, and Bao‑verified streaming, while preserving S3/IPFS compatibility.
 
 ---
 
@@ -311,11 +315,12 @@ Scores are **1–10**, where 10 is best given typical modern requirements. Score
 | **Per‑object / per‑node keys** | Per‑object random DEKs, plus BLAKE3 path‑derived DEKs for obfuscation and forest index encryption. Simpler than WNFS ratchets, but adequate for object storage. | **8** | Per‑node **ratchet** → `TemporalKey` → `SnapshotKey`. Every node has its own ratchet state across revisions, giving strong forward secrecy per object and revision. | **9–10** | Two random symmetric keys per file or directory and a Cryptree key hierarchy give each subtree its own key material. Holders of a parent capability can decrypt all descendants; compromise is generally localized to that subtree rather than the entire account. | **9** |
 | **Metadata privacy (names, sizes, timestamps)** | `PrivateMetadata` is encrypted with DEK; storage keys are obfuscated (`DeterministicHash`, `RandomUuid`, `PreserveStructure`, or `FlatNamespace` via PrivateForest). Default config provides **complete structure hiding** (FlatNamespace) with encrypted forest index; plaintext sizes & metadata never exposed when privacy is enabled. | **9** | Names are cryptographic `Name`s accumulated and hashed; headers contain inumber and ratchet, encrypted with AES‑KWP. Forest is HAMT keyed by accumulators; server *never* sees plaintext paths or structure. Metadata is strongly hidden; the design is very mature. | **9–10** | Peergos encrypts or obfuscates file properties including names, modification times, MIME types, thumbnails, and directory structure; chunks are stored under random labels so servers cannot deduce file sizes or distinguish files from directories. | **9–10** |
 | **Structure hiding / directory privacy** | In FlatNamespace mode, server sees only CID‑like keys for files and forest index; all path structure is encoded in **encrypted `PrivateForest`**. Non‑flat modes can intentionally trade privacy for compatibility (e.g. `PreserveStructure`). | **9** (FlatNamespace) | HAMT forest + name accumulator from the start: all private trees are effectively structure‑hidden; directory structure only exists in encrypted blocks and accumulator state. Very strong by design. | **9–10** | A Merkle‑CHAMP of encrypted chunks under random labels gives strong structure hiding: directories and files both look like small encrypted nodes without cross‑links visible to the server; social graph information is also hidden from storage. | **9–10** |
-| **Sharing capability – primitives** | HPKE wrapping of DEKs; `ShareToken` and `FolderShareManager` provide path‑scoped shares with expiry and permissions. **Fully integrated** into `EncryptedClient` via `get_object_with_share()`, `accept_share()`, and `get_object_with_token()`. | **9** | `AccessKey` + RSA‑based `ExchangeKey` + `share.rs` implement asynchronous, store‑and‑forward sharing: sharer writes encrypted access keys to their private forest; recipient scans for them and decrypts. This is **fully wired** into the filesystem model. | **9** | Cryptree capabilities and the social/friend layer provide sharing: once B follows A, A can grant capabilities to files/folders; secret links encode key material after `#` so servers never see decryption keys. Sharing is strongly integrated into the filesystem and social model. | **9** |
-| **Sharing – granularity & expressiveness** | Folder‑level sharing via `FolderShareManager` (path prefix + permissions) and per‑file shares. `EncryptedClient` enforces expiry, path scope, and permissions (`can_read`, `can_write`, `can_delete`) at gateway level. Asynchronous/offline sharing semantics could be borrowed from WNFS for enhanced workflows. | **9** | Can share arbitrary private subtrees by exporting `AccessKey`s / `PrivateRef`s; ratchets allow carefully scoped read rights (snapshot vs temporal). Exchange keys are organized per device in public dirs. Better‑specified semantics for multi‑device, offline sharing. | **9–10** | Cryptree allows granting capabilities to arbitrary subtrees (directories or files), with the ability to issue public, secret, or friend-based shares. Very expressive, though revocation still requires re‑keying affected subtrees. | **9** |
+| **Sharing capability – primitives** | HPKE wrapping of DEKs; `ShareToken` and `FolderShareManager` provide path‑scoped shares with expiry and permissions. **Fully integrated** into `EncryptedClient` via `get_object_with_share()`, `accept_share()`, and `get_object_with_token()`. Async/offline **inbox sharing** is implemented via `ShareEnvelope`/`ShareInbox`. | **9–10** | `AccessKey` + RSA‑based `ExchangeKey` + `share.rs` implement asynchronous, store‑and‑forward sharing: sharer writes encrypted access keys to their private forest; recipient scans for them and decrypts. This is **fully wired** into the filesystem model. | **9** | Cryptree capabilities and the social/friend layer provide sharing: once B follows A, A can grant capabilities to files/folders; secret links encode key material after `#` so servers never see decryption keys. Sharing is strongly integrated into the filesystem and social model. | **9** |
+| **Sharing – granularity & expressiveness** | Folder‑level sharing via `FolderShareManager` (path prefix + permissions) and per‑file shares; subtree‑level sharing via `SubtreeShareToken`; async/offline flows via inbox; `ShareMode` supports snapshot vs temporal semantics. `EncryptedClient` enforces expiry, path scope, and permissions (`can_read`, `can_write`, `can_delete`). | **9–10** | Can share arbitrary private subtrees by exporting `AccessKey`s / `PrivateRef`s; ratchets allow carefully scoped read rights (snapshot vs temporal). Exchange keys are organized per device in public dirs. Better‑specified semantics for multi‑device, offline sharing. | **9–10** | Cryptree allows granting capabilities to arbitrary subtrees (directories or files), with the ability to issue public, secret, or friend-based shares. Very expressive, though revocation still requires re‑keying affected subtrees. | **9** |
+| **Security & privacy in multi‑user sharing** | Multi‑recipient HPKE wrapping and `ShareToken`s with path scopes and permissions; subtree‑level capabilities via `SubtreeShareToken`; async inbox entries are HPKE‑encrypted; secret links keep tokens in URL fragments so gateways never see key material. | **9–10** | Multi‑user sharing protocol is **explicitly specified** (shared‑private‑data extension): sharer and recipient roles, exchange directories, share counters, and how `AccessKey`s are created and consumed. Semantics and limitations are clearly laid out in code and spec. | **9** | Peergos protects both shared content and the social graph: follow requests are blinded, capabilities are end-to-end encrypted, and secret links keep keys in URL fragments. Multi-user sharing is strong, though—like WNFS and Fula—true revocation requires re‑keying. | **9** |
 | **Key rotation – mechanism** | `KeyRotationManager` + `FileSystemRotation` support KEK rotation and DEK re‑wrapping without re‑encrypting content. **Fully integrated**: object metadata includes `kek_version`, and `EncryptedClient` provides `rewrap_object_dek()` and `rotate_bucket()` for live rotation. | **9** | Ratchet progression inherently provides forward secrecy and "rotation" at node‑revision granularity; there is no central KEK to rotate, but you can rotate private roots and re‑derive structures. Rotation is per‑node/per‑revision, not via a single KEK, which is good for compromise isolation but heavier to orchestrate for "all data" rotations. | **8–9** | Cryptree supports subtree re‑keying by walking and rewriting keys, giving localized recovery from compromise. There is no single KEK layer, so global rotation is heavier operationally, but compromise impact is generally limited to affected subtrees. | **8** |
 | **Security & privacy against storage provider** | With FlatNamespace + PrivateForest, provider sees: random‑looking keys, ciphertext sizes, and encrypted index objects flagged only by metadata. AAD usage in HPKE and optional AAD in AEADs defend against context‑swap attacks. Very strong metadata privacy; main leakage is access pattern and ciphertext length. | **9** | WNFS was designed specifically against a very strong storage adversary: accumulators, ratchets, per‑revision labels, HAMT, etc. The provider sees only HAMT nodes and CIDs; neither structure nor evolution of revisions is easy to infer beyond coarse access patterns and object sizes. | **9–10** | Peergos assumes untrusted servers and blockstores: all data and metadata are encrypted client-side; file properties, directory structure, and even much of the social graph are hidden or blinded. Storage nodes see random labels and ciphertext, learning only coarse access patterns and total storage. | **9–10** |
-| **Security & privacy in multi‑user sharing** | Multi‑recipient HPKE wrapping and `ShareToken`s with path scopes and permissions. `EncryptedClient` now enforces these via `get_object_with_share()`. Asynchronous sharing protocol (store‑and‑forward) not yet implemented; could borrow from WNFS. | **9** | Multi‑user sharing protocol is **explicitly specified** (shared‑private‑data extension): sharer and recipient roles, exchange directories, share counters, and how `AccessKey`s are created and consumed. Semantics and limitations are clearly laid out in code and spec. | **9** | Peergos protects both shared content and the social graph: follow requests are blinded, capabilities are end-to-end encrypted, and secret links keep keys in URL fragments. Multi-user sharing is strong, though—like WNFS and Fula—true revocation requires re‑keying. | **9** |
+| **Security & privacy in multi‑user sharing** | Multi‑recipient HPKE wrapping and `ShareToken`s with path scopes and permissions; subtree‑level capabilities via `SubtreeShareToken`; async inbox entries are HPKE‑encrypted; secret links keep tokens in URL fragments so gateways never see key material. | **9–10** | Multi‑user sharing protocol is **explicitly specified** (shared‑private‑data extension): sharer and recipient roles, exchange directories, share counters, and how `AccessKey`s are created and consumed. Semantics and limitations are clearly laid out in code and spec. | **9** | Peergos protects both shared content and the social graph: follow requests are blinded, capabilities are end-to-end encrypted, and secret links keep keys in URL fragments. Multi-user sharing is strong, though—like WNFS and Fula—true revocation requires re‑keying. | **9** |
 | **Performance – large files** | Chunked/streaming encryption via `put_object_chunked`, `get_object_chunked`, and `get_object_range`. Large files are split into AES‑GCM‑encrypted chunks with a small index object, supporting partial reads and Bao‑verified streaming with O(chunk_size) memory and S3/IPFS‑compatible layout. | **9** | WNFS stores file content as blocks in the blockstore and encrypts them with `SnapshotKey`. Block‑level encryption + blockstore streaming scales well to large files, though it adds overhead in many small encrypted blocks. The design is more naturally suited to very big files. | **8–9** | Peergos encrypts files in independent ~5 MiB chunks; this yields good streaming performance on a user’s own server with relatively few chunks per file, but coarser granularity than Fula/WNFS for very fine-grained partial reads. IPFS traffic is moderate because data is typically served from the home server’s IPFS node. | **8–9** |
 | **Performance – deep / wide trees** | FlatNamespace + `PrivateForest` now support `ForestFormat::HamtV2` with a HAMT‑backed file index and automatic migration past a file‑count threshold. Tree operations (lookup/insert/remove) scale roughly O(log N), but the forest is still stored as a single encrypted index object per bucket, so very large forests still require fetching that object. | **8** | `HamtForest` is explicitly designed for large forests: HAMT structure, accumulator caching, and streaming store operations. Tree operations scale roughly `O(log N)` in number of nodes, and the forest can be diffed and merged efficiently. | **9** | The Merkle‑CHAMP underlying Peergos is also HAMT-like and scales well to large trees and multi-tenant spaces; directory operations touch only the nodes along the path but can involve multiple storage lookups. This is well-suited to a model where each user has a nearby Peergos+IPFS server. | **9** |
 | **Implementation complexity** | Fewer moving parts: single `PrivateForest` structure, straightforward KEK/DEK separation, HPKE, and AES‑GCM. Easier to reason about and integrate into an IPFS gateway. | **8** | Significantly more complex: accumulators, ratchets, HAMT, multivalue heads, async sharing, etc. Very powerful but harder to integrate correctly without following the spec very closely. | **7** | Also complex: Cryptree, Merkle‑CHAMP storage, multi-keypair model (login, identity, social), a PKI log, social graph and messaging, sync, FUSE/WebDAV, etc. Peergos is a full application platform, not just a crypto library. | **7** |
@@ -323,12 +328,12 @@ Scores are **1–10**, where 10 is best given typical modern requirements. Score
 
 **Very rough overall scores (for the current codebases):**
 
-- **Fula encryption subsystem:** **9.0 / 10**
+- **Fula encryption subsystem:** **~9.1 / 10**
   - Strong primitives and a design tailored to an IPFS/S3‑like gateway.
   - Metadata privacy and structure hiding excellent in FlatNamespace mode.
-  - Sharing is now **fully integrated** with permission‑checked, expiry‑validated, path‑scoped access.
-  - Key rotation is now **fully integrated** with `kek_version` in object metadata and bulk rotation via `rotate_bucket()`.
-  - Remaining gap: asynchronous offline sharing protocol and per‑node ratchet‑style forward secrecy; streaming and HAMT‑style indexing are now implemented.
+  - Sharing is now **fully integrated**, including snapshot vs temporal modes, subtree‑level capabilities, secret links, and async inbox‑based sharing.
+  - Key rotation is **fully integrated** with `kek_version` in object metadata and bulk rotation via `rotate_bucket()`.
+  - Remaining gaps are mainly around per‑node ratchet‑style forward secrecy and fully sharded, diff/merge‑capable forests for extremely large trees.
 
 - **WNFS private filesystem:** **9.2 / 10**
   - Extremely strong model for a general private filesystem, with rich sharing and revision semantics.
@@ -349,19 +354,19 @@ Scores are **1–10**, where 10 is best given typical modern requirements. Score
 
 - **Primitives:**
   - HPKE for multi‑recipient DEK wrapping (`encrypt_for_multiple`).
-  - `ShareToken` encapsulating a wrapped DEK, path scope, expiry, and permissions.
+  - `ShareToken` encapsulating a wrapped DEK, path scope, expiry, permissions, and **share mode** (snapshot vs temporal).
   - `FolderShareManager` for managing folder DEKs and associated shares.
-  - `ShareRecipient` to unwrap and validate shares.
+  - Subtree‑level capabilities via `SubtreeKeyManager` and `SubtreeShareToken`.
+  - Async/offline inbox entries via `ShareEnvelope`, `InboxEntry`, and `ShareInbox`.
 - **Strengths:**
   - Uses HPKE/X25519, which supports clean multi‑recipient workflows and potential integration with KEM‑based identity schemes.
-  - Path‑scoped `ShareToken` with explicit permissions is a good starting point for access control semantics.
-- **Gateway integration (now complete):**
-  - `get_object_with_share()` validates expiry, path scope, and permissions before decrypting.
+  - Path‑scoped `ShareToken` with explicit permissions and share modes gives precise control over what recipients can access and for how long.
+  - Subtree keys let you share or revoke whole directory subtrees without affecting the rest of the bucket.
+  - Async/offline inbox sharing allows sharers to enqueue capabilities for recipients to accept later, without both being online at the same time.
+- **Gateway and client integration:**
+  - `get_object_with_share()` validates expiry, path scope, permissions, and (for snapshot shares) binding data before decrypting.
   - `accept_share()` and `get_object_with_token()` provide convenience methods.
-  - Permissions (`can_read`, `can_write`, `can_delete`) are enforced at read time.
-- **Remaining gaps:**
-  - No explicit multi‑device story (e.g. device keys, revocation) at the filesystem level.
-  - Asynchronous/offline sharing protocol (store‑and‑forward) not yet implemented; could borrow design ideas from WNFS.
+  - Async inbox flows are implemented in `fula-crypto` and can be integrated into higher‑level clients and UIs as needed.
 
 #### WNFS
 
@@ -396,9 +401,9 @@ Scores are **1–10**, where 10 is best given typical modern requirements. Score
 **Verdict:**
 
 - All three systems now have **strong, capability‑based sharing** integrated into their core models.
-- **WNFS** has the most clearly specified **asynchronous, offline store‑and‑forward protocol** (exchange directories, share counters, explicit roles).
-- **Peergos** offers the richest **end‑user sharing experience** (social graph, friend requests, secret links) with strong crypto, but fewer low‑level protocol details published than WNFS.
-- **Fula** excels at **synchronous gateway‑based sharing** with modern HPKE primitives and a simple object model; you can still borrow WNFS‑style ideas to add offline semantics.
+- **WNFS** still has the most formally specified **asynchronous, offline store‑and‑forward protocol** (exchange directories, share counters, explicit roles).
+- **Peergos** offers the richest **end‑user sharing experience** (social graph, friend requests, secret links) with strong crypto.
+- **Fula** now covers both **synchronous gateway‑based sharing** and **async/offline inbox sharing** using modern HPKE primitives, plus snapshot/temporal modes and subtree shares. Its model remains simpler and more object‑centric than WNFS/Peergos, which is an advantage for a pinning gateway.
 
 ### 3.2 Key Rotation
 
@@ -655,66 +660,66 @@ This section focuses on the common "file manager" use case: **listing files in a
 
 ---
 
-## 4. Missing or Weaker Features in Fula Compared to WNFS
+## 4. Remaining Gaps in Fula Compared to WNFS/Peergos
 
-From a security & feature perspective, the following WNFS capabilities are not (yet) fully present in Fula:
+From a security & feature perspective, after the latest updates Fula is much closer to WNFS and Peergos. The main remaining gaps are:
 
-- **1. Asynchronous, offline sharing protocol (store‑and‑forward)**
-  - WNFS: complete shared‑private‑data extension, including public exchange directories, share counters, and recipient workflows for offline/queued sharing.
-  - Fula: synchronous gateway‑based sharing is now fully integrated (`get_object_with_share()`), but asynchronous offline sharing is not yet implemented. This can be added by borrowing ideas from WNFS.
+- **1. Per‑node ratchet‑based forward secrecy and rich revision semantics**
+  - WNFS: each private node has its own `Ratchet` → `TemporalKey` → `SnapshotKey`; compromise of one node's key doesn't expose others, and multi‑head revision graphs are well‑specified.
+  - Fula: now has per‑object DEKs, subtree keys, and snapshot/temporal share modes, but no per‑node ratchets or multi‑head revision model. Forward secrecy still relies on KEK rotation, subtree rotation, and DEK randomness, which is acceptable for an object store but less granular than WNFS.
 
-- **2. Per‑node ratchet‑based forward secrecy**
-  - WNFS: each private node has its own `Ratchet` → `TemporalKey` → `SnapshotKey`; compromise of one node's key doesn't expose others.
-  - Fula: per‑object DEKs and path‑derived keys are good, but there is no explicit per‑object ratchet notion; forward secrecy relies primarily on KEK rotation and DEK randomness.
+- **2. Fully sharded forest structure with diff/merge for extremely large trees**
+  - WNFS: `HamtForest` shards the index across many nodes and supports `diff`/`merge` operations for synchronization and conflict resolution.
+  - Fula: `PrivateForest` supports a HAMT‑backed index (`ForestFormat::HamtV2`) with O(log N) operations, but the forest is still stored as a single encrypted index object per bucket. For extremely large per‑user trees or sophisticated sync scenarios, a fully sharded, diff/merge‑capable forest (or optional coarse sharding) would still be an improvement.
 
-- **3. Scalable forest structure for extremely large trees**
-  - WNFS: HAMT forest scales gracefully to millions of entries, with diff/merge operations.
-  - Fula: `PrivateForest` now supports a HAMT‑backed index (`ForestFormat::HamtV2`) with O(log N) operations, but is still stored as a single encrypted index object per bucket. For extremely large, multi‑tenant trees, WNFS’s fully sharded `HamtForest` remains more scalable.
+- **3. Deep filesystem‑level semantics (multi‑head merges, complex rename/move histories)**
+  - WNFS: explicitly models revisions, multi‑head merges, and name accumulator semantics at the filesystem level.
+  - Fula: models a secure object store with an encrypted index; it does not attempt to provide full filesystem revision semantics.
 
-- **4. Snapshot vs temporal access semantics**
-  - WNFS: explicit distinction between `TemporalAccessKey` (future revisions) and `SnapshotAccessKey` (current revision only).
-  - Fula: no built‑in notion of "snapshot" vs "temporal" access; the semantics of shares are primarily path‑scoped, not revision‑scoped.
+These are **deliberate tradeoffs**: Fula optimizes for a secure, metadata‑hiding object gateway in front of IPFS/S3, not for a full-blown private filesystem with complex revision graphs.
 
-**Previously missing, now addressed:**
+**Previously missing, now addressed (WNFS/Peergos‑inspired):**
 
-- ✅ **Sharing integration**: `get_object_with_share()`, `accept_share()`, and `get_object_with_token()` now fully enforce expiry, path scope, and permissions.
-- ✅ **Key rotation integration**: object metadata now includes `kek_version`; `rewrap_object_dek()` and `rotate_bucket()` provide complete rotation workflows.
+- ✅ **Sharing integration**: `get_object_with_share()`, `accept_share()`, and `get_object_with_token()` fully enforce expiry, path scope, and permissions.
+- ✅ **Snapshot vs temporal share semantics**: `ShareMode` and `SnapshotBinding` provide WNFS‑style snapshot vs temporal behavior at the share level.
+- ✅ **Async/offline sharing**: Inbox‑style store‑and‑forward workflow via `ShareEnvelope`, `InboxEntry`, and `ShareInbox`.
+- ✅ **Subtree keys (Cryptree‑inspired)**: `SubtreeKeyManager`, `EncryptedSubtreeDek`, and `SubtreeShareToken` provide subtree‑level sharing and revocation.
+- ✅ **Secret link URL patterns**: `SecretLink` and `SecretLinkBuilder` keep share credentials in the URL fragment, ensuring gateways never see key material.
+- ✅ **Key rotation integration**: object metadata includes `kek_version`; `rewrap_object_dek()` and `rotate_bucket()` provide complete rotation workflows.
 - ✅ **Streaming encryption for large files**: `put_object_chunked`, `get_object_chunked`, and `get_object_range` implement chunked uploads, partial reads, and Bao‑verified streaming.
-- ✅ **HAMT‑backed forest index**: `PrivateForest` now supports `ForestFormat::HamtV2` with `HamtIndex`, auto‑migrated for large forests.
+- ✅ **HAMT‑backed forest index**: `PrivateForest` supports `ForestFormat::HamtV2` with `HamtIndex`, auto‑migrated for large forests.
+
 
 ---
 
 ## 5. Recommendations for Fula
 
-From a security‑auditor perspective, the following steps would close most of the remaining gaps and may *exceed* WNFS in some areas for an IPFS pinning gateway:
+From a security‑auditor perspective, the following steps would close most of the remaining conceptual gaps and further strengthen Fula for its gateway use case:
 
-1. ✅ **~~Integrate KEK versioning into object metadata~~** — **DONE**
-   - `kek_version` is now included in `x-fula-encryption` JSON.
-   - `rewrap_object_dek()` and `rotate_bucket()` provide complete rotation workflows.
+1. **Keep per‑user forest model, add optional coarse sharding only if needed**
+   - For typical users, a single HAMT‑backed `PrivateForest` per user/bucket is sufficient and preserves low round‑trip counts.
+   - For pathological cases (very large, high‑churn trees), consider an **optional, hash‑based forest partitioning** mode that splits a user’s forest into a small number of shards, without exposing semantics (no “photos vs videos” shards).
 
-2. ✅ **~~Define and implement a concrete sharing protocol using `ShareToken`~~** — **DONE**
-   - `get_object_with_share()` validates expiry, path scope, and permissions before decrypting.
-   - `accept_share()` and `get_object_with_token()` provide convenience methods.
-   - Permissions (`can_read`, `can_write`, `can_delete`) are now enforced at gateway level.
+2. **Evaluate limited, application‑appropriate forward‑secrecy enhancements**
+   - Fula does not need full WNFS‑style per‑node ratchets, but could consider:
+     - Optional per‑object or per‑subtree key rotation schedules.
+     - Integrating rotation triggers into `SubtreeKeyManager` for higher‑risk prefixes.
 
-3. ✅ **~~Expose a streaming encrypted upload/download API~~** — **DONE**
-   - `put_object_chunked`, `get_object_chunked`, and `get_object_range` provide chunked encryption, partial reads, and Bao‑verified streaming for large files.
+3. **Continue to refine multi‑device guidance and tooling**
+   - The new threat‑model and multi‑device docs are a strong start; over time, add:
+     - Reference flows for adding/removing devices.
+     - Example policies for how often to rotate KEKs and subtree keys after device loss.
 
-4. **Implement asynchronous offline sharing protocol** (remaining)
-   - Borrow from WNFS's shared‑private‑data extension for store‑and‑forward sharing semantics.
-   - Allows sharing with offline recipients or across heterogeneous devices.
+4. **Monitor real‑world scaling and adjust forest/index strategy as needed**
+   - Instrument forest size and access patterns to see whether some deployments approach WNFS‑like scales.
+   - Only if that happens, prioritize more advanced forest sharding or diff/merge semantics.
 
-5. **Clarify multi‑device and multi‑user key management** (remaining)
-   - Decide how device keys, user KEKs, and rotation are managed (e.g. one `KeyManager` per user identity, separate keys per device, etc.).
-   - Provide a stable format for exporting/importing the `SecretKey` that backs `KeyManager::from_secret_key`.
+5. **Stay focused on gateway strengths**
+   - Avoid replicating every WNFS/Peergos feature; instead, keep Fula optimized for:
+     - Encrypted object storage in front of IPFS/S3.
+     - Strong metadata privacy.
+     - Simple, well‑tested primitives (HPKE, AES‑GCM, BLAKE3, Bao).
 
-6. ✅ **~~Scale PrivateForest for large deployments~~** (partially DONE)
-   - `ForestFormat::HamtV2` and `HamtIndex` provide a HAMT‑backed file index with automatic migration for large forests.
-   - Further improvements (e.g., sharding the forest index across multiple objects) can be explored for extreme multi‑tenant scales.
-
-7. **Document threat models and guarantees explicitly** (optional)
-   - Borrow from WNFS documentation style: specify attacker models (malicious storage, malicious peer, compromised client), and list what each feature guarantees (and what it doesn't).
-   - Helps integrators use the crypto correctly and avoid misconfiguration (e.g. choosing non‑private obfuscation modes in sensitive environments).
 
 ---
 
@@ -725,8 +730,8 @@ From a security‑auditor perspective, the following steps would close most of t
 - Fula’s design is **better aligned with your stated goal**:
   - Direct support for S3‑compatible APIs and remote pinning endpoints.
   - Simple, object‑centric encryption model with powerful metadata privacy.
-  - HPKE‑based sharing is more naturally integrated into modern ecosystems.
-- WNFS is overkill if you only need a secure object store; its complexity makes sense when you need a *full private filesystem* with offline sharing and revisioned directories.
+  - HPKE‑based sharing, snapshot vs temporal modes, subtree keys, secret links, and async inbox sharing are now fully integrated.
+- WNFS is overkill if you only need a secure object store; its complexity makes sense when you need a *full private filesystem* with offline sharing, revisioned directories, and multi‑head merges.
 
 **For a general private filesystem (multi‑device, offline‑capable, rich sharing):**
 
@@ -737,7 +742,7 @@ From a security‑auditor perspective, the following steps would close most of t
 
 **Overall judgment from a security expert perspective:**
 
-- **Fula**: very strong foundation with modern algorithm choices (HPKE, BLAKE3) and excellent metadata privacy. Sharing and rotation are now **fully integrated**. **Score: ~9.0/10.**
+- **Fula**: very strong foundation with modern algorithm choices (HPKE, BLAKE3) and excellent metadata privacy. Sharing, snapshot/temporal modes, subtree keys, secret links, async inbox sharing, and rotation are now **fully integrated**. **Score: ~9.1/10.**
 - **WNFS**: more conceptually complete as a private filesystem with rich sharing and revision semantics; slightly older crypto choices in some areas but still robust. **Score: ~9.2/10.**
 
 For your **encrypted IPFS pinning gateway**, I would recommend **keep Fula as the core**, and **adopt specific design ideas from WNFS** (asynchronous offline sharing protocol, per‑node ratchets for fine‑grained forward secrecy, and possibly HAMT‑like forest structures for very large deployments) rather than trying to drop WNFS in wholesale.
@@ -752,13 +757,13 @@ For your **encrypted IPFS pinning gateway**, I would recommend **keep Fula as th
 | **Primary goal / fit** | Encrypted object storage in front of S3/IPFS + pinning services and remote pinning endpoints. | General private filesystem with rich revisioning and offline sharing. | End‑to‑end encrypted global filesystem and social platform built on IPFS, with its own server stack. | **Fula** as core (best match to a thin encryption gateway in front of IPFS/S3). |
 | **Crypto primitives** | AES‑256‑GCM / ChaCha20‑Poly1305, HPKE (X25519), BLAKE3, Bao. Very modern and HPKE‑centric. | XChaCha20‑Poly1305, AES‑KWP, BLAKE3, RSA‑OAEP, accumulators. Strong but slightly older in sharing layer. | NaCl/Curve25519, XSalsa20‑Poly1305, scrypt. Robust and widely deployed but without HPKE or accumulator components. | For a gateway, **Fula** has the best balance of modern primitives and integration simplicity. |
 | **Metadata & structure privacy** | Encrypted `PrivateMetadata` + `KeyObfuscation`; FlatNamespace + `PrivateForest` hides folder structure from the server. | Name accumulators + HAMT; per‑node headers encrypted with AES‑KWP; directory structure fully hidden. | Encrypts names, modification times, MIME types, thumbnails, and directory structure; random labels in Merkle‑CHAMP hide file sizes and types. | All three are strong; **Fula** is already very good, while **WNFS** and **Peergos** are more fully explored for general filesystems. |
-| **Sharing** | HPKE‑wrapped `ShareToken`s, folder‑scoped, with expiry & permissions; **fully integrated** via `get_object_with_share()`. Async/offline flows not yet specified. | `AccessKey` + RSA exchange keys + shared‑private‑data extension for asynchronous, offline sharing. | Cryptree capabilities, blinded friend requests, and secret links (`#KEY_MATERIAL`) for rich user‑level sharing. | For **gateway sharing**, **Fula** is now complete; for **offline protocols**, look to **WNFS**, and for end‑user social flows, **Peergos**. |
+| **Sharing** | HPKE‑wrapped `ShareToken`s, folder‑/subtree‑scoped, with expiry, permissions, and snapshot/temporal modes; **fully integrated** via `get_object_with_share()`, inbox‑based async sharing, and secret links. | `AccessKey` + RSA exchange keys + shared‑private‑data extension for asynchronous, offline sharing. | Cryptree capabilities, blinded friend requests, and secret links (`#KEY_MATERIAL`) for rich user‑level sharing. | For **gateway sharing**, **Fula** is now complete (including async inbox flows); for **filesystem‑wide offline protocols**, look to **WNFS**, and for end‑user social flows, **Peergos**. |
 | **Key rotation / forward secrecy** | KEK/DEK with `KeyRotationManager` and `FileSystemRotation`; **fully integrated** with `kek_version` in metadata and `rotate_bucket()`. | Per‑node ratchet → `TemporalKey` → `SnapshotKey`; strong forward secrecy at node/revision level. | Cryptree supports subtree re‑keying; login/identity keys can change without re‑encrypting all content. | For **global KEK rotation**, **Fula** is simplest; for **per‑subtree/node forward secrecy**, **WNFS** and **Peergos** are stronger. |
 | **Performance – large files** | Chunked/streaming encryption with `put_object_chunked`, `get_object_chunked`, and `get_object_range`; O(chunk_size) memory, partial reads only download needed chunks, S3/IPFS‑friendly layout. | Block‑level encrypted content; excellent for very large files and partial reads, at cost of more blockstore operations. | ~5 MiB encrypted chunks give good throughput from a user’s own server; coarser partial reads than Fula/WNFS but fewer chunks per file. | For a remote IPFS/S3 backend, **Fula** is now comparable to WNFS on large‑file handling with a simpler object API. |
 | **Performance – large / deep trees** | Single encrypted `PrivateForest` index per bucket, with optional HAMT‑backed index (`ForestFormat::HamtV2`) for large forests; still one index object per bucket. | HAMT‑based `HamtForest`; scales well to very large private trees and sync scenarios with diff/merge. | Merkle‑CHAMP (HAMT‑like) under each user; scales well to deep and wide trees, especially when each user has their own Peergos server. | For huge multi‑tenant trees in a shared backend, borrow HAMT ideas from **WNFS**/Peergos; Fula’s HAMT‑backed forest improves scaling but still uses a single index object per bucket. |
 | **Round‑trips to storage engine (per typical op)** | Low: 1 `get` for forest index (cacheable) + 1 `get` per small file or per needed chunk; ideal when the gateway talks to a remote IPFS/S3 cluster. | Higher: multiple `get`s for HAMT nodes, headers, and blocks per operation; best when client is close to the blockstore. | Higher: multiple `get`s for Merkle‑CHAMP nodes and chunks, typically from a user‑local Peergos+IPFS server. | For minimizing back‑and‑forth between gateway and a remote IPFS/S3 backend, **Fula** clearly wins. |
 | **Future‑proofing** | HPKE, BLAKE3, explicit versioning; easier migration to new suites and formats for a gateway. | DSIs and traits help, but accumulators and RSA exchange keys are heavier to migrate. | Uses long‑lived, well‑understood primitives; changes to Cryptree or CHAMP are possible but more invasive at the app level. | **Fula** has a slight edge for gateway deployments; **WNFS** and **Peergos** are upgradeable but with heavier protocol migrations. |
-| **Overall security score (this audit)** | ~**9.0 / 10** – strong primitives and design; sharing and rotation now **fully integrated**. | ~**9.2 / 10** – very complete private filesystem model, especially for sharing and revisions. | ~**9.0 / 10** – strong end‑to‑end crypto, excellent metadata and social‑graph privacy, higher complexity. | For a **pinning gateway**, use **Fula** as core and selectively adopt ideas from **WNFS** and **Peergos** where needed. |
+| **Overall security score (this audit)** | ~**9.1 / 10** – strong primitives and design; sharing, snapshot/temporal modes, subtree keys, secret links, async inbox sharing, and rotation are now **fully integrated**. | ~**9.2 / 10** – very complete private filesystem model, especially for sharing and revisions. | ~**9.0 / 10** – strong end‑to‑end crypto, excellent metadata and social‑graph privacy, higher complexity. | For a **pinning gateway**, use **Fula** as core and selectively adopt ideas from **WNFS** and **Peergos** where needed. |
 
 ---
 
