@@ -795,8 +795,35 @@ impl EncryptedClient {
 
     /// Put an encrypted object using FlatNamespace mode
     /// 
-    /// This automatically updates the forest index.
+    /// This automatically updates AND SAVES the forest index after each file.
+    /// For bulk uploads, use `put_object_flat_deferred` + `flush_forest` instead.
     pub async fn put_object_flat(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        content_type: Option<&str>,
+    ) -> Result<PutObjectResult> {
+        let result = self.put_object_flat_deferred(bucket, key, data, content_type).await?;
+        self.flush_forest(bucket).await?;
+        Ok(result)
+    }
+
+    /// Put an encrypted object using FlatNamespace mode WITHOUT saving forest
+    /// 
+    /// Use this for bulk uploads. Call `flush_forest` after uploading all files
+    /// to persist the forest index. This is much more efficient for many files.
+    /// 
+    /// # Example
+    /// ```ignore
+    /// // Upload 100 files efficiently
+    /// for file in files {
+    ///     client.put_object_flat_deferred(bucket, &file.path, file.data, None).await?;
+    /// }
+    /// // Save forest once at the end
+    /// client.flush_forest(bucket).await?;
+    /// ```
+    pub async fn put_object_flat_deferred(
         &self,
         bucket: &str,
         key: &str,
@@ -806,7 +833,7 @@ impl EncryptedClient {
         let data = data.into();
         let original_size = data.len() as u64;
         
-        // Load or create forest
+        // Load or create forest (from cache if available)
         let mut forest = self.load_forest(bucket).await?;
         
         // Generate a DEK for this object
@@ -833,7 +860,7 @@ impl EncryptedClient {
         let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
             .map_err(ClientError::Encryption)?;
 
-        // Add to forest index
+        // Add to forest index (in memory only)
         let entry = ForestFileEntry::from_metadata(&private_meta, storage_key.clone());
         forest.upsert_file(entry);
 
@@ -856,17 +883,55 @@ impl EncryptedClient {
             .with_metadata("x-fula-encrypted", "true")
             .with_metadata("x-fula-encryption", &enc_metadata.to_string());
 
-        let result = self.inner.put_object_with_metadata(
-            bucket,
-            &storage_key,
-            Bytes::from(ciphertext),
-            Some(metadata),
-        ).await?;
+        // Upload with optional pinning
+        let result = if let Some(ref pinning) = self.pinning {
+            self.inner.put_object_with_metadata_and_pinning(
+                bucket,
+                &storage_key,
+                Bytes::from(ciphertext),
+                Some(metadata),
+                &pinning.endpoint,
+                &pinning.token,
+            ).await?
+        } else {
+            self.inner.put_object_with_metadata(
+                bucket,
+                &storage_key,
+                Bytes::from(ciphertext),
+                Some(metadata),
+            ).await?
+        };
 
-        // Save updated forest
-        self.save_forest(bucket, &forest).await?;
+        // Update cache (but don't save to storage yet)
+        {
+            let mut cache = self.forest_cache.write().unwrap();
+            cache.insert(bucket.to_string(), forest);
+        }
 
         Ok(result)
+    }
+
+    /// Flush the forest index to storage
+    /// 
+    /// Call this after bulk uploads using `put_object_flat_deferred`.
+    /// This persists the in-memory forest index to encrypted storage.
+    pub async fn flush_forest(&self, bucket: &str) -> Result<()> {
+        let forest = {
+            let cache = self.forest_cache.read().unwrap();
+            cache.get(bucket).cloned()
+        };
+        
+        if let Some(forest) = forest {
+            self.save_forest(bucket, &forest).await?;
+        }
+        
+        Ok(())
+    }
+
+    /// Check if there are unsaved forest changes
+    pub fn has_pending_forest_changes(&self, bucket: &str) -> bool {
+        let cache = self.forest_cache.read().unwrap();
+        cache.contains_key(bucket)
     }
 
     /// Get an object using FlatNamespace mode

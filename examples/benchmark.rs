@@ -300,11 +300,15 @@ async fn main() -> anyhow::Result<()> {
             let data = generate_random_data(file_size);
             let path = format!("/{}/file_{:03}.bin", folder_name, file_idx);
             
-            user_a_client.put_object_encrypted(bucket_a, &path, data.clone()).await?;
+            // Use deferred save for efficiency - only saves forest once per folder
+            user_a_client.put_object_flat_deferred(bucket_a, &path, data.clone(), None).await?;
             
             small_files_paths.push(path);
             total_small_bytes += file_size;
         }
+        
+        // Flush forest index once per folder (much more efficient than per-file)
+        user_a_client.flush_forest(bucket_a).await?;
         println!("✓ ({} files)", config.files_per_folder);
     }
 
@@ -331,7 +335,7 @@ async fn main() -> anyhow::Result<()> {
     let download_start = Instant::now();
     
     for (i, path) in small_files_paths.iter().take(sample_count).enumerate() {
-        let _data = user_a_client.get_object_decrypted(bucket_a, path).await?;
+        let _data = user_a_client.get_object_flat(bucket_a, path).await?;
         if i % 10 == 0 {
             print!(".");
         }
@@ -353,7 +357,8 @@ async fn main() -> anyhow::Result<()> {
         let large_path = "/large_files/big_file.bin";
         
         let upload_start = Instant::now();
-        user_a_client.put_object_encrypted(bucket_a, large_path, large_data.clone()).await?;
+        user_a_client.put_object_flat_deferred(bucket_a, large_path, large_data.clone(), None).await?;
+        user_a_client.flush_forest(bucket_a).await?;
         results.large_file_encrypt_upload_time = upload_start.elapsed();
         results.large_file_size_bytes = large_size;
         
@@ -362,7 +367,7 @@ async fn main() -> anyhow::Result<()> {
         // Download
         println!("   └─ Downloading & decrypting...");
         let download_start = Instant::now();
-        let downloaded = user_a_client.get_object_decrypted(bucket_a, large_path).await?;
+        let downloaded = user_a_client.get_object_flat(bucket_a, large_path).await?;
         results.large_file_download_decrypt_time = download_start.elapsed();
         
         assert_eq!(downloaded.len(), large_size, "Downloaded size mismatch!");
@@ -391,9 +396,11 @@ async fn main() -> anyhow::Result<()> {
         let file_path = format!("{}/file_{}.txt", deep_path, file_idx);
         let content = format!("Deep file {} at level {}", file_idx, config.deep_levels);
         
-        user_a_client.put_object_encrypted(bucket_a, &file_path, content.into_bytes()).await?;
+        user_a_client.put_object_flat_deferred(bucket_a, &file_path, content.into_bytes(), None).await?;
         deep_files_paths.push(file_path);
     }
+    // Flush forest after all deep files
+    user_a_client.flush_forest(bucket_a).await?;
     
     results.deep_structure_upload_time = deep_start.elapsed();
     results.deep_structure_files = config.files_at_bottom;
