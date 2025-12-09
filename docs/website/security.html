@@ -58,6 +58,7 @@
             <ul>
                 <li><a href="#overview">Security Overview</a></li>
                 <li><a href="#trust-model">Trust Model</a></li>
+                <li><a href="#api-auth">API Authentication</a></li>
                 <li><a href="#encryption-flow">Encryption Flow</a></li>
                 <li><a href="#key-architecture">Key Architecture</a></li>
                 <li><a href="#hpke">HPKE Implementation</a></li>
@@ -231,6 +232,93 @@
                         <li><strong>Your device is secure</strong> - If compromised, keys can be extracted</li>
                         <li><strong>Cryptographic primitives are secure</strong> - X25519, AES-256-GCM, BLAKE3 are industry-standard</li>
                         <li><strong>Random number generator is secure</strong> - Using OS-provided CSPRNG (OsRng)</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- API Authentication -->
+        <section id="api-auth" class="security-section">
+            <h2>API Authentication</h2>
+            <p class="section-intro">Fula supports both Bearer tokens and AWS Signature V4, enabling full S3 SDK compatibility.</p>
+
+            <div class="auth-content">
+                <div class="auth-methods">
+                    <h3>Authentication Methods</h3>
+                    <div class="methods-grid">
+                        <div class="method-card">
+                            <h4>🔑 Bearer Token (Simple)</h4>
+                            <p>For HTTP clients, REST APIs, and custom integrations.</p>
+                            <div class="code-snippet">
+                                <pre>Authorization: Bearer eyJhbGciOiJIUzI1NiIs...</pre>
+                            </div>
+                        </div>
+                        <div class="method-card">
+                            <h4>📦 AWS Signature V4 (S3 Compatible)</h4>
+                            <p>For boto3, AWS CLI, aws-sdk-js, and all S3 tools.</p>
+                            <div class="code-snippet">
+                                <pre>Authorization: AWS4-HMAC-SHA256 
+  Credential=JWT:eyJhbGci.../20231207/us-east-1/s3/aws4_request,
+  SignedHeaders=host;x-amz-date,
+  Signature=abc123...</pre>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="auth-sigv4">
+                    <h3>AWS Sig V4 with JWT</h3>
+                    <p>Embed your JWT token in the AWS access key with a <code>JWT:</code> prefix. This enables full compatibility with standard S3 clients while maintaining JWT-based authentication.</p>
+                    
+                    <div class="code-snippet">
+                        <pre># Python (boto3)
+import boto3
+
+s3 = boto3.client('s3',
+    endpoint_url='https://gateway.example.com',
+    aws_access_key_id=f'JWT:{jwt_token}',  # JWT embedded here
+    aws_secret_access_key='not-used',       # Not validated
+    region_name='us-east-1'
+)
+
+s3.put_object(Bucket='my-bucket', Key='file.txt', Body=b'Hello!')</pre>
+                    </div>
+
+                    <div class="code-snippet">
+                        <pre># AWS CLI (~/.aws/credentials)
+[fula]
+aws_access_key_id = JWT:eyJhbGciOiJIUzI1NiIs...
+aws_secret_access_key = not-used
+
+# Usage:
+aws s3 cp file.txt s3://my-bucket/ --endpoint-url https://gateway.example.com --profile fula</pre>
+                    </div>
+
+                    <div class="code-snippet">
+                        <pre>// JavaScript (AWS SDK v3)
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+
+const s3 = new S3Client({
+  endpoint: "https://gateway.example.com",
+  region: "us-east-1",
+  forcePathStyle: true,
+  credentials: {
+    accessKeyId: `JWT:${jwtToken}`,
+    secretAccessKey: "not-used"
+  }
+});
+
+await s3.send(new PutObjectCommand({ Bucket: "my-bucket", Key: "file.txt", Body: "Hello!" }));</pre>
+                    </div>
+                </div>
+
+                <div class="auth-security">
+                    <h3>Security Properties</h3>
+                    <ul>
+                        <li><strong>JWT Validation:</strong> Full signature, expiry, and claims validation</li>
+                        <li><strong>Replay Protection:</strong> x-amz-date must be within 15 minutes</li>
+                        <li><strong>Scope Enforcement:</strong> JWT scopes control read/write/delete permissions</li>
+                        <li><strong>S3 Compatibility:</strong> Works with boto3, AWS CLI, aws-sdk-js, and all S3 tools</li>
                     </ul>
                 </div>
             </div>

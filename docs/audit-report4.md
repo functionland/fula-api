@@ -60,10 +60,78 @@ The S3 API is implemented in `fula-cli`, acting as a gateway to the underlying I
 
 ## 4. Vulnerabilities & Loopholes
 
-### 4.1 High: Lack of AWS Signature V4 Support
-**Description:** The API rejects requests without a Bearer token, meaning it does not support the standard authentication mechanism for S3.
-**Risk:** Low security risk (JWT is secure), but High operational/compatibility risk. It breaks the promise of "S3-compatible" for standard clients.
-**Mitigation:** Implement a middleware that parses the `Authorization` header for `AWS4-HMAC-SHA256` and validates the signature against the user's secret key (which would need to be stored or derived).
+### 4.1 ✅ RESOLVED: AWS Signature V4 Support with JWT
+
+**Original Issue:** The API only accepted Bearer tokens, rejecting AWS Signature V4 requests from standard S3 clients.
+
+**Resolution:** Implemented hybrid AWS Sig V4 + JWT authentication that allows standard S3 clients to work by embedding the JWT token in the access key with a `JWT:` prefix.
+
+**Implementation Details:**
+
+| File | Changes |
+|------|---------|
+| `crates/fula-cli/src/auth.rs` | Added `parse_aws_sigv4_header()`, `extract_token_from_header()`, `validate_sigv4_timestamp()` |
+| `crates/fula-cli/src/middleware.rs` | Updated `auth_middleware` to accept both Bearer and AWS Sig V4 |
+| `examples/s3_sdk_integration.rs` | Added examples for boto3, AWS CLI, JavaScript SDK, curl |
+
+**How It Works:**
+
+```
+Authorization: AWS4-HMAC-SHA256 Credential=JWT:eyJhbGci.../20231207/us-east-1/s3/aws4_request,
+SignedHeaders=host;x-amz-date, Signature=abc123...
+```
+
+1. Gateway parses the AWS Sig V4 Authorization header
+2. Extracts the access key which must start with `JWT:` prefix
+3. Validates the JWT token for authentication/authorization
+4. Validates `x-amz-date` timestamp (15-minute window) for replay protection
+5. The signature itself is not validated (asymmetric JWT, no shared secret)
+
+**Client Configuration:**
+
+```python
+# Python (boto3)
+s3 = boto3.client('s3',
+    endpoint_url='https://gateway.example.com',
+    aws_access_key_id=f'JWT:{jwt_token}',
+    aws_secret_access_key='not-used',
+    region_name='us-east-1'
+)
+
+# Works normally!
+s3.put_object(Bucket='my-bucket', Key='file.txt', Body=b'Hello!')
+```
+
+```bash
+# AWS CLI (~/.aws/credentials)
+[fula]
+aws_access_key_id = JWT:eyJhbGciOiJIUzI1NiIs...
+aws_secret_access_key = not-used
+
+# Use:
+aws s3 cp file.txt s3://my-bucket/ --endpoint-url https://gateway.example.com --profile fula
+```
+
+**Security Properties:**
+
+| Property | Status |
+|----------|--------|
+| JWT authentication | ✅ Full validation (signature, expiry, claims) |
+| Replay protection | ✅ x-amz-date timestamp must be within 15 minutes |
+| Scope enforcement | ✅ JWT scopes checked for read/write operations |
+| S3 compatibility | ✅ Works with boto3, AWS CLI, aws-sdk-js |
+
+**Tests Added:**
+- `test_is_aws_sigv4` - Format detection
+- `test_parse_aws_sigv4_header_valid` - Parsing with spaces
+- `test_parse_aws_sigv4_header_no_spaces` - Parsing without spaces  
+- `test_parse_aws_sigv4_header_missing_jwt_prefix` - Rejects non-JWT access keys
+- `test_parse_aws_sigv4_header_empty_jwt` - Rejects empty JWT
+- `test_parse_amz_date` - Timestamp parsing
+- `test_parse_amz_date_invalid` - Invalid timestamp formats
+- `test_extract_token_from_header_bearer` - Bearer token extraction
+- `test_extract_token_from_header_sigv4` - Sig V4 token extraction
+- `test_extract_token_from_header_invalid` - Invalid header rejection
 
 ### 4.2 Medium: No Server-Side Encryption Enforcement
 **Description:** The encryption is entirely client-side. The server accepts any binary data sent to `PUT /bucket/key`.

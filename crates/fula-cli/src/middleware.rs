@@ -1,7 +1,14 @@
 //! HTTP middleware for authentication, rate limiting, etc.
+//!
+//! Supports two authentication methods:
+//! 1. Bearer token: `Authorization: Bearer <jwt>`
+//! 2. AWS Signature V4: `Authorization: AWS4-HMAC-SHA256 Credential=JWT:<jwt>/...`
+//!
+//! The AWS Sig V4 method allows standard S3 clients (boto3, AWS CLI, etc.) to work
+//! by embedding the JWT in the access key with a `JWT:` prefix.
 
 use crate::{ApiError, S3ErrorCode, AppState};
-use crate::auth::{extract_bearer_token, validate_token, claims_to_session, dev_session};
+use crate::auth::{extract_token_from_header, validate_token, claims_to_session, dev_session};
 use crate::state::UserSession;
 use axum::{
     body::Body,
@@ -24,6 +31,13 @@ pub fn create_rate_limiter(requests_per_second: u32) -> Arc<KeyedRateLimiter> {
 }
 
 /// Authentication middleware
+///
+/// Supports both Bearer token and AWS Signature V4 authentication:
+/// - Bearer: `Authorization: Bearer <jwt>`
+/// - AWS Sig V4: `Authorization: AWS4-HMAC-SHA256 Credential=JWT:<jwt>/...`
+///
+/// For AWS Sig V4, the access key must be prefixed with `JWT:` and contain the JWT token.
+/// The secret access key can be any value (it's not used for validation since we validate the JWT).
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     mut request: Request<Body>,
@@ -44,19 +58,20 @@ pub async fn auth_middleware(
 
     let session = match auth_header {
         Some(header) => {
-            let token = extract_bearer_token(header)
-                .ok_or_else(|| ApiError::s3(S3ErrorCode::InvalidToken, "Invalid Authorization header format"))?;
+            // Extract JWT from either Bearer token or AWS Sig V4 format
+            let token = extract_token_from_header(header, request.headers())?;
             
             let secret = state.config.jwt_secret.as_ref()
                 .ok_or_else(|| ApiError::s3(S3ErrorCode::InternalError, "JWT secret not configured"))?;
             
-            let claims = validate_token(token, secret)?;
+            let claims = validate_token(&token, secret)?;
             claims_to_session(claims)
         }
         None => {
-            // For S3 compatibility, also check for AWS Signature
-            // For now, reject unauthenticated requests when auth is enabled
-            return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Authentication required"));
+            return Err(ApiError::s3(
+                S3ErrorCode::AccessDenied, 
+                "Authentication required. Use 'Bearer <jwt>' or AWS Signature V4 with 'JWT:<jwt>' as access key"
+            ));
         }
     };
 

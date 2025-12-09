@@ -68,21 +68,60 @@ docker-compose up -d
 
 ### Using AWS CLI
 
+Fula supports **AWS Signature V4** authentication, enabling full compatibility with standard S3 tools. Embed your JWT token in the access key with a `JWT:` prefix:
+
 ```bash
-# Configure endpoint
-export AWS_ENDPOINT_URL=http://localhost:9000
+# Configure credentials (~/.aws/credentials)
+cat >> ~/.aws/credentials << EOF
+[fula]
+aws_access_key_id = JWT:your-jwt-token-here
+aws_secret_access_key = not-used
+EOF
 
-# Create a bucket
-aws s3 mb s3://my-bucket
+# Use AWS CLI with Fula gateway
+aws s3 mb s3://my-bucket --endpoint-url http://localhost:9000 --profile fula
+aws s3 cp file.txt s3://my-bucket/ --endpoint-url http://localhost:9000 --profile fula
+aws s3 ls s3://my-bucket/ --endpoint-url http://localhost:9000 --profile fula
+```
 
-# Upload a file
-aws s3 cp file.txt s3://my-bucket/
+### Using Python (boto3)
 
-# List objects
-aws s3 ls s3://my-bucket/
+```python
+import boto3
 
-# Download a file
-aws s3 cp s3://my-bucket/file.txt .
+# Configure with JWT embedded in access key
+s3 = boto3.client('s3',
+    endpoint_url='http://localhost:9000',
+    aws_access_key_id=f'JWT:{jwt_token}',
+    aws_secret_access_key='not-used',
+    region_name='us-east-1'
+)
+
+# Use S3 API normally
+s3.create_bucket(Bucket='my-bucket')
+s3.put_object(Bucket='my-bucket', Key='hello.txt', Body=b'Hello World!')
+```
+
+### Using JavaScript (AWS SDK)
+
+```javascript
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+
+const s3 = new S3Client({
+  endpoint: "http://localhost:9000",
+  region: "us-east-1",
+  forcePathStyle: true,
+  credentials: {
+    accessKeyId: `JWT:${jwtToken}`,
+    secretAccessKey: "not-used"
+  }
+});
+
+await s3.send(new PutObjectCommand({
+  Bucket: "my-bucket",
+  Key: "hello.txt",
+  Body: "Hello World!"
+}));
 ```
 
 ### Using the Rust Client SDK
