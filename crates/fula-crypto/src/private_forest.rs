@@ -167,6 +167,10 @@ pub struct ForestDirectoryEntry {
     pub subdirs: Vec<String>,
     /// Directory metadata (optional)
     pub metadata: Option<HashMap<String, String>>,
+    /// Encrypted subtree DEK (for Cryptree-style key hierarchy)
+    /// If present, files under this directory use this subtree's DEK
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtree_dek: Option<crate::subtree_keys::EncryptedSubtreeDek>,
 }
 
 /// The private forest - an encrypted index of the entire file system
@@ -244,6 +248,7 @@ impl PrivateForest {
             files: Vec::new(),
             subdirs: Vec::new(),
             metadata: None,
+            subtree_dek: None,
         });
 
         let (files, files_hamt) = match format {
@@ -380,6 +385,7 @@ impl PrivateForest {
             files: Vec::new(),
             subdirs: Vec::new(),
             metadata: None,
+            subtree_dek: None,
         });
         
         // Add to parent's subdirs

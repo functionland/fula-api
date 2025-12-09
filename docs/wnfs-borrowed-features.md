@@ -335,6 +335,14 @@ for (path, cid) in index.iter_prefix("/photos/") {
 | `AsyncStreamingEncoder` | ✅ Complete | `crates/fula-crypto/src/chunked.rs` |
 | `VerifiedStreamingDecoder` | ✅ Complete | `crates/fula-crypto/src/chunked.rs` |
 | `ForestFormat` (versioning) | ✅ Complete | `crates/fula-crypto/src/private_forest.rs` |
+| `SecretLink` | ✅ Complete | `crates/fula-crypto/src/secret_link.rs` |
+| `SecretLinkBuilder` | ✅ Complete | `crates/fula-crypto/src/secret_link.rs` |
+| `ShareMode` | ✅ Complete | `crates/fula-crypto/src/sharing.rs` |
+| `SnapshotBinding` | ✅ Complete | `crates/fula-crypto/src/sharing.rs` |
+| `SubtreeKeyManager` | ✅ Complete | `crates/fula-crypto/src/subtree_keys.rs` |
+| `SubtreeShareToken` | ✅ Complete | `crates/fula-crypto/src/subtree_keys.rs` |
+| `ShareEnvelope` | ✅ Complete | `crates/fula-crypto/src/inbox.rs` |
+| `ShareInbox` | ✅ Complete | `crates/fula-crypto/src/inbox.rs` |
 
 ---
 
@@ -364,7 +372,64 @@ Private Forest HAMT tests (4 tests):
   test_hamt_operations ... ok
   test_hamt_serialization_roundtrip ... ok
 
-Total: 105 tests in fula-crypto
+Secret Link tests (14 tests):
+  test_secret_link_creation ... ok
+  test_secret_link_to_url ... ok
+  test_secret_link_roundtrip ... ok
+  test_secret_link_with_label ... ok
+  test_secret_link_with_metadata ... ok
+  test_extract_opaque_id ... ok
+  test_is_valid_secret_link_url ... ok
+  test_parse_invalid_url_no_fragment ... ok
+  test_parse_invalid_url_wrong_path ... ok
+  test_parse_invalid_payload ... ok
+  test_gateway_url_trailing_slash ... ok
+  test_secret_link_permissions ... ok
+  test_secret_link_path_validation ... ok
+  test_fragment_never_contains_sensitive_chars ... ok
+
+Snapshot/Temporal Share Mode tests (12 tests):
+  test_temporal_share_default ... ok
+  test_snapshot_share_creation ... ok
+  test_snapshot_share_with_values ... ok
+  test_snapshot_verification_valid ... ok
+  test_snapshot_verification_content_changed ... ok
+  test_snapshot_verification_size_changed ... ok
+  test_temporal_share_always_valid ... ok
+  test_snapshot_requires_binding ... ok
+  test_snapshot_binding_storage_key ... ok
+  test_is_snapshot_valid_helper ... ok
+  test_share_mode_enum ... ok
+  test_share_token_serialization_with_mode ... ok
+
+Subtree Keys tests (14 tests - Peergos Cryptree-inspired):
+  test_encrypted_subtree_dek_roundtrip ... ok
+  test_subtree_key_manager_create ... ok
+  test_subtree_key_manager_resolve ... ok
+  test_subtree_key_manager_nested_resolution ... ok
+  test_subtree_key_rotation ... ok
+  test_subtree_key_load ... ok
+  test_subtree_share_token_creation ... ok
+  test_subtree_share_accept ... ok
+  test_wrong_recipient_cannot_accept ... ok
+  test_path_normalization ... ok
+  test_list_subtrees ... ok
+  test_remove_subtree ... ok
+  test_subtree_share_serialization ... ok
+
+Async Inbox tests (10 tests - WNFS-inspired):
+  test_share_envelope_creation ... ok
+  test_inbox_entry_encrypt_decrypt ... ok
+  test_wrong_recipient_cannot_decrypt ... ok
+  test_share_inbox_workflow ... ok
+  test_inbox_dismiss ... ok
+  test_inbox_cleanup ... ok
+  test_inbox_path_generation ... ok
+  test_share_envelope_builder ... ok
+  test_multiple_shares_same_recipient ... ok
+  test_inbox_entry_serialization ... ok
+
+Total: 154 tests in fula-crypto
 ```
 
 ---
@@ -420,13 +485,135 @@ for chunk in chunks {
 let is_valid = decoder.finalize_and_verify()?;
 ```
 
+### ✅ 4. Secret Link URL Patterns (Peergos-Inspired)
+- **Fragment privacy**: All key material in URL fragment, never sent to server
+- **`SecretLink`**: Create and parse share links with embedded tokens
+- **`SecretLinkBuilder`**: Fluent API for building links with labels and metadata
+- **URL-safe encoding**: Base64url encoding without padding
+
+```rust
+use fula_crypto::{SecretLink, SecretLinkBuilder, ShareBuilder, KekKeyPair, DekKey};
+
+// Create a secret link (key material only in fragment)
+let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+    .path_scope("/photos/vacation/")
+    .expires_in(3600)
+    .build()?;
+
+let link = SecretLinkBuilder::new(&token, "https://gateway.example")
+    .label("Vacation Photos")
+    .build()?;
+
+let url = link.to_url()?;
+// => "https://gateway.example/fula/share/abc123#eyJ2ZXJzaW9uIjox..."
+// Server only sees: /fula/share/abc123
+
+// Parse received link
+let parsed = SecretLink::parse(&url)?;
+let extracted_token = parsed.extract_token();
+```
+
+### ✅ 5. Snapshot vs Temporal Share Modes (WNFS-Inspired)
+- **`ShareMode` enum**: `Temporal` (default) vs `Snapshot` variants
+- **`SnapshotBinding`**: Content hash, size, and timestamp for snapshot verification
+- **Backward compatible**: Existing shares default to Temporal mode
+- **Verification methods**: `verify_snapshot()` and `is_snapshot_valid()`
+
+```rust
+use fula_crypto::{ShareBuilder, SnapshotBinding, ShareMode};
+
+// Temporal share (default) - access evolves with content
+let temporal_share = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+    .path_scope("/photos/vacation/")
+    .temporal()
+    .build()?;
+
+// Snapshot share - bound to specific content version
+let snapshot_share = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+    .path_scope("/documents/contract.pdf")
+    .snapshot_with("abc123def456", 102400, 1700000000)
+    .build()?;
+
+// Verify snapshot validity
+assert!(snapshot_share.is_snapshot_valid("abc123def456"));
+```
+
+### ✅ 6. Multi-Device Key Management & Threat Model Documentation
+- **Comprehensive threat model**: `docs/THREAT_MODEL.md` with adversary analysis
+- **Multi-device patterns**: Shared identity, per-device keys, hierarchical keys
+- **Device loss handling**: Rotation procedures, revocation strategies
+- **Key backup strategies**: Paper backup, HSM, encrypted cloud
+- **WNFS comparison**: Security model differences documented
+
+### ✅ 7. Shallow Cryptree-Style Subtree Keys (Peergos-Inspired)
+- **`SubtreeKeyManager`**: Manages master + subtree DEKs hierarchy
+- **`EncryptedSubtreeDek`**: Encrypted subtree key stored in directory entries
+- **`SubtreeShareToken`**: Share entire subtrees with recipients
+- **Key resolution**: Most specific prefix match, falls back to master
+- **Subtree rotation**: Re-key individual subtrees for revocation
+
+```rust
+use fula_crypto::{SubtreeKeyManager, SubtreeShareBuilder, DekKey};
+
+// Create subtree key hierarchy
+let mut manager = SubtreeKeyManager::with_master_dek(master_dek);
+let (photos_dek, encrypted) = manager.create_subtree("/photos/")?;
+
+// Files automatically use the right DEK
+let dek = manager.resolve_dek("/photos/beach.jpg");  // Returns photos_dek
+let dek = manager.resolve_dek("/readme.txt");        // Returns master_dek
+
+// Revoke by rotating subtree key
+let rotation = manager.rotate_subtree("/photos/")?;
+// Old shares become invalid, new shares use rotation.new_dek
+```
+
+### ✅ 8. Async/Offline Inbox Sharing (WNFS-Inspired)
+- **`ShareEnvelope`**: Container for ShareToken + metadata (label, message, sharer info)
+- **`InboxEntry`**: HPKE-encrypted envelope for store-and-forward sharing
+- **`ShareInbox`**: Manager for inbox operations (enqueue, list, accept, dismiss)
+- **`ShareEnvelopeBuilder`**: Fluent API for creating share envelopes
+- **Inbox location**: `/.fula/inbox/<recipient-hash>/` convention
+
+```rust
+use fula_crypto::{ShareEnvelopeBuilder, ShareInbox, KekKeyPair, DekKey};
+
+// Sharer creates and enqueues share
+let (envelope, entry) = ShareEnvelopeBuilder::new(&sharer, recipient.public_key(), &dek)
+    .path_scope("/photos/")
+    .label("Vacation Photos")
+    .message("Check these out!")
+    .sharer_name("Alice")
+    .build()?;
+
+// Store in recipient's inbox location
+let path = ShareInbox::entry_storage_path(recipient.public_key(), &entry.id);
+
+// Later, recipient lists and accepts shares
+let mut inbox = ShareInbox::new();
+inbox.add_entry(entry);
+let pending = inbox.list_pending(&recipient);
+let accepted = inbox.accept_entry(&entry_id, &recipient)?;
+```
+
 ---
 
 ## 9. Remaining Future Work
 
-4. **Borrow more from WNFS**
-   - Asynchronous offline sharing protocol
-   - Store-and-forward share discovery
+All major WNFS/Peergos-inspired features have been implemented:
+- ✅ HAMT integration for large forests
+- ✅ Chunked streaming encryption
+- ✅ Secret links (key material in URL fragment)
+- ✅ Snapshot vs Temporal share modes
+- ✅ Subtree keys (Cryptree-style)
+- ✅ Async/offline inbox sharing
+- ✅ Multi-device key management documentation
+- ✅ Comprehensive threat model
+
+**Optional future enhancements:**
+- Coarse forest sharding (only if very large buckets become an issue)
+- Integration with DID/identity systems for sharer verification
+- Push notifications for inbox updates
 
 ---
 

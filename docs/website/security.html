@@ -65,10 +65,16 @@
                 <li><a href="#integrity">Data Integrity</a></li>
                 <li><a href="#key-management">Key Management</a></li>
                 <li><a href="#sharing">Secure Sharing</a></li>
+                <li><a href="#complete-sharing-example">Complete Sharing Example</a></li>
+                <li><a href="#secret-links">Secret Links</a></li>
+                <li><a href="#share-modes">Share Modes</a></li>
+                <li><a href="#async-inbox">Async Inbox</a></li>
+                <li><a href="#subtree-keys">Subtree Keys</a></li>
                 <li><a href="#key-rotation-detail">Key Rotation</a></li>
                 <li><a href="#metadata-privacy">Metadata Privacy</a></li>
                 <li><a href="#security-guarantees">Security Guarantees</a></li>
                 <li><a href="#threat-model">Threat Model</a></li>
+                <li><a href="#multi-device">Multi-Device</a></li>
                 <li><a href="#best-practices">Best Practices</a></li>
             </ul>
         </div>
@@ -943,6 +949,180 @@ let access = handler.accept_share(&share)?;
                     </div>
                 </div>
 
+                <div id="complete-sharing-example" class="sharing-complete-example">
+                    <h3>Complete Sharing Example: Alice Shares Photos with Bob</h3>
+                    <p>This end-to-end example shows how sharing works in Fula, from key setup through content access:</p>
+                    
+                    <div class="code-snippet">
+                        <pre>use fula_crypto::{
+    // Key management
+    KekKeyPair, DekKey, KeyManager,
+    // Sharing primitives
+    ShareBuilder, ShareRecipient, SharePermissions, ShareMode, SnapshotBinding,
+    // Inbox for async/offline sharing
+    ShareEnvelopeBuilder, ShareInbox,
+    // Secret links
+    SecretLinkBuilder, SecretLink,
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SETUP: Alice and Bob each have their own key pairs
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Alice (owner) creates her identity
+let alice_keypair = KekKeyPair::generate();
+let alice_public_key = alice_keypair.public_key().clone();
+
+// Bob (recipient) creates his identity
+let bob_keypair = KekKeyPair::generate();
+let bob_public_key = bob_keypair.public_key().clone();
+
+// Alice has encrypted files with a DEK for her /photos/ folder
+let photos_dek = DekKey::generate();
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OPTION 1: Direct Share (synchronous - both online)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Alice creates a share token for Bob
+let share_token = ShareBuilder::new(
+    &alice_keypair,           // Alice's keypair (for future signing)
+    &bob_public_key,          // Bob's public key (DEK encrypted for him)
+    &photos_dek,              // The DEK that decrypts the files
+)
+    .path_scope("/photos/vacation/")  // Bob can only access this folder
+    .expires_in(7 * 24 * 3600)        // Expires in 1 week
+    .read_only()                       // Bob cannot modify files
+    .build()?;
+
+// Alice sends share_token to Bob (via any channel - encrypted for Bob only)
+// The token contains: wrapped DEK, path scope, expiry, permissions
+
+// Bob receives and accepts the share
+let bob_handler = ShareRecipient::new(&bob_keypair);
+let access = bob_handler.accept_share(&share_token)?;
+
+// Bob can now decrypt files in /photos/vacation/
+assert!(access.is_path_allowed("/photos/vacation/beach.jpg"));  // ✓ allowed
+assert!(!access.is_path_allowed("/photos/family/"));             // ✗ denied
+assert!(access.can_read);                                        // ✓ read access
+assert!(!access.can_write);                                      // ✗ no write
+
+// Bob uses access.dek to decrypt file content:
+// let plaintext = aead.decrypt(&nonce, &ciphertext)?;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OPTION 2: Secret Link (shareable URL with key in fragment)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Alice creates a secret link she can send via email/chat
+let secret_link = SecretLinkBuilder::new(&share_token, "https://gateway.functionland.io")
+    .label("Hawaii Trip 2024")
+    .build()?;
+
+let url = secret_link.to_url()?;
+// => "https://gateway.functionland.io/fula/share/abc123#eyJ2ZXJzaW9uIjoxLC..."
+//    Server sees: /fula/share/abc123 (opaque ID)
+//    Client sees: #... fragment with encrypted token
+
+// Bob opens the link in his browser/app
+let parsed_link = SecretLink::parse(&url)?;
+let extracted_token = parsed_link.extract_token();
+
+// Bob accepts and uses it as above
+let access = bob_handler.accept_share(&extracted_token)?;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OPTION 3: Async Inbox (offline sharing - Bob picks up later)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Alice creates a share envelope with rich metadata
+let (envelope, inbox_entry) = ShareEnvelopeBuilder::new(
+    &alice_keypair,
+    &bob_public_key,
+    &photos_dek,
+)
+    .path_scope("/photos/vacation/")
+    .expires_in(7 * 24 * 3600)
+    .read_only()
+    .label("Hawaii Trip 2024")                    // Human-readable label
+    .message("Hey Bob, check out these pics!")    // Personal message
+    .sharer_name("Alice")                         // Sharer display name
+    .metadata("album", "vacation-2024")           // Custom metadata
+    .build()?;
+
+// Alice stores the inbox entry for Bob (via PrivateForest)
+let inbox_path = ShareInbox::entry_storage_path(&bob_public_key, &inbox_entry.id);
+// => "/.fula/inbox/&lt;bob-key-hash&gt;/&lt;entry-id&gt;.share"
+
+// Later: Bob comes online and checks his inbox
+let mut bob_inbox = ShareInbox::new();
+
+// Bob loads entries from storage
+bob_inbox.add_entry(inbox_entry);
+
+// Bob lists pending shares
+let pending = bob_inbox.list_pending(&bob_keypair);
+println!("You have {} new shares", pending.len());  // "You have 1 new shares"
+
+// Bob accepts Alice's share
+let entry_id = pending[0].id.clone();
+let accepted_envelope = bob_inbox.accept_entry(&entry_id, &bob_keypair)?;
+
+println!("From: {:?}", accepted_envelope.sharer_name);    // "Alice"
+println!("Message: {:?}", accepted_envelope.message);     // "Hey Bob, check out..."
+println!("Path: {}", accepted_envelope.token.path_scope); // "/photos/vacation/"
+
+// Bob uses the ShareToken from the envelope
+let access = bob_handler.accept_share(&accepted_envelope.token)?;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OPTION 4: Snapshot Share (immutable version only)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Alice wants to share a specific report version that won't change
+let report_hash = "abc123def456...";  // BLAKE3 hash of file content
+let report_size = 1024;               // File size in bytes
+let report_modified = 1699876543;     // Modification timestamp
+
+let snapshot_share = ShareBuilder::new(&alice_keypair, &bob_public_key, &photos_dek)
+    .path_scope("/documents/report.pdf")
+    .snapshot_with(report_hash, report_size, report_modified)  // Bind to version
+    .read_only()
+    .build()?;
+
+// Later: Bob tries to access the file
+let current_hash = "abc123def456...";  // Current file hash
+if snapshot_share.is_snapshot_valid(current_hash) {
+    // File hasn't changed, access granted
+    let access = bob_handler.accept_share(&snapshot_share)?;
+} else {
+    // File was modified, snapshot share is no longer valid
+    println!("The shared file has been modified since the share was created");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SUMMARY: Who Controls What
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// ALICE (Application/Owner) decides:
+//   - WHO to share with (Bob's public key)
+//   - WHAT to share (path scope)
+//   - HOW LONG (expiry)
+//   - WHAT PERMISSIONS (read/write/delete)
+//   - WHAT MODE (temporal vs snapshot)
+//
+// FULA PROTOCOL handles:
+//   - HPKE encryption of DEK so only Bob can decrypt
+//   - Unique share ID generation
+//   - Expiry validation
+//   - Path scope enforcement
+//   - Snapshot binding verification
+//   - Inbox entry encryption
+//   - Secret link key isolation (fragment never sent to server)</pre>
+                    </div>
+                </div>
+
                 <div class="sharing-security">
                     <h3>Security Properties</h3>
                     <ul>
@@ -951,6 +1131,363 @@ let access = handler.accept_share(&share)?;
                         <li><strong>Time-Bound Access:</strong> Expired tokens are cryptographically validated and rejected</li>
                         <li><strong>Path Scoping:</strong> Recipients cannot access files outside their granted scope</li>
                     </ul>
+                </div>
+
+                <div id="secret-links" class="sharing-secret-links">
+                    <h3>Secret Links (Peergos-Inspired)</h3>
+                    <p>Fula supports <strong>secret link URL patterns</strong> where all sensitive key material is kept in the URL fragment (<code>#...</code>), which is never sent to the server.</p>
+                    
+                    <div class="code-snippet">
+                        <pre>URL Format:
+https://gateway.example/fula/share/&lt;opaque-id&gt;#&lt;base64url-encoded-payload&gt;
+
+Server sees: /fula/share/abc123 (opaque ID for logging/rate-limits)
+Client sees: Fragment containing encrypted ShareToken with DEK and permissions
+
+Example:
+https://gateway.example/fula/share/a1b2c3d4#eyJ2ZXJzaW9uIjoxLCJ0b2tlbiI6ey...</pre>
+                    </div>
+
+                    <div class="code-snippet">
+                        <pre>use fula_crypto::{SecretLink, SecretLinkBuilder, ShareBuilder, KekKeyPair, DekKey};
+
+// Create a share token
+let owner = KekKeyPair::generate();
+let recipient = KekKeyPair::generate();
+let dek = DekKey::generate();
+
+let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+    .path_scope("/photos/vacation/")
+    .expires_in(3600)  // 1 hour
+    .read_only()
+    .build()?;
+
+// Create a secret link (key material only in fragment)
+let link = SecretLinkBuilder::new(&token, "https://gateway.example")
+    .label("Vacation Photos 2024")
+    .build()?;
+
+let url = link.to_url()?;
+// => "https://gateway.example/fula/share/abc123#eyJ2ZXJzaW9uIjoxLC..."
+
+// Parse a received secret link
+let parsed = SecretLink::parse(&url)?;
+let extracted_token = parsed.extract_token();
+
+// Gateway never sees the key material in the fragment!</pre>
+                    </div>
+
+                    <h4>Security Benefits</h4>
+                    <ul>
+                        <li><strong>Fragment Privacy:</strong> URL fragments are never sent to servers in HTTP requests</li>
+                        <li><strong>Key Isolation:</strong> Gateway cannot decrypt shared content even if compromised</li>
+                        <li><strong>Revocation Support:</strong> Opaque ID can be checked against a server-side revocation list</li>
+                        <li><strong>URL-Safe:</strong> Uses base64url encoding (no <code>+</code> or <code>/</code> characters)</li>
+                    </ul>
+                </div>
+
+                <div id="share-modes" class="sharing-modes">
+                    <h3>Snapshot vs Temporal Share Modes (WNFS-Inspired)</h3>
+                    <p>Fula supports two share modes that determine how access evolves over time, inspired by WNFS's <code>AccessKey</code> semantics:</p>
+                    
+                    <div class="mode-comparison">
+                        <div class="mode-card temporal">
+                            <h4>🔄 Temporal Mode (Default)</h4>
+                            <p>Recipients always see the <strong>latest version</strong> of shared content.</p>
+                            <ul>
+                                <li>Access to current state of files/folders</li>
+                                <li>Updates by owner are visible to recipients</li>
+                                <li>Best for ongoing collaboration</li>
+                            </ul>
+                        </div>
+                        <div class="mode-card snapshot">
+                            <h4>📸 Snapshot Mode</h4>
+                            <p>Recipients can only access the <strong>exact version</strong> at share creation time.</p>
+                            <ul>
+                                <li>Bound to specific content hash, size, and timestamp</li>
+                                <li>If content changes, share becomes invalid</li>
+                                <li>Best for compliance, auditing, or "point-in-time" sharing</li>
+                            </ul>
+                        </div>
+                    </div>
+
+                    <div class="code-snippet">
+                        <pre>use fula_crypto::{ShareBuilder, SnapshotBinding, ShareMode, KekKeyPair, DekKey};
+
+let owner = KekKeyPair::generate();
+let recipient = KekKeyPair::generate();
+let dek = DekKey::generate();
+
+// Temporal share (default) - access evolves with content
+let temporal_share = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+    .path_scope("/photos/vacation/")
+    .temporal()  // or omit - temporal is default
+    .build()?;
+
+// Snapshot share - bound to specific content version
+let snapshot_share = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+    .path_scope("/documents/contract.pdf")
+    .snapshot_with(
+        "abc123def456",  // content hash (BLAKE3)
+        102400,          // size in bytes
+        1700000000,      // modification timestamp
+    )
+    .build()?;
+
+// Verify snapshot is still valid
+let verification = snapshot_share.verify_snapshot(
+    "abc123def456",  // current content hash
+    102400,          // current size
+    1700000000,      // current timestamp
+)?;
+assert_eq!(verification, SnapshotVerification::Valid);
+
+// Quick check
+assert!(snapshot_share.is_snapshot_valid("abc123def456"));
+assert!(!snapshot_share.is_snapshot_valid("different_hash"));</pre>
+                    </div>
+
+                    <h4>When to Use Each Mode</h4>
+                    <table class="mode-table">
+                        <thead>
+                            <tr>
+                                <th>Use Case</th>
+                                <th>Recommended Mode</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Sharing a folder for ongoing collaboration</td>
+                                <td><strong>Temporal</strong></td>
+                            </tr>
+                            <tr>
+                                <td>Sharing a signed contract for audit trail</td>
+                                <td><strong>Snapshot</strong></td>
+                            </tr>
+                            <tr>
+                                <td>Giving access to a photo album that may be updated</td>
+                                <td><strong>Temporal</strong></td>
+                            </tr>
+                            <tr>
+                                <td>Sharing a specific version of a report</td>
+                                <td><strong>Snapshot</strong></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- Async Inbox Sharing -->
+        <section id="async-inbox" class="security-section alt-bg">
+            <h2>Async/Offline Inbox Sharing (WNFS-Inspired)</h2>
+            <p class="section-intro">Store-and-forward sharing where recipients can pick up shares later without the sharer being online.</p>
+
+            <div class="inbox-content">
+                <div class="inbox-overview">
+                    <h3>How It Works</h3>
+                    <p>Inspired by WNFS's exchange directories, Fula supports asynchronous sharing where:</p>
+                    <ul>
+                        <li><strong>Sharer</strong> creates an encrypted <code>ShareEnvelope</code> and stores it in the recipient's inbox</li>
+                        <li><strong>Recipient</strong> can later list, decrypt, and accept shares when convenient</li>
+                        <li><strong>No coordination</strong> required - both parties can be offline at different times</li>
+                    </ul>
+                    
+                    <div class="diagram-box">
+                        <pre class="diagram-ascii">
+Sharer                          Storage                         Recipient
+  │                                │                                │
+  │ 1. Create ShareEnvelope        │                                │
+  │    + HPKE encrypt for recipient│                                │
+  │                                │                                │
+  │ 2. Store in inbox ─────────────│►[Encrypted entry stored]       │
+  │                                │                                │
+  │                                │  [Later, recipient comes online]
+  │                                │                                │
+  │                                │◄──3. List inbox entries ───────│
+  │                                │                                │
+  │                                │◄──4. Decrypt & accept ─────────│
+  │                                │                                │
+  │                                │  5. Use ShareToken to access   │
+  │                                │     shared content             │</pre>
+                    </div>
+                </div>
+
+                <div class="code-snippet">
+                    <pre>use fula_crypto::{ShareEnvelopeBuilder, ShareInbox, KekKeyPair, DekKey};
+
+// === SHARER FLOW ===
+let sharer = KekKeyPair::generate();
+let recipient = KekKeyPair::generate();
+let dek = DekKey::generate();
+
+// Create share envelope with metadata
+let (envelope, entry) = ShareEnvelopeBuilder::new(
+    &sharer,
+    recipient.public_key(),
+    &dek
+)
+    .path_scope("/photos/vacation/")
+    .expires_in(7 * 24 * 3600)  // 1 week
+    .read_only()
+    .label("Vacation Photos 2024")
+    .message("Check out these pics from Hawaii!")
+    .sharer_name("Alice")
+    .build()?;
+
+// Store entry in recipient's inbox (via PrivateForest)
+let inbox_path = ShareInbox::entry_storage_path(recipient.public_key(), &entry.id);
+// put_object_flat(bucket, &inbox_path, serialize(&entry), ...);
+
+// === RECIPIENT FLOW ===
+let mut inbox = ShareInbox::new();
+
+// Load entries from storage
+inbox.add_entry(entry);
+
+// List pending shares
+let pending = inbox.list_pending(&recipient);
+println!("You have {} new shares", pending.len());
+
+// Accept a share
+let accepted = inbox.accept_entry(&entry_id, &recipient)?;
+println!("From: {:?}", accepted.sharer_name);  // "Alice"
+println!("Message: {:?}", accepted.message);   // "Check out these pics..."
+
+// Now use the ShareToken to access content
+let dek = recipient.accept_share(&accepted.token)?;</pre>
+                </div>
+
+                <div class="inbox-features">
+                    <h3>Key Features</h3>
+                    <div class="benefits-grid">
+                        <div class="benefit-card">
+                            <strong>📬 Offline Delivery</strong>
+                            <p>Shares are stored encrypted until recipient comes online</p>
+                        </div>
+                        <div class="benefit-card">
+                            <strong>🔒 End-to-End Encrypted</strong>
+                            <p>Only recipient can decrypt inbox entries using HPKE</p>
+                        </div>
+                        <div class="benefit-card">
+                            <strong>📝 Rich Metadata</strong>
+                            <p>Include labels, messages, and sharer info with each share</p>
+                        </div>
+                        <div class="benefit-card">
+                            <strong>⏰ Auto-Expiry</strong>
+                            <p>Configurable TTL for inbox entries (default: 30 days)</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Subtree Keys (Cryptree-Style) -->
+        <section id="subtree-keys" class="security-section">
+            <h2>Subtree Keys (Peergos Cryptree-Inspired)</h2>
+            <p class="section-intro">Allocate separate DEKs for major folders for better revocation and least privilege.</p>
+
+            <div class="subtree-content">
+                <div class="subtree-overview">
+                    <h3>What are Subtree Keys?</h3>
+                    <p>Inspired by <a href="https://book.peergos.org/security/cryptree.html">Peergos Cryptree</a>, Fula supports a <strong>shallow key hierarchy</strong> where top-level folders can have their own DEKs:</p>
+                    
+                    <div class="diagram-box">
+                        <pre class="diagram-ascii">
+Master DEK (bucket-level)
+     │
+     ├── /photos/ ─── Subtree DEK A ─── [beach.jpg, sunset.jpg, ...]
+     │
+     ├── /documents/ ─── Subtree DEK B ─── [report.pdf, notes.txt, ...]
+     │
+     └── /apps/myapp/ ─── Subtree DEK C ─── [config.json, data.bin, ...]
+
+Sharing /photos/ only exposes Subtree DEK A.
+Revoking that share only requires re-keying /photos/, not the whole bucket.</pre>
+                    </div>
+                </div>
+
+                <div class="subtree-benefits">
+                    <h3>Key Benefits</h3>
+                    <div class="benefits-grid">
+                        <div class="benefit-card">
+                            <strong>🔄 Efficient Revocation</strong>
+                            <p>Re-key just one subtree instead of rotating the entire bucket</p>
+                        </div>
+                        <div class="benefit-card">
+                            <strong>🔒 Least Privilege</strong>
+                            <p>A subtree share cannot be escalated to access unrelated data</p>
+                        </div>
+                        <div class="benefit-card">
+                            <strong>⚡ Low Overhead</strong>
+                            <p>Still uses a single PrivateForest - no structural changes needed</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="code-snippet">
+                    <pre>use fula_crypto::{SubtreeKeyManager, SubtreeShareBuilder, DekKey, KekKeyPair};
+
+// Create manager with master DEK
+let master_dek = DekKey::generate();
+let mut manager = SubtreeKeyManager::with_master_dek(master_dek);
+
+// Create subtrees with their own DEKs
+let (photos_dek, encrypted_photos) = manager.create_subtree("/photos/")?;
+let (docs_dek, encrypted_docs) = manager.create_subtree("/documents/")?;
+
+// Resolve DEK for a file path
+let dek = manager.resolve_dek("/photos/vacation/beach.jpg");  // Returns photos_dek
+
+// Share a subtree with someone
+let owner = KekKeyPair::generate();
+let recipient = KekKeyPair::generate();
+
+let share = SubtreeShareBuilder::new(
+    &owner,
+    recipient.public_key(),
+    &photos_dek,
+    "/photos/",
+    1,  // version
+)
+    .expires_in(86400)  // 24 hours
+    .read_only()
+    .build()?;
+
+// Rotate subtree key after revocation
+let rotation = manager.rotate_subtree("/photos/")?;
+// rotation.new_dek is now used for /photos/*
+// Old shares become invalid</pre>
+                </div>
+
+                <div class="subtree-use-cases">
+                    <h3>When to Use Subtree Keys</h3>
+                    <table class="mode-table">
+                        <thead>
+                            <tr>
+                                <th>Scenario</th>
+                                <th>Recommendation</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Sharing app-specific data folders</td>
+                                <td>Use subtree DEK per app namespace</td>
+                            </tr>
+                            <tr>
+                                <td>Sharing project folders with different teams</td>
+                                <td>Use subtree DEK per project</td>
+                            </tr>
+                            <tr>
+                                <td>Need to revoke access to specific shared folder</td>
+                                <td>Rotate just that subtree's DEK</td>
+                            </tr>
+                            <tr>
+                                <td>Single user, no sharing</td>
+                                <td>Master DEK is sufficient</td>
+                            </tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </section>
@@ -1277,8 +1814,146 @@ println!("Original size: {}", info.original_size);</pre>
             </div>
         </section>
 
+        <!-- Multi-Device Key Management -->
+        <section id="multi-device" class="security-section">
+            <h2>Multi-Device Key Management</h2>
+            <p class="section-intro">Securely manage encryption keys across multiple devices.</p>
+
+            <div class="multi-device-content">
+                <div class="patterns-overview">
+                    <h3>Key Management Patterns</h3>
+                    <p>Fula supports multiple patterns for managing keys across devices:</p>
+                    
+                    <div class="pattern-cards">
+                        <div class="pattern-card">
+                            <h4>Pattern A: Shared Identity</h4>
+                            <p>All devices share the same master key. Simple but all devices are equally trusted.</p>
+                            <div class="code-snippet">
+                                <pre>// All devices use same backed-up secret
+let master_secret = SecretKey::from_bytes(backed_up_secret)?;
+let keypair = KekKeyPair::from_secret(master_secret);
+let key_manager = KeyManager::new(&keypair);
+// Files encrypted on one device readable on all</pre>
+                            </div>
+                            <div class="pattern-pros-cons">
+                                <span class="pro">+ Simple setup</span>
+                                <span class="pro">+ Seamless sync</span>
+                                <span class="con">- No device revocation</span>
+                            </div>
+                        </div>
+
+                        <div class="pattern-card recommended">
+                            <span class="badge">Recommended</span>
+                            <h4>Pattern B: Per-Device Keys</h4>
+                            <p>Each device has its own KEK. Access granted via ShareToken.</p>
+                            <div class="code-snippet">
+                                <pre>// Device A (primary)
+let device_a = KekKeyPair::generate();
+
+// Device B (secondary) 
+let device_b = KekKeyPair::generate();
+
+// Grant Device B access to specific folders
+let share = ShareBuilder::new(
+    &device_a,
+    device_b.public_key(),
+    &folder_dek
+)
+    .path_scope("/shared/")
+    .build()?;</pre>
+                            </div>
+                            <div class="pattern-pros-cons">
+                                <span class="pro">+ Device revocation</span>
+                                <span class="pro">+ Granular access</span>
+                                <span class="con">- More complex setup</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="device-loss">
+                    <h3>Handling Device Loss</h3>
+                    <p>When a device is lost or stolen:</p>
+                    <ol>
+                        <li><strong>Immediate:</strong> Rotate KEK on remaining devices</li>
+                        <li><strong>Re-wrap:</strong> Use <code>FileSystemRotation</code> to re-wrap all DEKs</li>
+                        <li><strong>Revoke:</strong> Remove device from any shared access</li>
+                        <li><strong>Audit:</strong> Review what data the device had access to</li>
+                    </ol>
+                    <div class="code-snippet">
+                        <pre>// On remaining device - rotate immediately
+let mut rotation = FileSystemRotation::new(current_keypair);
+let new_public_key = rotation.rotate();
+
+// Re-wrap all DEKs with new KEK
+while !rotation.is_rotation_complete() {
+    rotation.rotate_batch();
+}
+// Lost device's wrapped keys are now useless</pre>
+                    </div>
+                </div>
+
+                <div class="key-backup">
+                    <h3>Key Backup Strategy</h3>
+                    <div class="backup-options">
+                        <div class="backup-option">
+                            <strong>📝 Paper Backup</strong>
+                            <p>24-word mnemonic phrase stored offline in multiple secure locations</p>
+                        </div>
+                        <div class="backup-option">
+                            <strong>🔐 Hardware Security</strong>
+                            <p>YubiKey, Ledger, or other HSM for master key storage</p>
+                        </div>
+                        <div class="backup-option">
+                            <strong>☁️ Encrypted Cloud</strong>
+                            <p>Password-protected backup on different provider than data</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="recovery-info">
+                    <h3>Recovery Scenarios</h3>
+                    <table class="recovery-table">
+                        <thead>
+                            <tr>
+                                <th>Scenario</th>
+                                <th>Recovery Method</th>
+                                <th>Data Loss</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Lost device (backup exists)</td>
+                                <td>Restore from backup</td>
+                                <td class="success">None</td>
+                            </tr>
+                            <tr>
+                                <td>Lost device (no backup)</td>
+                                <td>Cannot recover</td>
+                                <td class="danger">All data</td>
+                            </tr>
+                            <tr>
+                                <td>Compromised device (detected early)</td>
+                                <td>Rotate + restore</td>
+                                <td class="success">None</td>
+                            </tr>
+                            <tr>
+                                <td>Compromised device (delayed detection)</td>
+                                <td>Rotate + audit</td>
+                                <td class="warning">Potentially exposed</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <p class="doc-link">
+                    📄 <strong>Full Documentation:</strong> See <a href="https://github.com/functionland/fula-api/blob/main/docs/THREAT_MODEL.md">THREAT_MODEL.md</a> for comprehensive multi-device patterns and threat analysis.
+                </p>
+            </div>
+        </section>
+
         <!-- Best Practices -->
-        <section id="best-practices" class="security-section">
+        <section id="best-practices" class="security-section alt-bg">
             <h2>Security Best Practices</h2>
             <p class="section-intro">Recommendations for securely using Fula encryption.</p>
 

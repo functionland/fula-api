@@ -39,12 +39,15 @@ pub mod error;
 pub mod hamt_index;
 pub mod hashing;
 pub mod hpke;
+pub mod inbox;
 pub mod keys;
 pub mod private_forest;
 pub mod private_metadata;
 pub mod rotation;
+pub mod secret_link;
 pub mod sharing;
 pub mod streaming;
+pub mod subtree_keys;
 pub mod symmetric;
 
 pub use chunked::{ChunkedEncoder, ChunkedDecoder, ChunkedFileMetadata, EncryptedChunk, should_use_chunked, CHUNKED_THRESHOLD, AsyncStreamingEncoder, VerifiedStreamingDecoder};
@@ -53,12 +56,15 @@ pub use error::{CryptoError, Result};
 pub use hamt_index::{HamtIndex, HamtNode, ShardedIndex};
 pub use hashing::{Blake3Hash, Hasher, HashOutput};
 pub use hpke::{Decryptor, EncapsulatedKey, EncryptedData, Encryptor, HpkeConfig, SharePermissions};
+pub use inbox::{ShareEnvelope, ShareEnvelopeBuilder, InboxEntry, InboxEntryStatus, ShareInbox, INBOX_PREFIX, DEFAULT_INBOX_TTL_SECONDS};
 pub use keys::{DekKey, KekKeyPair, KeyManager, PublicKey, SecretKey};
 pub use private_forest::{PrivateForest, EncryptedForest, ForestFileEntry, ForestDirectoryEntry, ForestFormat, derive_index_key, generate_flat_key};
 pub use private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, PublicMetadata, KeyObfuscation, obfuscate_key};
 pub use rotation::{KeyRotationManager, FileSystemRotation, WrappedKeyInfo, RotationResult};
-pub use sharing::{ShareToken, ShareBuilder, ShareRecipient, AcceptedShare, FolderShareManager, AccessValidation};
+pub use secret_link::{SecretLink, SecretLinkBuilder, SecretLinkPayload, is_valid_secret_link_url, extract_opaque_id, SHARE_PATH_PREFIX};
+pub use sharing::{ShareToken, ShareBuilder, ShareRecipient, AcceptedShare, FolderShareManager, AccessValidation, ShareMode, SnapshotBinding, SnapshotVerification};
 pub use streaming::{BaoEncoder, BaoDecoder, BaoOutboard, VerifiedStream};
+pub use subtree_keys::{SubtreeKeyManager, EncryptedSubtreeDek, SubtreeKeyInfo, SubtreeRotationResult, SubtreeShareToken, SubtreeShareBuilder, SubtreeShareRecipient, AcceptedSubtreeShare};
 pub use symmetric::{Aead, AeadCipher, Nonce};
 
 /// The version of the cryptographic format

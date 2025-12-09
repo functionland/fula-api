@@ -5,6 +5,7 @@
 //! - Time-limited share links with expiry validation
 //! - Permission-based access control (read/write/delete)
 //! - Re-encryption for sharing without revealing original DEK
+//! - Snapshot vs Temporal share modes (WNFS-inspired)
 
 use crate::{
     CryptoError, Result,
@@ -14,6 +15,120 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SHARE MODE (WNFS-Inspired Snapshot vs Temporal Semantics)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Share mode determines how access evolves over time
+///
+/// Inspired by WNFS's `AccessKey` enum with `Temporal` and `Snapshot` variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ShareMode {
+    /// Temporal mode (default): Access to the *latest* version under a path
+    /// 
+    /// The recipient always sees the current state of the shared content,
+    /// including any updates made after the share was created.
+    #[default]
+    Temporal,
+    
+    /// Snapshot mode: Access only to the *specific version* at share creation time
+    /// 
+    /// The share is bound to a specific content state (hash, size, timestamp).
+    /// If the content changes, the share becomes invalid for the new version.
+    Snapshot,
+}
+
+impl ShareMode {
+    /// Check if this is a snapshot share
+    pub fn is_snapshot(&self) -> bool {
+        matches!(self, ShareMode::Snapshot)
+    }
+    
+    /// Check if this is a temporal share
+    pub fn is_temporal(&self) -> bool {
+        matches!(self, ShareMode::Temporal)
+    }
+}
+
+/// Binding data for snapshot shares
+///
+/// When a share is created in Snapshot mode, this structure captures
+/// the exact state of the content at that moment. Recipients can only
+/// access content that matches this binding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotBinding {
+    /// BLAKE3 hash of the file content (hex-encoded)
+    pub content_hash: String,
+    /// Size of the file in bytes at snapshot time
+    pub size: u64,
+    /// Modification timestamp at snapshot time (Unix seconds)
+    pub modified_at: i64,
+    /// Storage key at snapshot time (for verification)
+    pub storage_key: Option<String>,
+}
+
+impl SnapshotBinding {
+    /// Create a new snapshot binding
+    pub fn new(content_hash: impl Into<String>, size: u64, modified_at: i64) -> Self {
+        Self {
+            content_hash: content_hash.into(),
+            size,
+            modified_at,
+            storage_key: None,
+        }
+    }
+    
+    /// Create with storage key
+    pub fn with_storage_key(
+        content_hash: impl Into<String>,
+        size: u64,
+        modified_at: i64,
+        storage_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            content_hash: content_hash.into(),
+            size,
+            modified_at,
+            storage_key: Some(storage_key.into()),
+        }
+    }
+    
+    /// Verify that current content matches this binding
+    pub fn verify(&self, current_hash: &str, current_size: u64, current_modified_at: i64) -> SnapshotVerification {
+        let hash_matches = self.content_hash == current_hash;
+        let size_matches = self.size == current_size;
+        let timestamp_matches = self.modified_at == current_modified_at;
+        
+        if hash_matches && size_matches && timestamp_matches {
+            SnapshotVerification::Valid
+        } else if !hash_matches {
+            SnapshotVerification::ContentChanged
+        } else if !size_matches {
+            SnapshotVerification::SizeChanged
+        } else {
+            SnapshotVerification::TimestampChanged
+        }
+    }
+    
+    /// Quick check if content hash matches (most important check)
+    pub fn hash_matches(&self, current_hash: &str) -> bool {
+        self.content_hash == current_hash
+    }
+}
+
+/// Result of snapshot verification
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotVerification {
+    /// Content matches the snapshot binding
+    Valid,
+    /// Content hash has changed since snapshot
+    ContentChanged,
+    /// File size has changed since snapshot  
+    SizeChanged,
+    /// Modification timestamp has changed
+    TimestampChanged,
+}
 
 /// Get current Unix timestamp in seconds
 pub fn current_timestamp() -> i64 {
@@ -40,6 +155,12 @@ pub struct ShareToken {
     pub permissions: SharePermissions,
     /// Version of the share format
     pub version: u8,
+    /// Share mode: Temporal (default) or Snapshot
+    #[serde(default)]
+    pub mode: ShareMode,
+    /// Snapshot binding (required for Snapshot mode)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_binding: Option<SnapshotBinding>,
 }
 
 impl ShareToken {
@@ -77,6 +198,60 @@ impl ShareToken {
     pub fn time_until_expiry(&self) -> Option<i64> {
         self.expires_at.map(|exp| exp - current_timestamp()).filter(|&t| t > 0)
     }
+
+    /// Check if this is a snapshot share
+    pub fn is_snapshot(&self) -> bool {
+        self.mode.is_snapshot()
+    }
+
+    /// Check if this is a temporal share
+    pub fn is_temporal(&self) -> bool {
+        self.mode.is_temporal()
+    }
+
+    /// Verify that content matches the snapshot binding (for Snapshot mode)
+    /// 
+    /// Returns `Ok(())` for temporal shares or if content matches.
+    /// Returns `Err` with details if content has changed.
+    pub fn verify_snapshot(
+        &self,
+        current_hash: &str,
+        current_size: u64,
+        current_modified_at: i64,
+    ) -> Result<SnapshotVerification> {
+        match &self.mode {
+            ShareMode::Temporal => Ok(SnapshotVerification::Valid),
+            ShareMode::Snapshot => {
+                match &self.snapshot_binding {
+                    Some(binding) => Ok(binding.verify(current_hash, current_size, current_modified_at)),
+                    None => Err(CryptoError::InvalidFormat(
+                        "Snapshot share missing binding data".to_string()
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Quick check if snapshot is still valid by content hash only
+    /// 
+    /// For temporal shares, always returns true.
+    /// For snapshot shares, checks if content hash matches.
+    pub fn is_snapshot_valid(&self, current_hash: &str) -> bool {
+        match &self.mode {
+            ShareMode::Temporal => true,
+            ShareMode::Snapshot => {
+                self.snapshot_binding
+                    .as_ref()
+                    .map(|b| b.hash_matches(current_hash))
+                    .unwrap_or(false)
+            }
+        }
+    }
+
+    /// Get the snapshot binding if this is a snapshot share
+    pub fn get_snapshot_binding(&self) -> Option<&SnapshotBinding> {
+        self.snapshot_binding.as_ref()
+    }
 }
 
 /// Builder for creating share tokens
@@ -88,10 +263,12 @@ pub struct ShareBuilder<'a> {
     path_scope: String,
     expires_at: Option<i64>,
     permissions: SharePermissions,
+    mode: ShareMode,
+    snapshot_binding: Option<SnapshotBinding>,
 }
 
 impl<'a> ShareBuilder<'a> {
-    /// Create a new share builder
+    /// Create a new share builder (defaults to Temporal mode)
     pub fn new(
         owner_keypair: &'a KekKeyPair,
         recipient_public_key: &'a PublicKey,
@@ -104,6 +281,8 @@ impl<'a> ShareBuilder<'a> {
             path_scope: "/".to_string(),
             expires_at: None,
             permissions: SharePermissions::read_only(),
+            mode: ShareMode::Temporal,
+            snapshot_binding: None,
         }
     }
 
@@ -149,8 +328,46 @@ impl<'a> ShareBuilder<'a> {
         self
     }
 
+    /// Set share mode to Temporal (default)
+    /// 
+    /// Temporal shares give access to the latest version of the content.
+    pub fn temporal(mut self) -> Self {
+        self.mode = ShareMode::Temporal;
+        self.snapshot_binding = None;
+        self
+    }
+
+    /// Set share mode to Snapshot with binding data
+    /// 
+    /// Snapshot shares are bound to a specific content version.
+    /// The recipient can only access content that matches the binding.
+    pub fn snapshot(mut self, binding: SnapshotBinding) -> Self {
+        self.mode = ShareMode::Snapshot;
+        self.snapshot_binding = Some(binding);
+        self
+    }
+
+    /// Create a snapshot share with explicit binding values
+    pub fn snapshot_with(
+        mut self,
+        content_hash: impl Into<String>,
+        size: u64,
+        modified_at: i64,
+    ) -> Self {
+        self.mode = ShareMode::Snapshot;
+        self.snapshot_binding = Some(SnapshotBinding::new(content_hash, size, modified_at));
+        self
+    }
+
     /// Build the share token
     pub fn build(self) -> Result<ShareToken> {
+        // Validate snapshot mode has binding
+        if self.mode == ShareMode::Snapshot && self.snapshot_binding.is_none() {
+            return Err(CryptoError::InvalidFormat(
+                "Snapshot share requires snapshot_binding".to_string()
+            ));
+        }
+
         // Generate a unique share ID
         let id = generate_share_id();
 
@@ -165,7 +382,9 @@ impl<'a> ShareBuilder<'a> {
             expires_at: self.expires_at,
             created_at: current_timestamp(),
             permissions: self.permissions,
-            version: 1,
+            version: 2, // Bump version for new format with mode
+            mode: self.mode,
+            snapshot_binding: self.snapshot_binding,
         })
     }
 }
@@ -578,5 +797,222 @@ mod tests {
         assert!(!token.is_valid_for_path("/photos/2024/work/"));
         assert!(!token.is_valid_for_path("/documents/"));
         assert!(!token.is_valid_for_path("/photos/2023/vacation/")); // Different year
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SNAPSHOT VS TEMPORAL MODE TESTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_temporal_share_default() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        // Default is temporal mode
+        let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .path_scope("/photos/")
+            .build()
+            .unwrap();
+
+        assert!(token.is_temporal());
+        assert!(!token.is_snapshot());
+        assert_eq!(token.mode, ShareMode::Temporal);
+        assert!(token.snapshot_binding.is_none());
+    }
+
+    #[test]
+    fn test_snapshot_share_creation() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let binding = SnapshotBinding::new(
+            "abc123def456", // content hash
+            1024,           // size
+            1700000000,     // modified_at
+        );
+
+        let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .path_scope("/photos/vacation/")
+            .snapshot(binding.clone())
+            .build()
+            .unwrap();
+
+        assert!(token.is_snapshot());
+        assert!(!token.is_temporal());
+        assert_eq!(token.mode, ShareMode::Snapshot);
+        
+        let stored_binding = token.snapshot_binding.as_ref().unwrap();
+        assert_eq!(stored_binding.content_hash, "abc123def456");
+        assert_eq!(stored_binding.size, 1024);
+        assert_eq!(stored_binding.modified_at, 1700000000);
+    }
+
+    #[test]
+    fn test_snapshot_share_with_values() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .path_scope("/photos/")
+            .snapshot_with("hash123", 2048, 1700000000)
+            .build()
+            .unwrap();
+
+        assert!(token.is_snapshot());
+        let binding = token.snapshot_binding.as_ref().unwrap();
+        assert_eq!(binding.content_hash, "hash123");
+        assert_eq!(binding.size, 2048);
+    }
+
+    #[test]
+    fn test_snapshot_verification_valid() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .snapshot_with("abc123", 1024, 1700000000)
+            .build()
+            .unwrap();
+
+        // Content matches
+        let result = token.verify_snapshot("abc123", 1024, 1700000000).unwrap();
+        assert_eq!(result, SnapshotVerification::Valid);
+    }
+
+    #[test]
+    fn test_snapshot_verification_content_changed() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .snapshot_with("original_hash", 1024, 1700000000)
+            .build()
+            .unwrap();
+
+        // Content hash changed
+        let result = token.verify_snapshot("different_hash", 1024, 1700000000).unwrap();
+        assert_eq!(result, SnapshotVerification::ContentChanged);
+    }
+
+    #[test]
+    fn test_snapshot_verification_size_changed() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .snapshot_with("same_hash", 1024, 1700000000)
+            .build()
+            .unwrap();
+
+        // Size changed but hash matches
+        let result = token.verify_snapshot("same_hash", 2048, 1700000000).unwrap();
+        assert_eq!(result, SnapshotVerification::SizeChanged);
+    }
+
+    #[test]
+    fn test_temporal_share_always_valid() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .temporal()
+            .build()
+            .unwrap();
+
+        // Temporal shares don't care about content changes
+        assert!(token.is_snapshot_valid("any_hash"));
+        assert!(token.is_snapshot_valid("another_hash"));
+        
+        let result = token.verify_snapshot("any_hash", 9999, 0).unwrap();
+        assert_eq!(result, SnapshotVerification::Valid);
+    }
+
+    #[test]
+    fn test_snapshot_requires_binding() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        // Manually set mode to Snapshot without binding
+        let mut builder = ShareBuilder::new(&owner, recipient.public_key(), &dek);
+        builder.mode = ShareMode::Snapshot;
+        builder.snapshot_binding = None;
+
+        let result = builder.build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_snapshot_binding_storage_key() {
+        let binding = SnapshotBinding::with_storage_key(
+            "hash123",
+            1024,
+            1700000000,
+            "Qm123abc456"
+        );
+
+        assert_eq!(binding.content_hash, "hash123");
+        assert_eq!(binding.size, 1024);
+        assert_eq!(binding.storage_key, Some("Qm123abc456".to_string()));
+    }
+
+    #[test]
+    fn test_is_snapshot_valid_helper() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .snapshot_with("correct_hash", 1024, 1700000000)
+            .build()
+            .unwrap();
+
+        assert!(token.is_snapshot_valid("correct_hash"));
+        assert!(!token.is_snapshot_valid("wrong_hash"));
+    }
+
+    #[test]
+    fn test_share_mode_enum() {
+        assert!(ShareMode::Temporal.is_temporal());
+        assert!(!ShareMode::Temporal.is_snapshot());
+        
+        assert!(ShareMode::Snapshot.is_snapshot());
+        assert!(!ShareMode::Snapshot.is_temporal());
+        
+        // Default is Temporal
+        assert_eq!(ShareMode::default(), ShareMode::Temporal);
+    }
+
+    #[test]
+    fn test_share_token_serialization_with_mode() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        // Create snapshot share
+        let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .path_scope("/files/")
+            .snapshot_with("hash", 512, 1700000000)
+            .build()
+            .unwrap();
+
+        // Serialize
+        let json = serde_json::to_string(&token).unwrap();
+        
+        // Deserialize
+        let restored: ShareToken = serde_json::from_str(&json).unwrap();
+        
+        assert!(restored.is_snapshot());
+        assert_eq!(restored.mode, ShareMode::Snapshot);
+        let binding = restored.snapshot_binding.unwrap();
+        assert_eq!(binding.content_hash, "hash");
+        assert_eq!(binding.size, 512);
     }
 }

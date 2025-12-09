@@ -75,4 +75,8 @@ pub enum CryptoError {
     /// Access denied
     #[error("access denied: {0}")]
     AccessDenied(String),
+
+    /// Invalid format (for parsing URLs, links, etc.)
+    #[error("invalid format: {0}")]
+    InvalidFormat(String),
 }

@@ -585,7 +585,7 @@ fn test_combined_stress_scenario() {
 
     // List all files
     let start = Instant::now();
-    let all_files: Vec<_> = forest.list_all_files().collect();
+    let all_files = forest.list_all_files();
     let list_time = start.elapsed();
     println!("📋 Listed all {} files in {:?}", all_files.len(), list_time);
 
