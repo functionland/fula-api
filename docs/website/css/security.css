@@ -1159,6 +1159,29 @@
     font-style: italic;
 }
 
+/* Quantum-Safe Styling */
+.quantum-note {
+    background: linear-gradient(135deg, rgba(56, 139, 253, 0.1) 0%, rgba(136, 46, 224, 0.1) 100%);
+    border: 1px solid rgba(56, 139, 253, 0.3);
+    border-radius: 8px;
+    padding: 1rem 1.5rem;
+    margin-top: 1.5rem;
+    font-size: 0.95rem;
+    line-height: 1.6;
+}
+
+.quantum-note strong {
+    color: #58a6ff;
+}
+
+.highlight-row {
+    background: linear-gradient(135deg, rgba(56, 139, 253, 0.15) 0%, rgba(136, 46, 224, 0.15) 100%);
+}
+
+.highlight-row td {
+    font-weight: 500;
+}
+
 /* Footer */
 footer {
     text-align: center;
