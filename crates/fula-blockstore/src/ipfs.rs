@@ -158,11 +158,15 @@ impl IpfsBlockStore {
     }
 
     /// Put a raw block
+    /// Note: Raw blocks (file chunks) are NOT pinned inline to avoid timeouts.
+    /// They are protected by the bucket root's recursive pin after flush_forest.
     #[instrument(skip(self, data), fields(size = data.len()))]
     pub async fn put_block_raw(&self, data: &[u8]) -> Result<Cid> {
+        // Don't pin raw blocks inline - even small blocks can cause timeouts under load.
+        // All blocks are protected by recursive pinning of the bucket root CID at flush time.
         let url = format!(
             "{}/api/v0/block/put?cid-codec=raw&mhtype=blake3",
-            self.config.api_url
+            self.config.api_url,
         );
 
         let part = multipart::Part::bytes(data.to_vec())
@@ -267,6 +271,8 @@ impl BlockStore for IpfsBlockStore {
         
         tracing::debug!(bytes_len = bytes.len(), "Serialized IPLD data to CBOR");
         
+        // Don't pin inline - it delays the response body and causes timeouts.
+        // All data is protected by bucket root recursive pin at flush_forest time.
         let url = format!(
             "{}/api/v0/dag/put?store-codec=dag-cbor&input-codec=dag-cbor",
             self.config.api_url
@@ -294,10 +300,14 @@ impl BlockStore for IpfsBlockStore {
             )));
         }
 
-        let result: DagPutResponse = response
-            .json()
-            .await
-            .map_err(|e| BlockStoreError::IpfsApi(e.to_string()))?;
+        // Read response body as text first for debugging
+        let body_text = response.text().await
+            .map_err(|e| BlockStoreError::IpfsApi(format!("Failed to read response body: {}", e)))?;
+        
+        tracing::debug!(body = %body_text, "IPFS dag/put response body");
+        
+        let result: DagPutResponse = serde_json::from_str(&body_text)
+            .map_err(|e| BlockStoreError::IpfsApi(format!("Failed to parse response: {} - body: {}", e, body_text)))?;
 
         tracing::debug!(cid = %result.cid.root_cid, "DAG stored successfully");
         

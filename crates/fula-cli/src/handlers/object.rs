@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use fula_blockstore::BlockStore;
+use fula_blockstore::{BlockStore, PinStore};
 use fula_core::metadata::ObjectMetadata;
 use fula_crypto::hashing::md5_hash;
 use serde::Deserialize;
@@ -91,13 +91,28 @@ pub async fn put_object(
         })?;
     
     tracing::debug!("Flushing bucket");
-    bucket.flush().await
+    let bucket_root_cid = bucket.flush().await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to flush bucket");
             e
         })?;
 
-    // Pin to user's pinning service if credentials provided
+    // Pin the BUCKET ROOT CID to ensure tree structure survives GC.
+    // This recursively pins all tree nodes AND all referenced object data.
+    // NOTE: Pinning is async (fire-and-forget) to avoid blocking the response.
+    {
+        let block_store = Arc::clone(&state.block_store);
+        let pin_name = format!("bucket:{}", bucket_name);
+        tokio::spawn(async move {
+            if let Err(e) = block_store.pin(&bucket_root_cid, Some(&pin_name)).await {
+                tracing::warn!(cid = %bucket_root_cid, error = %e, "Failed to pin bucket root CID");
+            } else {
+                tracing::info!(cid = %bucket_root_cid, bucket = %pin_name, "Bucket root CID pinned (recursive)");
+            }
+        });
+    }
+
+    // Also pin to user's external pinning service if credentials provided
     // Headers: X-Pinning-Service, X-Pinning-Token
     pin_for_user(&headers, &cid, Some(&key)).await;
 

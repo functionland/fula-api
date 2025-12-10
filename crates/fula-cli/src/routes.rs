@@ -220,7 +220,7 @@ async fn object_post_handler(
     if query.uploads.is_some() {
         handlers::create_multipart_upload(state, session, path, headers).await
     } else if query.upload_id.is_some() {
-        handlers::complete_multipart_upload(state, session, path, query, body).await
+        handlers::complete_multipart_upload(state, session, path, query, headers, body).await
     } else {
         Err(crate::ApiError::s3(
             crate::S3ErrorCode::InvalidRequest,

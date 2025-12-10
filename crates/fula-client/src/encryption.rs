@@ -16,6 +16,7 @@ use fula_crypto::{
     private_forest::{PrivateForest, EncryptedForest, ForestFileEntry, derive_index_key},
     sharing::{ShareToken, AcceptedShare, ShareRecipient},
     rotation::{KeyRotationManager, WrappedKeyInfo},
+    ChunkedEncoder, ChunkedFileMetadata, should_use_chunked,
 };
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
@@ -321,6 +322,8 @@ impl EncryptedClient {
     /// 
     /// Use this when you already have the obfuscated storage key
     /// (e.g., from list_objects_decrypted)
+    /// 
+    /// Handles both single-block and chunked objects automatically.
     pub async fn get_object_decrypted_by_storage_key(
         &self,
         bucket: &str,
@@ -338,6 +341,12 @@ impl EncryptedClient {
             return Ok(result.data);
         }
 
+        // Check if this is a chunked object
+        let is_chunked = result.metadata
+            .get("x-fula-chunked")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
         // Parse encryption metadata
         let enc_metadata_str = result.metadata
             .get("x-fula-encryption")
@@ -350,21 +359,7 @@ impl EncryptedClient {
                 fula_crypto::CryptoError::Decryption(e.to_string())
             ))?;
 
-        // Extract nonce
-        let nonce_b64 = enc_metadata["nonce"].as_str()
-            .ok_or_else(|| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption("Missing nonce".to_string())
-            ))?;
-        let nonce_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            nonce_b64,
-        ).map_err(|e| ClientError::Encryption(
-            fula_crypto::CryptoError::Decryption(e.to_string())
-        ))?;
-        let nonce = Nonce::from_bytes(&nonce_bytes)
-            .map_err(ClientError::Encryption)?;
-
-        // Unwrap the DEK
+        // Unwrap the DEK (common to both chunked and non-chunked)
         let wrapped_key: EncryptedData = serde_json::from_value(
             enc_metadata["wrapped_key"].clone()
         ).map_err(|e| ClientError::Encryption(
@@ -375,10 +370,64 @@ impl EncryptedClient {
         let dek = decryptor.decrypt_dek(&wrapped_key)
             .map_err(ClientError::Encryption)?;
 
-        // Decrypt the data
-        let aead = Aead::new_default(&dek);
-        let plaintext = aead.decrypt(&nonce, &result.data)
-            .map_err(ClientError::Encryption)?;
+        if is_chunked {
+            // CHUNKED DOWNLOAD: Download and decrypt each chunk
+            self.get_object_chunked_internal(bucket, storage_key, &enc_metadata, &dek).await
+        } else {
+            // SINGLE OBJECT: Decrypt directly
+            let nonce_b64 = enc_metadata["nonce"].as_str()
+                .ok_or_else(|| ClientError::Encryption(
+                    fula_crypto::CryptoError::Decryption("Missing nonce".to_string())
+                ))?;
+            let nonce_bytes = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                nonce_b64,
+            ).map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(e.to_string())
+            ))?;
+            let nonce = Nonce::from_bytes(&nonce_bytes)
+                .map_err(ClientError::Encryption)?;
+
+            let aead = Aead::new_default(&dek);
+            let plaintext = aead.decrypt(&nonce, &result.data)
+                .map_err(ClientError::Encryption)?;
+
+            Ok(Bytes::from(plaintext))
+        }
+    }
+
+    /// Internal: Download and decrypt a chunked file
+    async fn get_object_chunked_internal(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        enc_metadata: &serde_json::Value,
+        dek: &fula_crypto::keys::DekKey,
+    ) -> Result<Bytes> {
+        // Parse chunked metadata
+        let chunked_meta: ChunkedFileMetadata = serde_json::from_value(
+            enc_metadata["chunked"].clone()
+        ).map_err(|e| ClientError::Encryption(
+            fula_crypto::CryptoError::Decryption(format!("Invalid chunked metadata: {}", e))
+        ))?;
+
+        // Create decoder
+        let mut decoder = fula_crypto::ChunkedDecoder::new(dek.clone(), chunked_meta.clone());
+
+        // Pre-allocate result buffer
+        let mut plaintext = Vec::with_capacity(chunked_meta.total_size as usize);
+
+        // Download and decrypt each chunk in order
+        for chunk_index in 0..chunked_meta.num_chunks {
+            let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk_index);
+            
+            let chunk_result = self.inner.get_object(bucket, &chunk_key).await?;
+            
+            let chunk_plaintext = decoder.decrypt_chunk(chunk_index, &chunk_result)
+                .map_err(ClientError::Encryption)?;
+            
+            plaintext.extend_from_slice(&chunk_plaintext);
+        }
 
         Ok(Bytes::from(plaintext))
     }
@@ -839,12 +888,6 @@ impl EncryptedClient {
         // Generate a DEK for this object
         let dek = self.encryption.key_manager.generate_dek();
         
-        // Encrypt the data
-        let nonce = Nonce::generate();
-        let aead = Aead::new_default(&dek);
-        let ciphertext = aead.encrypt(&nonce, &data)
-            .map_err(ClientError::Encryption)?;
-
         // Generate flat storage key (no structure hints!)
         let storage_key = forest.generate_key(key, &dek);
 
@@ -864,42 +907,61 @@ impl EncryptedClient {
         let entry = ForestFileEntry::from_metadata(&private_meta, storage_key.clone());
         forest.upsert_file(entry);
 
-        // Serialize encryption metadata with KEK version
         let kek_version = self.encryption.key_manager.version();
-        let enc_metadata = serde_json::json!({
-            "version": 2,
-            "algorithm": "AES-256-GCM",
-            "nonce": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce.as_bytes()),
-            "wrapped_key": serde_json::to_value(&wrapped_dek).unwrap(),
-            "kek_version": kek_version,
-            "metadata_privacy": true,
-            "obfuscation_mode": "flat",
-            "private_metadata": encrypted_meta.to_json().map_err(ClientError::Encryption)?,
-        });
 
-        // Upload the file (server sees only QmX7a8f3...)
-        let metadata = ObjectMetadata::new()
-            .with_content_type("application/octet-stream")
-            .with_metadata("x-fula-encrypted", "true")
-            .with_metadata("x-fula-encryption", &enc_metadata.to_string());
-
-        // Upload with optional pinning
-        let result = if let Some(ref pinning) = self.pinning {
-            self.inner.put_object_with_metadata_and_pinning(
+        // Check if we need chunked upload (for IPFS block size limit)
+        let result = if should_use_chunked(data.len()) {
+            // CHUNKED UPLOAD: Split into chunks under IPFS 1MB limit
+            self.put_object_chunked_internal(
                 bucket,
                 &storage_key,
-                Bytes::from(ciphertext),
-                Some(metadata),
-                &pinning.endpoint,
-                &pinning.token,
+                &data,
+                &dek,
+                &wrapped_dek,
+                &encrypted_meta,
+                kek_version,
             ).await?
         } else {
-            self.inner.put_object_with_metadata(
-                bucket,
-                &storage_key,
-                Bytes::from(ciphertext),
-                Some(metadata),
-            ).await?
+            // SINGLE OBJECT: File is small enough for one block
+            let nonce = Nonce::generate();
+            let aead = Aead::new_default(&dek);
+            let ciphertext = aead.encrypt(&nonce, &data)
+                .map_err(ClientError::Encryption)?;
+
+            // Serialize encryption metadata
+            let enc_metadata = serde_json::json!({
+                "version": 2,
+                "algorithm": "AES-256-GCM",
+                "nonce": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce.as_bytes()),
+                "wrapped_key": serde_json::to_value(&wrapped_dek).unwrap(),
+                "kek_version": kek_version,
+                "metadata_privacy": true,
+                "obfuscation_mode": "flat",
+                "private_metadata": encrypted_meta.to_json().map_err(ClientError::Encryption)?,
+            });
+
+            let metadata = ObjectMetadata::new()
+                .with_content_type("application/octet-stream")
+                .with_metadata("x-fula-encrypted", "true")
+                .with_metadata("x-fula-encryption", &enc_metadata.to_string());
+
+            if let Some(ref pinning) = self.pinning {
+                self.inner.put_object_with_metadata_and_pinning(
+                    bucket,
+                    &storage_key,
+                    Bytes::from(ciphertext),
+                    Some(metadata),
+                    &pinning.endpoint,
+                    &pinning.token,
+                ).await?
+            } else {
+                self.inner.put_object_with_metadata(
+                    bucket,
+                    &storage_key,
+                    Bytes::from(ciphertext),
+                    Some(metadata),
+                ).await?
+            }
         };
 
         // Update cache (but don't save to storage yet)
@@ -908,6 +970,103 @@ impl EncryptedClient {
             cache.insert(bucket.to_string(), forest);
         }
 
+        Ok(result)
+    }
+
+    /// Internal: Upload a large file using chunked encoding
+    async fn put_object_chunked_internal(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        data: &[u8],
+        dek: &fula_crypto::keys::DekKey,
+        wrapped_dek: &EncryptedData,
+        encrypted_meta: &EncryptedPrivateMetadata,
+        kek_version: u32,
+    ) -> Result<PutObjectResult> {
+        // Create chunked encoder
+        let mut encoder = ChunkedEncoder::new(dek.clone());
+        
+        // Process all data through encoder
+        let mut all_chunks = encoder.update(data)
+            .map_err(ClientError::Encryption)?;
+        
+        // Finalize to get last chunk and metadata
+        let (final_chunk, chunked_metadata, _outboard) = encoder.finalize()
+            .map_err(ClientError::Encryption)?;
+        
+        if let Some(chunk) = final_chunk {
+            all_chunks.push(chunk);
+        }
+        
+        // Upload each chunk as a separate object
+        for chunk in &all_chunks {
+            let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk.index);
+            
+            // Upload chunk (no encryption metadata needed, just raw encrypted bytes)
+            let chunk_metadata = ObjectMetadata::new()
+                .with_content_type("application/octet-stream")
+                .with_metadata("x-fula-chunk", "true")
+                .with_metadata("x-fula-chunk-index", &chunk.index.to_string());
+            
+            if let Some(ref pinning) = self.pinning {
+                self.inner.put_object_with_metadata_and_pinning(
+                    bucket,
+                    &chunk_key,
+                    chunk.ciphertext.clone(),
+                    Some(chunk_metadata),
+                    &pinning.endpoint,
+                    &pinning.token,
+                ).await?;
+            } else {
+                self.inner.put_object_with_metadata(
+                    bucket,
+                    &chunk_key,
+                    chunk.ciphertext.clone(),
+                    Some(chunk_metadata),
+                ).await?;
+            }
+        }
+        
+        // Create index object with encryption metadata and chunk info
+        let enc_metadata = serde_json::json!({
+            "version": 2,
+            "algorithm": "AES-256-GCM",
+            "wrapped_key": serde_json::to_value(wrapped_dek).unwrap(),
+            "kek_version": kek_version,
+            "metadata_privacy": true,
+            "obfuscation_mode": "flat",
+            "private_metadata": encrypted_meta.to_json().map_err(ClientError::Encryption)?,
+            "chunked": serde_json::to_value(&chunked_metadata).unwrap(),
+        });
+        
+        // The index object is small - just metadata, no file content
+        let index_body = enc_metadata.to_string();
+        let metadata = ObjectMetadata::new()
+            .with_content_type("application/json")
+            .with_metadata("x-fula-encrypted", "true")
+            .with_metadata("x-fula-chunked", "true")
+            .with_metadata("x-fula-encryption", &index_body);
+        
+        // Upload index object
+        let result = if let Some(ref pinning) = self.pinning {
+            self.inner.put_object_with_metadata_and_pinning(
+                bucket,
+                storage_key,
+                Bytes::from(index_body.clone()),
+                Some(metadata),
+                &pinning.endpoint,
+                &pinning.token,
+            ).await?
+        } else {
+            self.inner.put_object_with_metadata(
+                bucket,
+                storage_key,
+                Bytes::from(index_body.clone()),
+                Some(metadata),
+            ).await?
+        };
+        
         Ok(result)
     }
 

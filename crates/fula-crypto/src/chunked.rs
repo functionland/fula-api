@@ -39,11 +39,14 @@ pub const DEFAULT_CHUNK_SIZE: usize = 256 * 1024;
 /// Minimum chunk size: 64 KB
 pub const MIN_CHUNK_SIZE: usize = 64 * 1024;
 
-/// Maximum chunk size: 16 MB
-pub const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+/// Maximum chunk size: 768 KB
+/// CRITICAL: IPFS has a 1MB block limit. With encryption overhead (~16 bytes tag +
+/// potential padding), we must stay well under 1MB. 768KB provides safety margin.
+pub const MAX_CHUNK_SIZE: usize = 768 * 1024;
 
 /// Threshold for using chunked upload (files larger than this use chunking)
-pub const CHUNKED_THRESHOLD: usize = 5 * 1024 * 1024; // 5 MB
+/// Set to MAX_CHUNK_SIZE so any file that would exceed IPFS's block limit gets chunked.
+pub const CHUNKED_THRESHOLD: usize = MAX_CHUNK_SIZE;
 
 /// Metadata for a chunked/streaming encrypted file
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -630,9 +633,10 @@ mod tests {
     #[test]
     fn test_should_use_chunked() {
         assert!(!should_use_chunked(1024)); // 1 KB
-        assert!(!should_use_chunked(1024 * 1024)); // 1 MB
-        assert!(!should_use_chunked(5 * 1024 * 1024)); // 5 MB (exactly at threshold)
-        assert!(should_use_chunked(5 * 1024 * 1024 + 1)); // Just over 5 MB
+        assert!(!should_use_chunked(256 * 1024)); // 256 KB
+        assert!(!should_use_chunked(MAX_CHUNK_SIZE)); // Exactly at threshold
+        assert!(should_use_chunked(MAX_CHUNK_SIZE + 1)); // Just over threshold
+        assert!(should_use_chunked(1024 * 1024)); // 1 MB - must be chunked for IPFS
         assert!(should_use_chunked(100 * 1024 * 1024)); // 100 MB
     }
 

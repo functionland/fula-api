@@ -189,6 +189,14 @@ impl IntoResponse for ApiError {
             ApiError::S3Error { request_id, .. } => request_id.clone(),
             _ => uuid::Uuid::new_v4().to_string(),
         };
+        
+        // Log the actual error for debugging
+        tracing::error!(
+            error_code = %code.as_str(),
+            status = %status,
+            error = %self,
+            "API error response"
+        );
 
         let xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>

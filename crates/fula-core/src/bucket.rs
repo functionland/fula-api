@@ -286,6 +286,8 @@ impl<S: BlockStore> BucketManager<S> {
         name: String,
         owner: Owner,
     ) -> Result<BucketMetadata> {
+        tracing::debug!(bucket_name = %name, "Creating bucket");
+        
         // Check if bucket already exists
         if self.buckets.contains_key(&name) {
             return Err(CoreError::BucketAlreadyExists(name));
@@ -299,7 +301,11 @@ impl<S: BlockStore> BucketManager<S> {
         ).await?;
 
         let metadata = bucket.metadata().clone();
-        self.buckets.insert(name, metadata.clone());
+        tracing::debug!(bucket_name = %name, root_cid = %metadata.root_cid, "Bucket created in IPFS, adding to registry");
+        
+        self.buckets.insert(name.clone(), metadata.clone());
+        
+        tracing::info!(bucket_name = %name, total_buckets = %self.buckets.len(), "Bucket registered successfully");
         
         Ok(metadata)
     }
@@ -311,9 +317,14 @@ impl<S: BlockStore> BucketManager<S> {
 
     /// Open a bucket for operations
     pub async fn open_bucket(&self, name: &str) -> Result<Bucket<S>> {
+        tracing::debug!(bucket_name = %name, registered_buckets = ?self.buckets.iter().map(|r| r.key().clone()).collect::<Vec<_>>(), "Opening bucket");
+        
         let metadata = self.buckets.get(name)
             .map(|r| r.clone())
-            .ok_or_else(|| CoreError::BucketNotFound(name.to_string()))?;
+            .ok_or_else(|| {
+                tracing::error!(bucket_name = %name, "Bucket not found in registry");
+                CoreError::BucketNotFound(name.to_string())
+            })?;
 
         Bucket::load(
             metadata,

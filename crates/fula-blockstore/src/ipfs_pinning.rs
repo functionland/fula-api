@@ -242,10 +242,14 @@ impl BlockStore for IpfsPinningBlockStore {
             self.cache.insert(cid, Bytes::copy_from_slice(data));
         }
 
-        // Pin for persistence
-        if let Err(e) = self.pin_cid(&cid, None).await {
-            warn!(cid = %cid, error = %e, "Failed to pin CID, data may not be persistent");
-        }
+        // NOTE: We deliberately DO NOT pin individual blocks here.
+        // Instead, the root CID should be pinned at upload completion.
+        // IPFS recursive pinning will automatically pin all referenced blocks.
+        // This optimization reduces N pin requests to 1 for chunked uploads.
+        //
+        // Pinning should happen at:
+        // - put_object() completion for single objects
+        // - complete_multipart_upload() for multipart uploads
 
         Ok(cid)
     }
@@ -302,10 +306,8 @@ impl BlockStore for IpfsPinningBlockStore {
     async fn put_ipld<T: serde::Serialize + Send + Sync>(&self, data: &T) -> Result<Cid> {
         let cid = self.ipfs.put_ipld(data).await?;
 
-        // Pin for persistence
-        if let Err(e) = self.pin_cid(&cid, None).await {
-            warn!(cid = %cid, error = %e, "Failed to pin IPLD, data may not be persistent");
-        }
+        // NOTE: We deliberately DO NOT pin IPLD nodes inline.
+        // Pin the root CID at upload completion for recursive pinning.
 
         Ok(cid)
     }
@@ -487,6 +489,47 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.get_ipld(cid).await,
             Self::Memory(store) => store.get_ipld(cid).await,
+        }
+    }
+}
+
+#[async_trait]
+impl PinStore for FlexibleBlockStore {
+    async fn pin(&self, cid: &Cid, name: Option<&str>) -> Result<()> {
+        match self {
+            Self::IpfsPinning(store) => store.pin(cid, name).await,
+            Self::Memory(_) => {
+                // Memory store doesn't need pinning, just succeed silently
+                Ok(())
+            }
+        }
+    }
+
+    async fn unpin(&self, cid: &Cid) -> Result<()> {
+        match self {
+            Self::IpfsPinning(store) => store.unpin(cid).await,
+            Self::Memory(_) => Ok(()),
+        }
+    }
+
+    async fn is_pinned(&self, cid: &Cid) -> Result<bool> {
+        match self {
+            Self::IpfsPinning(store) => store.is_pinned(cid).await,
+            Self::Memory(_) => Ok(true), // Memory store "pins" everything
+        }
+    }
+
+    async fn list_pins(&self) -> Result<Vec<Cid>> {
+        match self {
+            Self::IpfsPinning(store) => store.list_pins().await,
+            Self::Memory(_) => Ok(Vec::new()),
+        }
+    }
+
+    async fn pin_status(&self, cid: &Cid) -> Result<crate::PinStatus> {
+        match self {
+            Self::IpfsPinning(store) => store.pin_status(cid).await,
+            Self::Memory(_) => Ok(crate::PinStatus::Pinned), // Memory store "pins" everything
         }
     }
 }

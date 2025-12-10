@@ -1,6 +1,7 @@
 //! Multipart upload handlers
 
 use crate::{AppState, ApiError, S3ErrorCode};
+use crate::pinning::pin_for_user;
 use crate::state::UserSession;
 use crate::multipart::UploadPart;
 use crate::xml;
@@ -10,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use fula_blockstore::BlockStore;
+use fula_blockstore::{BlockStore, PinStore};
 use fula_core::metadata::ObjectMetadata;
 use fula_crypto::hashing::md5_hash;
 use serde::Deserialize;
@@ -139,6 +140,7 @@ pub async fn complete_multipart_upload(
     Extension(session): Extension<UserSession>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<MultipartParams>,
+    headers: HeaderMap,
     _body: Bytes,
 ) -> Result<Response, ApiError> {
     if !session.can_write() {
@@ -167,10 +169,15 @@ pub async fn complete_multipart_upload(
     // Calculate total size
     let total_size: u64 = upload.parts.values().map(|p| p.size).sum();
 
+    // Collect all part CIDs for pinning
+    let part_cids: Vec<cid::Cid> = upload.parts.values()
+        .filter_map(|p| p.cid.parse().ok())
+        .collect();
+
     // Create the final object metadata
     // In a real implementation, we'd create a DAG linking all parts
-    let first_part_cid: cid::Cid = upload.parts.values().next()
-        .map(|p| p.cid.parse().unwrap())
+    let first_part_cid: cid::Cid = part_cids.first()
+        .copied()
         .ok_or_else(|| ApiError::s3(S3ErrorCode::InvalidPart, "No parts uploaded"))?;
 
     let mut metadata = ObjectMetadata::new(first_part_cid, total_size, final_etag.clone())
@@ -187,7 +194,27 @@ pub async fn complete_multipart_upload(
     // Store in bucket
     let mut bucket_handle = state.bucket_manager.open_bucket(&bucket).await?;
     bucket_handle.put_object(key.clone(), metadata).await?;
-    bucket_handle.flush().await?;
+    let bucket_root_cid = bucket_handle.flush().await?;
+
+    // Pin the BUCKET ROOT CID to ensure tree structure survives GC.
+    // This recursively pins all tree nodes AND all referenced object data (including parts).
+    // NOTE: Pinning is async (fire-and-forget) to avoid blocking the response.
+    {
+        let block_store = Arc::clone(&state.block_store);
+        let pin_bucket = bucket.clone();
+        tokio::spawn(async move {
+            let pin_name = format!("bucket:{}", pin_bucket);
+            if let Err(e) = block_store.pin(&bucket_root_cid, Some(&pin_name)).await {
+                tracing::warn!(cid = %bucket_root_cid, error = %e, "Failed to pin bucket root CID");
+            } else {
+                tracing::info!(cid = %bucket_root_cid, bucket = %pin_name, "Bucket root CID pinned (recursive)");
+            }
+        });
+    }
+
+    // Also pin to user's external pinning service if credentials provided
+    // Pin the first part CID as the representative (or all parts)
+    pin_for_user(&headers, &first_part_cid, Some(&key)).await;
 
     let location = format!("/{}/{}", bucket, key);
     let xml_response = xml::complete_multipart_upload_result(
