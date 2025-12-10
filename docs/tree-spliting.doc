@@ -1,0 +1,372 @@
+Tree Splitting Design and Audit
+================================
+
+Context and Goals
+-----------------
+
+This document summarizes the current state, strengths, and downsides of the ProllyTree-based splitting implementation and the encrypted PrivateForest design in Fula, and proposes a step-by-step plan for optimizing them for Fula’s actual use case:
+
+- Encrypted gateway in front of IPFS/S3-like storage.
+- Minimize client ↔ storage engine round-trips.
+- Preserve strong privacy and full encryption of filesystem structure.
+- Ensure no individual IPFS block exceeds ~1 MiB.
+
+The analysis is explicitly **not** trying to copy WNFS behavior; instead, it evaluates what we have and what we need given Fula’s goals.
+
+
+High-Level Architecture (Today)
+-------------------------------
+
+1. PrivateForest (fula-crypto)
+
+- A **single logical forest index per bucket**, serialized as JSON into a `PrivateForest` struct and then encrypted into an `EncryptedForest` blob.
+- Contains:
+  - `files: HashMap<String, ForestFileEntry>` (FlatMapV1) or
+  - `files_hamt: Option<HamtIndex<ForestFileEntry>>` (HamtV2) as the internal file index.
+  - Directory structure (`directories`), subtree DEKs, timestamps, etc.
+- Stored under a **single, deterministic** index key per bucket, derived via `derive_index_key(forest_dek, bucket)`.
+- On the wire:
+  - Storage sees exactly one `x-fula-forest: true` object per bucket (or none, if unused).
+  - All filenames, directories, and metadata live inside the encrypted payload.
+
+Effectively, for each bucket you have **one encrypted index blob** in front of many opaque data objects.
+
+
+2. EncryptedClient (fula-client)
+
+- High-level client that:
+  - Encrypts data with per-object DEKs.
+  - Wraps DEKs with HPKE for the owner.
+  - Uses `PrivateForest::generate_key` to derive flat `Qm…`-style storage keys.
+  - Maintains a per-bucket `PrivateForest` in memory and persists it as an `EncryptedForest` when needed.
+- For FlatNamespace mode:
+  - `put_object_flat_deferred` updates the in-memory `PrivateForest` and uploads the ciphertext under a flat storage key.
+  - `flush_forest` encrypts and uploads the `PrivateForest` once.
+  - Directory/listing operations read from the decrypted forest without fetching file content.
+
+Net result: **one forest fetch + many data fetches** instead of “many forest node fetches + data fetches.” This aligns with minimizing round-trips.
+
+
+3. ProllyTree (fula-core/prolly)
+
+- A generic Prolly/B+ tree-like structure, intended for content-addressed indexing of bucket contents:
+  - `ProllyTree<K, V, S: BlockStore>` with `ProllyConfig`:
+    - `max_leaf_entries` (default 64)
+    - `max_children` (default 256)
+    - `branching_factor`, `boundary_bits` (reserved for future heuristics)
+  - Nodes stored as IPLD blocks via a `BlockStore`.
+  - `ProllyNode` has:
+    - `pointers: Vec<Pointer<K,V>>` where `Pointer` is `Values(Vec<NodeEntry<K,V>>)` or `Link(Cid)`.
+    - Simple `bitmask` field (not yet used for routing).
+
+- Current behavior:
+  - New tree starts as a single leaf node.
+  - `set` on a leaf root:
+    - Inserts into the leaf (`ProllyNode::insert` keeps that leaf’s entries sorted).
+    - If `count_leaf_entries_direct(root) > max_leaf_entries`, calls `split_root()`.
+  - `split_root()` and `rebuild_from_entries()`:
+    - Collect all entries (for a leaf root), sort by key, and split into chunks of `max_leaf_entries`.
+    - For each chunk, build a leaf node and store it as a separate IPLD block.
+    - If the number of leaves exceeds `max_children`, recursively construct multiple internal levels.
+    - Result is a deterministic, content-addressed tree shape.
+  - After the root stops being a leaf:
+    - `set` and `remove` call `iter()` (full scan), modify the `(K,V)` list, then `rebuild_from_entries()` again.
+
+- Important: **ProllyTree is not used by PrivateForest today**. The encrypted forest remains a single blob; ProllyTree is a separate indexing building block.
+
+
+Findings: Strengths
+-------------------
+
+1. Alignment with Gateway Goals
+
+- PrivateForest + EncryptedForest:
+  - Matches the gateway’s need to **minimize round-trips** to a remote IPFS/S3 cluster.
+  - One index object per bucket, cached client-side, avoids WNFS-style many-node HAMT traversals.
+  - Provides strong **metadata privacy and structure hiding**.
+
+- ProllyTree:
+  - Provides a deterministic, content-addressed tree shape for generic indexes.
+  - Splits leaves and internal nodes based on entry counts, roughly controlling node size.
+  - Tests cover splitting, deep trees, and flush/reload, giving good confidence in correctness for small–medium trees.
+
+
+2. Determinism and Simplicity
+
+- Tree shape is determined entirely by sorted `(K,V)` and `max_leaf_entries`/`max_children`:
+  - Good for caching, deduplication, and potential tree-level diffing.
+  - Independent of insertion order; no hard-to-debug structural randomness.
+
+- `PrivateForest` API remains a simple in-memory map + optional HAMT index:
+  - Easy to reason about.
+  - Easy to encrypt/decrypt as one object.
+
+
+3. Privacy Properties
+
+- PrivateForest + EncryptedForest:
+  - All path names, directory structure, content types, and per-file metadata live only inside one AEAD ciphertext.
+  - Storage sees only:
+    - Opaque `Qm…` keys for data.
+    - The existence of a forest index object (`x-fula-forest: true`), not its contents.
+
+- FlatNamespace mode in EncryptedClient ensures:
+  - No path structure is leaked via storage keys.
+  - Directory structure cannot be inferred from key prefixes or path-like object names.
+
+
+Findings: Downsides & Risks (Given Your Goals)
+---------------------------------------------
+
+A. PrivateForest as a Single Encrypted Blob
+
+1. Block Size Risk
+
+- There is **no size guard** when encrypting `PrivateForest` into `EncryptedForest`:
+  - As forests grow (more files/directories per bucket, more metadata per entry), the serialized JSON can exceed IPFS’s 1 MiB block size limit.
+  - For typical use (hundreds or low thousands of entries) this is unlikely, but:
+    - A bucket with tens of thousands of entries could create an encrypted forest >1 MiB.
+  - Today this would only be caught by a failure at put-time, not proactively.
+
+2. No Forest Sharding Option
+
+- There is no “escape hatch” when a forest becomes too large:
+  - Either you accept a huge single blob, or you must redesign.
+  - For your typical gateway use case this is a deliberate trade-off, but it’s still a risk for pathological buckets.
+
+
+B. ProllyTree Behavior
+
+1. Per-Update Cost Once Tree is Split
+
+- After the root becomes an internal node:
+  - `set` and `remove`:
+    - Load **all nodes** via `iter()` (complete traversal and in-memory accumulation of `(K,V)`),
+    - Rebuild the entire tree via `rebuild_from_entries`.
+  - Complexity per update is effectively **O(n log n)** time and **O(n)** writes.
+  - For small–medium trees this is fine; for very large trees it becomes inefficient.
+  - This mostly matters for **write-heavy** workloads.
+
+2. Lookups Do Not Use Routing Keys
+
+- Internal ProllyTree nodes hold `Pointer::Link(Cid)` without any key ranges or hash prefixes.
+- `get_from_node`:
+  - Iterates over **every pointer**, and for each `Link` fetches the child node and recurses.
+  - In the worst case, a lookup touches nearly every node.
+
+This does not violate your privacy or encryption goals, but it 
+- Increases blockstore reads for lookups.
+- Limits scalability if ProllyTree is ever used in latency-sensitive paths.
+
+3. Splitting Heuristics Are Count-Based, Not Size-Based
+
+- `max_leaf_entries` and `max_children` control when splitting happens.
+- `MAX_BLOCK_SIZE` (900 000 bytes) is defined but **never used**.
+- If `K` and `V` are roughly small (e.g., short strings), then 64 entries is likely far under 1 MiB, but:
+  - If you later add fields to `V` or store larger keys/values, a node can pass IPFS’s 1 MiB limit without any warning.
+
+4. ProllyTree is Not Encrypted
+
+- ProllyTree stores `K` and `V` plaintext in each node’s IPLD block.
+- This is acceptable for public or low-sensitivity indexes, but:
+  - It is **not** suitable for directly storing private paths or metadata; doing so would leak structure and names to the blockstore.
+  - For your strong privacy goal, ProllyTree must only be used under an additional encryption layer or on non-sensitive data.
+
+
+Step-by-Step Optimization Plan
+------------------------------
+
+The plan below is intentionally incremental and respects your main priorities:
+
+- Keep the **current one-blob PrivateForest model** as the default (minimal round-trips, simple, private).
+- Add **safety checks** and **optional modes** for extreme cases, without forcing WNFS-style chatter.
+- Hardening ProllyTree for future use, but not making it a required part of PrivateForest.
+
+
+Phase 1 – Safety and Correctness Hardening (Low Risk)
+-----------------------------------------------------
+
+Goal: Make the current design more robust and self-checking without changing external behavior.
+
+1. Enforce a Soft Forest Size Limit
+
+- In `EncryptedForest::encrypt` or just before calling it from `save_forest`:
+  - Measure the serialized size of the `PrivateForest` JSON.
+  - If it exceeds a conservative threshold (e.g. 800 KB):
+    - Log a warning and/or return a specific error type indicating “forest too large”.
+    - This does **not** shard yet; it just prevents silent failures and allows the client to react.
+
+Implementation steps (high-level):
+
+- Add a constant, e.g. `FOREST_MAX_SERIALIZED_SIZE: usize = 900_000` near `MAX_BLOCK_SIZE`.
+- In `EncryptedForest::encrypt(forest, dek)`:
+  - Serialize `forest` into a buffer and check `len()` before encrypting.
+  - If > `FOREST_MAX_SERIALIZED_SIZE`, return a new `CryptoError::ForestTooLarge { size }`.
+- In `EncryptedClient::save_forest`, surface this error clearly and document it.
+
+2. Tighten ProllyTree Invariants
+
+- Add an assert or guard in `split_root` to make its precondition explicit:
+  - If `!self.root.is_leaf`, either:
+    - Call `iter()` + `rebuild_from_entries()` (same as today’s internal-branch path), or
+    - Panic in debug builds to catch accidental misuse.
+
+- Add comments/tests reinforcing that `split_root` is only for leaf roots.
+
+3. Document ProllyTree’s Intended Use
+
+- In `prolly/mod.rs` and/or `tree.rs` docs, state explicitly:
+  - It is **not** privacy-preserving by itself.
+  - It’s intended for generic indexing where plaintext keys/values are acceptable, or for future use behind an encryption wrapper.
+
+This avoids accidental misuse for private metadata.
+
+
+Phase 2 – Size-Aware Node Splitting (Moderate Impact, Still Optional)
+---------------------------------------------------------------------
+
+Goal: Make ProllyTree and any future sharded structures respect the 1 MiB limit **by design**, using actual encoded size, while still keeping trees shallow and minimizing round-trips.
+
+1. Introduce a `max_node_bytes` Parameter in ProllyConfig
+
+- Extend `ProllyConfig` with:
+  - `max_node_bytes: usize`, defaulting to something like `MAX_BLOCK_SIZE` (900 000 bytes).
+
+2. Size-Aware Split Check in `rebuild_from_entries`
+
+- When building leaves and internal nodes:
+  - For each node candidate, serialize it to an in-memory buffer (or estimate size) before writing.
+  - If the encoded size would exceed `max_node_bytes`:
+    - Reduce the chunk size (fewer entries per leaf) or increase tree depth (more internal nodes).
+
+Practical approach:
+
+- Leaf splitting:
+  - Start with the existing `chunk_size = max_leaf_entries`.
+  - Build a temporary `ProllyNode::leaf_with_entries(chunk)` and serialize it using the same codec as `put_ipld`.
+  - If `len(encoded) > max_node_bytes`, halve `chunk_size` and retry.
+  - This ensures that each leaf stays under the desired size, at the cost of a bounded number of attempts.
+
+- Internal node splitting:
+  - Similar strategy: when building an internal node with `max_children` links, serialize and check size.
+  - If too big, lower `max_children` for that build step and create additional internal levels.
+
+3. Cache Encoded Size During Flush
+
+- To reduce overhead, you can:
+  - Measure size once per node creation, reuse it for both the size decision and the later `put_ipld` call.
+  - This avoids double-encoding.
+
+Result:
+
+- Every IPLD node (leaf or internal) is **guaranteed** to be below `max_node_bytes`.
+- You can safely store trees whose total content is much larger than 1 MiB, while each block is small enough for IPFS.
+
+
+Phase 3 – Optional Sharded Forest Mode (Only if Needed)
+-------------------------------------------------------
+
+Goal: Provide an **optional** escape hatch for pathological buckets (huge forests), without changing the default behavior for normal users.
+
+Key idea: keep the **current “one encrypted PrivateForest per bucket” as the default**, and add a **“sharded forest” mode** that splits the forest into a small number of encrypted sub-forests based on a hash of the path, without encoding semantics (no “photos vs docs” shards).
+
+1. Sharded Forest Concept
+
+- Instead of a single `EncryptedForest` per bucket, have N shards per bucket:
+  - For example, N=8 or 16.
+  - Shard id = `hash(path) mod N`.
+- Each shard is a smaller `PrivateForest` with its own salt and file subset.
+- All shards are still **fully encrypted**; storage sees N unrelated blobs with `x-fula-forest: true`.
+
+2. API and On-Wire Design
+
+- Keep the existing APIs in `EncryptedClient`:
+  - `load_forest`, `save_forest`, `get_object_flat`, `list_directory_from_forest`, etc.
+
+- Internally, introduce:
+  - A `ShardedForest` abstraction that:
+    - Maps each path to a shard index.
+    - Loads/saves only the relevant shard for a given operation.
+
+- Storage layout:
+  - Index keys could be `derive_index_key(forest_dek, bucket + shard_id)`.
+  - This reveals **only** that there are multiple encrypted indexes; no semantic grouping is visible.
+
+3. When to Use Sharded Mode
+
+- Configurable via:
+  - A threshold on forest serialized size, or
+  - A per-bucket policy.
+
+- Example strategy:
+  - If a single-bucket `PrivateForest` exceeds 800 KB serialized:
+    - Refuse to save in single-blob mode and suggest enabling sharded mode, or
+    - Automatically migrate (if you are comfortable with automatic migration semantics).
+
+4. Migration Strategy (If You Choose to Support It)
+
+- Migration from single-forest to N-shard forest would:
+  - Decrypt the existing forest.
+  - Partition the files by `hash(path) mod N`.
+  - Create N smaller `PrivateForest` values and encrypt/store each.
+
+Performance and privacy characteristics:
+
+- Round-trips:
+  - Reading a single file or directory usually touches **only 1 shard + data blobs**.
+- Block size:
+  - Each shard’s forest is smaller; easier to stay under 1 MiB.
+- Privacy:
+  - Shards are hash-based, not semantic; server gains no information from the fact that a given file is in shard 3 vs shard 7.
+
+This provides scaling similar to “many forest nodes” but with only a **small constant factor on the number of index objects**, preserving your low-round-trip design.
+
+
+Phase 4 – Optional ProllyTree Hardening (If You Use It for Indexing)
+---------------------------------------------------------------------
+
+Goal: If you later decide to use ProllyTree for any gateway-visible index, make it more efficient and less I/O-heavy without compromising determinism.
+
+1. Add Basic Routing Metadata to Internal Nodes
+
+- Augment `ProllyNode` with optional routing info:
+  - For example, min/max key ranges for each child pointer, or a set of key prefixes.
+- Update `get_from_node` to choose the child link(s) more selectively instead of scanning all children.
+- This moves lookups from “visit every node” toward “visit a small subset of children per level.”
+
+2. Avoid Full Rebuild on Every Update
+
+- Introduce a more incremental insert/remove:
+  - Navigate down the tree using routing info.
+  - Modify only the affected leaf and ancestors.
+  - Trigger splits/merges locally only when a node violates size/entry constraints.
+
+This is significantly more work and is only justified if you plan to use ProllyTree in hot paths; for now it can remain a lower priority.
+
+3. Wrap ProllyTree in an Encryption Layer if Used for Private Data
+
+- If ProllyTree ever stores sensitive keys/values (paths, metadata):
+  - Introduce an `EncryptedProllyTree` that:
+    - Serializes each `ProllyNode` and encrypts it with a DEK.
+    - Stores only encrypted node blobs in the blockstore.
+  - This would give you a WNFS-like sharded private index, but you can keep node sizes large and the tree shallow to avoid WNFS’s chattiness.
+
+
+Summary
+-------
+
+- The existing **PrivateForest + EncryptedForest** design is a good fit for Fula’s gateway use case:
+  - Very few storage round-trips per operation.
+  - Strong metadata privacy and structure hiding.
+  - Simple operational model.
+
+- The main **gap vs your explicit goals** is:
+  - Lack of a hard guarantee that forests and ProllyTree nodes always stay under IPFS’s 1 MiB block size.
+
+- The recommended path forward is:
+  1. Add **size checks** and invariant hardening (Phase 1).
+  2. Make ProllyTree **size-aware** using `max_node_bytes` (Phase 2).
+  3. Add an **optional sharded forest mode** for extreme buckets, keeping the default as a single encrypted forest per bucket (Phase 3).
+  4. Only if necessary, invest in **ProllyTree routing, incremental updates, and encryption wrappers** (Phase 4).
+
+This keeps your core design (few round-trips, strong privacy) intact, while providing a clear roadmap to safely handle large deployments without drifting into WNFS’s heavier, client-near-blockstore model.

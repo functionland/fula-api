@@ -22,6 +22,10 @@ md-5 = { workspace = true }
 x25519-dalek = { workspace = true }
 ed25519-dalek = { workspace = true }
 
+# Post-Quantum Cryptography (NIST ML-KEM / Kyber)
+pqc_kyber = { version = "0.7", features = ["kyber768", "90s"] }
+hkdf = "0.12"
+
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -88,9 +88,10 @@
                 <h1>🔒 Security & Encryption</h1>
                 <p class="hero-subtitle">In-Depth Technical Documentation of Fula's Cryptographic Implementation</p>
                 <div class="hero-badges">
+                    <span class="badge-item">🛡️ Quantum-Safe</span>
                     <span class="badge-item">🔐 HPKE (RFC 9180)</span>
                     <span class="badge-item">⚡ AES-256-GCM</span>
-                    <span class="badge-item">🔑 X25519</span>
+                    <span class="badge-item">🔑 X25519 + ML-KEM-768</span>
                     <span class="badge-item">✅ BLAKE3</span>
                 </div>
             </div>
@@ -133,39 +134,51 @@
                                 <th>Layer</th>
                                 <th>Algorithm</th>
                                 <th>Purpose</th>
-                                <th>Key Size</th>
+                                <th>Security Level</th>
                             </tr>
                         </thead>
                         <tbody>
+                            <tr class="highlight-row">
+                                <td>🛡️ Quantum-Safe KEM</td>
+                                <td><strong>X25519 + ML-KEM-768</strong></td>
+                                <td>Hybrid key encapsulation (classical + post-quantum)</td>
+                                <td>NIST Level 3 + 128-bit classical</td>
+                            </tr>
                             <tr>
                                 <td>Key Exchange</td>
                                 <td><strong>X25519</strong></td>
-                                <td>Elliptic Curve Diffie-Hellman</td>
-                                <td>256-bit</td>
+                                <td>Classical Elliptic Curve Diffie-Hellman</td>
+                                <td>128-bit classical</td>
+                            </tr>
+                            <tr>
+                                <td>Post-Quantum KEM</td>
+                                <td><strong>ML-KEM-768 (Kyber)</strong></td>
+                                <td>NIST FIPS 203 lattice-based KEM</td>
+                                <td>192-bit post-quantum (NIST Level 3)</td>
                             </tr>
                             <tr>
                                 <td>Key Derivation</td>
-                                <td><strong>BLAKE3 KDF</strong></td>
-                                <td>Derive encryption keys from shared secrets</td>
+                                <td><strong>HKDF-SHA256</strong></td>
+                                <td>Combine X25519 + ML-KEM shared secrets</td>
                                 <td>256-bit output</td>
                             </tr>
                             <tr>
                                 <td>Symmetric Encryption</td>
                                 <td><strong>AES-256-GCM</strong></td>
                                 <td>Authenticated encryption of data</td>
-                                <td>256-bit key, 96-bit nonce</td>
+                                <td>256-bit (quantum-resistant)</td>
                             </tr>
                             <tr>
                                 <td>Alternative Cipher</td>
                                 <td><strong>ChaCha20-Poly1305</strong></td>
                                 <td>Authenticated encryption (software-optimized)</td>
-                                <td>256-bit key, 96-bit nonce</td>
+                                <td>256-bit (quantum-resistant)</td>
                             </tr>
                             <tr>
                                 <td>Hashing</td>
                                 <td><strong>BLAKE3</strong></td>
                                 <td>Content addressing, integrity verification</td>
-                                <td>256-bit output</td>
+                                <td>256-bit (quantum-resistant)</td>
                             </tr>
                             <tr>
                                 <td>Streaming Verification</td>
@@ -175,6 +188,12 @@
                             </tr>
                         </tbody>
                     </table>
+                    <div class="quantum-note">
+                        <strong>🛡️ Post-Quantum Security:</strong> The hybrid X25519 + ML-KEM-768 approach provides defense-in-depth. 
+                        If quantum computers break X25519, ML-KEM-768 still protects your data. 
+                        If ML-KEM has unforeseen weaknesses, X25519 provides classical security.
+                        ML-KEM-768 is NIST FIPS 203 standardized (formerly Kyber768).
+                    </div>
                 </div>
             </div>
         </section>

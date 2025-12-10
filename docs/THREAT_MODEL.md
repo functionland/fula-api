@@ -65,6 +65,7 @@ Fula provides client-side encryption for decentralized storage. The core princip
 | **Metadata Privacy** | Hide file names, structure, sizes | FlatNamespace mode + encrypted PrivateForest |
 | **Forward Secrecy** | Past data protected if current key compromised | Ephemeral keys in HPKE key wrapping |
 | **Key Isolation** | Compromise of one file's key doesn't affect others | Unique DEK per file |
+| **🛡️ Quantum Safety** | Protected against future quantum computers | Hybrid X25519 + ML-KEM-768 KEM |
 
 ### Secondary Goals
 
@@ -176,6 +177,34 @@ Fula provides client-side encryption for decentralized storage. The core princip
 - ❌ Current user's secret key
 - ❌ All data accessible with that key
 - ❌ Shared data from other users
+
+### 3.6 Quantum Computer Adversary (Future Threat)
+
+**Description:** An adversary with access to a cryptographically relevant quantum computer.
+
+**Capabilities:**
+- Can run Shor's algorithm to break X25519 in polynomial time
+- Can run Grover's algorithm to reduce symmetric key security by half
+
+**What is Protected (with Hybrid KEM):**
+- ✅ Key encapsulation (ML-KEM-768 provides 192-bit post-quantum security)
+- ✅ Symmetric encryption (AES-256 provides 128-bit post-quantum security after Grover)
+- ✅ Hashing (BLAKE3 provides 128-bit post-quantum collision resistance after Grover)
+- ✅ Long-term confidentiality of stored data
+
+**Why Hybrid (X25519 + ML-KEM-768)?**
+- If quantum computers break X25519, ML-KEM-768 still protects your data
+- If ML-KEM has unforeseen weaknesses, X25519 still provides classical security
+- Defense-in-depth approach recommended by NIST and security experts
+
+**Algorithm Details:**
+| Component | Algorithm | Post-Quantum Security |
+|-----------|-----------|----------------------|
+| Hybrid KEM | X25519 + ML-KEM-768 | NIST Level 3 (192-bit) |
+| Symmetric | AES-256-GCM | 128-bit (after Grover) |
+| Hashing | BLAKE3 | 128-bit collision resistance |
+
+**Note:** ML-KEM-768 is the NIST FIPS 203 standard (formerly known as Kyber768).
 
 ### 3.6 Stolen or Lost Device
 

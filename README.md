@@ -11,6 +11,7 @@ Fula Storage provides an Amazon S3-compatible API backed by a decentralized netw
 
 - **🌐 Decentralization**: Data is stored across a network of individually owned IPFS nodes
 - **🔒 End-to-End Encryption**: Client-side HPKE encryption - storage nodes never see your data
+- **🛡️ Quantum-Safe Cryptography**: Hybrid X25519 + ML-KEM-768 (NIST FIPS 203) for post-quantum security
 - **✅ Verified Streaming**: BLAKE3/Bao ensures data integrity from untrusted nodes
 - **🔄 Conflict-Free Sync**: CRDT-based metadata for distributed updates
 - **📈 Efficient Indexing**: Prolly Trees for O(log n) bucket operations
@@ -44,9 +45,10 @@ Fula Storage provides an Amazon S3-compatible API backed by a decentralized netw
 │    │    IPFS     │ IPFS Cluster │      Chunking        │    │
 │    └─────────────┴──────────────┴──────────────────────┘    │
 ├─────────────────────────────────────────────────────────────┤
-│                    fula-crypto                               │
+│                    fula-crypto (Quantum-Safe)                │
 │    ┌─────────────┬──────────────┬──────────────────────┐    │
-│    │    HPKE     │   BLAKE3     │        Bao           │    │
+│    │ Hybrid KEM  │   BLAKE3     │        Bao           │    │
+│    │ X25519+MLKEM│              │                      │    │
 │    └─────────────┴──────────────┴──────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -210,7 +212,7 @@ let etag = upload_large_file(
 
 | Crate | Description |
 |-------|-------------|
-| `fula-crypto` | Cryptographic primitives (HPKE, BLAKE3, Bao) |
+| `fula-crypto` | Quantum-safe cryptography (Hybrid X25519+ML-KEM, HPKE, BLAKE3, Bao) |
 | `fula-blockstore` | IPFS block storage and chunking |
 | `fula-core` | Storage engine (Prolly Trees, CRDTs) |
 | `fula-cli` | S3-compatible gateway server |
@@ -287,6 +289,36 @@ cargo run --example flat_namespace_demo
 ```
 
 ## Security
+
+### 🛡️ Quantum-Safe Cryptography
+
+Fula implements **post-quantum cryptographic protection** using a hybrid approach that provides defense-in-depth:
+
+| Component | Algorithm | Security Level |
+|-----------|-----------|----------------|
+| Key Encapsulation | **X25519 + ML-KEM-768** | Hybrid classical + post-quantum |
+| Symmetric Encryption | AES-256-GCM / ChaCha20-Poly1305 | 256-bit (quantum-resistant) |
+| Hashing | BLAKE3 | 256-bit (quantum-resistant) |
+| Integrity | Bao (BLAKE3-based) | Verified streaming |
+
+**Why Hybrid?**
+- If quantum computers break X25519 (Shor's algorithm), ML-KEM-768 still protects your data
+- If ML-KEM has unforeseen weaknesses, X25519 still provides classical security
+- ML-KEM-768 is NIST FIPS 203 standardized (formerly Kyber768)
+
+```rust
+use fula_crypto::{HybridKeyPair, hybrid_encapsulate, hybrid_decapsulate};
+
+// Generate quantum-safe keypair (X25519 + ML-KEM-768)
+let keypair = HybridKeyPair::generate();
+
+// Sender encapsulates shared secret
+let (encapsulated_key, shared_secret) = hybrid_encapsulate(keypair.public_key())?;
+
+// Recipient decapsulates
+let recovered = hybrid_decapsulate(&encapsulated_key, keypair.secret_key())?;
+assert_eq!(shared_secret, recovered);
+```
 
 ### Trust Model
 
