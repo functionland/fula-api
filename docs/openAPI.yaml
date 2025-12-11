@@ -64,6 +64,17 @@ paths:
   # ============================================================================
   
   /:
+    head:
+      tags:
+        - Control Plane
+      summary: HealthCheck
+      operationId: healthCheck
+      description: Check if the gateway is healthy and accepting requests
+      security: []
+      responses:
+        '200':
+          description: Gateway is healthy
+    
     get:
       tags:
         - Bucket Operations
@@ -297,12 +308,15 @@ paths:
         
         **Encryption Flow**:
         1. Client encrypts data with HPKE (keys never sent to server)
-        2. Client chunks encrypted data (256KB blocks)
-        3. Client uploads blocks to gateway
+        2. Client chunks encrypted data (768KB max per chunk, under IPFS 1MB limit)
+        3. Client uploads chunks to gateway (automatic for files >768KB)
         4. Gateway pins to IPFS Cluster
         5. Gateway updates Prolly Tree index
         
         **Max Size**: 5GB for single PUT (use multipart for larger files)
+        
+        **Chunked Files**: Files >768KB are automatically split into chunks by the client.
+        The `x-fula-chunked: true` header indicates a chunked file manifest.
       security:
         - oauth2: [storage:write]
       parameters:
@@ -360,6 +374,15 @@ paths:
           schema:
             type: string
             format: json
+        - name: x-fula-chunked
+          in: header
+          description: |
+            Indicates this object is a chunked file manifest (for files >768KB).
+            The manifest contains chunk CIDs and metadata for reassembly.
+            Value: "true"
+          schema:
+            type: string
+            enum: ["true"]
         - name: x-fula-forest
           in: header
           description: |
