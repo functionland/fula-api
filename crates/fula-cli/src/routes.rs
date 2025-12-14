@@ -260,8 +260,14 @@ fn create_cors_layer(origins: &[String]) -> CorsLayer {
         header::HeaderName::from_static("x-amz-content-sha256"),
         header::HeaderName::from_static("x-amz-date"),
         header::HeaderName::from_static("x-amz-copy-source"),
+        // Direct pinning headers
         header::HeaderName::from_static("x-pinning-service"),
         header::HeaderName::from_static("x-pinning-token"),
+        header::HeaderName::from_static("x-pinning-name"),
+        // S3-compatible x-amz-meta-* pinning headers (for MinIO and other S3 clients)
+        header::HeaderName::from_static("x-amz-meta-x-pinning-service"),
+        header::HeaderName::from_static("x-amz-meta-x-pinning-token"),
+        header::HeaderName::from_static("x-amz-meta-x-pinning-name"),
     ];
     
     let cors = CorsLayer::new()

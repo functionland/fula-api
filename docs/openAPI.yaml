@@ -400,6 +400,9 @@ paths:
             - Pinata: https://api.pinata.cloud/psa
             - Web3.Storage: https://api.web3.storage
             - NFT.Storage: https://nft.storage/api
+            
+            **S3 Client Compatibility**: Also accepts `x-amz-meta-x-pinning-service`
+            for S3 client libraries like MinIO that prefix custom headers.
           schema:
             type: string
             format: uri
@@ -409,6 +412,8 @@ paths:
           description: |
             User's IPFS Pinning Service access token (Bearer token).
             This is the user's own credential - NOT stored by the gateway.
+            
+            **S3 Client Compatibility**: Also accepts `x-amz-meta-x-pinning-token`.
           schema:
             type: string
         - name: x-pinning-name
