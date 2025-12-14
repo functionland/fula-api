@@ -26,10 +26,13 @@ ENV_FILE="${FULA_CONFIG}/.env"
 NGINX_CONF="/etc/nginx/sites-available/fula-gateway"
 NGINX_ENABLED="/etc/nginx/sites-enabled/fula-gateway"
 
-# Default values
-DEFAULT_GATEWAY_PORT="8080"
+# Default values (must match Dockerfile defaults)
+DEFAULT_GATEWAY_PORT="9000"
 DEFAULT_IPFS_PORT="5001"
 DEFAULT_IPFS_GATEWAY_PORT="8081"
+DEFAULT_MAX_BODY_SIZE="5368709120"  # 5GB
+DEFAULT_RATE_LIMIT_RPS="100"
+DEFAULT_REQUEST_TIMEOUT="3600"  # 1 hour for large uploads
 
 # Logging
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -244,6 +247,13 @@ collect_configuration() {
     # Gateway port
     prompt_env "GATEWAY_PORT" "Gateway internal port" "${GATEWAY_PORT:-$DEFAULT_GATEWAY_PORT}"
     
+    # Performance settings
+    echo ""
+    log_info "Performance Settings"
+    prompt_env "MAX_BODY_SIZE" "Max upload size in bytes (default 5GB)" "${MAX_BODY_SIZE:-$DEFAULT_MAX_BODY_SIZE}"
+    prompt_env "RATE_LIMIT_RPS" "Rate limit requests per second" "${RATE_LIMIT_RPS:-$DEFAULT_RATE_LIMIT_RPS}"
+    prompt_env "REQUEST_TIMEOUT" "Request timeout in seconds" "${REQUEST_TIMEOUT:-$DEFAULT_REQUEST_TIMEOUT}"
+    
     # Confirm
     echo ""
     echo "==========================================="
@@ -286,14 +296,20 @@ OAUTH_AUDIENCE=${OAUTH_AUDIENCE:-}
 CORS_ENABLED=true
 CORS_ORIGINS=${CORS_ORIGINS}
 
-# Gateway Settings
-GATEWAY_PORT=${GATEWAY_PORT}
-RUST_LOG=info,fula_cli=debug
+# Gateway Settings (FULA_PORT must match Dockerfile)
+FULA_HOST=0.0.0.0
+FULA_PORT=${GATEWAY_PORT}
+RUST_LOG=info,fula_cli=debug,fula_core=debug
+
+# Performance Settings
+MAX_BODY_SIZE=${MAX_BODY_SIZE}
+RATE_LIMIT_RPS=${RATE_LIMIT_RPS}
+REQUEST_TIMEOUT=${REQUEST_TIMEOUT}
 
 # IPFS Configuration
 IPFS_URL=http://localhost:5001
 
-# Pinning Service (optional)
+# Pinning Service (optional - gateway-level pinning for all uploads)
 PINNING_SERVICE_ENDPOINT=${PINNING_SERVICE_ENDPOINT:-}
 PINNING_SERVICE_TOKEN=${PINNING_SERVICE_TOKEN:-}
 EOF
@@ -312,7 +328,7 @@ create_docker_compose() {
     if [[ -n "${IPFS_DOMAIN}" ]] && [[ "${IPFS_RUNNING}" != "true" ]]; then
         IPFS_SERVICE="
   ipfs:
-    image: ipfs/kubo:latest
+    image: ipfs/kubo:v0.32.1
     container_name: fula-ipfs
     restart: unless-stopped
     volumes:
@@ -320,16 +336,39 @@ create_docker_compose() {
     ports:
       - '127.0.0.1:5001:5001'
       - '127.0.0.1:8081:8080'
+      - '4001:4001'      # Swarm TCP
+      - '4001:4001/udp'  # Swarm QUIC
     environment:
       - IPFS_PROFILE=server
+    command: ['daemon', '--migrate=true', '--enable-gc']
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
     healthcheck:
       test: ['CMD-SHELL', 'ipfs id || exit 1']
       interval: 30s
       timeout: 10s
       retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: '100m'
+        max-file: '3'
 "
     fi
     
+    # Determine depends_on based on IPFS configuration
+    local DEPENDS_ON=""
+    if [[ -n "${IPFS_DOMAIN}" ]] && [[ "${IPFS_RUNNING}" != "true" ]]; then
+        DEPENDS_ON="
+    depends_on:
+      ipfs:
+        condition: service_healthy"
+    fi
+
     cat > "${FULA_CONFIG}/docker-compose.yml" << EOF
 version: '3.8'
 
@@ -340,18 +379,33 @@ services:
     restart: unless-stopped
     env_file:
       - ${ENV_FILE}
+    environment:
+      # Override IPFS URL to use Docker network
+      - IPFS_API_URL=http://ipfs:5001
     volumes:
       - ${FULA_HOME}/data:/var/lib/fula/data
     ports:
       - '127.0.0.1:${GATEWAY_PORT}:${GATEWAY_PORT}'
-    depends_on:
-      ${IPFS_DOMAIN:+ipfs:}
-      ${IPFS_DOMAIN:+  condition: service_healthy}
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
     healthcheck:
-      test: ['CMD', 'curl', '-f', 'http://localhost:${GATEWAY_PORT}/']
+      # Use HEAD request to health check endpoint (more efficient)
+      test: ['CMD', 'curl', '-f', '-X', 'HEAD', 'http://localhost:${GATEWAY_PORT}/']
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: '100m'
+        max-file: '5'
+    # Graceful shutdown - allow time for in-flight requests
+    stop_grace_period: 30s${DEPENDS_ON}
 ${IPFS_SERVICE}
 networks:
   default:
@@ -370,8 +424,14 @@ configure_nginx() {
     # Gateway nginx config
     cat > "${NGINX_CONF}" << EOF
 # Fula Gateway - Rate Limiting
-limit_req_zone \$binary_remote_addr zone=fula_limit:10m rate=100r/s;
+limit_req_zone \$binary_remote_addr zone=fula_limit:10m rate=${RATE_LIMIT_RPS}r/s;
 limit_conn_zone \$binary_remote_addr zone=fula_conn:10m;
+
+# Upstream with keepalive connections
+upstream fula_gateway {
+    server 127.0.0.1:${GATEWAY_PORT};
+    keepalive 32;
+}
 
 # Gateway Server
 server {
@@ -384,19 +444,27 @@ server {
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Content-Security-Policy "default-src 'self'" always;
 
     # Rate limiting
     limit_req zone=fula_limit burst=50 nodelay;
     limit_conn fula_conn 20;
 
-    # Request size limit (for large uploads, adjust as needed)
+    # Request size limit (for large uploads)
     client_max_body_size 5G;
-    client_body_timeout 3600s;
-    proxy_read_timeout 3600s;
-    proxy_send_timeout 3600s;
+    client_body_timeout ${REQUEST_TIMEOUT}s;
+    proxy_read_timeout ${REQUEST_TIMEOUT}s;
+    proxy_send_timeout ${REQUEST_TIMEOUT}s;
+    send_timeout ${REQUEST_TIMEOUT}s;
+    
+    # Increase buffer sizes for S3 clients that send many headers
+    proxy_buffer_size 16k;
+    proxy_buffers 4 32k;
+    proxy_busy_buffers_size 64k;
+    large_client_header_buffers 4 32k;
 
     location / {
-        proxy_pass http://127.0.0.1:${GATEWAY_PORT};
+        proxy_pass http://fula_gateway;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -404,15 +472,20 @@ server {
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header Connection "";
         
-        # Buffering settings for large files
+        # Disable buffering for streaming uploads/downloads
         proxy_buffering off;
         proxy_request_buffering off;
+        
+        # Pass through all S3 headers
+        proxy_pass_request_headers on;
     }
 
-    # Health check endpoint (no rate limit)
-    location = /health {
+    # Health check endpoint (no rate limit, efficient HEAD request)
+    location = /_health {
         limit_req off;
-        proxy_pass http://127.0.0.1:${GATEWAY_PORT}/;
+        limit_conn off;
+        proxy_pass http://fula_gateway/;
+        proxy_method HEAD;
     }
 }
 EOF
@@ -502,7 +575,8 @@ configure_firewall() {
     
     # Allow IPFS swarm if running local IPFS
     if [[ -n "${IPFS_DOMAIN}" ]] && [[ "${IPFS_RUNNING}" != "true" ]]; then
-        ufw allow 4001/tcp  # IPFS swarm
+        ufw allow 4001/tcp   # IPFS swarm TCP
+        ufw allow 4001/udp   # IPFS swarm QUIC
     fi
     
     ufw --force enable
@@ -569,6 +643,40 @@ EOF
     log_success "Systemd service created"
 }
 
+# Configure IPFS settings for optimal performance
+configure_ipfs_settings() {
+    if [[ -z "${IPFS_DOMAIN}" ]] && [[ "${IPFS_RUNNING}" != "true" ]]; then
+        return 0
+    fi
+    
+    log_info "Configuring IPFS settings..."
+    
+    # Wait for IPFS to be ready
+    local retries=30
+    while ! curl -s http://localhost:5001/api/v0/id > /dev/null 2>&1; do
+        retries=$((retries - 1))
+        if [[ $retries -eq 0 ]]; then
+            log_warn "IPFS not responding, skipping configuration"
+            return 0
+        fi
+        sleep 2
+    done
+    
+    # Configure IPFS for production
+    # Increase connection limits
+    curl -s -X POST "http://localhost:5001/api/v0/config?arg=Swarm.ConnMgr.LowWater&arg=100&json=true" > /dev/null
+    curl -s -X POST "http://localhost:5001/api/v0/config?arg=Swarm.ConnMgr.HighWater&arg=400&json=true" > /dev/null
+    curl -s -X POST "http://localhost:5001/api/v0/config?arg=Swarm.ConnMgr.GracePeriod&arg=60s&json=true" > /dev/null
+    
+    # Enable QUIC transport
+    curl -s -X POST "http://localhost:5001/api/v0/config?arg=Swarm.Transports.Network.QUIC&arg=true&json=true" > /dev/null
+    
+    # Increase API timeout for large operations
+    curl -s -X POST "http://localhost:5001/api/v0/config?arg=API.HTTPHeaders.Access-Control-Allow-Origin&arg=[\"*\"]&json=true" > /dev/null
+    
+    log_success "IPFS configured for production"
+}
+
 # Start services
 start_services() {
     log_info "Starting services..."
@@ -578,6 +686,9 @@ start_services() {
     
     # Wait for services to start
     sleep 5
+    
+    # Configure IPFS if running
+    configure_ipfs_settings
     
     log_success "Services started"
 }
@@ -603,12 +714,22 @@ verify_installation() {
         log_warn "Gateway container not yet running (may be pulling image)"
     fi
     
-    # Check gateway health (via localhost)
+    # Check gateway health (via localhost) using HEAD request
     sleep 10
-    if curl -s http://localhost:${GATEWAY_PORT}/ > /dev/null 2>&1; then
+    if curl -s -X HEAD -o /dev/null -w "%{http_code}" http://localhost:${GATEWAY_PORT}/ | grep -q "200"; then
         log_success "Gateway responding on localhost:${GATEWAY_PORT}"
     else
         log_warn "Gateway not responding yet (may still be starting)"
+        log_info "Check logs: docker compose -f ${FULA_CONFIG}/docker-compose.yml logs gateway"
+    fi
+    
+    # Check IPFS if configured
+    if [[ -n "${IPFS_DOMAIN}" ]] || [[ "${IPFS_RUNNING}" == "true" ]]; then
+        if curl -s http://localhost:5001/api/v0/id > /dev/null 2>&1; then
+            log_success "IPFS daemon responding on localhost:5001"
+        else
+            log_warn "IPFS daemon not responding"
+        fi
     fi
     
     # Check SSL
@@ -637,7 +758,12 @@ verify_installation() {
     echo "  Stop:          systemctl stop fula-gateway"
     echo "  Restart:       systemctl restart fula-gateway"
     echo "  Status:        systemctl status fula-gateway"
-    echo "  Logs:          journalctl -u fula-gateway -f"
+    echo "  Logs:          docker compose -f ${FULA_CONFIG}/docker-compose.yml logs -f"
+    echo ""
+    echo "Configuration files:"
+    echo "  Environment:   ${ENV_FILE}"
+    echo "  Docker:        ${FULA_CONFIG}/docker-compose.yml"
+    echo "  Nginx:         ${NGINX_CONF}"
     echo ""
     
     if [[ ! "${IPFS_RUNNING}" == "true" ]] && [[ -z "${IPFS_DOMAIN}" ]]; then
@@ -648,6 +774,13 @@ verify_installation() {
         log_warn "  2. Re-run this script with an IPFS domain"
     fi
     
+    echo ""
+    echo "Troubleshooting:"
+    echo "  View gateway logs:  docker compose -f ${FULA_CONFIG}/docker-compose.yml logs gateway"
+    echo "  View IPFS logs:     docker compose -f ${FULA_CONFIG}/docker-compose.yml logs ipfs"
+    echo "  Test health:        curl -I https://${FULA_DOMAIN}/"
+    echo "  Rebuild image:      cd /path/to/fula-api && docker build -t ghcr.io/functionland/fula-gateway:latest ."
+    echo ""
     echo "==========================================="
     
     if [[ $errors -gt 0 ]]; then
