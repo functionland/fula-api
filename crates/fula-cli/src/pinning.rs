@@ -14,9 +14,18 @@ use tracing::{info, warn};
 
 /// Header name for pinning service endpoint
 pub const HEADER_PINNING_SERVICE: &str = "x-pinning-service";
+/// S3-compatible metadata header for pinning service endpoint
+pub const HEADER_AMZ_PINNING_SERVICE: &str = "x-amz-meta-x-pinning-service";
 
 /// Header name for pinning service token
 pub const HEADER_PINNING_TOKEN: &str = "x-pinning-token";
+/// S3-compatible metadata header for pinning service token
+pub const HEADER_AMZ_PINNING_TOKEN: &str = "x-amz-meta-x-pinning-token";
+
+/// Header name for pinning name
+pub const HEADER_PINNING_NAME: &str = "x-pinning-name";
+/// S3-compatible metadata header for pinning name
+pub const HEADER_AMZ_PINNING_NAME: &str = "x-amz-meta-x-pinning-name";
 
 /// Extracted pinning credentials from request headers
 #[derive(Debug, Clone)]
@@ -32,13 +41,14 @@ pub struct PinningCredentials {
 impl PinningCredentials {
     /// Extract pinning credentials from request headers
     ///
+    /// Checks both direct headers (x-pinning-*) and S3-compatible metadata headers
+    /// (x-amz-meta-x-pinning-*) for compatibility with S3 client libraries like MinIO.
+    ///
     /// Returns None if headers are not present (pinning not requested)
     /// Security audit fix #3: Validates endpoint to prevent SSRF
     pub fn from_headers(headers: &HeaderMap) -> Option<Self> {
-        let endpoint = headers
-            .get(HEADER_PINNING_SERVICE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())?;
+        // Check direct header first, then fall back to x-amz-meta-* prefixed version
+        let endpoint = Self::get_header_value(headers, HEADER_PINNING_SERVICE, HEADER_AMZ_PINNING_SERVICE)?;
 
         // Security audit fix #3: Validate endpoint
         if !Self::is_valid_pinning_endpoint(&endpoint) {
@@ -48,22 +58,25 @@ impl PinningCredentials {
             return None;
         }
 
-        let token = headers
-            .get(HEADER_PINNING_TOKEN)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())?;
+        let token = Self::get_header_value(headers, HEADER_PINNING_TOKEN, HEADER_AMZ_PINNING_TOKEN)?;
 
-        // Optional: pin name from x-pinning-name header
-        let name = headers
-            .get("x-pinning-name")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        // Optional: pin name from x-pinning-name header (or x-amz-meta-x-pinning-name)
+        let name = Self::get_header_value(headers, HEADER_PINNING_NAME, HEADER_AMZ_PINNING_NAME);
 
         Some(Self {
             endpoint,
             token,
             name,
         })
+    }
+    
+    /// Get a header value, checking the direct header first, then the x-amz-meta-* prefixed version
+    fn get_header_value(headers: &HeaderMap, direct: &str, amz_meta: &str) -> Option<String> {
+        headers
+            .get(direct)
+            .or_else(|| headers.get(amz_meta))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
     }
     
     /// Security audit fix #3: Validate pinning endpoint to prevent SSRF
@@ -124,12 +137,15 @@ impl PinningCredentials {
 pub async fn pin_for_user(headers: &HeaderMap, cid: &Cid, object_key: Option<&str>) {
     // Security audit fix #2: Don't log header VALUES (contains tokens)
     // Only log presence of headers, never their values
-    let has_service = headers.get(HEADER_PINNING_SERVICE).is_some();
-    let has_token = headers.get(HEADER_PINNING_TOKEN).is_some();
+    // Check both direct and x-amz-meta-* prefixed headers
+    let has_service = headers.get(HEADER_PINNING_SERVICE).is_some() 
+        || headers.get(HEADER_AMZ_PINNING_SERVICE).is_some();
+    let has_token = headers.get(HEADER_PINNING_TOKEN).is_some()
+        || headers.get(HEADER_AMZ_PINNING_TOKEN).is_some();
     tracing::debug!(
         has_pinning_service = has_service,
         has_pinning_token = has_token,
-        "Checking for pinning credentials"
+        "Checking for pinning credentials (direct or x-amz-meta-* headers)"
     );
     
     if let Some(creds) = PinningCredentials::from_headers(headers) {
@@ -262,5 +278,56 @@ mod tests {
         );
         // Missing token
         assert!(PinningCredentials::from_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_s3_compatible_amz_meta_headers() {
+        // Test that x-amz-meta-x-pinning-* headers work (S3 client compatibility)
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_AMZ_PINNING_SERVICE,
+            HeaderValue::from_static("https://api.pinata.cloud/psa"),
+        );
+        headers.insert(
+            HEADER_AMZ_PINNING_TOKEN,
+            HeaderValue::from_static("test-token-456"),
+        );
+        headers.insert(
+            HEADER_AMZ_PINNING_NAME,
+            HeaderValue::from_static("my-pin-name"),
+        );
+
+        let creds = PinningCredentials::from_headers(&headers).unwrap();
+        assert_eq!(creds.endpoint, "https://api.pinata.cloud/psa");
+        assert_eq!(creds.token, "test-token-456");
+        assert_eq!(creds.name, Some("my-pin-name".to_string()));
+    }
+
+    #[test]
+    fn test_direct_headers_take_precedence() {
+        // Direct headers should take precedence over x-amz-meta-* headers
+        let mut headers = HeaderMap::new();
+        // Direct headers
+        headers.insert(
+            HEADER_PINNING_SERVICE,
+            HeaderValue::from_static("https://direct.example.com/psa"),
+        );
+        headers.insert(
+            HEADER_PINNING_TOKEN,
+            HeaderValue::from_static("direct-token"),
+        );
+        // Also add x-amz-meta-* headers (should be ignored)
+        headers.insert(
+            HEADER_AMZ_PINNING_SERVICE,
+            HeaderValue::from_static("https://amz.example.com/psa"),
+        );
+        headers.insert(
+            HEADER_AMZ_PINNING_TOKEN,
+            HeaderValue::from_static("amz-token"),
+        );
+
+        let creds = PinningCredentials::from_headers(&headers).unwrap();
+        assert_eq!(creds.endpoint, "https://direct.example.com/psa");
+        assert_eq!(creds.token, "direct-token");
     }
 }
