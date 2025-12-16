@@ -516,6 +516,7 @@ footer {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 8px;
     padding: 0 20px 20px;
     border-bottom: 1px solid var(--border-color);
     margin-bottom: 20px;
@@ -525,6 +526,15 @@ footer {
     padding: 0;
     border: none;
     margin: 0;
+    flex: 1;
+}
+
+.sidebar-header .language-selector {
+    flex-shrink: 0;
+}
+
+.sidebar-header .theme-toggle {
+    flex-shrink: 0;
 }
 
 /* Mobile Overlay */
