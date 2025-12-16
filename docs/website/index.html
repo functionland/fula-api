@@ -51,25 +51,25 @@
             </button>
         </div>
         <div class="nav-section">
-            <h3>Documentation</h3>
+            <h3 data-i18n="nav.documentation">Documentation</h3>
             <ul>
-                <li><a href="index.html" class="active">Introduction</a></li>
-                <li><a href="security.html">Security & Encryption</a></li>
-                <li><a href="api.html">API Reference</a></li>
-                <li><a href="sdk.html">SDK Examples</a></li>
-                <li><a href="platforms.html">Platform Guides</a></li>
+                <li><a href="index.html" class="active" data-i18n="nav.introduction">Introduction</a></li>
+                <li><a href="security.html" data-i18n="nav.security">Security & Encryption</a></li>
+                <li><a href="api.html" data-i18n="nav.api">API Reference</a></li>
+                <li><a href="sdk.html" data-i18n="nav.sdk">SDK Examples</a></li>
+                <li><a href="platforms.html" data-i18n="nav.platforms">Platform Guides</a></li>
             </ul>
         </div>
         <div class="nav-section">
-            <h3>On This Page</h3>
+            <h3 data-i18n="nav.onThisPage">On This Page</h3>
             <ul>
-                <li><a href="#overview">Overview</a></li>
-                <li><a href="#why-fula">Why Fula?</a></li>
+                <li><a href="#overview" data-i18n="overview.title">Overview</a></li>
+                <li><a href="#why-fula" data-i18n="whyFula.title">Why Fula?</a></li>
                 <li><a href="#architecture">Architecture</a></li>
                 <li><a href="#how-it-works">How It Works</a></li>
                 <li><a href="#encryption">Encryption</a></li>
                 <li><a href="#data-structures">Data Structures</a></li>
-                <li><a href="#getting-started">Getting Started</a></li>
+                <li><a href="#getting-started" data-i18n="gettingStarted.title">Getting Started</a></li>
             </ul>
         </div>
     </nav>
@@ -78,24 +78,24 @@
         <!-- Hero Section -->
         <section class="hero">
             <div class="hero-content">
-                <h1>Fula Storage API</h1>
-                <p class="hero-subtitle">S3-Compatible Decentralized Storage Engine powered by IPFS</p>
+                <h1 data-i18n="hero.title">Fula Storage API</h1>
+                <p class="hero-subtitle" data-i18n="hero.subtitle">S3-Compatible Decentralized Storage Engine powered by IPFS</p>
                 <div class="hero-badges">
-                    <span class="badge-item">🌐 Decentralized</span>
-                    <span class="badge-item">🔒 End-to-End Encrypted</span>
-                    <span class="badge-item">✅ Verifiable</span>
-                    <span class="badge-item">🔄 Conflict-Free</span>
+                    <span class="badge-item" data-i18n="hero.badge.decentralized">🌐 Decentralized</span>
+                    <span class="badge-item" data-i18n="hero.badge.encrypted">🔒 End-to-End Encrypted</span>
+                    <span class="badge-item" data-i18n="hero.badge.verifiable">✅ Verifiable</span>
+                    <span class="badge-item" data-i18n="hero.badge.conflictFree">🔄 Conflict-Free</span>
                 </div>
                 <div class="hero-actions">
-                    <a href="index.html" class="btn btn-primary">API Reference</a>
-                    <a href="#getting-started" class="btn btn-secondary">Get Started</a>
+                    <a href="api.html" class="btn btn-primary" data-i18n="hero.btn.apiReference">API Reference</a>
+                    <a href="#getting-started" class="btn btn-secondary" data-i18n="hero.btn.getStarted">Get Started</a>
                 </div>
             </div>
         </section>
 
         <!-- Overview Section -->
         <section id="overview" class="intro-section">
-            <h2>Overview</h2>
+            <h2 data-i18n="overview.title">Overview</h2>
             <div class="overview-grid">
                 <div class="overview-text">
                     <p>Fula Storage provides an <strong>Amazon S3-compatible API</strong> backed by a decentralized network of IPFS nodes. It enables developers to build applications using familiar S3 tools and SDKs while benefiting from true data ownership and decentralization.</p>
@@ -104,23 +104,23 @@
                 <div class="overview-features">
                     <div class="feature-card">
                         <div class="feature-icon">🌐</div>
-                        <h3>Decentralized Storage</h3>
-                        <p>Data stored across a network of community-owned IPFS nodes. No single point of failure or control.</p>
+                        <h3 data-i18n="feature.decentralized.title">Decentralized Storage</h3>
+                        <p data-i18n="feature.decentralized.desc">Data stored across a network of community-owned IPFS nodes. No single point of failure or control.</p>
                     </div>
                     <div class="feature-card">
                         <div class="feature-icon">🔒</div>
-                        <h3>End-to-End Encryption</h3>
-                        <p>HPKE encryption happens on your device. Storage nodes never see your plaintext data.</p>
+                        <h3 data-i18n="feature.encryption.title">End-to-End Encryption</h3>
+                        <p data-i18n="feature.encryption.desc">HPKE encryption happens on your device. Storage nodes never see your plaintext data.</p>
                     </div>
                     <div class="feature-card">
                         <div class="feature-icon">✅</div>
-                        <h3>Verified Streaming</h3>
-                        <p>BLAKE3/Bao ensures data integrity. Detect tampering even from untrusted nodes.</p>
+                        <h3 data-i18n="feature.verified.title">Verified Streaming</h3>
+                        <p data-i18n="feature.verified.desc">BLAKE3/Bao ensures data integrity. Detect tampering even from untrusted nodes.</p>
                     </div>
                     <div class="feature-card">
                         <div class="feature-icon">🔄</div>
-                        <h3>Conflict-Free Sync</h3>
-                        <p>CRDT-based metadata enables distributed updates without coordination.</p>
+                        <h3 data-i18n="feature.sync.title">Conflict-Free Sync</h3>
+                        <p data-i18n="feature.sync.desc">CRDT-based metadata enables distributed updates without coordination.</p>
                     </div>
                 </div>
             </div>
@@ -128,14 +128,14 @@
 
         <!-- Why Fula Section -->
         <section id="why-fula" class="intro-section alt-bg">
-            <h2>Why Fula?</h2>
+            <h2 data-i18n="whyFula.title">Why Fula?</h2>
             <div class="comparison-table">
                 <table>
                     <thead>
                         <tr>
-                            <th>Feature</th>
-                            <th>Traditional Cloud (S3, GCS)</th>
-                            <th>Fula Storage</th>
+                            <th data-i18n="whyFula.feature">Feature</th>
+                            <th data-i18n="whyFula.traditional">Traditional Cloud (S3, GCS)</th>
+                            <th data-i18n="whyFula.fula">Fula Storage</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -456,7 +456,7 @@ Chunks: [CID1] [CID2] [CID3] [CID4]</pre>
 
         <!-- Getting Started Section -->
         <section id="getting-started" class="intro-section">
-            <h2>Getting Started</h2>
+            <h2 data-i18n="gettingStarted.title">Getting Started</h2>
             
             <!-- Row 1: Setup -->
             <h3 class="section-subtitle">1. Setup Your Environment</h3>
