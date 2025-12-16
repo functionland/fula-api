@@ -276,7 +276,12 @@ const translations = {
     }
 };
 
-// Load translations into i18n
-if (typeof i18n !== 'undefined') {
-    i18n.loadTranslations(translations);
-}
+// Load translations into i18n (wait for it to be available)
+(function loadTranslationsIntoI18n() {
+    if (typeof window.i18n !== 'undefined' && window.i18n.loadTranslations) {
+        window.i18n.loadTranslations(translations);
+    } else {
+        // Retry after a short delay if i18n isn't ready yet
+        setTimeout(loadTranslationsIntoI18n, 10);
+    }
+})();
