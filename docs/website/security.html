@@ -8,8 +8,13 @@
     <link rel="stylesheet" href="css/security.css">
     <script>
         (function() {
-            const saved = localStorage.getItem('fula-docs-theme');
-            if (saved) document.documentElement.setAttribute('data-theme', saved);
+            const savedTheme = localStorage.getItem('fula-docs-theme');
+            if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
+            const savedLang = localStorage.getItem('fula-docs-language');
+            if (savedLang && ['fa', 'ar'].includes(savedLang)) {
+                document.documentElement.setAttribute('dir', 'rtl');
+                document.documentElement.setAttribute('lang', savedLang);
+            }
         })();
     </script>
 </head>
@@ -2120,6 +2125,8 @@ while !rotation.is_rotation_complete() {
         </footer>
     </main>
 
+    <script src="js/i18n.js"></script>
+    <script src="js/translations.js"></script>
     <script src="js/app.js"></script>
 </body>
 </html>
