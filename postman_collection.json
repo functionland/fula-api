@@ -1,0 +1,786 @@
+{
+  "info": {
+    "_postman_id": "fula-api-s3-collection",
+    "name": "Fula API - S3 Compatible",
+    "description": "S3-compatible API endpoints for Fula distributed storage. This collection provides examples for bucket management, object operations, multipart uploads, and tagging.\n\n## Authentication\nSet the `Authorization` header with your access credentials. The API supports standard S3-style authentication.\n\n## Variables\n- `baseUrl`: The API server URL (default: http://localhost:3000)\n- `bucket`: Bucket name for testing\n- `key`: Object key for testing\n- `uploadId`: Multipart upload ID (set automatically after initiating upload)",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000",
+      "type": "string"
+    },
+    {
+      "key": "bucket",
+      "value": "test-bucket",
+      "type": "string"
+    },
+    {
+      "key": "key",
+      "value": "test-file.txt",
+      "type": "string"
+    },
+    {
+      "key": "uploadId",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      {
+        "key": "key",
+        "value": "Authorization",
+        "type": "string"
+      },
+      {
+        "key": "value",
+        "value": "Bearer {{accessToken}}",
+        "type": "string"
+      },
+      {
+        "key": "in",
+        "value": "header",
+        "type": "string"
+      }
+    ]
+  },
+  "item": [
+    {
+      "name": "Service",
+      "description": "Service-level operations",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "HEAD",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/",
+              "host": ["{{baseUrl}}"],
+              "path": [""]
+            },
+            "description": "Check if the API service is healthy and running."
+          },
+          "response": []
+        },
+        {
+          "name": "List All Buckets",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/xml"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/",
+              "host": ["{{baseUrl}}"],
+              "path": [""]
+            },
+            "description": "List all buckets owned by the authenticated user. Returns XML response with bucket names and creation dates."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Bucket Operations",
+      "description": "Create, delete, and manage buckets",
+      "item": [
+        {
+          "name": "Create Bucket",
+          "request": {
+            "method": "PUT",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}"]
+            },
+            "description": "Create a new bucket with the specified name. Bucket names must be unique within your account."
+          },
+          "response": []
+        },
+        {
+          "name": "Check Bucket Exists (HEAD)",
+          "request": {
+            "method": "HEAD",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}"]
+            },
+            "description": "Check if a bucket exists. Returns 200 OK if exists, 404 if not found."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Bucket Location",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/xml"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}?location",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}"],
+              "query": [
+                {
+                  "key": "location",
+                  "value": null
+                }
+              ]
+            },
+            "description": "Get the location constraint for a bucket."
+          },
+          "response": []
+        },
+        {
+          "name": "List Objects in Bucket",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/xml"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}?list-type=2&max-keys=100",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}"],
+              "query": [
+                {
+                  "key": "list-type",
+                  "value": "2",
+                  "description": "Use ListObjectsV2 (recommended)"
+                },
+                {
+                  "key": "max-keys",
+                  "value": "100",
+                  "description": "Maximum number of keys to return"
+                },
+                {
+                  "key": "prefix",
+                  "value": "",
+                  "description": "Filter by prefix",
+                  "disabled": true
+                },
+                {
+                  "key": "delimiter",
+                  "value": "/",
+                  "description": "Delimiter for grouping (usually /)",
+                  "disabled": true
+                },
+                {
+                  "key": "continuation-token",
+                  "value": "",
+                  "description": "Token for pagination",
+                  "disabled": true
+                },
+                {
+                  "key": "start-after",
+                  "value": "",
+                  "description": "Start listing after this key",
+                  "disabled": true
+                },
+                {
+                  "key": "fetch-owner",
+                  "value": "true",
+                  "description": "Include owner info",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "List objects in a bucket using ListObjectsV2. Supports pagination, prefix filtering, and delimiter grouping."
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Bucket",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}"]
+            },
+            "description": "Delete a bucket. The bucket must be empty before deletion."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Object Operations",
+      "description": "Upload, download, and manage objects",
+      "item": [
+        {
+          "name": "Upload Object (PUT)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain",
+                "description": "Content type of the object"
+              },
+              {
+                "key": "x-amz-meta-custom-key",
+                "value": "custom-value",
+                "description": "Custom metadata (optional)",
+                "disabled": true
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "Hello, this is test file content!"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/{{key}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "{{key}}"]
+            },
+            "description": "Upload an object to a bucket. You can include custom metadata using x-amz-meta-* headers."
+          },
+          "response": []
+        },
+        {
+          "name": "Upload Binary File",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/octet-stream"
+              }
+            ],
+            "body": {
+              "mode": "file",
+              "file": {
+                "src": ""
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/uploads/myfile.bin",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "uploads", "myfile.bin"]
+            },
+            "description": "Upload a binary file. Select a file from your system in the Body tab."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Object",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "If-None-Match",
+                "value": "",
+                "description": "Return 304 if ETag matches",
+                "disabled": true
+              },
+              {
+                "key": "If-Modified-Since",
+                "value": "",
+                "description": "Return 304 if not modified since date",
+                "disabled": true
+              },
+              {
+                "key": "Range",
+                "value": "bytes=0-1023",
+                "description": "Request specific byte range",
+                "disabled": true
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/{{key}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "{{key}}"]
+            },
+            "description": "Download an object. Supports conditional requests (If-None-Match, If-Modified-Since) and range requests."
+          },
+          "response": []
+        },
+        {
+          "name": "Get Object (Range Request)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Range",
+                "value": "bytes=0-99",
+                "description": "Request first 100 bytes"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/{{key}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "{{key}}"]
+            },
+            "description": "Download a specific byte range of an object. Returns 206 Partial Content."
+          },
+          "response": []
+        },
+        {
+          "name": "Head Object",
+          "request": {
+            "method": "HEAD",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/{{key}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "{{key}}"]
+            },
+            "description": "Get object metadata without downloading the content. Returns headers like ETag, Content-Length, Content-Type, etc."
+          },
+          "response": []
+        },
+        {
+          "name": "Copy Object",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "x-amz-copy-source",
+                "value": "/{{bucket}}/{{key}}",
+                "description": "Source object path (/{bucket}/{key})"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/copied-{{key}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "copied-{{key}}"]
+            },
+            "description": "Copy an object to a new location. The source is specified in the x-amz-copy-source header."
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Object",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/{{key}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "{{key}}"]
+            },
+            "description": "Delete a single object from a bucket."
+          },
+          "response": []
+        },
+        {
+          "name": "Batch Delete Objects",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/xml"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Delete>\n    <Quiet>false</Quiet>\n    <Object>\n        <Key>file1.txt</Key>\n    </Object>\n    <Object>\n        <Key>file2.txt</Key>\n    </Object>\n</Delete>"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}?delete",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}"],
+              "query": [
+                {
+                  "key": "delete",
+                  "value": null
+                }
+              ]
+            },
+            "description": "Delete multiple objects in a single request. Set Quiet to true to only receive error responses."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Object Tagging",
+      "description": "Manage object tags",
+      "item": [
+        {
+          "name": "Get Object Tags",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/xml"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/{{key}}?tagging",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "{{key}}"],
+              "query": [
+                {
+                  "key": "tagging",
+                  "value": null
+                }
+              ]
+            },
+            "description": "Get all tags associated with an object."
+          },
+          "response": []
+        },
+        {
+          "name": "Set Object Tags",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/xml"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging>\n    <TagSet>\n        <Tag>\n            <Key>environment</Key>\n            <Value>production</Value>\n        </Tag>\n        <Tag>\n            <Key>project</Key>\n            <Value>fula</Value>\n        </Tag>\n    </TagSet>\n</Tagging>"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/{{key}}?tagging",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "{{key}}"],
+              "query": [
+                {
+                  "key": "tagging",
+                  "value": null
+                }
+              ]
+            },
+            "description": "Set tags on an object. Maximum 10 tags allowed per object."
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Object Tags",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/{{key}}?tagging",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "{{key}}"],
+              "query": [
+                {
+                  "key": "tagging",
+                  "value": null
+                }
+              ]
+            },
+            "description": "Remove all tags from an object."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Multipart Upload",
+      "description": "Upload large files in parts",
+      "item": [
+        {
+          "name": "List Multipart Uploads",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/xml"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}?uploads",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}"],
+              "query": [
+                {
+                  "key": "uploads",
+                  "value": null
+                }
+              ]
+            },
+            "description": "List all in-progress multipart uploads for a bucket."
+          },
+          "response": []
+        },
+        {
+          "name": "1. Initiate Multipart Upload",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "// Extract uploadId from XML response",
+                  "var responseText = pm.response.text();",
+                  "var match = responseText.match(/<UploadId>([^<]+)<\\/UploadId>/);",
+                  "if (match && match[1]) {",
+                  "    pm.collectionVariables.set('uploadId', match[1]);",
+                  "    console.log('Upload ID saved:', match[1]);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/octet-stream",
+                "description": "Content type of the final object"
+              },
+              {
+                "key": "x-amz-meta-description",
+                "value": "Large file upload",
+                "description": "Custom metadata (optional)",
+                "disabled": true
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/large-file.bin?uploads",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "large-file.bin"],
+              "query": [
+                {
+                  "key": "uploads",
+                  "value": null
+                }
+              ]
+            },
+            "description": "Start a multipart upload. Returns an uploadId that must be used for all subsequent part uploads. The test script automatically saves the uploadId to collection variables."
+          },
+          "response": []
+        },
+        {
+          "name": "2. Upload Part",
+          "request": {
+            "method": "PUT",
+            "header": [],
+            "body": {
+              "mode": "raw",
+              "raw": "This is part 1 content of the multipart upload..."
+            },
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/large-file.bin?partNumber=1&uploadId={{uploadId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "large-file.bin"],
+              "query": [
+                {
+                  "key": "partNumber",
+                  "value": "1",
+                  "description": "Part number (1-10000)"
+                },
+                {
+                  "key": "uploadId",
+                  "value": "{{uploadId}}",
+                  "description": "Upload ID from initiate request"
+                }
+              ]
+            },
+            "description": "Upload a part of a multipart upload. Part numbers must be between 1 and 10000. Each part (except the last) should be at least 5MB for optimal performance."
+          },
+          "response": []
+        },
+        {
+          "name": "2b. Upload Part 2",
+          "request": {
+            "method": "PUT",
+            "header": [],
+            "body": {
+              "mode": "raw",
+              "raw": "This is part 2 content of the multipart upload..."
+            },
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/large-file.bin?partNumber=2&uploadId={{uploadId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "large-file.bin"],
+              "query": [
+                {
+                  "key": "partNumber",
+                  "value": "2"
+                },
+                {
+                  "key": "uploadId",
+                  "value": "{{uploadId}}"
+                }
+              ]
+            },
+            "description": "Upload part 2 of the multipart upload."
+          },
+          "response": []
+        },
+        {
+          "name": "3. List Parts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/xml"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/large-file.bin?uploadId={{uploadId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "large-file.bin"],
+              "query": [
+                {
+                  "key": "uploadId",
+                  "value": "{{uploadId}}"
+                }
+              ]
+            },
+            "description": "List all uploaded parts for a multipart upload. Use this to verify parts before completing the upload."
+          },
+          "response": []
+        },
+        {
+          "name": "4. Complete Multipart Upload",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/xml"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUpload>\n    <Part>\n        <PartNumber>1</PartNumber>\n        <ETag>\"etag-from-part-1\"</ETag>\n    </Part>\n    <Part>\n        <PartNumber>2</PartNumber>\n        <ETag>\"etag-from-part-2\"</ETag>\n    </Part>\n</CompleteMultipartUpload>"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/large-file.bin?uploadId={{uploadId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "large-file.bin"],
+              "query": [
+                {
+                  "key": "uploadId",
+                  "value": "{{uploadId}}"
+                }
+              ]
+            },
+            "description": "Complete a multipart upload by listing all parts with their ETags. The server will assemble all parts into the final object."
+          },
+          "response": []
+        },
+        {
+          "name": "Abort Multipart Upload",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/{{bucket}}/large-file.bin?uploadId={{uploadId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{bucket}}", "large-file.bin"],
+              "query": [
+                {
+                  "key": "uploadId",
+                  "value": "{{uploadId}}"
+                }
+              ]
+            },
+            "description": "Abort a multipart upload and clean up all uploaded parts."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Workflows",
+      "description": "Common workflow examples",
+      "item": [
+        {
+          "name": "Full Workflow - Create Bucket and Upload",
+          "item": [
+            {
+              "name": "Step 1: Create Bucket",
+              "request": {
+                "method": "PUT",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/my-new-bucket",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["my-new-bucket"]
+                }
+              },
+              "response": []
+            },
+            {
+              "name": "Step 2: Upload File",
+              "request": {
+                "method": "PUT",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "text/plain"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "Hello World! This is my first file."
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/my-new-bucket/hello.txt",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["my-new-bucket", "hello.txt"]
+                }
+              },
+              "response": []
+            },
+            {
+              "name": "Step 3: List Files",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/my-new-bucket?list-type=2",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["my-new-bucket"],
+                  "query": [
+                    {
+                      "key": "list-type",
+                      "value": "2"
+                    }
+                  ]
+                }
+              },
+              "response": []
+            },
+            {
+              "name": "Step 4: Download File",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/my-new-bucket/hello.txt",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["my-new-bucket", "hello.txt"]
+                }
+              },
+              "response": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
