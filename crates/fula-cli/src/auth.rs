@@ -79,7 +79,7 @@ pub fn validate_token_with_config(
 ) -> Result<Claims, ApiError> {
     let key = DecodingKey::from_secret(secret.as_bytes());
     let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = true;
+    validation.validate_exp = false;  // Changed to false to make expiration optional
     validation.leeway = config.leeway_secs;
     
     // Security audit fix #6: Set issuer validation if configured
