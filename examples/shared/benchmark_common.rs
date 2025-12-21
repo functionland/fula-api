@@ -1,5 +1,6 @@
 // Common utilities for benchmark examples
 // This file is included via include!() in other benchmark files
+// Do NOT add use statements or main() here - they come from the including file
 
 use fula_client::{Config, EncryptedClient, EncryptionConfig, KeyObfuscation, PinningCredentials};
 

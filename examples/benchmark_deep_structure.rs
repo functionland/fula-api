@@ -16,7 +16,7 @@ use std::env;
 use std::time::Instant;
 
 // Include common benchmark utilities
-include!("benchmark_common.rs");
+include!("shared/benchmark_common.rs");
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

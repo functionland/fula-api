@@ -19,7 +19,7 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 
 // Include common benchmark utilities
-include!("benchmark_common.rs");
+include!("shared/benchmark_common.rs");
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
