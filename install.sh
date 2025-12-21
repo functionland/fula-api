@@ -480,12 +480,12 @@ server {
         proxy_pass_request_headers on;
     }
 
-    # Health check endpoint (no rate limit, efficient HEAD request)
+    # Health check endpoint (efficient HEAD request)
     location = /_health {
-        limit_req off;
-        limit_conn off;
         proxy_pass http://fula_gateway/;
         proxy_method HEAD;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
     }
 }
 EOF
