@@ -655,7 +655,20 @@ EOF
 # Create systemd service for Docker Compose
 create_systemd_service() {
     log_info "Creating systemd service..."
-    
+
+    # Detect which Docker Compose version is installed
+    local COMPOSE_CMD
+    if docker compose version &> /dev/null; then
+        # Docker Compose v2 (plugin)
+        COMPOSE_CMD="/usr/bin/docker compose"
+    elif command -v docker-compose &> /dev/null; then
+        # Docker Compose v1 (standalone)
+        COMPOSE_CMD="/usr/local/bin/docker-compose"
+    else
+        log_error "No Docker Compose installation found"
+        return 1
+    fi
+
     cat > /etc/systemd/system/fula-gateway.service << EOF
 [Unit]
 Description=Fula Gateway (Docker Compose)
@@ -667,8 +680,8 @@ Type=oneshot
 RemainAfterExit=yes
 User=root
 WorkingDirectory=${FULA_CONFIG}
-ExecStart=/usr/bin/docker compose up -d
-ExecStop=/usr/bin/docker compose down
+ExecStart=${COMPOSE_CMD} up -d
+ExecStop=${COMPOSE_CMD} down
 TimeoutStartSec=0
 
 [Install]
@@ -677,7 +690,7 @@ EOF
 
     systemctl daemon-reload
     systemctl enable fula-gateway
-    
+
     log_success "Systemd service created"
 }
 
