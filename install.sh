@@ -115,10 +115,33 @@ install_docker_compose() {
         log_info "Docker Compose already available"
         return 0
     fi
-    
+
     log_info "Installing Docker Compose..."
-    apt-get install -y -qq docker-compose-plugin > /dev/null
-    log_success "Docker Compose installed"
+
+    # Ubuntu 24.04+ uses Docker Compose v2 as a plugin
+    # Try installing via apt first (for older Ubuntu versions)
+    if apt-get install -y -qq docker-compose-plugin > /dev/null 2>&1; then
+        log_success "Docker Compose installed via apt"
+        return 0
+    fi
+
+    # If apt install failed, try manual installation
+    log_info "Installing Docker Compose manually..."
+    local COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+
+    if [[ -z "$COMPOSE_VERSION" ]]; then
+        COMPOSE_VERSION="v2.29.1"  # fallback version
+    fi
+
+    curl -L "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+
+    if docker-compose version &> /dev/null; then
+        log_success "Docker Compose installed manually"
+    else
+        log_error "Failed to install Docker Compose"
+        return 1
+    fi
 }
 
 # Clone or update source code
