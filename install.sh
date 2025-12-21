@@ -76,6 +76,7 @@ install_dependencies() {
         curl \
         wget \
         gnupg \
+        git \
         ca-certificates \
         lsb-release \
         software-properties-common \
@@ -118,6 +119,25 @@ install_docker_compose() {
     log_info "Installing Docker Compose..."
     apt-get install -y -qq docker-compose-plugin > /dev/null
     log_success "Docker Compose installed"
+}
+
+# Clone or update source code
+clone_source() {
+    local SOURCE_DIR="/opt/fula-api"
+    local REPO_URL="https://github.com/functionland/fula-api.git"
+    
+    if [[ -d "${SOURCE_DIR}" ]]; then
+        log_info "Updating source code in ${SOURCE_DIR}..."
+        cd "${SOURCE_DIR}"
+        git fetch origin main --depth=1 2>/dev/null || true
+        git reset --hard origin/main 2>/dev/null || true
+        cd - > /dev/null
+    else
+        log_info "Cloning source code to ${SOURCE_DIR}..."
+        git clone --depth=1 "${REPO_URL}" "${SOURCE_DIR}"
+    fi
+    
+    log_success "Source code ready at ${SOURCE_DIR}"
 }
 
 # Create fula user and group
@@ -227,10 +247,6 @@ collect_configuration() {
     DEFAULT_JWT_SECRET="${JWT_SECRET:-$(generate_secret)}"
     prompt_env "JWT_SECRET" "JWT Secret (auto-generated if empty)" "$DEFAULT_JWT_SECRET" true
     
-    # OAuth settings
-    prompt_env "OAUTH_ISSUER" "OAuth Issuer URL (optional)" "${OAUTH_ISSUER:-}"
-    prompt_env "OAUTH_AUDIENCE" "OAuth Audience (optional)" "${OAUTH_AUDIENCE:-}"
-    
     # CORS
     echo ""
     log_info "CORS Configuration"
@@ -242,6 +258,10 @@ collect_configuration() {
     prompt_env "PINNING_SERVICE_ENDPOINT" "Pinning service endpoint" "${PINNING_SERVICE_ENDPOINT:-}"
     if [[ -n "${PINNING_SERVICE_ENDPOINT}" ]]; then
         prompt_env "PINNING_SERVICE_TOKEN" "Pinning service token" "${PINNING_SERVICE_TOKEN:-}" true
+        if [[ -z "${PINNING_SERVICE_TOKEN}" ]]; then
+            log_warn "Pinning service endpoint provided without token - SERVER-LEVEL pinning will be DISABLED"
+            log_warn "Users can still pin via per-request headers (X-Pinning-Service, X-Pinning-Token)"
+        fi
     fi
     
     # Gateway port
@@ -289,8 +309,6 @@ IPFS_DOMAIN=${IPFS_DOMAIN:-}
 
 # Authentication (REQUIRED - auth is always enabled)
 JWT_SECRET=${JWT_SECRET}
-OAUTH_ISSUER=${OAUTH_ISSUER:-}
-OAUTH_AUDIENCE=${OAUTH_AUDIENCE:-}
 
 # CORS Configuration
 CORS_ENABLED=true
@@ -374,7 +392,10 @@ version: '3.8'
 
 services:
   gateway:
-    image: ghcr.io/functionland/fula-gateway:latest
+    build:
+      context: /opt/fula-api
+      dockerfile: Dockerfile
+    image: fula-gateway:local
     container_name: fula-gateway
     restart: unless-stopped
     env_file:
@@ -779,7 +800,7 @@ verify_installation() {
     echo "  View gateway logs:  docker compose -f ${FULA_CONFIG}/docker-compose.yml logs gateway"
     echo "  View IPFS logs:     docker compose -f ${FULA_CONFIG}/docker-compose.yml logs ipfs"
     echo "  Test health:        curl -I https://${FULA_DOMAIN}/"
-    echo "  Rebuild image:      cd /path/to/fula-api && docker build -t ghcr.io/functionland/fula-gateway:latest ."
+    echo "  Rebuild image:      cd /opt/fula-api && git pull && docker compose -f ${FULA_CONFIG}/docker-compose.yml build gateway"
     echo ""
     echo "==========================================="
     
@@ -805,6 +826,7 @@ main() {
     install_dependencies
     install_docker
     install_docker_compose
+    clone_source
     
     create_user
     create_directories
