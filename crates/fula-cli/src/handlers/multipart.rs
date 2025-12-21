@@ -214,7 +214,8 @@ pub async fn complete_multipart_upload(
 
     // Also pin to user's external pinning service if credentials provided
     // Pin the first part CID as the representative (or all parts)
-    pin_for_user(&headers, &first_part_cid, Some(&key)).await;
+    // Users can send only X-Pinning-Token if server has a default endpoint configured
+    pin_for_user(&headers, &first_part_cid, Some(&key), state.config.pinning_service_endpoint.as_deref()).await;
 
     let location = format!("/{}/{}", bucket, key);
     let xml_response = xml::complete_multipart_upload_result(

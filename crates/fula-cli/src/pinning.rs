@@ -47,18 +47,42 @@ impl PinningCredentials {
     /// Returns None if headers are not present (pinning not requested)
     /// Security audit fix #3: Validates endpoint to prevent SSRF
     pub fn from_headers(headers: &HeaderMap) -> Option<Self> {
-        // Check direct header first, then fall back to x-amz-meta-* prefixed version
-        let endpoint = Self::get_header_value(headers, HEADER_PINNING_SERVICE, HEADER_AMZ_PINNING_SERVICE)?;
-
-        // Security audit fix #3: Validate endpoint
-        if !Self::is_valid_pinning_endpoint(&endpoint) {
-            warn!(
-                "Rejected invalid pinning endpoint (must be https, no private IPs)"
-            );
-            return None;
-        }
-
+        Self::from_headers_with_default(headers, None)
+    }
+    
+    /// Extract pinning credentials with optional server-configured default endpoint
+    ///
+    /// If user provides only X-Pinning-Token (no X-Pinning-Service), uses the
+    /// server's default endpoint. This allows local pinning services where the
+    /// endpoint is controlled by the server admin (no SSRF risk).
+    ///
+    /// - If user provides both endpoint + token: validates endpoint for SSRF
+    /// - If user provides only token + server has default: uses server's endpoint (no validation needed)
+    /// - If user provides only token + no server default: returns None
+    pub fn from_headers_with_default(headers: &HeaderMap, default_endpoint: Option<&str>) -> Option<Self> {
         let token = Self::get_header_value(headers, HEADER_PINNING_TOKEN, HEADER_AMZ_PINNING_TOKEN)?;
+        
+        // Check if user provided their own endpoint
+        let user_endpoint = Self::get_header_value(headers, HEADER_PINNING_SERVICE, HEADER_AMZ_PINNING_SERVICE);
+        
+        let endpoint = if let Some(ep) = user_endpoint {
+            // User provided endpoint - must validate for SSRF protection
+            if !Self::is_valid_pinning_endpoint(&ep) {
+                warn!(
+                    "Rejected invalid pinning endpoint (must be https, no private IPs)"
+                );
+                return None;
+            }
+            ep
+        } else if let Some(default) = default_endpoint {
+            // No user endpoint, but server has a default - use it (no validation needed,
+            // server admin controls this so no SSRF risk)
+            info!("Using server's default pinning endpoint");
+            default.to_string()
+        } else {
+            // No endpoint from user or server
+            return None;
+        };
 
         // Optional: pin name from x-pinning-name header (or x-amz-meta-x-pinning-name)
         let name = Self::get_header_value(headers, HEADER_PINNING_NAME, HEADER_AMZ_PINNING_NAME);
@@ -134,7 +158,10 @@ impl PinningCredentials {
 ///
 /// This is a fire-and-forget operation - pinning happens asynchronously
 /// and errors are logged but don't fail the main request.
-pub async fn pin_for_user(headers: &HeaderMap, cid: &Cid, object_key: Option<&str>) {
+///
+/// If `default_endpoint` is provided, users can send only X-Pinning-Token
+/// and the server's endpoint will be used. This enables local pinning services.
+pub async fn pin_for_user(headers: &HeaderMap, cid: &Cid, object_key: Option<&str>, default_endpoint: Option<&str>) {
     // Security audit fix #2: Don't log header VALUES (contains tokens)
     // Only log presence of headers, never their values
     // Check both direct and x-amz-meta-* prefixed headers
@@ -145,10 +172,11 @@ pub async fn pin_for_user(headers: &HeaderMap, cid: &Cid, object_key: Option<&st
     tracing::debug!(
         has_pinning_service = has_service,
         has_pinning_token = has_token,
+        has_default_endpoint = default_endpoint.is_some(),
         "Checking for pinning credentials (direct or x-amz-meta-* headers)"
     );
     
-    if let Some(creds) = PinningCredentials::from_headers(headers) {
+    if let Some(creds) = PinningCredentials::from_headers_with_default(headers, default_endpoint) {
         tracing::info!(
             endpoint = %creds.endpoint,
             "Remote pinning credentials found, will pin to user's service"
@@ -329,5 +357,48 @@ mod tests {
         let creds = PinningCredentials::from_headers(&headers).unwrap();
         assert_eq!(creds.endpoint, "https://direct.example.com/psa");
         assert_eq!(creds.token, "direct-token");
+    }
+
+    #[test]
+    fn test_token_only_with_default_endpoint() {
+        // User provides only token, server has default endpoint
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_PINNING_TOKEN,
+            HeaderValue::from_static("user-token-123"),
+        );
+
+        // Without default endpoint - should fail
+        assert!(PinningCredentials::from_headers(&headers).is_none());
+
+        // With default endpoint - should use server's endpoint
+        let creds = PinningCredentials::from_headers_with_default(
+            &headers,
+            Some("http://localhost:6000/api/v1"),
+        ).unwrap();
+        assert_eq!(creds.endpoint, "http://localhost:6000/api/v1");
+        assert_eq!(creds.token, "user-token-123");
+    }
+
+    #[test]
+    fn test_user_endpoint_overrides_default() {
+        // User provides both endpoint and token - should use user's (with validation)
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_PINNING_SERVICE,
+            HeaderValue::from_static("https://user.pinata.cloud/psa"),
+        );
+        headers.insert(
+            HEADER_PINNING_TOKEN,
+            HeaderValue::from_static("user-token"),
+        );
+
+        let creds = PinningCredentials::from_headers_with_default(
+            &headers,
+            Some("http://localhost:6000/api/v1"),
+        ).unwrap();
+        // User's endpoint should be used, not the default
+        assert_eq!(creds.endpoint, "https://user.pinata.cloud/psa");
+        assert_eq!(creds.token, "user-token");
     }
 }

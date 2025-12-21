@@ -18,7 +18,10 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build release binary
+# Build release binary with reduced parallelism for low-memory systems
+# Set CARGO_BUILD_JOBS=1 to use single thread (less RAM, slower)
+# Set CARGO_BUILD_JOBS=2 for balance between speed and memory
+ENV CARGO_BUILD_JOBS=2
 RUN cargo build --release --package fula-cli
 
 # ============================================

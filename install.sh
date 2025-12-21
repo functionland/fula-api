@@ -562,19 +562,13 @@ EOF
 
 # Configure SSL with Certbot
 configure_ssl() {
-    log_info "Configuring SSL certificates..."
+    log_info "Configuring SSL certificate for gateway..."
     
-    # Gateway certificate
+    # Gateway certificate only - IPFS and pinning endpoints are external services
+    # with their own SSL already configured by the user
     certbot --nginx -d "${FULA_DOMAIN}" --non-interactive --agree-tos --register-unsafely-without-email || {
         log_warn "Certbot failed for ${FULA_DOMAIN}. You may need to run it manually."
     }
-    
-    # IPFS certificate
-    if [[ -n "${IPFS_DOMAIN}" ]]; then
-        certbot --nginx -d "${IPFS_DOMAIN}" --non-interactive --agree-tos --register-unsafely-without-email || {
-            log_warn "Certbot failed for ${IPFS_DOMAIN}. You may need to run it manually."
-        }
-    fi
     
     # Setup auto-renewal
     systemctl enable certbot.timer
@@ -698,9 +692,33 @@ configure_ipfs_settings() {
     log_success "IPFS configured for production"
 }
 
+# Build Docker image
+build_docker_image() {
+    log_info "Building Docker image (this may take 5-15 minutes on first run)..."
+    
+    cd "${FULA_CONFIG}"
+    
+    # Build with visible output so user can see any errors
+    if ! docker compose build --progress=plain gateway 2>&1 | tee /tmp/fula-build.log; then
+        log_error "Docker build failed. Check /tmp/fula-build.log for details"
+        log_error "Common fixes:"
+        log_error "  - Ensure server has at least 4GB RAM for Rust compilation"
+        log_error "  - Try: CARGO_BUILD_JOBS=1 docker compose build gateway"
+        return 1
+    fi
+    
+    log_success "Docker image built successfully"
+}
+
 # Start services
 start_services() {
     log_info "Starting services..."
+    
+    # Build the Docker image first (with visible output)
+    build_docker_image || {
+        log_error "Cannot start services - Docker build failed"
+        return 1
+    }
     
     systemctl restart nginx
     systemctl start fula-gateway

@@ -114,7 +114,8 @@ pub async fn put_object(
 
     // Also pin to user's external pinning service if credentials provided
     // Headers: X-Pinning-Service, X-Pinning-Token
-    pin_for_user(&headers, &cid, Some(&key)).await;
+    // Users can send only X-Pinning-Token if server has a default endpoint configured
+    pin_for_user(&headers, &cid, Some(&key), state.config.pinning_service_endpoint.as_deref()).await;
 
     Ok((
         StatusCode::OK,
