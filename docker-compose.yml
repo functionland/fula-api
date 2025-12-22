@@ -11,21 +11,16 @@ services:
     build:
       context: /opt/fula-api
       dockerfile: Dockerfile
-    ports:
-      - "9000:9000"
     environment:
       - FULA_HOST=0.0.0.0
       - FULA_PORT=9000
-      - IPFS_API_URL=http://host.docker.internal:5001
-      - CLUSTER_API_URL=http://host.docker.internal:9094
+      - IPFS_API_URL=http://localhost:5001
+      - CLUSTER_API_URL=http://localhost:9094
       - JWT_SECRET=${JWT_SECRET:-development-secret-change-in-production}
       - FULA_NO_AUTH=${FULA_NO_AUTH:-false}
       - RUST_LOG=info,fula_cli=debug
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    network_mode: host
     restart: unless-stopped
-    networks:
-      - fula-network
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/"]
       interval: 30s
