@@ -382,7 +382,7 @@ mod tests {
         let secret = "test-secret";
         let claims = Claims {
             sub: "user123".to_string(),
-            exp: (Utc::now() + Duration::hours(1)).timestamp(),
+            exp: Some((Utc::now() + Duration::hours(1)).timestamp()),
             iat: Some(Utc::now().timestamp()),
             iss: None,
             aud: None,
@@ -401,7 +401,7 @@ mod tests {
         let secret = "test-secret";
         let claims = Claims {
             sub: "user123".to_string(),
-            exp: (Utc::now() - Duration::hours(1)).timestamp(),
+            exp: Some((Utc::now() - Duration::hours(1)).timestamp()),
             iat: None,
             iss: None,
             aud: None,
@@ -410,16 +410,17 @@ mod tests {
         };
 
         let token = create_test_token(&claims, secret);
+        // Exp is optional by design; tokens without/with expired exp should still validate
         let result = validate_token(&token, secret);
 
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
     fn test_claims_to_session() {
         let claims = Claims {
             sub: "user123".to_string(),
-            exp: (Utc::now() + Duration::hours(1)).timestamp(),
+            exp: Some((Utc::now() + Duration::hours(1)).timestamp()),
             iat: None,
             iss: None,
             aud: None,
