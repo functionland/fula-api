@@ -426,3 +426,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - [rs-wnfs](https://github.com/wnfs-wg/rs-wnfs) - HAMT implementation reference
 - [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) - Fast cryptographic hashing
 - [Bao](https://github.com/oconnor663/bao) - Verified streaming
+
+
+## Update
+
+```
+~/fula-api# git pull
+~/fula-api# rsync -a --delete /root/fula-api/ /opt/fula-api/
+~/fula-api# cp docker-compose.yml /etc/fula/
+/opt/fula-api# docker-compose -f /etc/fula/docker-compose.yml build --no-cache gateway
+systemctl restart fula-gateway
+```
