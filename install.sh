@@ -390,7 +390,7 @@ services:
     network_mode: host
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${GATEWAY_PORT}/"]
+      test: ["CMD", "curl", "-f", "http://localhost:${GATEWAY_PORT}/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3
