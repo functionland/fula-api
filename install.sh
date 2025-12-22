@@ -364,96 +364,106 @@ EOF
 # Create Docker Compose file
 create_docker_compose() {
     log_info "Creating Docker Compose configuration..."
-    
-    local IPFS_SERVICE=""
-    if [[ -n "${IPFS_DOMAIN}" ]] && [[ "${IPFS_RUNNING}" != "true" ]]; then
-        IPFS_SERVICE="
-  ipfs:
-    image: ipfs/kubo:v0.32.1
-    container_name: fula-ipfs
-    restart: unless-stopped
-    volumes:
-      - ${FULA_HOME}/ipfs:/data/ipfs
-    ports:
-      - '127.0.0.1:5001:5001'
-      - '127.0.0.1:8081:8080'
-      - '4001:4001'      # Swarm TCP
-      - '4001:4001/udp'  # Swarm QUIC
-    environment:
-      - IPFS_PROFILE=server
-    command: ['daemon', '--migrate=true', '--enable-gc']
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-        reservations:
-          memory: 1G
-    healthcheck:
-      test: ['CMD-SHELL', 'ipfs id || exit 1']
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    logging:
-      driver: json-file
-      options:
-        max-size: '100m'
-        max-file: '3'
-"
-    fi
-    
-    # Determine depends_on based on IPFS configuration
-    local DEPENDS_ON=""
-    if [[ -n "${IPFS_DOMAIN}" ]] && [[ "${IPFS_RUNNING}" != "true" ]]; then
-        DEPENDS_ON="
-    depends_on:
-      ipfs:
-        condition: service_healthy"
-    fi
 
     cat > "${FULA_CONFIG}/docker-compose.yml" << EOF
-version: '3.8'
+# Fula Storage - Complete Development Stack
+# Run with: docker-compose up -d
+
+version: "3.8"
 
 services:
+  # ============================================
+  # Fula Gateway - S3-Compatible API
+  # ============================================
   gateway:
     build:
       context: /opt/fula-api
       dockerfile: Dockerfile
-    image: fula-gateway:local
-    container_name: fula-gateway
-    restart: unless-stopped
-    env_file:
-      - ${ENV_FILE}
     environment:
-      # Override IPFS URL to use Docker network
-      - IPFS_API_URL=http://ipfs:5001
-    volumes:
-      - ${FULA_HOME}/data:/var/lib/fula/data
-    ports:
-      - '127.0.0.1:${GATEWAY_PORT}:${GATEWAY_PORT}'
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 512M
+      - FULA_HOST=0.0.0.0
+      - FULA_PORT=${GATEWAY_PORT}
+      - IPFS_API_URL=http://localhost:5001
+      - CLUSTER_API_URL=http://localhost:9094
+      - JWT_SECRET=\${JWT_SECRET:-development-secret-change-in-production}
+      - FULA_NO_AUTH=\${FULA_NO_AUTH:-false}
+      - RUST_LOG=info,fula_cli=debug
+    network_mode: host
+    restart: unless-stopped
     healthcheck:
-      # Use HEAD request to health check endpoint (more efficient)
-      test: ['CMD', 'curl', '-f', '-X', 'HEAD', 'http://localhost:${GATEWAY_PORT}/']
+      test: ["CMD", "curl", "-f", "http://localhost:${GATEWAY_PORT}/"]
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       retries: 3
-      start_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: '100m'
-        max-file: '5'
-    # Graceful shutdown - allow time for in-flight requests
-    stop_grace_period: 30s${DEPENDS_ON}
-${IPFS_SERVICE}
+
+  # ============================================
+  # Redis (optional - for multi-gateway sync)
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - fula-network
+    profiles:
+      - full
+
+  # ============================================
+  # Prometheus (optional - monitoring)
+  # ============================================
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    networks:
+      - fula-network
+    profiles:
+      - monitoring
+
+  # ============================================
+  # Grafana (optional - dashboards)
+  # ============================================
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=\${GRAFANA_PASSWORD:-admin}
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - fula-network
+    profiles:
+      - monitoring
+
+# ============================================
+# Networks
+# ============================================
 networks:
-  default:
-    name: fula-network
+  fula-network:
+    driver: bridge
+
+# ============================================
+# Volumes
+# ============================================
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:
 EOF
 
     chown ${FULA_USER}:${FULA_GROUP} "${FULA_CONFIG}/docker-compose.yml"
