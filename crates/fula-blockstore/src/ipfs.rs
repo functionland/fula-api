@@ -7,7 +7,11 @@ use cid::Cid;
 use reqwest::{Client, multipart};
 use serde::Deserialize;
 use std::time::Duration;
-use tracing::instrument;
+use tracing::{instrument, warn};
+
+/// Maximum size for a single IPFS block (slightly under 1MB to be safe)
+/// Data larger than this MUST use UnixFS chunking via /api/v0/add
+const MAX_BLOCK_SIZE: usize = 1024 * 1024 - 256; // ~1MB minus safety margin
 
 /// Configuration for IPFS connection
 #[derive(Clone)]
@@ -160,8 +164,21 @@ impl IpfsBlockStore {
     /// Put a raw block
     /// Note: Raw blocks (file chunks) are NOT pinned inline to avoid timeouts.
     /// They are protected by the bucket root's recursive pin after flush_forest.
+    /// 
+    /// IMPORTANT: IPFS has a 1MB block limit. Data larger than ~1MB is automatically
+    /// stored using UnixFS chunking via /api/v0/add instead of /api/v0/block/put.
     #[instrument(skip(self, data), fields(size = data.len()))]
     pub async fn put_block_raw(&self, data: &[u8]) -> Result<Cid> {
+        // CRITICAL: IPFS block/put has a 1MB limit. Use UnixFS add for larger data.
+        if data.len() > MAX_BLOCK_SIZE {
+            warn!(
+                size = data.len(),
+                max = MAX_BLOCK_SIZE,
+                "Data exceeds IPFS block limit, using UnixFS chunking"
+            );
+            return self.add_with_unixfs(data).await;
+        }
+
         // Don't pin raw blocks inline - even small blocks can cause timeouts under load.
         // All blocks are protected by recursive pinning of the bucket root CID at flush time.
         let url = format!(
@@ -192,6 +209,45 @@ impl IpfsBlockStore {
             .map_err(|e| BlockStoreError::IpfsApi(e.to_string()))?;
 
         result.key.parse().map_err(|e: cid::Error| {
+            BlockStoreError::InvalidCid(e.to_string())
+        })
+    }
+
+    /// Add data using UnixFS (automatic chunking for large files)
+    /// This uses /api/v0/add which handles files of any size by splitting
+    /// them into chunks and creating a DAG structure.
+    #[instrument(skip(self, data), fields(size = data.len()))]
+    async fn add_with_unixfs(&self, data: &[u8]) -> Result<Cid> {
+        // Use raw-leaves and CIDv1 for consistency with block/put
+        // chunker=size-262144 creates 256KB chunks (well under 1MB limit)
+        let url = format!(
+            "{}/api/v0/add?raw-leaves=true&cid-version=1&chunker=size-262144&pin=false",
+            self.config.api_url
+        );
+
+        let part = multipart::Part::bytes(data.to_vec())
+            .file_name("data")
+            .mime_str("application/octet-stream")
+            .map_err(|e| BlockStoreError::IpfsApi(e.to_string()))?;
+
+        let form = multipart::Form::new().part("file", part);
+
+        let response = self.client.post(&url).multipart(form).send().await?;
+
+        if !response.status().is_success() {
+            let error = response.text().await.unwrap_or_default();
+            return Err(BlockStoreError::IpfsApi(format!(
+                "Failed to add data with UnixFS: {}",
+                error
+            )));
+        }
+
+        let result: AddResponse = response
+            .json()
+            .await
+            .map_err(|e| BlockStoreError::IpfsApi(e.to_string()))?;
+
+        result.hash.parse().map_err(|e: cid::Error| {
             BlockStoreError::InvalidCid(e.to_string())
         })
     }
@@ -407,6 +463,8 @@ pub struct DagCid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use httpmock::prelude::*;
+    use serde_json::json;
 
     #[test]
     fn test_config_default() {
@@ -419,5 +477,79 @@ mod tests {
     fn test_config_with_url() {
         let config = IpfsConfig::with_url("http://custom:5001");
         assert_eq!(config.api_url, "http://custom:5001");
+    }
+
+    #[tokio::test]
+    async fn put_block_uses_block_put_for_small_data() {
+        let server = MockServer::start_async().await;
+
+        // Mock /api/v0/id probe
+        let _id_mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/v0/id");
+                then.status(200).body("{}");
+            })
+            .await;
+
+        // Expect block/put to be called for small payloads
+        let block_put = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/v0/block/put")
+                    .query_param("cid-codec", "raw")
+                    .query_param("mhtype", "blake3");
+                then.status(200).json_body(json!({
+                    "Key": "bafkreigh2akiscaildc6v5q2xg34x5sqo5djznnha64x4jn3fjvu3j6jci",
+                    "Size": 5,
+                }));
+            })
+            .await;
+
+        let store = IpfsBlockStore::new(IpfsConfig::with_url(server.base_url()))
+            .await
+            .expect("ipfs store init");
+
+        let _ = store.put_block(b"hello").await.expect("block put");
+
+        block_put.assert_hits_async(1).await;
+    }
+
+    #[tokio::test]
+    async fn put_block_uses_unixfs_add_for_large_data() {
+        let server = MockServer::start_async().await;
+
+        // Mock /api/v0/id probe
+        let _id_mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/v0/id");
+                then.status(200).body("{}");
+            })
+            .await;
+
+        // Expect /api/v0/add when payload exceeds MAX_BLOCK_SIZE
+        let add_mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/v0/add")
+                    .query_param("raw-leaves", "true")
+                    .query_param("cid-version", "1")
+                    .query_param("chunker", "size-262144")
+                    .query_param("pin", "false");
+                then.status(200).json_body(json!({
+                    "Name": "data",
+                    "Hash": "bafkreigh2akiscaildc6v5q2xg34x5sqo5djznnha64x4jn3fjvu3j6jci",
+                    "Size": "1049000",
+                }));
+            })
+            .await;
+
+        let store = IpfsBlockStore::new(IpfsConfig::with_url(server.base_url()))
+            .await
+            .expect("ipfs store init");
+
+        let large = vec![0u8; MAX_BLOCK_SIZE + 10];
+        let _ = store.put_block(&large).await.expect("unixfs add");
+
+        add_mock.assert_hits_async(1).await;
     }
 }
