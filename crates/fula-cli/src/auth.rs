@@ -20,7 +20,7 @@ pub struct Claims {
     /// Subject (user ID)
     pub sub: String,
     /// Expiration time
-    pub exp: i64,
+    pub exp: Option<i64>,
     /// Issued at
     pub iat: Option<i64>,
     /// Issuer
@@ -107,7 +107,8 @@ pub fn claims_to_session(claims: Claims) -> UserSession {
         .map(|s| s.to_string())
         .collect();
 
-    let expires_at = DateTime::from_timestamp(claims.exp, 0)
+    let expires_at = claims.exp
+        .and_then(|exp| DateTime::from_timestamp(exp, 0))
         .unwrap_or_else(|| Utc::now() + Duration::hours(1));
 
     // Security audit fix A3: Use UserSession::new() to auto-hash user ID
