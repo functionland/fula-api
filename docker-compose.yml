@@ -9,7 +9,7 @@ services:
   # ============================================
   gateway:
     build:
-      context: .
+      context: /opt/fula-api
       dockerfile: Dockerfile
     ports:
       - "9000:9000"
