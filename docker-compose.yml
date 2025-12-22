@@ -16,14 +16,13 @@ services:
     environment:
       - FULA_HOST=0.0.0.0
       - FULA_PORT=9000
-      - IPFS_API_URL=http://ipfs:5001
-      - CLUSTER_API_URL=http://cluster:9094
+      - IPFS_API_URL=http://host.docker.internal:5001
+      - CLUSTER_API_URL=http://host.docker.internal:9094
       - JWT_SECRET=${JWT_SECRET:-development-secret-change-in-production}
       - FULA_NO_AUTH=${FULA_NO_AUTH:-false}
       - RUST_LOG=info,fula_cli=debug
-    depends_on:
-      - ipfs
-      - cluster
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     networks:
       - fula-network
@@ -32,54 +31,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-
-  # ============================================
-  # IPFS Node
-  # ============================================
-  ipfs:
-    image: ipfs/kubo:latest
-    ports:
-      - "4001:4001"     # Swarm
-      - "5001:5001"     # API
-      - "8080:8080"     # Gateway
-    volumes:
-      - ipfs-data:/data/ipfs
-      - ipfs-staging:/export
-    environment:
-      - IPFS_PROFILE=server
-    restart: unless-stopped
-    networks:
-      - fula-network
-    healthcheck:
-      test: ["CMD-SHELL", "ipfs dag stat /ipfs/QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # ============================================
-  # IPFS Cluster
-  # ============================================
-  cluster:
-    image: ipfs/ipfs-cluster:latest
-    ports:
-      - "9094:9094"     # API
-      - "9095:9095"     # Proxy
-      - "9096:9096"     # Cluster swarm
-    volumes:
-      - cluster-data:/data/ipfs-cluster
-    environment:
-      - CLUSTER_PEERNAME=master
-      - CLUSTER_SECRET=${CLUSTER_SECRET:-}
-      - CLUSTER_IPFSHTTP_NODEMULTIADDRESS=/dns4/ipfs/tcp/5001
-      - CLUSTER_CRDT_TRUSTEDPEERS=*
-      - CLUSTER_REPLICATIONFACTORMIN=1
-      - CLUSTER_REPLICATIONFACTORMAX=3
-      - CLUSTER_MONITORPINGINTERVAL=15s
-    depends_on:
-      - ipfs
-    restart: unless-stopped
-    networks:
-      - fula-network
 
   # ============================================
   # Redis (optional - for multi-gateway sync)
@@ -147,9 +98,6 @@ networks:
 # Volumes
 # ============================================
 volumes:
-  ipfs-data:
-  ipfs-staging:
-  cluster-data:
   redis-data:
   prometheus-data:
   grafana-data:
