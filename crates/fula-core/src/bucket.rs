@@ -7,10 +7,12 @@ use crate::{
 };
 use cid::Cid;
 use chrono::Utc;
-use fula_blockstore::BlockStore;
+use fula_blockstore::{BlockStore, PinStore};
 use std::sync::Arc;
+use std::path::Path;
 use dashmap::DashMap;
-use tracing::instrument;
+use serde::{Serialize, Deserialize};
+use tracing::{instrument, info, warn, error};
 
 /// Configuration for bucket behavior
 #[derive(Clone, Debug)]
@@ -259,24 +261,170 @@ pub struct ListedObject {
     pub metadata: ObjectMetadata,
 }
 
+/// Serializable bucket registry for persistence
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BucketRegistry {
+    /// Version for future migrations
+    pub version: u32,
+    /// All bucket metadata
+    pub buckets: Vec<BucketMetadata>,
+}
+
+impl BucketRegistry {
+    /// Current registry version
+    pub const CURRENT_VERSION: u32 = 1;
+
+    /// Create a new registry from bucket metadata
+    pub fn new(buckets: Vec<BucketMetadata>) -> Self {
+        Self {
+            version: Self::CURRENT_VERSION,
+            buckets,
+        }
+    }
+}
+
 /// Bucket manager for handling multiple buckets
-pub struct BucketManager<S: BlockStore> {
+pub struct BucketManager<S: BlockStore + PinStore> {
     /// Block store
     store: Arc<S>,
     /// Bucket metadata cache
     buckets: Arc<DashMap<String, BucketMetadata>>,
     /// Default configuration
     default_config: BucketConfig,
+    /// Path to store the registry CID (for persistence)
+    registry_cid_path: Option<std::path::PathBuf>,
 }
 
-impl<S: BlockStore> BucketManager<S> {
+impl<S: BlockStore + PinStore> BucketManager<S> {
     /// Create a new bucket manager
     pub fn new(store: Arc<S>) -> Self {
         Self {
             store,
             buckets: Arc::new(DashMap::new()),
             default_config: BucketConfig::default(),
+            registry_cid_path: None,
         }
+    }
+
+    /// Create a new bucket manager with persistence enabled
+    pub fn with_persistence(store: Arc<S>, registry_cid_path: impl AsRef<Path>) -> Self {
+        Self {
+            store,
+            buckets: Arc::new(DashMap::new()),
+            default_config: BucketConfig::default(),
+            registry_cid_path: Some(registry_cid_path.as_ref().to_path_buf()),
+        }
+    }
+
+    /// Load bucket registry from IPFS on startup
+    /// Returns the number of buckets loaded
+    pub async fn load_registry(&self) -> Result<usize> {
+        let cid_path = match &self.registry_cid_path {
+            Some(p) => p,
+            None => {
+                info!("No registry CID path configured, starting with empty registry");
+                return Ok(0);
+            }
+        };
+
+        // Read CID from file
+        let cid_str = match std::fs::read_to_string(cid_path) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!(path = %cid_path.display(), "Registry CID file not found, starting fresh");
+                return Ok(0);
+            }
+            Err(e) => {
+                error!(path = %cid_path.display(), error = %e, "Failed to read registry CID file");
+                return Err(CoreError::StorageError(format!(
+                    "Failed to read registry CID: {}",
+                    e
+                )));
+            }
+        };
+
+        if cid_str.is_empty() {
+            info!("Registry CID file is empty, starting fresh");
+            return Ok(0);
+        }
+
+        // Parse CID
+        let cid: Cid = cid_str.parse().map_err(|e: cid::Error| {
+            CoreError::StorageError(format!("Invalid registry CID '{}': {}", cid_str, e))
+        })?;
+
+        info!(cid = %cid, "Loading bucket registry from IPFS");
+
+        // Fetch registry from IPFS
+        let registry: BucketRegistry = self.store.get_ipld(&cid).await.map_err(|e| {
+            CoreError::StorageError(format!("Failed to load registry from IPFS: {}", e))
+        })?;
+
+        // Validate version
+        if registry.version > BucketRegistry::CURRENT_VERSION {
+            warn!(
+                stored_version = registry.version,
+                current_version = BucketRegistry::CURRENT_VERSION,
+                "Registry version is newer than supported, some features may not work"
+            );
+        }
+
+        // Populate the in-memory cache
+        let count = registry.buckets.len();
+        for bucket_meta in registry.buckets {
+            info!(bucket = %bucket_meta.name, "Restoring bucket from registry");
+            self.buckets.insert(bucket_meta.name.clone(), bucket_meta);
+        }
+
+        info!(bucket_count = count, "Bucket registry loaded successfully");
+        Ok(count)
+    }
+
+    /// Persist the bucket registry to IPFS
+    pub async fn persist_registry(&self) -> Result<Cid> {
+        // Collect all bucket metadata
+        let buckets: Vec<BucketMetadata> = self.buckets.iter().map(|r| r.value().clone()).collect();
+        let registry = BucketRegistry::new(buckets);
+
+        info!(bucket_count = registry.buckets.len(), "Persisting bucket registry to IPFS");
+
+        // Store as IPLD (DAG-CBOR)
+        let cid = self.store.put_ipld(&registry).await.map_err(|e| {
+            CoreError::StorageError(format!("Failed to store registry in IPFS: {}", e))
+        })?;
+
+        // Pin the registry for persistence
+        self.store.pin(&cid, Some("fula-bucket-registry")).await.map_err(|e| {
+            CoreError::StorageError(format!("Failed to pin registry: {}", e))
+        })?;
+
+        // Save CID to local file if path is configured
+        if let Some(ref path) = self.registry_cid_path {
+            // Ensure parent directory exists
+            if let Some(parent) = path.parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        CoreError::StorageError(format!(
+                            "Failed to create directory {}: {}",
+                            parent.display(),
+                            e
+                        ))
+                    })?;
+                }
+            }
+
+            std::fs::write(path, cid.to_string()).map_err(|e| {
+                CoreError::StorageError(format!(
+                    "Failed to write registry CID to {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+
+            info!(cid = %cid, path = %path.display(), "Registry CID saved to file");
+        }
+
+        Ok(cid)
     }
 
     /// Create a new bucket
@@ -304,6 +452,12 @@ impl<S: BlockStore> BucketManager<S> {
         tracing::debug!(bucket_name = %name, root_cid = %metadata.root_cid, "Bucket created in IPFS, adding to registry");
         
         self.buckets.insert(name.clone(), metadata.clone());
+        
+        // Persist the registry after adding a bucket
+        if let Err(e) = self.persist_registry().await {
+            warn!(error = %e, "Failed to persist registry after bucket creation");
+            // Don't fail the operation, bucket is still created in memory
+        }
         
         tracing::info!(bucket_name = %name, total_buckets = %self.buckets.len(), "Bucket registered successfully");
         
@@ -345,6 +499,13 @@ impl<S: BlockStore> BucketManager<S> {
         }
 
         self.buckets.remove(name);
+        
+        // Persist the registry after removing a bucket
+        if let Err(e) = self.persist_registry().await {
+            warn!(error = %e, "Failed to persist registry after bucket deletion");
+            // Don't fail the operation, bucket is still deleted from memory
+        }
+        
         Ok(())
     }
 
@@ -458,5 +619,90 @@ mod tests {
 
         let buckets = manager.list_buckets();
         assert_eq!(buckets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_bucket_registry_serialization() {
+        use crate::metadata::BucketMetadata;
+        
+        let cid = fula_blockstore::cid_utils::create_cid(
+            b"root",
+            fula_blockstore::cid_utils::CidCodec::DagCbor,
+        );
+        
+        let buckets = vec![
+            BucketMetadata::new("bucket1".to_string(), "owner1".to_string(), cid),
+            BucketMetadata::new("bucket2".to_string(), "owner2".to_string(), cid),
+        ];
+        
+        let registry = BucketRegistry::new(buckets);
+        assert_eq!(registry.version, BucketRegistry::CURRENT_VERSION);
+        assert_eq!(registry.buckets.len(), 2);
+        
+        // Test serialization roundtrip
+        let serialized = serde_json::to_string(&registry).unwrap();
+        let deserialized: BucketRegistry = serde_json::from_str(&serialized).unwrap();
+        
+        assert_eq!(deserialized.version, registry.version);
+        assert_eq!(deserialized.buckets.len(), registry.buckets.len());
+        assert_eq!(deserialized.buckets[0].name, "bucket1");
+        assert_eq!(deserialized.buckets[1].name, "bucket2");
+    }
+
+    #[tokio::test]
+    async fn test_bucket_manager_persistence() {
+        use tempfile::tempdir;
+        
+        let temp_dir = tempdir().unwrap();
+        let cid_path = temp_dir.path().join("registry.cid");
+        
+        // Create a shared store that simulates IPFS persistence
+        let store = Arc::new(MemoryBlockStore::new());
+        
+        // Create manager with persistence and add buckets
+        {
+            let manager = BucketManager::with_persistence(Arc::clone(&store), &cid_path);
+            
+            let owner = Owner::new("user123");
+            manager.create_bucket("persist-bucket1".to_string(), owner.clone()).await.unwrap();
+            manager.create_bucket("persist-bucket2".to_string(), owner).await.unwrap();
+            
+            assert_eq!(manager.list_buckets().len(), 2);
+            
+            // Verify CID file was created
+            assert!(cid_path.exists(), "Registry CID file should exist");
+        }
+        
+        // Create a new manager and load the registry
+        {
+            let manager = BucketManager::with_persistence(Arc::clone(&store), &cid_path);
+            
+            // Initially empty
+            assert_eq!(manager.list_buckets().len(), 0);
+            
+            // Load from persisted registry
+            let loaded_count = manager.load_registry().await.unwrap();
+            assert_eq!(loaded_count, 2, "Should load 2 buckets from registry");
+            
+            // Verify buckets are restored
+            assert!(manager.bucket_exists("persist-bucket1"));
+            assert!(manager.bucket_exists("persist-bucket2"));
+            assert_eq!(manager.list_buckets().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bucket_manager_persistence_empty_start() {
+        use tempfile::tempdir;
+        
+        let temp_dir = tempdir().unwrap();
+        let cid_path = temp_dir.path().join("nonexistent.cid");
+        
+        let store = Arc::new(MemoryBlockStore::new());
+        let manager = BucketManager::with_persistence(store, &cid_path);
+        
+        // Should gracefully handle missing CID file
+        let loaded_count = manager.load_registry().await.unwrap();
+        assert_eq!(loaded_count, 0, "Should start with 0 buckets when CID file doesn't exist");
     }
 }

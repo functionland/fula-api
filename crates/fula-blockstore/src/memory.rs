@@ -1,6 +1,6 @@
 //! In-memory block store for testing and caching
 
-use crate::{BlockStore, BlockStoreError, Result};
+use crate::{BlockStore, BlockStoreError, PinStore, PinStatus, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cid::Cid;
@@ -90,6 +90,36 @@ impl BlockStore for MemoryBlockStore {
         let bytes = self.get_block(cid).await?;
         serde_ipld_dagcbor::from_slice(&bytes)
             .map_err(|e| BlockStoreError::Deserialization(e.to_string()))
+    }
+}
+
+#[async_trait]
+impl PinStore for MemoryBlockStore {
+    async fn pin(&self, _cid: &Cid, _name: Option<&str>) -> Result<()> {
+        // Memory store doesn't need real pinning - all blocks are kept in memory
+        Ok(())
+    }
+
+    async fn unpin(&self, _cid: &Cid) -> Result<()> {
+        // Memory store doesn't need real unpinning
+        Ok(())
+    }
+
+    async fn is_pinned(&self, cid: &Cid) -> Result<bool> {
+        // Consider all stored blocks as "pinned"
+        self.has_block(cid).await
+    }
+
+    async fn list_pins(&self) -> Result<Vec<Cid>> {
+        Ok(self.list_cids())
+    }
+
+    async fn pin_status(&self, cid: &Cid) -> Result<PinStatus> {
+        if self.has_block(cid).await? {
+            Ok(PinStatus::Pinned)
+        } else {
+            Ok(PinStatus::Unpinned)
+        }
     }
 }
 

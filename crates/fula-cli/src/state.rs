@@ -70,8 +70,30 @@ impl AppState {
             warn!("⚠ Storage mode: In-memory (NOT persistent - for development only)");
         }
 
-        // Initialize bucket manager
-        let bucket_manager = Arc::new(BucketManager::new(Arc::clone(&block_store)));
+        // Initialize bucket manager with persistence if configured
+        let bucket_manager = if let Some(ref registry_path) = config.registry_cid_path {
+            info!("Bucket registry persistence enabled at: {}", registry_path);
+            Arc::new(BucketManager::with_persistence(
+                Arc::clone(&block_store),
+                registry_path,
+            ))
+        } else {
+            info!("Bucket registry persistence disabled (no registry_cid_path configured)");
+            Arc::new(BucketManager::new(Arc::clone(&block_store)))
+        };
+
+        // Load existing bucket registry from IPFS if available
+        match bucket_manager.load_registry().await {
+            Ok(count) if count > 0 => {
+                info!("✓ Loaded {} bucket(s) from persistent registry", count);
+            }
+            Ok(_) => {
+                info!("Starting with empty bucket registry");
+            }
+            Err(e) => {
+                warn!("Failed to load bucket registry: {}. Starting fresh.", e);
+            }
+        }
 
         // Initialize multipart manager
         let multipart_manager = Arc::new(MultipartManager::new(config.multipart_expiry_secs));

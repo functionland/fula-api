@@ -35,6 +35,8 @@ pub struct GatewayConfig {
     pub cors_enabled: bool,
     /// CORS allowed origins
     pub cors_origins: Vec<String>,
+    /// Path to store bucket registry CID for persistence
+    pub registry_cid_path: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -55,6 +57,7 @@ impl Default for GatewayConfig {
             multipart_expiry_secs: 24 * 60 * 60, // 24 hours
             cors_enabled: true,
             cors_origins: vec!["*".to_string()],
+            registry_cid_path: Some("/var/lib/fula-gateway/registry.cid".to_string()),
         }
     }
 }

@@ -28,7 +28,7 @@ pub mod error;
 pub mod metadata;
 pub mod prolly;
 
-pub use bucket::{Bucket, BucketConfig, BucketManager};
+pub use bucket::{Bucket, BucketConfig, BucketManager, BucketRegistry};
 pub use error::{CoreError, Result};
 pub use metadata::{ObjectMetadata, EncryptionMetadata, StorageClass};
 pub use prolly::{ProllyTree, ProllyNode, ProllyConfig};

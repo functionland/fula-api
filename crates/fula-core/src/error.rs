@@ -67,4 +67,8 @@ pub enum CoreError {
     /// Precondition failed
     #[error("precondition failed: {0}")]
     PreconditionFailed(String),
+
+    /// Storage error (persistence, I/O)
+    #[error("storage error: {0}")]
+    StorageError(String),
 }
