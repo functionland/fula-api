@@ -56,6 +56,11 @@ pub async fn delete_objects(
 
     bucket.flush().await?;
 
+    // Persist the bucket registry so the updated root CID survives restarts
+    if let Err(e) = state.bucket_manager.persist_registry().await {
+        tracing::warn!(error = %e, "Failed to persist bucket registry after batch delete");
+    }
+
     // Build response
     let xml_response = if quiet && errors.is_empty() {
         // Quiet mode - only return errors
