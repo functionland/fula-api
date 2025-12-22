@@ -10,7 +10,7 @@ use axum::{
 };
 use std::sync::Arc;
 
-/// GET / - List all buckets
+/// GET / - List buckets (S3 ListBuckets)
 pub async fn list_buckets(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<UserSession>,
@@ -42,4 +42,9 @@ pub async fn list_buckets(
 /// HEAD / - Health check
 pub async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "OK")
+}
+
+/// GET /healthz - unauthenticated container health check
+pub async fn healthz() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
 }

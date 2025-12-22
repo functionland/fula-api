@@ -23,8 +23,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     // Security audit fix #7: Configurable CORS
     let cors = create_cors_layer(&state.config.cors_origins);
 
+    // Public routes that must bypass auth (e.g., container health checks)
+    let public = Router::new()
+        .route("/healthz", get(handlers::healthz));
+
     // Build the router
     Router::new()
+        // Public routes (no auth)
+        .merge(public)
         // Service endpoints
         .route("/", get(handlers::list_buckets))
         .route("/", head(handlers::health_check))
