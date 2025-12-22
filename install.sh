@@ -387,6 +387,8 @@ services:
       - JWT_SECRET=\${JWT_SECRET:-development-secret-change-in-production}
       - FULA_NO_AUTH=\${FULA_NO_AUTH:-false}
       - RUST_LOG=info,fula_cli=debug
+    volumes:
+      - gateway-data:/var/lib/fula-gateway
     network_mode: host
     restart: unless-stopped
     healthcheck:
@@ -461,6 +463,7 @@ networks:
 # Volumes
 # ============================================
 volumes:
+  gateway-data:
   redis-data:
   prometheus-data:
   grafana-data:
