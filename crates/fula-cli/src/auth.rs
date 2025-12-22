@@ -80,6 +80,7 @@ pub fn validate_token_with_config(
     let key = DecodingKey::from_secret(secret.as_bytes());
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = false;  // Changed to false to make expiration optional
+    validation.required_spec_claims.remove("exp"); // Allow tokens without exp
     validation.leeway = config.leeway_secs;
     
     // Security audit fix #6: Set issuer validation if configured
