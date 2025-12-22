@@ -24,32 +24,26 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let cors = create_cors_layer(&state.config.cors_origins);
 
     // Public routes that must bypass auth (e.g., container health checks)
-    let public = Router::new()
-        .route("/healthz", get(handlers::healthz));
+    let public = Router::new().route("/healthz", get(handlers::healthz));
 
-    // Build the router
-    Router::new()
-        // Public routes (no auth)
-        .merge(public)
+    // Private (authenticated) routes
+    let private = Router::new()
         // Service endpoints
         .route("/", get(handlers::list_buckets))
         .route("/", head(handlers::health_check))
-        
         // Bucket endpoints
         .route("/{bucket}", put(handlers::create_bucket))
         .route("/{bucket}", delete(handlers::delete_bucket))
         .route("/{bucket}", head(handlers::head_bucket))
         .route("/{bucket}", get(bucket_or_list_handler))
         .route("/{bucket}", post(bucket_post_handler))
-        
         // Object endpoints
         .route("/{bucket}/{*key}", put(object_put_handler))
         .route("/{bucket}/{*key}", get(object_get_handler))
         .route("/{bucket}/{*key}", head(handlers::head_object))
         .route("/{bucket}/{*key}", delete(object_delete_handler))
         .route("/{bucket}/{*key}", post(object_post_handler))
-        
-        // Apply middleware
+        // Private middleware only
         .layer(axum_middleware::from_fn(middleware::request_id_middleware))
         .layer(axum_middleware::from_fn(middleware::logging_middleware))
         .layer(axum_middleware::from_fn_with_state(
@@ -60,11 +54,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             Arc::clone(&state),
             middleware::auth_middleware,
         ))
+        .with_state(state.clone());
+
+    // Combine public and private, then apply shared layers
+    Router::new()
+        .merge(public)
+        .merge(private)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
         .layer(DefaultBodyLimit::max(state.config.max_body_size))
-        .with_state(state)
 }
 
 /// Handler that routes to list objects, list multipart uploads, or bucket POST operations
