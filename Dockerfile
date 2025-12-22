@@ -41,8 +41,10 @@ RUN apt-get update && apt-get install -y \
 # Copy binary from builder
 COPY --from=builder /app/target/release/fula-gateway /usr/local/bin/fula-gateway
 
-# Create non-root user
-RUN useradd -r -s /bin/false fula
+# Create non-root user and data directory
+RUN useradd -r -s /bin/false fula && \
+    mkdir -p /var/lib/fula-gateway && \
+    chown fula:fula /var/lib/fula-gateway
 USER fula
 
 # Expose port
