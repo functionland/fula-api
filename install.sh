@@ -521,6 +521,20 @@ server {
     large_client_header_buffers 4 32k;
 
     location / {
+        # Hide CORS headers from upstream (S3 server) to avoid duplicates
+        proxy_hide_header 'Access-Control-Allow-Origin';
+        proxy_hide_header 'Access-Control-Allow-Methods';
+        proxy_hide_header 'Access-Control-Allow-Headers';
+        proxy_hide_header 'Access-Control-Expose-Headers';
+        proxy_hide_header 'Access-Control-Max-Age';
+
+        # CORS - allow all origins
+        add_header 'Access-Control-Allow-Origin' '*' always;
+        add_header 'Access-Control-Allow-Methods' 'GET, HEAD, PUT, POST, DELETE, OPTIONS' always;
+        add_header 'Access-Control-Allow-Headers' '*' always;
+        add_header 'Access-Control-Expose-Headers' 'ETag, x-amz-meta-*' always;
+        add_header 'Access-Control-Max-Age' '3600' always;
+
         proxy_pass http://fula_gateway;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
