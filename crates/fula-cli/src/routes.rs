@@ -31,12 +31,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Service endpoints
         .route("/", get(handlers::list_buckets))
         .route("/", head(handlers::health_check))
-        // Bucket endpoints
+        // Bucket endpoints (with and without trailing slash for S3 compatibility)
+        // Note: We do NOT normalize object keys (/{bucket}/{*key}) as S3 allows keys ending in '/'
         .route("/{bucket}", put(handlers::create_bucket))
+        .route("/{bucket}/", put(handlers::create_bucket))
         .route("/{bucket}", delete(handlers::delete_bucket))
+        .route("/{bucket}/", delete(handlers::delete_bucket))
         .route("/{bucket}", head(handlers::head_bucket))
+        .route("/{bucket}/", head(handlers::head_bucket))
         .route("/{bucket}", get(bucket_or_list_handler))
+        .route("/{bucket}/", get(bucket_or_list_handler))
         .route("/{bucket}", post(bucket_post_handler))
+        .route("/{bucket}/", post(bucket_post_handler))
         // Object endpoints
         .route("/{bucket}/{*key}", put(object_put_handler))
         .route("/{bucket}/{*key}", get(object_get_handler))
