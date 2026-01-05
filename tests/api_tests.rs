@@ -9,7 +9,8 @@ async fn spawn_server(auth_enabled: bool) -> (String, String) {
     config.host = "127.0.0.1".to_string();
     config.port = 0; // Random port
     config.auth_enabled = auth_enabled;
-    
+    config.use_memory_store = true; // Use memory store for tests (no IPFS dependency)
+
     // Set a secret for auth tests
     let jwt_secret = "test-secret-123".to_string();
     config.jwt_secret = Some(jwt_secret.clone());
