@@ -268,14 +268,14 @@ paths:
                   <Contents>
                     <Key>photos/beach.jpg</Key>
                     <LastModified>2025-12-07T01:42:00.000Z</LastModified>
-                    <ETag>"b2419b1e3fd45d596ee22bdf62aaaa2f"</ETag>
+                    <ETag>"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oc"</ETag>
                     <Size>2048576</Size>
                     <StorageClass>STANDARD</StorageClass>
                   </Contents>
                   <Contents>
                     <Key>photos/sunset.png</Key>
                     <LastModified>2025-12-07T03:15:00.000Z</LastModified>
-                    <ETag>"8f47e10b6a3c9d2e5f1a4b7c3d8e6f9a"</ETag>
+                    <ETag>"bafkreihxvh4d5pqhkhxqfdy3yzpfmam5a6t3wbmtj7d3iur"</ETag>
                     <Size>1536000</Size>
                     <StorageClass>STANDARD</StorageClass>
                   </Contents>
@@ -456,10 +456,13 @@ paths:
           description: Object uploaded successfully
           headers:
             ETag:
-              description: MD5 hash of the object or IPFS CID
+              description: |
+                IPFS CID of the uploaded object (content-addressed identifier).
+                This is S3-compliant as AWS states "The ETag may or may not be an MD5 digest."
+                The CID can be used directly to retrieve the object from IPFS.
               schema:
                 type: string
-              example: '"b2419b1e3fd45d596ee22bdf62aaaa2f"'
+              example: '"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oc"'
             x-amz-version-id:
               description: Version ID (if versioning enabled)
               schema:
@@ -838,11 +841,11 @@ paths:
           headers:
             ETag:
               description: |
-                ETag of the uploaded part (IPFS CID).
+                IPFS CID of the uploaded part (content-addressed identifier).
                 **Important**: Save this for CompleteMultipartUpload.
               schema:
                 type: string
-              example: '"a54357aff0632cce46d942af68356b38"'
+              example: '"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oc"'
         '400':
           description: Bad Request (part too small, invalid upload ID)
           content:
@@ -894,11 +897,11 @@ paths:
               <CompleteMultipartUpload>
                 <Part>
                   <PartNumber>1</PartNumber>
-                  <ETag>"a54357aff0632cce46d942af68356b38"</ETag>
+                  <ETag>"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oc"</ETag>
                 </Part>
                 <Part>
                   <PartNumber>2</PartNumber>
-                  <ETag>"0c78aef83f66abc1fa1e8477f296d394"</ETag>
+                  <ETag>"bafkreihxvh4d5pqhkhxqfdy3yzpfmam5a6t3wbmtj7d3iur"</ETag>
                 </Part>
               </CompleteMultipartUpload>
       responses:
@@ -914,8 +917,9 @@ paths:
                   <Location>https://gateway.example.com/my-bucket/large-file.bin</Location>
                   <Bucket>my-bucket</Bucket>
                   <Key>large-file.bin</Key>
-                  <ETag>"3858f62230ac3c915f300c664312c11f-2"</ETag>
+                  <ETag>"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6-2"</ETag>
                 </CompleteMultipartUploadResult>
+                # Note: Multipart ETag format is {BLAKE3-hash-of-CIDs}-{partCount}
         '400':
           description: Invalid part list or missing parts
           content:
@@ -1132,7 +1136,7 @@ paths:
                 <?xml version="1.0" encoding="UTF-8"?>
                 <CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
                   <LastModified>2025-12-07T12:00:00.000Z</LastModified>
-                  <ETag>"b2419b1e3fd45d596ee22bdf62aaaa2f"</ETag>
+                  <ETag>"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oc"</ETag>
                 </CopyObjectResult>
         '404':
           $ref: '#/components/responses/NoSuchKey'

@@ -13,7 +13,6 @@ use axum::{
 use bytes::Bytes;
 use fula_blockstore::{BlockStore, PinStore};
 use fula_core::metadata::ObjectMetadata;
-use fula_crypto::hashing::md5_hash;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -116,7 +115,9 @@ pub async fn upload_part(
 
     // Store part data
     let cid = state.block_store.put_block(&body).await?;
-    let etag = md5_hash(&body);
+
+    // Use CID as ETag for parts (content-addressed identifier)
+    let etag = cid.to_string();
 
     let part = UploadPart::new(
         part_number,
@@ -158,13 +159,17 @@ pub async fn complete_multipart_upload(
         return Err(ApiError::s3(S3ErrorCode::InvalidArgument, "Bucket/key mismatch"));
     }
 
-    // Calculate final ETag (MD5 of ETags + "-N")
+    // Calculate final ETag using CIDs (S3 multipart format: {hash}-{partCount})
+    // We hash the concatenated part CIDs to create a unique identifier
     let part_count = upload.parts.len();
-    let mut etag_concat = String::new();
+    let mut cid_concat = String::new();
     for part in upload.sorted_parts() {
-        etag_concat.push_str(&part.etag);
+        cid_concat.push_str(&part.cid);
     }
-    let final_etag = format!("{}-{}", md5_hash(etag_concat.as_bytes()), part_count);
+    // Use BLAKE3 hash of concatenated CIDs, truncated to 32 hex chars for compatibility
+    let hash = fula_crypto::hashing::hash(cid_concat.as_bytes());
+    let hash_hex = hex::encode(&hash.as_bytes()[..16]); // First 16 bytes = 32 hex chars
+    let final_etag = format!("{}-{}", hash_hex, part_count);
 
     // Calculate total size
     let total_size: u64 = upload.parts.values().map(|p| p.size).sum();

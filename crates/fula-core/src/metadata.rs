@@ -63,7 +63,8 @@ pub struct ObjectMetadata {
     /// Size in bytes
     pub size: u64,
     
-    /// ETag (usually MD5 hash for S3 compatibility)
+    /// ETag (CID for single uploads, BLAKE3-hash-of-CIDs-{partCount} for multipart)
+    /// Using CID as ETag is S3-compliant: AWS docs state "The ETag may or may not be an MD5 digest"
     pub etag: String,
     
     /// Last modified timestamp

@@ -32,15 +32,17 @@ pub async fn put_object(
 
     // Store the data
     let cid = state.block_store.put_block(&body).await?;
-    
-    // Calculate ETag (MD5)
-    let etag = md5_hash(&body);
 
-    // Verify Content-MD5 if present
+    // Use CID as ETag (content-addressed identifier)
+    // This is S3-compliant: AWS docs state "The ETag may or may not be an MD5 digest"
+    let etag = cid.to_string();
+
+    // Verify Content-MD5 if present (still uses MD5 for S3 compatibility)
     if let Some(md5_header) = headers.get("Content-MD5").and_then(|v| v.to_str().ok()) {
         if let Ok(expected_bytes) = general_purpose::STANDARD.decode(md5_header) {
             let expected_hex = hex::encode(expected_bytes);
-            if etag != expected_hex {
+            let actual_md5 = md5_hash(&body);
+            if actual_md5 != expected_hex {
                 return Err(ApiError::s3(S3ErrorCode::InvalidDigest, "The Content-MD5 you specified did not match what we received."));
             }
         } else {

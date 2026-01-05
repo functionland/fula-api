@@ -75,7 +75,7 @@ impl MultipartUpload {
 pub struct UploadPart {
     /// Part number (1-10000)
     pub part_number: u32,
-    /// ETag (MD5 hash of part content)
+    /// ETag (CID of part content - content-addressed identifier)
     pub etag: String,
     /// Part size in bytes
     pub size: u64,
