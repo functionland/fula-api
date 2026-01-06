@@ -2,3 +2,4 @@
 .env
 /target/release
 /.claude
+/target

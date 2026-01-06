@@ -333,6 +333,11 @@ impl ShareInbox {
     }
     
     /// List all entries (any status)
+    ///
+    /// # Deprecated
+    /// Use `list_pending()` with recipient key for user-scoped access.
+    /// This method returns all entries without recipient verification.
+    #[deprecated(note = "Use list_pending() with recipient key for user-scoped access")]
     pub fn list_all(&self) -> Vec<&InboxEntry> {
         self.entries.values().collect()
     }
@@ -371,28 +376,51 @@ impl ShareInbox {
     }
     
     /// Mark an entry as read (without accepting)
-    pub fn mark_read(&mut self, entry_id: &str) -> bool {
+    ///
+    /// Security: Verifies the entry belongs to the recipient before modifying.
+    pub fn mark_read(&mut self, entry_id: &str, recipient: &PublicKey) -> Result<bool> {
         if let Some(entry) = self.entries.get_mut(entry_id) {
+            // Verify recipient owns this entry
+            if !entry.is_for_recipient(recipient) {
+                return Err(CryptoError::InvalidKey("Entry is not for this recipient".into()));
+            }
             if entry.status == InboxEntryStatus::Pending {
                 entry.status = InboxEntryStatus::Read;
-                return true;
+                return Ok(true);
+            }
+            Ok(false)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Dismiss/reject an entry
+    ///
+    /// Security: Verifies the entry belongs to the recipient before modifying.
+    pub fn dismiss_entry(&mut self, entry_id: &str, recipient: &PublicKey) -> Result<bool> {
+        if let Some(entry) = self.entries.get_mut(entry_id) {
+            // Verify recipient owns this entry
+            if !entry.is_for_recipient(recipient) {
+                return Err(CryptoError::InvalidKey("Entry is not for this recipient".into()));
+            }
+            entry.status = InboxEntryStatus::Dismissed;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Remove an entry from the inbox
+    ///
+    /// Security: Verifies the entry belongs to the recipient before removing.
+    pub fn remove_entry(&mut self, entry_id: &str, recipient: &PublicKey) -> Result<Option<InboxEntry>> {
+        // First verify ownership
+        if let Some(entry) = self.entries.get(entry_id) {
+            if !entry.is_for_recipient(recipient) {
+                return Err(CryptoError::InvalidKey("Entry is not for this recipient".into()));
             }
         }
-        false
-    }
-    
-    /// Dismiss/reject an entry
-    pub fn dismiss_entry(&mut self, entry_id: &str) -> bool {
-        if let Some(entry) = self.entries.get_mut(entry_id) {
-            entry.status = InboxEntryStatus::Dismissed;
-            return true;
-        }
-        false
-    }
-    
-    /// Remove an entry from the inbox
-    pub fn remove_entry(&mut self, entry_id: &str) -> Option<InboxEntry> {
-        self.entries.remove(entry_id)
+        Ok(self.entries.remove(entry_id))
     }
     
     /// Clean up stale and expired entries
@@ -714,48 +742,76 @@ mod tests {
         let owner = KekKeyPair::generate();
         let recipient = KekKeyPair::generate();
         let dek = DekKey::generate();
-        
+
         let mut inbox = ShareInbox::new();
-        
+
         let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
             .build()
             .unwrap();
-        
+
         let envelope = ShareEnvelope::new(token);
         let entry = inbox.enqueue_share(&envelope, recipient.public_key()).unwrap();
         let entry_id = entry.id.clone();
-        
-        // Dismiss
-        assert!(inbox.dismiss_entry(&entry_id));
-        
+
+        // Dismiss with correct recipient
+        assert!(inbox.dismiss_entry(&entry_id, recipient.public_key()).unwrap());
+
         let entry = inbox.get_entry(&entry_id).unwrap();
         assert_eq!(entry.status, InboxEntryStatus::Dismissed);
-        
+
         // Dismissed entries not in pending
         let pending = inbox.list_pending(&recipient);
         assert_eq!(pending.len(), 0);
     }
+
+    #[test]
+    fn test_inbox_dismiss_wrong_recipient() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let wrong_recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let mut inbox = ShareInbox::new();
+
+        let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .build()
+            .unwrap();
+
+        let envelope = ShareEnvelope::new(token);
+        let entry = inbox.enqueue_share(&envelope, recipient.public_key()).unwrap();
+        let entry_id = entry.id.clone();
+
+        // Wrong recipient cannot dismiss
+        let result = inbox.dismiss_entry(&entry_id, wrong_recipient.public_key());
+        assert!(result.is_err());
+
+        // Entry should still be pending
+        let entry = inbox.get_entry(&entry_id).unwrap();
+        assert_eq!(entry.status, InboxEntryStatus::Pending);
+    }
     
     #[test]
+    #[allow(deprecated)]
     fn test_inbox_cleanup() {
         let owner = KekKeyPair::generate();
         let recipient = KekKeyPair::generate();
         let dek = DekKey::generate();
-        
+
         let mut inbox = ShareInbox::with_ttl(1); // 1 second TTL
-        
+
         let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
             .build()
             .unwrap();
-        
+
         let envelope = ShareEnvelope::new(token);
         inbox.enqueue_share(&envelope, recipient.public_key()).unwrap();
-        
+
+        // Using deprecated list_all() for test purposes
         assert_eq!(inbox.list_all().len(), 1);
-        
+
         // Wait for TTL to expire
         std::thread::sleep(std::time::Duration::from_secs(2));
-        
+
         // Cleanup removes stale entries
         let removed = inbox.cleanup();
         assert_eq!(removed, 1);
