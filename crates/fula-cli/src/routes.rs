@@ -82,7 +82,7 @@ async fn bucket_or_list_handler(
     if query.uploads.is_some() {
         handlers::list_multipart_uploads(state, session, path).await
     } else if query.location.is_some() {
-        handlers::get_bucket_location(state, path).await
+        handlers::get_bucket_location(state, session, path).await
     } else {
         let list_params = handlers::ListObjectsParams {
             list_type: query.list_type,

@@ -1539,6 +1539,7 @@ dependencies = [
  "fula-core",
  "fula-crypto",
  "hex",
+ "jsonwebtoken",
  "md-5",
  "rand 0.8.5",
  "reqwest",

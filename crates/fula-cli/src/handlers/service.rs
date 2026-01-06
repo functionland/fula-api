@@ -15,17 +15,15 @@ pub async fn list_buckets(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<UserSession>,
 ) -> Result<Response, ApiError> {
-    let buckets = state.bucket_manager.list_buckets();
-    
-    // Filter to buckets owned by this user (or show all for admin)
-    // Security audit fix A3: Compare using hashed user IDs
+    // User-scoped bucket listing (returns only this user's buckets)
+    let buckets = state.bucket_manager.list_buckets_for_user(&session.hashed_user_id);
+
     let user_buckets: Vec<_> = buckets
         .into_iter()
-        .filter(|b| session.can_access_bucket(&b.owner_id))
         .map(|b| (b.name, b.created_at))
         .collect();
 
-    // Return hashed user ID in XML for privacy (Security audit fix A3)
+    // Return hashed user ID in XML for privacy
     let xml_response = xml::list_all_my_buckets_result(
         &session.hashed_user_id,
         session.display_name.as_deref().unwrap_or("User"),

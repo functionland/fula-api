@@ -2,6 +2,9 @@ use fula_cli::{GatewayConfig, AppState, routes};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use reqwest::{Client, StatusCode};
+use jsonwebtoken::{encode, EncodingKey, Header};
+use serde::{Serialize, Deserialize};
+use chrono::{Utc, Duration};
 
 // Helper to spawn a server on a random port
 async fn spawn_server(auth_enabled: bool) -> (String, String) {
@@ -26,6 +29,26 @@ async fn spawn_server(auth_enabled: bool) -> (String, String) {
     });
 
     (format!("http://{}", addr), jwt_secret)
+}
+
+/// JWT claims for test tokens
+#[derive(Debug, Serialize, Deserialize)]
+struct TestClaims {
+    sub: String,
+    exp: i64,
+    scope: String,
+    name: Option<String>,
+}
+
+/// Generate a valid JWT token for a specific user
+fn generate_test_token(user_id: &str, secret: &str) -> String {
+    let claims = TestClaims {
+        sub: user_id.to_string(),
+        exp: (Utc::now() + Duration::hours(1)).timestamp(),
+        scope: "storage:read storage:write storage:delete".to_string(),
+        name: Some(format!("Test User {}", user_id)),
+    };
+    encode(&Header::default(), &claims, &EncodingKey::from_secret(secret.as_bytes())).unwrap()
 }
 
 #[tokio::test]
@@ -253,4 +276,377 @@ async fn test_integrity_check() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+// ============================================================================
+// MULTI-TENANT ISOLATION TESTS
+// ============================================================================
+
+/// Test that two different users can create buckets with the same name
+#[tokio::test]
+async fn test_multitenant_same_bucket_name() {
+    let (base_url, secret) = spawn_server(true).await;
+    let client = Client::new();
+
+    let token_alice = generate_test_token("alice@example.com", &secret);
+    let token_bob = generate_test_token("bob@example.com", &secret);
+    let bucket_name = "shared-name-bucket";
+
+    // Alice creates bucket "shared-name-bucket"
+    let res = client.put(&format!("{}/{}", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_alice))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "Alice should be able to create bucket");
+
+    // Bob creates bucket with SAME name - should succeed (per-user isolation)
+    let res = client.put(&format!("{}/{}", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_bob))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "Bob should be able to create bucket with same name");
+
+    // Both users should see their own bucket in listings
+    let res = client.get(&format!("{}/", base_url))
+        .header("Authorization", format!("Bearer {}", token_alice))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.text().await.unwrap();
+    assert!(body.contains(bucket_name), "Alice should see her bucket");
+
+    let res = client.get(&format!("{}/", base_url))
+        .header("Authorization", format!("Bearer {}", token_bob))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.text().await.unwrap();
+    assert!(body.contains(bucket_name), "Bob should see his bucket");
+}
+
+/// Test that users cannot access each other's buckets
+#[tokio::test]
+async fn test_multitenant_bucket_isolation() {
+    let (base_url, secret) = spawn_server(true).await;
+    let client = Client::new();
+
+    let token_alice = generate_test_token("alice@example.com", &secret);
+    let token_bob = generate_test_token("bob@example.com", &secret);
+
+    // Alice creates her bucket
+    let alice_bucket = "alice-private-bucket";
+    client.put(&format!("{}/{}", base_url, alice_bucket))
+        .header("Authorization", format!("Bearer {}", token_alice))
+        .send()
+        .await
+        .unwrap();
+
+    // Bob tries to access Alice's bucket - should get 404 (not found for Bob)
+    let res = client.head(&format!("{}/{}", base_url, alice_bucket))
+        .header("Authorization", format!("Bearer {}", token_bob))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "Bob should not find Alice's bucket");
+
+    // Bob tries to list objects in Alice's bucket - should get 404
+    let res = client.get(&format!("{}/{}?list-type=2", base_url, alice_bucket))
+        .header("Authorization", format!("Bearer {}", token_bob))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "Bob should not list Alice's bucket");
+
+    // Bob tries to delete Alice's bucket - should get 404
+    let res = client.delete(&format!("{}/{}", base_url, alice_bucket))
+        .header("Authorization", format!("Bearer {}", token_bob))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "Bob should not delete Alice's bucket");
+}
+
+/// Test that objects are isolated between users with same bucket name
+#[tokio::test]
+async fn test_multitenant_object_isolation() {
+    let (base_url, secret) = spawn_server(true).await;
+    let client = Client::new();
+
+    let token_alice = generate_test_token("alice@example.com", &secret);
+    let token_bob = generate_test_token("bob@example.com", &secret);
+    let bucket_name = "photos";
+    let object_key = "vacation.jpg";
+
+    // Both users create bucket with same name
+    client.put(&format!("{}/{}", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_alice))
+        .send()
+        .await
+        .unwrap();
+    client.put(&format!("{}/{}", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_bob))
+        .send()
+        .await
+        .unwrap();
+
+    // Alice uploads an object
+    let alice_content = "Alice's vacation photo";
+    let res = client.put(&format!("{}/{}/{}", base_url, bucket_name, object_key))
+        .header("Authorization", format!("Bearer {}", token_alice))
+        .body(alice_content)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Alice can read her object
+    let res = client.get(&format!("{}/{}/{}", base_url, bucket_name, object_key))
+        .header("Authorization", format!("Bearer {}", token_alice))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.text().await.unwrap(), alice_content);
+
+    // Bob cannot read Alice's object (his bucket is empty)
+    let res = client.get(&format!("{}/{}/{}", base_url, bucket_name, object_key))
+        .header("Authorization", format!("Bearer {}", token_bob))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "Bob should not see Alice's object");
+
+    // Bob uploads his own object with same key
+    let bob_content = "Bob's vacation photo";
+    let res = client.put(&format!("{}/{}/{}", base_url, bucket_name, object_key))
+        .header("Authorization", format!("Bearer {}", token_bob))
+        .body(bob_content)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Bob reads his object - should get Bob's content, not Alice's
+    let res = client.get(&format!("{}/{}/{}", base_url, bucket_name, object_key))
+        .header("Authorization", format!("Bearer {}", token_bob))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.text().await.unwrap(), bob_content);
+
+    // Alice's object should still be intact
+    let res = client.get(&format!("{}/{}/{}", base_url, bucket_name, object_key))
+        .header("Authorization", format!("Bearer {}", token_alice))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.text().await.unwrap(), alice_content);
+}
+
+/// Test that bucket listings only show user's own buckets
+#[tokio::test]
+async fn test_multitenant_list_buckets_isolation() {
+    let (base_url, secret) = spawn_server(true).await;
+    let client = Client::new();
+
+    let token_alice = generate_test_token("alice@example.com", &secret);
+    let token_bob = generate_test_token("bob@example.com", &secret);
+
+    // Alice creates multiple buckets
+    for bucket in &["alice-bucket-1", "alice-bucket-2", "alice-bucket-3"] {
+        client.put(&format!("{}/{}", base_url, bucket))
+            .header("Authorization", format!("Bearer {}", token_alice))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Bob creates his bucket
+    client.put(&format!("{}/{}", base_url, "bob-bucket"))
+        .header("Authorization", format!("Bearer {}", token_bob))
+        .send()
+        .await
+        .unwrap();
+
+    // Alice lists buckets - should only see her 3 buckets
+    let res = client.get(&format!("{}/", base_url))
+        .header("Authorization", format!("Bearer {}", token_alice))
+        .send()
+        .await
+        .unwrap();
+    let body = res.text().await.unwrap();
+    assert!(body.contains("alice-bucket-1"));
+    assert!(body.contains("alice-bucket-2"));
+    assert!(body.contains("alice-bucket-3"));
+    assert!(!body.contains("bob-bucket"), "Alice should not see Bob's bucket");
+
+    // Bob lists buckets - should only see his 1 bucket
+    let res = client.get(&format!("{}/", base_url))
+        .header("Authorization", format!("Bearer {}", token_bob))
+        .send()
+        .await
+        .unwrap();
+    let body = res.text().await.unwrap();
+    assert!(body.contains("bob-bucket"));
+    assert!(!body.contains("alice-bucket"), "Bob should not see Alice's buckets");
+}
+
+/// Test that delete operations are isolated
+#[tokio::test]
+async fn test_multitenant_delete_isolation() {
+    let (base_url, secret) = spawn_server(true).await;
+    let client = Client::new();
+
+    let token_alice = generate_test_token("alice@example.com", &secret);
+    let token_bob = generate_test_token("bob@example.com", &secret);
+    let bucket_name = "delete-test-bucket";
+
+    // Both users create bucket with same name
+    client.put(&format!("{}/{}", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_alice))
+        .send()
+        .await
+        .unwrap();
+    client.put(&format!("{}/{}", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_bob))
+        .send()
+        .await
+        .unwrap();
+
+    // Alice uploads an object
+    client.put(&format!("{}/{}/file.txt", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_alice))
+        .body("Alice's data")
+        .send()
+        .await
+        .unwrap();
+
+    // Bob deletes his (empty) bucket
+    let res = client.delete(&format!("{}/{}", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_bob))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT, "Bob should delete his empty bucket");
+
+    // Alice's bucket and object should still exist
+    let res = client.head(&format!("{}/{}", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_alice))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "Alice's bucket should still exist");
+
+    let res = client.get(&format!("{}/{}/file.txt", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_alice))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "Alice's object should still exist");
+    assert_eq!(res.text().await.unwrap(), "Alice's data");
+}
+
+/// Test object operations after multiple put/get cycles (cache consistency)
+#[tokio::test]
+async fn test_multitenant_cache_consistency() {
+    let (base_url, secret) = spawn_server(true).await;
+    let client = Client::new();
+
+    let token_user = generate_test_token("cache-test-user@example.com", &secret);
+    let bucket_name = "cache-test-bucket";
+
+    // Create bucket
+    client.put(&format!("{}/{}", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_user))
+        .send()
+        .await
+        .unwrap();
+
+    // Perform multiple put/get cycles to test cache consistency
+    for i in 0..5 {
+        let key = format!("file-{}.txt", i);
+        let content = format!("Content version {}", i);
+
+        // Put object
+        let res = client.put(&format!("{}/{}/{}", base_url, bucket_name, key))
+            .header("Authorization", format!("Bearer {}", token_user))
+            .body(content.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "Put {} should succeed", i);
+
+        // Immediately get object
+        let res = client.get(&format!("{}/{}/{}", base_url, bucket_name, key))
+            .header("Authorization", format!("Bearer {}", token_user))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "Get {} should succeed", i);
+        assert_eq!(res.text().await.unwrap(), content, "Content {} should match", i);
+    }
+
+    // List objects - should have all 5
+    let res = client.get(&format!("{}/{}?list-type=2", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_user))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.text().await.unwrap();
+    assert!(body.contains("<KeyCount>5</KeyCount>"), "Should have 5 objects");
+}
+
+/// Test that a new user starts with no buckets
+#[tokio::test]
+async fn test_multitenant_new_user_empty() {
+    let (base_url, secret) = spawn_server(true).await;
+    let client = Client::new();
+
+    // Create a token for a brand new user
+    let token_new_user = generate_test_token("brand-new-user@example.com", &secret);
+
+    // List buckets - should be empty
+    let res = client.get(&format!("{}/", base_url))
+        .header("Authorization", format!("Bearer {}", token_new_user))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.text().await.unwrap();
+    assert!(body.contains("<Buckets></Buckets>") || body.contains("<Buckets/>") ||
+            (!body.contains("<Bucket>") && body.contains("<Buckets>")),
+            "New user should have no buckets");
+}
+
+/// Test duplicate bucket creation for same user fails
+#[tokio::test]
+async fn test_multitenant_duplicate_bucket_same_user() {
+    let (base_url, secret) = spawn_server(true).await;
+    let client = Client::new();
+
+    let token_user = generate_test_token("duplicate-test@example.com", &secret);
+    let bucket_name = "my-unique-bucket";
+
+    // Create bucket first time - should succeed
+    let res = client.put(&format!("{}/{}", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_user))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Create same bucket again - should fail with 409
+    let res = client.put(&format!("{}/{}", base_url, bucket_name))
+        .header("Authorization", format!("Bearer {}", token_user))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT, "Duplicate bucket for same user should fail");
 }

@@ -37,8 +37,8 @@ pub async fn create_multipart_upload(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
 
-    // Verify bucket exists
-    if !state.bucket_manager.bucket_exists(&bucket) {
+    // Verify bucket exists for this user
+    if !state.bucket_manager.bucket_exists_for_user(&session.hashed_user_id, &bucket) {
         return Err(ApiError::s3(S3ErrorCode::NoSuchBucket, "Bucket not found"));
     }
 
@@ -196,8 +196,8 @@ pub async fn complete_multipart_upload(
         metadata = metadata.with_user_metadata(k, v);
     }
 
-    // Store in bucket
-    let mut bucket_handle = state.bucket_manager.open_bucket(&bucket).await?;
+    // Store in bucket (user-scoped)
+    let mut bucket_handle = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket).await?;
     bucket_handle.put_object(key.clone(), metadata).await?;
     let bucket_root_cid = bucket_handle.flush().await?;
 

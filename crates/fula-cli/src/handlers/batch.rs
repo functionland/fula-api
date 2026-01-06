@@ -22,7 +22,8 @@ pub async fn delete_objects(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
 
-    let mut bucket = state.bucket_manager.open_bucket(&bucket_name).await?;
+    // User-scoped bucket access
+    let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
     
     // Parse the delete request XML
     let body_str = String::from_utf8_lossy(&body);

@@ -19,6 +19,7 @@ info:
     - Automatic deduplication via content-addressing
     - Real-time collaboration with CRDTs
     - Versioning and immutable history
+    - Per-user bucket isolation (multiple users can have same bucket names)
     
     **Client-Side Encryption (FlatNamespace Mode)**:
     - Complete structure hiding - server sees only random CID-like hashes
@@ -80,7 +81,9 @@ paths:
         - Bucket Operations
       summary: ListBuckets
       operationId: listBuckets
-      description: Returns a list of all buckets owned by the authenticated user
+      description: |
+        Returns a list of all buckets owned by the authenticated user.
+        Each user has isolated bucket namespaces, so you will only see your own buckets.
       security:
         - oauth2: [storage:read]
       responses:
@@ -122,7 +125,10 @@ paths:
         - Bucket Operations
       summary: CreateBucket
       operationId: createBucket
-      description: Creates a new bucket with the specified name
+      description: |
+        Creates a new bucket with the specified name. Buckets are automatically
+        isolated per user - each user has their own namespace, so multiple users
+        can create buckets with the same name without conflicts.
       security:
         - oauth2: [storage:write]
       parameters:

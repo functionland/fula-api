@@ -72,19 +72,14 @@ pub async fn put_object(
         }
     }
 
-    // Store in bucket
-    tracing::debug!(bucket = %bucket_name, "Opening bucket");
-    let mut bucket = state.bucket_manager.open_bucket(&bucket_name).await
+    // Store in bucket (user-scoped)
+    tracing::debug!(bucket = %bucket_name, "Opening user-scoped bucket");
+    let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await
         .map_err(|e| {
             tracing::error!(error = %e, bucket = %bucket_name, "Failed to open bucket");
             e
         })?;
-    
-    // Verify bucket ownership (security audit fix #1)
-    if !session.can_access_bucket(&bucket.metadata().owner_id) {
-        return Err(ApiError::s3(S3ErrorCode::AccessDenied, "You do not have access to this bucket"));
-    }
-    
+
     tracing::debug!(key = %key, "Storing object metadata");
     bucket.put_object(key.clone(), metadata).await
         .map_err(|e| {
@@ -142,13 +137,9 @@ pub async fn get_object(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Read access required"));
     }
 
-    let bucket = state.bucket_manager.open_bucket(&bucket_name).await?;
-    
-    // Verify bucket ownership (security audit fix #1)
-    if !session.can_access_bucket(&bucket.metadata().owner_id) {
-        return Err(ApiError::s3(S3ErrorCode::AccessDenied, "You do not have access to this bucket"));
-    }
-    
+    // User-scoped bucket access
+    let bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
+
     let metadata = bucket.get_object(&key).await?
         .ok_or_else(|| ApiError::s3_with_resource(
             S3ErrorCode::NoSuchKey,
@@ -301,13 +292,9 @@ pub async fn head_object(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Read access required"));
     }
 
-    let bucket = state.bucket_manager.open_bucket(&bucket_name).await?;
-    
-    // Verify bucket ownership (security audit fix #1)
-    if !session.can_access_bucket(&bucket.metadata().owner_id) {
-        return Err(ApiError::s3(S3ErrorCode::AccessDenied, "You do not have access to this bucket"));
-    }
-    
+    // User-scoped bucket access
+    let bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
+
     let metadata = bucket.get_object(&key).await?
         .ok_or_else(|| ApiError::s3_with_resource(
             S3ErrorCode::NoSuchKey,
@@ -343,13 +330,9 @@ pub async fn delete_object(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
 
-    let mut bucket = state.bucket_manager.open_bucket(&bucket_name).await?;
-    
-    // Verify bucket ownership (security audit fix #1)
-    if !session.can_access_bucket(&bucket.metadata().owner_id) {
-        return Err(ApiError::s3(S3ErrorCode::AccessDenied, "You do not have access to this bucket"));
-    }
-    
+    // User-scoped bucket access
+    let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
+
     bucket.delete_object(&key).await?;
     bucket.flush().await?;
 
@@ -390,14 +373,9 @@ pub async fn copy_object(
         .split_once('/')
         .ok_or_else(|| ApiError::s3(S3ErrorCode::InvalidArgument, "Invalid copy source format"))?;
 
-    // Get source object
-    let source_bucket_handle = state.bucket_manager.open_bucket(source_bucket).await?;
-    
-    // Verify source bucket ownership (security audit fix #1)
-    if !session.can_access_bucket(&source_bucket_handle.metadata().owner_id) {
-        return Err(ApiError::s3(S3ErrorCode::AccessDenied, "You do not have access to the source bucket"));
-    }
-    
+    // Get source object (user-scoped)
+    let source_bucket_handle = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, source_bucket).await?;
+
     let source_metadata = source_bucket_handle.get_object(source_key).await?
         .ok_or_else(|| ApiError::s3_with_resource(
             S3ErrorCode::NoSuchKey,
@@ -405,18 +383,13 @@ pub async fn copy_object(
             copy_source,
         ))?;
 
-    // Copy to destination
-    // Security audit fix A3: Use hashed user ID
+    // Copy to destination (user-scoped)
     let mut dest_metadata = source_metadata.clone();
     dest_metadata.last_modified = chrono::Utc::now();
     dest_metadata.owner_id = Some(session.hashed_user_id.clone());
 
-    let mut dest_bucket_handle = state.bucket_manager.open_bucket(&dest_bucket).await?;
-    
-    // Verify destination bucket ownership (security audit fix #1)
-    if !session.can_access_bucket(&dest_bucket_handle.metadata().owner_id) {
-        return Err(ApiError::s3(S3ErrorCode::AccessDenied, "You do not have access to the destination bucket"));
-    }
+    let mut dest_bucket_handle = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &dest_bucket).await?;
+
     dest_bucket_handle.put_object(dest_key, dest_metadata.clone()).await?;
     dest_bucket_handle.flush().await?;
 

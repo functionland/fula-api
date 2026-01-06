@@ -325,6 +325,7 @@ assert_eq!(shared_secret, recovered);
 - **Storage nodes are untrusted**: All sensitive data is encrypted client-side
 - **Gateway is trusted for routing**: But never sees encryption keys
 - **Keys never leave the client**: HPKE ensures end-to-end encryption
+- **Per-user bucket isolation**: Each user's buckets are automatically namespaced - multiple users can have buckets with the same name without conflicts
 
 ### Key Management
 

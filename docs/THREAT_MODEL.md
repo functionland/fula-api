@@ -119,6 +119,7 @@ Fula provides client-side encryption for decentralized storage. The core princip
 - ✅ Encryption keys (HPKE wrapping happens client-side)
 - ✅ File names (FlatNamespace mode)
 - ✅ User IDs (hashed before storage)
+- ✅ Bucket isolation (each user's buckets are namespaced by hashed user ID)
 
 **What Leaks:**
 - ⚠️ Bucket names (S3 API requirement)

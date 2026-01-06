@@ -45,6 +45,8 @@ pub struct Bucket<S: BlockStore> {
     config: BucketConfig,
     /// Reference to bucket metadata cache for updates
     metadata_cache: Option<Arc<DashMap<String, BucketMetadata>>>,
+    /// Key used in the metadata cache (may differ from metadata.name for user-scoped buckets)
+    cache_key: Option<String>,
 }
 
 impl<S: BlockStore> Bucket<S> {
@@ -71,6 +73,7 @@ impl<S: BlockStore> Bucket<S> {
             index: index_mut,
             config,
             metadata_cache: None,
+            cache_key: None,
         })
     }
 
@@ -87,6 +90,26 @@ impl<S: BlockStore> Bucket<S> {
             index,
             config,
             metadata_cache,
+            cache_key: None,
+        })
+    }
+
+    /// Load an existing bucket with a specific cache key
+    /// Used for user-scoped buckets where the cache key differs from the bucket name
+    pub async fn load_with_cache_key(
+        metadata: BucketMetadata,
+        store: Arc<S>,
+        config: BucketConfig,
+        metadata_cache: Option<Arc<DashMap<String, BucketMetadata>>>,
+        cache_key: String,
+    ) -> Result<Self> {
+        let index = ProllyTree::load(store, metadata.root_cid).await?;
+        Ok(Self {
+            metadata,
+            index,
+            config,
+            metadata_cache,
+            cache_key: Some(cache_key),
         })
     }
 
@@ -231,12 +254,14 @@ impl<S: BlockStore> Bucket<S> {
     pub async fn flush(&mut self) -> Result<Cid> {
         let root_cid = self.index.flush().await?;
         self.metadata.root_cid = root_cid;
-        
+
         // Update the metadata cache if we have a reference to it
+        // Use cache_key if set (for user-scoped buckets), otherwise use bucket name
         if let Some(ref cache) = self.metadata_cache {
-            cache.insert(self.metadata.name.clone(), self.metadata.clone());
+            let key = self.cache_key.clone().unwrap_or_else(|| self.metadata.name.clone());
+            cache.insert(key, self.metadata.clone());
         }
-        
+
         Ok(root_cid)
     }
 }
@@ -517,6 +542,126 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
     /// Check if bucket exists
     pub fn bucket_exists(&self, name: &str) -> bool {
         self.buckets.contains_key(name)
+    }
+
+    // =========================================================================
+    // User-scoped bucket operations (per-user isolation)
+    // =========================================================================
+
+    /// Generate internal bucket key with user namespace
+    /// Format: {user_id}:{bucket_name}
+    fn scoped_bucket_key(user_id: &str, bucket_name: &str) -> String {
+        format!("{}:{}", user_id, bucket_name)
+    }
+
+    /// Check if bucket exists for this user
+    pub fn bucket_exists_for_user(&self, user_id: &str, name: &str) -> bool {
+        let key = Self::scoped_bucket_key(user_id, name);
+        self.buckets.contains_key(&key)
+    }
+
+    /// Create a new bucket scoped to user
+    #[instrument(skip(self))]
+    pub async fn create_bucket_for_user(
+        &self,
+        user_id: &str,
+        name: String,
+        owner: Owner,
+    ) -> Result<BucketMetadata> {
+        let internal_key = Self::scoped_bucket_key(user_id, &name);
+        tracing::debug!(bucket_name = %name, internal_key = %internal_key, "Creating user-scoped bucket");
+
+        // Validate the display name
+        validate_bucket_name(&name)?;
+
+        // Check if bucket already exists for this user
+        if self.buckets.contains_key(&internal_key) {
+            return Err(CoreError::BucketAlreadyExists(name));
+        }
+
+        // Create the bucket with the display name (not the internal key)
+        let bucket = Bucket::create(
+            name.clone(),
+            owner,
+            Arc::clone(&self.store),
+            self.default_config.clone(),
+        ).await?;
+
+        let metadata = bucket.metadata().clone();
+        tracing::debug!(bucket_name = %name, internal_key = %internal_key, root_cid = %metadata.root_cid, "Bucket created in IPFS");
+
+        // Store with internal key, but metadata contains display name
+        self.buckets.insert(internal_key.clone(), metadata.clone());
+
+        // Persist the registry after adding a bucket
+        if let Err(e) = self.persist_registry().await {
+            warn!(error = %e, "Failed to persist registry after bucket creation");
+        }
+
+        tracing::info!(bucket_name = %name, internal_key = %internal_key, total_buckets = %self.buckets.len(), "User-scoped bucket registered");
+
+        Ok(metadata)
+    }
+
+    /// Open a bucket for a specific user
+    pub async fn open_bucket_for_user(&self, user_id: &str, name: &str) -> Result<Bucket<S>> {
+        let internal_key = Self::scoped_bucket_key(user_id, name);
+        tracing::debug!(bucket_name = %name, internal_key = %internal_key, "Opening user-scoped bucket");
+
+        let metadata = self.buckets.get(&internal_key)
+            .map(|r| r.clone())
+            .ok_or_else(|| {
+                tracing::error!(bucket_name = %name, internal_key = %internal_key, "User-scoped bucket not found");
+                CoreError::BucketNotFound(name.to_string())
+            })?;
+
+        // Use load_with_cache_key so flush() updates the correct entry
+        Bucket::load_with_cache_key(
+            metadata,
+            Arc::clone(&self.store),
+            self.default_config.clone(),
+            Some(Arc::clone(&self.buckets)),
+            internal_key,
+        ).await
+    }
+
+    /// Delete a bucket for a specific user
+    pub async fn delete_bucket_for_user(&self, user_id: &str, name: &str) -> Result<()> {
+        let internal_key = Self::scoped_bucket_key(user_id, name);
+
+        let bucket = self.open_bucket_for_user(user_id, name).await?;
+
+        if bucket.object_count() > 0 {
+            return Err(CoreError::PreconditionFailed(
+                "Bucket is not empty".to_string(),
+            ));
+        }
+
+        self.buckets.remove(&internal_key);
+
+        // Persist the registry after removing a bucket
+        if let Err(e) = self.persist_registry().await {
+            warn!(error = %e, "Failed to persist registry after bucket deletion");
+        }
+
+        Ok(())
+    }
+
+    /// Get bucket metadata for a specific user
+    pub fn get_bucket_metadata_for_user(&self, user_id: &str, name: &str) -> Option<BucketMetadata> {
+        let internal_key = Self::scoped_bucket_key(user_id, name);
+        self.buckets.get(&internal_key).map(|r| r.clone())
+    }
+
+    /// List all buckets for a specific user
+    /// Returns buckets with their display names (not internal keys)
+    pub fn list_buckets_for_user(&self, user_id: &str) -> Vec<BucketMetadata> {
+        let prefix = format!("{}:", user_id);
+        self.buckets
+            .iter()
+            .filter(|r| r.key().starts_with(&prefix))
+            .map(|r| r.value().clone())
+            .collect()
     }
 }
 

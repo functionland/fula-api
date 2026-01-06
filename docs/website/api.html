@@ -243,7 +243,7 @@ curl -X GET http://localhost:9000/ \
                 <div class="description">
                     <div class="method-badge get">GET</div>
                     <h2>List Buckets</h2>
-                    <p>Returns a list of all buckets owned by the authenticated user.</p>
+                    <p>Returns a list of all buckets owned by the authenticated user. Each user has isolated bucket namespaces, so you will only see your own buckets.</p>
                     
                     <h3>Endpoint</h3>
                     <code class="endpoint-url">GET /</code>
@@ -298,11 +298,11 @@ curl -X GET http://localhost:9000/ \
                 <div class="description">
                     <div class="method-badge put">PUT</div>
                     <h2>Create Bucket</h2>
-                    <p>Creates a new bucket with the specified name.</p>
-                    
+                    <p>Creates a new bucket with the specified name. Buckets are automatically isolated per user - each user has their own namespace, so multiple users can create buckets with the same name without conflicts.</p>
+
                     <h3>Endpoint</h3>
                     <code class="endpoint-url">PUT /{bucket}</code>
-                    
+
                     <h3>Path Parameters</h3>
                     <table class="params-table">
                         <thead>
@@ -316,11 +316,19 @@ curl -X GET http://localhost:9000/ \
                             </tr>
                         </tbody>
                     </table>
-                    
+
+                    <h3>Per-User Isolation</h3>
+                    <p>Buckets are transparently namespaced by user ID. This means:</p>
+                    <ul>
+                        <li>User A's bucket "images" is completely separate from User B's "images"</li>
+                        <li>Users can only see and access their own buckets</li>
+                        <li>No bucket name conflicts between different users</li>
+                    </ul>
+
                     <h3>Response Codes</h3>
                     <ul>
                         <li><code>200 OK</code> - Bucket created successfully</li>
-                        <li><code>409 Conflict</code> - Bucket already exists</li>
+                        <li><code>409 Conflict</code> - Bucket already exists (for this user)</li>
                     </ul>
                 </div>
                 <div class="example">

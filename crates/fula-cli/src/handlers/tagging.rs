@@ -20,7 +20,8 @@ pub async fn get_object_tagging(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Read access required"));
     }
 
-    let bucket = state.bucket_manager.open_bucket(&bucket_name).await?;
+    // User-scoped bucket access
+    let bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
     
     let metadata = bucket.get_object(&key).await?
         .ok_or_else(|| ApiError::s3_with_resource(
@@ -68,7 +69,8 @@ pub async fn put_object_tagging(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
 
-    let mut bucket = state.bucket_manager.open_bucket(&bucket_name).await?;
+    // User-scoped bucket access
+    let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
     
     let mut metadata = bucket.get_object(&key).await?
         .ok_or_else(|| ApiError::s3_with_resource(
@@ -100,7 +102,8 @@ pub async fn delete_object_tagging(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
 
-    let mut bucket = state.bucket_manager.open_bucket(&bucket_name).await?;
+    // User-scoped bucket access
+    let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
     
     let mut metadata = bucket.get_object(&key).await?
         .ok_or_else(|| ApiError::s3_with_resource(

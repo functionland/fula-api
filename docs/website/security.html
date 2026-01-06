@@ -258,6 +258,15 @@
                         <li><strong>Cryptographic primitives are secure</strong> - X25519, AES-256-GCM, BLAKE3 are industry-standard</li>
                         <li><strong>Random number generator is secure</strong> - Using OS-provided CSPRNG (OsRng)</li>
                     </ul>
+
+                    <h3>Bucket Isolation</h3>
+                    <p>Each user's buckets are automatically isolated using transparent per-user namespacing:</p>
+                    <ul>
+                        <li><strong>Automatic isolation</strong> - Buckets are internally namespaced by hashed user ID</li>
+                        <li><strong>No name conflicts</strong> - Multiple users can create buckets with the same name</li>
+                        <li><strong>Complete separation</strong> - Users cannot see or access other users' buckets</li>
+                        <li><strong>Transparent to clients</strong> - S3 API works normally, isolation is server-side</li>
+                    </ul>
                 </div>
             </div>
         </section>

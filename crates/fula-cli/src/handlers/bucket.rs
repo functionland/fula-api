@@ -26,7 +26,12 @@ pub async fn create_bucket(
     let owner = Owner::new(&session.hashed_user_id)
         .with_display_name(session.display_name.clone().unwrap_or_default());
 
-    state.bucket_manager.create_bucket(bucket.clone(), owner).await?;
+    // User-scoped bucket creation (each user has isolated namespace)
+    state.bucket_manager.create_bucket_for_user(
+        &session.hashed_user_id,
+        bucket.clone(),
+        owner,
+    ).await?;
 
     Ok((
         StatusCode::OK,
@@ -45,15 +50,8 @@ pub async fn delete_bucket(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
 
-    // Check ownership (Security audit fix A3: compare hashed IDs)
-    let metadata = state.bucket_manager.get_bucket_metadata(&bucket)
-        .ok_or_else(|| ApiError::s3(S3ErrorCode::NoSuchBucket, "Bucket not found"))?;
-    
-    if !session.can_access_bucket(&metadata.owner_id) {
-        return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Not bucket owner"));
-    }
-
-    state.bucket_manager.delete_bucket(&bucket).await?;
+    // User-scoped bucket deletion (user can only delete their own buckets)
+    state.bucket_manager.delete_bucket_for_user(&session.hashed_user_id, &bucket).await?;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -61,10 +59,11 @@ pub async fn delete_bucket(
 /// HEAD /{bucket} - Check if bucket exists
 pub async fn head_bucket(
     State(state): State<Arc<AppState>>,
-    Extension(_session): Extension<UserSession>,
+    Extension(session): Extension<UserSession>,
     Path(bucket): Path<String>,
 ) -> Result<Response, ApiError> {
-    if !state.bucket_manager.bucket_exists(&bucket) {
+    // User-scoped bucket check (user can only see their own buckets)
+    if !state.bucket_manager.bucket_exists_for_user(&session.hashed_user_id, &bucket) {
         return Err(ApiError::s3(S3ErrorCode::NoSuchBucket, "Bucket not found"));
     }
 
@@ -99,13 +98,9 @@ pub async fn list_objects(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Read access required"));
     }
 
-    let bucket = state.bucket_manager.open_bucket(&bucket_name).await?;
-    
-    // Verify bucket ownership (security audit fix #1)
-    if !session.can_access_bucket(&bucket.metadata().owner_id) {
-        return Err(ApiError::s3(S3ErrorCode::AccessDenied, "You do not have access to this bucket"));
-    }
-    
+    // User-scoped bucket access (user can only access their own buckets)
+    let bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
+
     let result = bucket.list_objects(
         params.prefix.as_deref(),
         params.delimiter.as_deref(),
@@ -140,9 +135,11 @@ pub async fn list_objects(
 /// GET /{bucket}?location - Get bucket location
 pub async fn get_bucket_location(
     State(state): State<Arc<AppState>>,
+    Extension(session): Extension<UserSession>,
     Path(bucket): Path<String>,
 ) -> Result<Response, ApiError> {
-    if !state.bucket_manager.bucket_exists(&bucket) {
+    // User-scoped bucket check
+    if !state.bucket_manager.bucket_exists_for_user(&session.hashed_user_id, &bucket) {
         return Err(ApiError::s3(S3ErrorCode::NoSuchBucket, "Bucket not found"));
     }
 
