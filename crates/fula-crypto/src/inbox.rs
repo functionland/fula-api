@@ -919,4 +919,315 @@ mod tests {
         let decrypted = loaded.decrypt(recipient.secret_key()).unwrap();
         assert_eq!(decrypted.label, Some("Test".to_string()));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ISOLATION / LEAKAGE TESTS
+    // These tests verify that no cross-user data leakage can occur
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_isolation_list_pending_only_shows_own_entries() {
+        // Scenario: Multiple users have entries in same ShareInbox
+        // Verify: Each user only sees their own entries via list_pending()
+        let owner = KekKeyPair::generate();
+        let user_a = KekKeyPair::generate();
+        let user_b = KekKeyPair::generate();
+        let user_c = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let mut inbox = ShareInbox::new();
+
+        // Create entries for different users
+        let token_a = ShareBuilder::new(&owner, user_a.public_key(), &dek)
+            .path_scope("/for-a/")
+            .build()
+            .unwrap();
+        let envelope_a = ShareEnvelope::new(token_a).with_label("For User A");
+        inbox.enqueue_share(&envelope_a, user_a.public_key()).unwrap();
+
+        let token_b1 = ShareBuilder::new(&owner, user_b.public_key(), &dek)
+            .path_scope("/for-b-1/")
+            .build()
+            .unwrap();
+        let envelope_b1 = ShareEnvelope::new(token_b1).with_label("For User B - 1");
+        inbox.enqueue_share(&envelope_b1, user_b.public_key()).unwrap();
+
+        let token_b2 = ShareBuilder::new(&owner, user_b.public_key(), &dek)
+            .path_scope("/for-b-2/")
+            .build()
+            .unwrap();
+        let envelope_b2 = ShareEnvelope::new(token_b2).with_label("For User B - 2");
+        inbox.enqueue_share(&envelope_b2, user_b.public_key()).unwrap();
+
+        // User A should only see 1 entry
+        let pending_a = inbox.list_pending(&user_a);
+        assert_eq!(pending_a.len(), 1, "User A should see exactly 1 entry");
+        assert!(pending_a[0].is_for_recipient(user_a.public_key()));
+
+        // User B should see 2 entries
+        let pending_b = inbox.list_pending(&user_b);
+        assert_eq!(pending_b.len(), 2, "User B should see exactly 2 entries");
+        for entry in &pending_b {
+            assert!(entry.is_for_recipient(user_b.public_key()));
+        }
+
+        // User C should see 0 entries (no shares for them)
+        let pending_c = inbox.list_pending(&user_c);
+        assert_eq!(pending_c.len(), 0, "User C should see no entries");
+    }
+
+    #[test]
+    fn test_isolation_wrong_recipient_cannot_mark_read() {
+        let owner = KekKeyPair::generate();
+        let intended_recipient = KekKeyPair::generate();
+        let attacker = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let mut inbox = ShareInbox::new();
+
+        let token = ShareBuilder::new(&owner, intended_recipient.public_key(), &dek)
+            .build()
+            .unwrap();
+        let envelope = ShareEnvelope::new(token);
+        let entry = inbox.enqueue_share(&envelope, intended_recipient.public_key()).unwrap();
+        let entry_id = entry.id.clone();
+
+        // Attacker tries to mark_read - should fail
+        let result = inbox.mark_read(&entry_id, attacker.public_key());
+        assert!(result.is_err(), "Attacker should not be able to mark_read");
+
+        // Entry should still be Pending
+        let entry = inbox.get_entry(&entry_id).unwrap();
+        assert_eq!(entry.status, InboxEntryStatus::Pending, "Status should remain Pending");
+
+        // Intended recipient can mark_read
+        let result = inbox.mark_read(&entry_id, intended_recipient.public_key());
+        assert!(result.is_ok(), "Intended recipient should be able to mark_read");
+        assert!(result.unwrap(), "mark_read should return true");
+    }
+
+    #[test]
+    fn test_isolation_wrong_recipient_cannot_remove() {
+        let owner = KekKeyPair::generate();
+        let intended_recipient = KekKeyPair::generate();
+        let attacker = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let mut inbox = ShareInbox::new();
+
+        let token = ShareBuilder::new(&owner, intended_recipient.public_key(), &dek)
+            .build()
+            .unwrap();
+        let envelope = ShareEnvelope::new(token);
+        let entry = inbox.enqueue_share(&envelope, intended_recipient.public_key()).unwrap();
+        let entry_id = entry.id.clone();
+
+        // Attacker tries to remove - should fail
+        let result = inbox.remove_entry(&entry_id, attacker.public_key());
+        assert!(result.is_err(), "Attacker should not be able to remove entry");
+
+        // Entry should still exist
+        assert!(inbox.get_entry(&entry_id).is_some(), "Entry should still exist");
+
+        // Intended recipient can remove
+        let result = inbox.remove_entry(&entry_id, intended_recipient.public_key());
+        assert!(result.is_ok(), "Intended recipient should be able to remove");
+        assert!(result.unwrap().is_some(), "remove_entry should return the entry");
+
+        // Entry should be gone
+        assert!(inbox.get_entry(&entry_id).is_none(), "Entry should be removed");
+    }
+
+    #[test]
+    fn test_isolation_wrong_recipient_cannot_accept() {
+        let owner = KekKeyPair::generate();
+        let intended_recipient = KekKeyPair::generate();
+        let attacker = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let mut inbox = ShareInbox::new();
+
+        let token = ShareBuilder::new(&owner, intended_recipient.public_key(), &dek)
+            .path_scope("/secret/")
+            .build()
+            .unwrap();
+        let envelope = ShareEnvelope::new(token).with_label("Secret Data");
+        let entry = inbox.enqueue_share(&envelope, intended_recipient.public_key()).unwrap();
+        let entry_id = entry.id.clone();
+
+        // Attacker tries to accept - should fail
+        let result = inbox.accept_entry(&entry_id, &attacker);
+        assert!(result.is_err(), "Attacker should not be able to accept entry");
+
+        // Entry should still be Pending (not Accepted)
+        let entry = inbox.get_entry(&entry_id).unwrap();
+        assert_eq!(entry.status, InboxEntryStatus::Pending, "Status should remain Pending");
+
+        // Intended recipient can accept
+        let result = inbox.accept_entry(&entry_id, &intended_recipient);
+        assert!(result.is_ok(), "Intended recipient should be able to accept");
+        let envelope = result.unwrap();
+        assert_eq!(envelope.label, Some("Secret Data".to_string()));
+    }
+
+    #[test]
+    fn test_isolation_entry_content_encrypted_per_recipient() {
+        // Scenario: Even if attacker gets the InboxEntry, they cannot decrypt
+        let owner = KekKeyPair::generate();
+        let intended_recipient = KekKeyPair::generate();
+        let attacker = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let token = ShareBuilder::new(&owner, intended_recipient.public_key(), &dek)
+            .path_scope("/confidential/")
+            .build()
+            .unwrap();
+        let envelope = ShareEnvelope::new(token).with_label("Confidential");
+        let entry = InboxEntry::create(&envelope, intended_recipient.public_key()).unwrap();
+
+        // Attacker cannot decrypt even with direct access to the entry
+        let decrypt_result = entry.decrypt(attacker.secret_key());
+        assert!(decrypt_result.is_err(), "Attacker should not be able to decrypt");
+
+        // Intended recipient can decrypt
+        let decrypt_result = entry.decrypt(intended_recipient.secret_key());
+        assert!(decrypt_result.is_ok(), "Intended recipient should be able to decrypt");
+        let decrypted = decrypt_result.unwrap();
+        assert_eq!(decrypted.label, Some("Confidential".to_string()));
+    }
+
+    #[test]
+    fn test_isolation_recipient_hash_prevents_enumeration() {
+        // Verify that recipient_key_hash correctly identifies ownership
+        let user_a = KekKeyPair::generate();
+        let user_b = KekKeyPair::generate();
+
+        // Different users should have different inbox paths
+        let path_a = ShareInbox::inbox_path_for_recipient(user_a.public_key());
+        let path_b = ShareInbox::inbox_path_for_recipient(user_b.public_key());
+
+        assert_ne!(path_a, path_b, "Different users should have different inbox paths");
+
+        // Same user should always get same path (deterministic)
+        let path_a2 = ShareInbox::inbox_path_for_recipient(user_a.public_key());
+        assert_eq!(path_a, path_a2, "Same user should get same inbox path");
+    }
+
+    #[test]
+    fn test_isolation_multi_user_inbox_no_cross_contamination() {
+        // Comprehensive test: multiple users, multiple shares, verify complete isolation
+        let owner = KekKeyPair::generate();
+        let alice = KekKeyPair::generate();
+        let bob = KekKeyPair::generate();
+        let charlie = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let mut inbox = ShareInbox::new();
+
+        // Create shares for Alice
+        let token_alice = ShareBuilder::new(&owner, alice.public_key(), &dek)
+            .path_scope("/alice-secret/")
+            .build()
+            .unwrap();
+        let envelope_alice = ShareEnvelope::new(token_alice).with_label("Alice's Secret");
+        let entry_alice = inbox.enqueue_share(&envelope_alice, alice.public_key()).unwrap();
+
+        // Create shares for Bob
+        let token_bob = ShareBuilder::new(&owner, bob.public_key(), &dek)
+            .path_scope("/bob-secret/")
+            .build()
+            .unwrap();
+        let envelope_bob = ShareEnvelope::new(token_bob).with_label("Bob's Secret");
+        let entry_bob = inbox.enqueue_share(&envelope_bob, bob.public_key()).unwrap();
+
+        // === VERIFICATION: Alice's operations ===
+
+        // Alice can see only her entry
+        let alice_pending = inbox.list_pending(&alice);
+        assert_eq!(alice_pending.len(), 1);
+        assert_eq!(alice_pending[0].id, entry_alice.id);
+
+        // Alice cannot operate on Bob's entry
+        assert!(inbox.mark_read(&entry_bob.id, alice.public_key()).is_err());
+        assert!(inbox.dismiss_entry(&entry_bob.id, alice.public_key()).is_err());
+        assert!(inbox.remove_entry(&entry_bob.id, alice.public_key()).is_err());
+        assert!(inbox.accept_entry(&entry_bob.id, &alice).is_err());
+
+        // Alice can operate on her own entry
+        assert!(inbox.accept_entry(&entry_alice.id, &alice).is_ok());
+
+        // === VERIFICATION: Bob's operations ===
+
+        // Bob can see only his entry
+        let bob_pending = inbox.list_pending(&bob);
+        assert_eq!(bob_pending.len(), 1);
+        assert_eq!(bob_pending[0].id, entry_bob.id);
+
+        // Bob cannot operate on Alice's entry (even though Alice already accepted it)
+        assert!(inbox.mark_read(&entry_alice.id, bob.public_key()).is_err());
+        assert!(inbox.dismiss_entry(&entry_alice.id, bob.public_key()).is_err());
+        assert!(inbox.remove_entry(&entry_alice.id, bob.public_key()).is_err());
+
+        // === VERIFICATION: Charlie (no shares) ===
+
+        // Charlie sees nothing
+        let charlie_pending = inbox.list_pending(&charlie);
+        assert_eq!(charlie_pending.len(), 0);
+
+        // Charlie cannot operate on anyone's entries
+        assert!(inbox.mark_read(&entry_alice.id, charlie.public_key()).is_err());
+        assert!(inbox.mark_read(&entry_bob.id, charlie.public_key()).is_err());
+        assert!(inbox.accept_entry(&entry_bob.id, &charlie).is_err());
+    }
+
+    #[test]
+    fn test_isolation_nonexistent_entry_returns_ok_false() {
+        // Verify that operations on non-existent entries don't leak information
+        // (should return Ok(false) or Ok(None), not Err)
+        let user = KekKeyPair::generate();
+        let mut inbox = ShareInbox::new();
+
+        let fake_entry_id = "nonexistent-entry-id-12345";
+
+        // These should all return Ok with false/None, not error
+        // (to prevent timing attacks or enumeration)
+        let mark_result = inbox.mark_read(fake_entry_id, user.public_key());
+        assert!(mark_result.is_ok(), "Non-existent entry should return Ok");
+        assert!(!mark_result.unwrap(), "Should return false for non-existent");
+
+        let dismiss_result = inbox.dismiss_entry(fake_entry_id, user.public_key());
+        assert!(dismiss_result.is_ok(), "Non-existent entry should return Ok");
+        assert!(!dismiss_result.unwrap(), "Should return false for non-existent");
+
+        let remove_result = inbox.remove_entry(fake_entry_id, user.public_key());
+        assert!(remove_result.is_ok(), "Non-existent entry should return Ok");
+        assert!(remove_result.unwrap().is_none(), "Should return None for non-existent");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_isolation_list_all_deprecation_warning() {
+        // This test exists to document that list_all() is deprecated
+        // and to verify it still works (for migration purposes)
+        let owner = KekKeyPair::generate();
+        let user = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let mut inbox = ShareInbox::new();
+
+        let token = ShareBuilder::new(&owner, user.public_key(), &dek)
+            .build()
+            .unwrap();
+        let envelope = ShareEnvelope::new(token);
+        inbox.enqueue_share(&envelope, user.public_key()).unwrap();
+
+        // list_all() still works but is deprecated
+        // Prefer list_pending() with recipient key
+        let all = inbox.list_all();
+        assert_eq!(all.len(), 1);
+
+        // Recommended alternative:
+        let pending = inbox.list_pending(&user);
+        assert_eq!(pending.len(), 1);
+    }
 }
