@@ -71,6 +71,7 @@
                 <li><a href="#aws-cli">AWS CLI</a></li>
                 <li><a href="#python">Python (boto3)</a></li>
                 <li><a href="#javascript">JavaScript</a></li>
+                <li><a href="#flutter">Flutter / Dart</a></li>
             </ul>
         </div>
     </nav>
@@ -842,6 +843,146 @@ main().catch(console.error);</code></pre>
             </div>
         </section>
 
+        <!-- Flutter -->
+        <section id="flutter" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>Flutter / Dart (Native SDK)</h2>
+                    <p>The fula-flutter package provides native Rust bindings for Flutter with full encryption support. Works on Android (FFI) and Web (WASM).</p>
+
+                    <h3>Key Features</h3>
+                    <ul>
+                        <li><strong>Client-side encryption</strong> - AES-256-GCM + HPKE</li>
+                        <li><strong>Metadata privacy</strong> - Obfuscated file names</li>
+                        <li><strong>Secure sharing</strong> - Capability-based access tokens</li>
+                        <li><strong>Key rotation</strong> - Re-wrap DEKs with new KEK</li>
+                        <li><strong>Cross-platform</strong> - Same API on Android and Web</li>
+                    </ul>
+                </div>
+                <div class="example">
+                    <div class="example-header">
+                        <span class="lang-label">Encrypted Storage Example</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-dart">import 'package:fula_flutter/fula_flutter.dart';
+import 'dart:convert';
+import 'dart:typed_data';
+
+Future&lt;void&gt; main() async {
+  // Create encrypted client
+  final config = FulaConfig(
+    endpoint: 'http://localhost:9000',
+    accessToken: 'your-jwt-token',
+    timeoutSeconds: 30,
+    maxRetries: 3,
+  );
+
+  final encConfig = EncryptionConfig(
+    secretKey: null, // Generate new key
+    enableMetadataPrivacy: true,
+    obfuscationMode: ObfuscationMode.deterministic,
+  );
+
+  final client = await createEncryptedClient(config, encConfig);
+
+  // Create bucket
+  await createBucket(client.client, 'secure-files');
+
+  // Upload encrypted file
+  final content = utf8.encode('Secret document content');
+  await putFlat(
+    client,
+    'secure-files',
+    '/documents/secret.txt',
+    Uint8List.fromList(content),
+    'text/plain',
+  );
+
+  // Download and decrypt
+  final decrypted = await getFlat(
+    client,
+    'secure-files',
+    '/documents/secret.txt',
+  );
+  print('Content: ${utf8.decode(decrypted)}');
+
+  // List files (shows original names)
+  final files = await listDecrypted(client, 'secure-files', ListOptions());
+  for (final file in files) {
+    print('${file.originalKey} - ${file.size} bytes');
+  }
+
+  // Create share token
+  final token = createShareToken(
+    client,
+    storageKey,
+    ShareMode.read,
+    null, // No expiration
+  );
+  print('Share token: $token');
+
+  // Export key for backup
+  final secretKey = exportSecretKey(client);
+  print('Key exported: ${secretKey.length} bytes');
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Key Rotation</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-dart">// Rotate encryption keys for enhanced security
+final rotationManager = createRotationManager(client);
+
+// Rotate all objects in a bucket
+final report = await rotateBucket(
+  client,
+  'secure-files',
+  rotationManager,
+);
+
+print('Rotation complete:');
+print('  Total: ${report.total}');
+print('  Rotated: ${report.rotated}');
+print('  Skipped: ${report.skipped}');
+print('  Failed: ${report.failed}');
+print('  Success rate: ${report.successRate()}%');</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Secure File Sharing</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-dart">// Create time-limited share
+final expiresAt = DateTime.now()
+    .add(Duration(hours: 24))
+    .millisecondsSinceEpoch ~/ 1000;
+
+final shareToken = createShareToken(
+  client,
+  storageKey,
+  ShareMode.temporal,
+  expiresAt,
+);
+
+// Recipient accepts the share
+final acceptedShare = acceptShare(shareTokenJson);
+
+// Check permissions
+final perms = getSharePermissions(acceptedShare);
+print('Can read: ${perms.canRead}');
+print('Can write: ${perms.canWrite}');
+print('Expires: ${perms.expiresAt}');
+
+// Access shared file
+final sharedData = await getWithShare(
+  client,
+  'shared-bucket',
+  storageKey,
+  acceptedShare,
+);</code></pre>
+                </div>
+            </div>
+        </section>
+
         <footer>
             <p>Fula API Documentation • Built with ❤️ for decentralized storage</p>
         </footer>
@@ -851,6 +992,7 @@ main().catch(console.error);</code></pre>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/rust.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/typescript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/dart.min.js"></script>
     <script src="js/i18n.js"></script>
     <script src="js/translations.js"></script>
     <script src="js/app.js"></script>

@@ -456,17 +456,61 @@ public async Task UploadPhotoAsync()
             <div class="endpoint-content">
                 <div class="description">
                     <h2>🐦 Flutter / Dart</h2>
-                    <p>Use the minio package for S3-compatible storage in Flutter apps.</p>
-                    
-                    <h3>Installation</h3>
+                    <p>Two integration options: S3-compatible SDK for basic storage, or Native Rust SDK for encrypted storage with client-side encryption.</p>
+
+                    <h3>Option 1: S3-Compatible (minio)</h3>
                     <code class="inline-code">flutter pub add minio</code>
-                    
-                    <h3>Platforms</h3>
-                    <p>Works on iOS, Android, Web, Windows, macOS, and Linux.</p>
+                    <p>Best for: Basic storage, presigned URLs, cross-platform compatibility.</p>
+
+                    <h3>Option 2: Native Rust SDK (fula_flutter)</h3>
+                    <p>Best for: Client-side encryption, metadata privacy, secure sharing, key rotation.</p>
+                    <p>Platforms: Android (FFI) and Web (WASM).</p>
                 </div>
                 <div class="example">
                     <div class="example-header">
-                        <span class="lang-label">fula_client.dart</span>
+                        <span class="lang-label">Native SDK - Encrypted Storage</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-dart">import 'package:fula_flutter/fula_flutter.dart';
+import 'dart:convert';
+import 'dart:typed_data';
+
+// Create encrypted client
+final config = FulaConfig(
+  endpoint: 'http://your-gateway:9000',
+  accessToken: 'your-jwt-token',
+);
+
+final encConfig = EncryptionConfig(
+  enableMetadataPrivacy: true,
+  obfuscationMode: ObfuscationMode.deterministic,
+);
+
+final client = await createEncryptedClient(config, encConfig);
+
+// Upload encrypted file
+final data = utf8.encode('Secret document content');
+await putFlat(client, 'my-bucket', '/docs/secret.txt',
+              Uint8List.fromList(data), 'text/plain');
+
+// Download and decrypt
+final decrypted = await getFlat(client, 'my-bucket', '/docs/secret.txt');
+print('Content: ${utf8.decode(decrypted)}');
+
+// List files (shows original names, not obfuscated)
+final files = await listDecrypted(client, 'my-bucket', ListOptions());
+for (final file in files) {
+  print('${file.originalKey} - ${file.size} bytes');
+}
+
+// Create share token for secure sharing
+final token = createShareToken(client, storageKey, ShareMode.read, null);
+
+// Export key for backup
+final secretKey = exportSecretKey(client);</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">S3-Compatible - Basic Storage</span>
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                     </div>
                     <pre><code class="language-dart">import 'package:minio/minio.dart';
@@ -494,17 +538,6 @@ class FulaClient {
     await _minio.fPutObject(bucket, key, file.path);
   }
 
-  Future&lt;void&gt; uploadBytes(String key, List&lt;int&gt; data, 
-                            String contentType) async {
-    await _minio.putObject(
-      bucket,
-      key,
-      Stream.value(data),
-      size: data.length,
-      metadata: {'Content-Type': contentType},
-    );
-  }
-
   Future&lt;List&lt;int&gt;&gt; downloadFile(String key) async {
     final stream = await _minio.getObject(bucket, key);
     final chunks = &lt;int&gt;[];
@@ -514,25 +547,18 @@ class FulaClient {
     return chunks;
   }
 
-  Future&lt;List&lt;Object&gt;&gt; listFiles(String prefix) async {
-    final objects = &lt;Object&gt;[];
-    await for (final obj in _minio.listObjects(bucket, prefix: prefix)) {
-      objects.addAll(obj.objects);
-    }
-    return objects;
-  }
-
   Future&lt;String&gt; getPresignedUrl(String key) async {
     return await _minio.presignedGetObject(bucket, key);
   }
 }</code></pre>
 
                     <div class="example-header">
-                        <span class="lang-label">Usage in Flutter</span>
+                        <span class="lang-label">Usage Example</span>
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                     </div>
                     <pre><code class="language-dart">import 'package:image_picker/image_picker.dart';
 
+// Using S3-compatible client
 final fula = FulaClient(
   endpoint: 'your-fula-gateway.com',
   accessKey: 'YOUR_ACCESS_KEY',
@@ -544,11 +570,10 @@ final fula = FulaClient(
 Future&lt;void&gt; uploadImage() async {
   final picker = ImagePicker();
   final image = await picker.pickImage(source: ImageSource.gallery);
-  
+
   if (image != null) {
     final file = File(image.path);
     final key = 'images/${DateTime.now().millisecondsSinceEpoch}.jpg';
-    
     await fula.uploadFile(key, file);
     print('Uploaded: $key');
   }

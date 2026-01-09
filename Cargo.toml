@@ -6,6 +6,7 @@ members = [
     "crates/fula-core",
     "crates/fula-cli",
     "crates/fula-client",
+    "crates/fula-flutter",
 ]
 
 # Root package for examples

@@ -1,0 +1,55 @@
+[package]
+name = "fula-flutter"
+description = "Flutter bindings for Fula decentralized storage - works on Android and Web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+# flutter_rust_bridge
+flutter_rust_bridge = "2"
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Async
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+
+# Thread safety
+parking_lot = { workspace = true }
+
+# Platform-specific dependencies
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Native: fula-client with default features (includes tokio)
+fula-client = { path = "../fula-client" }
+fula-crypto = { path = "../fula-crypto" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# WASM: fula-client without tokio
+fula-client = { path = "../fula-client", default-features = false }
+fula-crypto = { path = "../fula-crypto", default-features = false, features = ["wasm"] }
+wasm-bindgen-futures = "0.4"
+
+[dev-dependencies]
+# For WASM tests
+wasm-bindgen-test = "0.3"
+
+[features]
+default = []
