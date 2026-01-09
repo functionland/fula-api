@@ -1,0 +1,9 @@
+# flutter_rust_bridge v2 configuration
+# https://cjycode.com/flutter_rust_bridge/
+
+rust_input: crates/fula-flutter/src/api/mod.rs
+rust_root: crates/fula-flutter
+dart_output: packages/fula_client/lib/src
+
+# Optional: specify the full glue configuration
+full_dep: true

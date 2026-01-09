@@ -64,10 +64,8 @@ jobs:
 
       - name: Generate Dart bindings
         run: |
-          flutter_rust_bridge_codegen generate \
-            --rust-input crates/fula-flutter/src/api/mod.rs \
-            --rust-crate-dir crates/fula-flutter \
-            --dart-output packages/fula_client/lib/src/bridge_generated.dart
+          # flutter_rust_bridge v2 - use config file from repo root
+          flutter_rust_bridge_codegen generate
 
       - name: Update version in pubspec.yaml
         run: |
