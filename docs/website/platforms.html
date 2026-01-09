@@ -462,16 +462,21 @@ public async Task UploadPhotoAsync()
                     <code class="inline-code">flutter pub add minio</code>
                     <p>Best for: Basic storage, presigned URLs, cross-platform compatibility.</p>
 
-                    <h3>Option 2: Native Rust SDK (fula_flutter)</h3>
+                    <h3>Option 2: Native Rust SDK (fula_client)</h3>
+                    <code class="inline-code">flutter pub add fula_client</code>
                     <p>Best for: Client-side encryption, metadata privacy, secure sharing, key rotation.</p>
                     <p>Platforms: Android (FFI) and Web (WASM).</p>
+
+                    <h3>Option 3: JavaScript/WASM (for web apps)</h3>
+                    <code class="inline-code">npm install @functionland/fula-client</code>
+                    <p>Best for: React, Vue, vanilla JS web applications with encryption.</p>
                 </div>
                 <div class="example">
                     <div class="example-header">
                         <span class="lang-label">Native SDK - Encrypted Storage</span>
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                     </div>
-                    <pre><code class="language-dart">import 'package:fula_flutter/fula_flutter.dart';
+                    <pre><code class="language-dart">import 'package:fula_client/fula_client.dart';
 import 'dart:convert';
 import 'dart:typed_data';
 

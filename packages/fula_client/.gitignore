@@ -1,0 +1,31 @@
+# Flutter/Dart specific
+.dart_tool/
+.packages
+build/
+*.iml
+.metadata
+
+# Generated files (from flutter_rust_bridge_codegen)
+lib/src/bridge_generated.dart
+lib/src/bridge_generated.io.dart
+lib/src/bridge_generated.web.dart
+
+# Native libraries (downloaded/built by CI)
+android/src/main/jniLibs/
+ios/libfula_flutter.a
+ios/Classes/
+
+# IDE
+.idea/
+*.swp
+*.swo
+.vscode/
+
+# Test outputs
+coverage/
+.test_results/
+
+# Pub
+.pub-cache/
+.pub/
+pubspec.lock

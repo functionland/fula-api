@@ -848,7 +848,13 @@ main().catch(console.error);</code></pre>
             <div class="endpoint-content">
                 <div class="description">
                     <h2>Flutter / Dart (Native SDK)</h2>
-                    <p>The fula-flutter package provides native Rust bindings for Flutter with full encryption support. Works on Android (FFI) and Web (WASM).</p>
+                    <p>The fula_client package provides native Rust bindings for Flutter with full encryption support. Works on Android (FFI) and Web (WASM).</p>
+
+                    <h3>Installation</h3>
+                    <p><strong>Flutter:</strong></p>
+                    <code class="inline-code">flutter pub add fula_client</code>
+                    <p><strong>JavaScript/WASM:</strong></p>
+                    <code class="inline-code">npm install @functionland/fula-client</code>
 
                     <h3>Key Features</h3>
                     <ul>
@@ -864,7 +870,7 @@ main().catch(console.error);</code></pre>
                         <span class="lang-label">Encrypted Storage Example</span>
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                     </div>
-                    <pre><code class="language-dart">import 'package:fula_flutter/fula_flutter.dart';
+                    <pre><code class="language-dart">import 'package:fula_client/fula_client.dart';
 import 'dart:convert';
 import 'dart:typed_data';
 

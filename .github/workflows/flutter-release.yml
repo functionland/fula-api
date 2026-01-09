@@ -1,0 +1,402 @@
+name: Flutter Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 0.1.0)'
+        required: true
+        default: '0.1.0'
+      skip_publish:
+        description: 'Skip publishing (for testing)'
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ==========================================================================
+  # Step 1: Generate Dart bindings
+  # ==========================================================================
+  generate-bindings:
+    name: Generate Dart Bindings
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION="${{ github.event.release.tag_name }}"
+            VERSION="${VERSION#v}"  # Remove 'v' prefix if present
+          else
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: 'stable'
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen
+
+      - name: Create Flutter package structure
+        run: |
+          mkdir -p packages/fula_client/lib/src
+          mkdir -p packages/fula_client/android/src/main/jniLibs
+          mkdir -p packages/fula_client/ios
+
+      - name: Generate Dart bindings
+        run: |
+          flutter_rust_bridge_codegen generate \
+            --rust-input crates/fula-flutter/src/api/mod.rs \
+            --rust-crate-dir crates/fula-flutter \
+            --dart-output packages/fula_client/lib/src/bridge_generated.dart
+
+      - name: Update version in pubspec.yaml
+        run: |
+          sed -i "s/version: .*/version: ${{ steps.version.outputs.version }}/" packages/fula_client/pubspec.yaml
+
+      - name: Upload Flutter package
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-package
+          path: packages/fula_client/
+          retention-days: 1
+
+  # ==========================================================================
+  # Step 2: Build native libraries for all platforms
+  # ==========================================================================
+  build-android:
+    name: Build Android
+    needs: generate-bindings
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+          - target: armv7-linux-androideabi
+            abi: armeabi-v7a
+          - target: x86_64-linux-android
+            abi: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-${{ matrix.target }}
+
+      - name: Configure Cargo for Android
+        run: |
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml << EOF
+          [target.${{ matrix.target }}]
+          linker = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target }}24-clang"
+          EOF
+
+      - name: Build
+        run: cargo build -p fula-flutter --target ${{ matrix.target }} --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.abi }}
+          path: target/${{ matrix.target }}/release/libfula_flutter.so
+          retention-days: 1
+
+  build-ios:
+    name: Build iOS
+    needs: generate-bindings
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-ios
+            artifact: ios-arm64
+          - target: x86_64-apple-ios
+            artifact: ios-x64-sim
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build -p fula-flutter --target ${{ matrix.target }} --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.target }}/release/libfula_flutter.a
+          retention-days: 1
+
+  build-wasm:
+    name: Build WASM
+    needs: generate-bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
+
+      - name: Build WASM
+        run: |
+          cd crates/fula-flutter
+          wasm-pack build --release --target web --out-dir ../../packages/fula_client_npm
+
+      - name: Create npm package.json
+        run: |
+          VERSION="${{ needs.generate-bindings.outputs.version }}"
+          cat > packages/fula_client_npm/package.json << EOF
+          {
+            "name": "@functionland/fula-client",
+            "version": "$VERSION",
+            "description": "Fula encrypted storage SDK for JavaScript/WASM",
+            "main": "fula_flutter.js",
+            "types": "fula_flutter.d.ts",
+            "files": [
+              "*.js",
+              "*.wasm",
+              "*.d.ts",
+              "snippets/**/*"
+            ],
+            "keywords": [
+              "fula",
+              "storage",
+              "encryption",
+              "wasm",
+              "decentralized"
+            ],
+            "repository": {
+              "type": "git",
+              "url": "https://github.com/functionland/fula-api.git"
+            },
+            "homepage": "https://fx.land",
+            "license": "MIT",
+            "author": "Functionland <info@fx.land>"
+          }
+          EOF
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-package
+          path: packages/fula_client_npm/
+          retention-days: 1
+
+  # ==========================================================================
+  # Step 3: Publish to registries
+  # ==========================================================================
+  publish-pubdev:
+    name: Publish to pub.dev
+    needs: [generate-bindings, build-android, build-ios]
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_publish }}
+    # OIDC authentication - no manual tokens needed
+    permissions:
+      id-token: write  # Required for pub.dev OIDC authentication
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Flutter package
+        uses: actions/download-artifact@v4
+        with:
+          name: flutter-package
+          path: packages/fula_client/
+
+      - name: Download Android arm64
+        uses: actions/download-artifact@v4
+        with:
+          name: android-arm64-v8a
+          path: packages/fula_client/android/src/main/jniLibs/arm64-v8a/
+
+      - name: Download Android armv7
+        uses: actions/download-artifact@v4
+        with:
+          name: android-armeabi-v7a
+          path: packages/fula_client/android/src/main/jniLibs/armeabi-v7a/
+
+      - name: Download Android x64
+        uses: actions/download-artifact@v4
+        with:
+          name: android-x86_64
+          path: packages/fula_client/android/src/main/jniLibs/x86_64/
+
+      - name: Download iOS arm64
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-arm64
+          path: packages/fula_client/ios/
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+
+      - name: Setup pub.dev OIDC credentials
+        uses: dart-lang/setup-dart@v1
+
+      - name: Verify package
+        working-directory: packages/fula_client
+        run: |
+          flutter pub get
+          flutter pub publish --dry-run
+
+      - name: Publish to pub.dev
+        working-directory: packages/fula_client
+        run: flutter pub publish --force
+
+  publish-npm:
+    name: Publish to npm
+    needs: [generate-bindings, build-wasm]
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_publish }}
+    steps:
+      - name: Download WASM package
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-package
+          path: packages/fula_client_npm/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish to npm
+        working-directory: packages/fula_client_npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ==========================================================================
+  # Step 4: Create GitHub Release artifacts
+  # ==========================================================================
+  github-release:
+    name: Upload Release Artifacts
+    needs: [generate-bindings, build-android, build-ios, build-wasm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Package Android libraries
+        run: |
+          mkdir -p release
+          cd artifacts
+          zip -r ../release/android-libs.zip android-*/
+
+      - name: Package iOS libraries
+        run: |
+          cd artifacts
+          zip -r ../release/ios-libs.zip ios-*/
+
+      - name: Package WASM
+        run: |
+          cd artifacts
+          zip -r ../release/wasm-package.zip wasm-package/
+
+      - name: Package Flutter source
+        run: |
+          cd artifacts
+          zip -r ../release/flutter-package-source.zip flutter-package/
+
+      - name: Upload to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            release/android-libs.zip
+            release/ios-libs.zip
+            release/wasm-package.zip
+            release/flutter-package-source.zip
+
+      - name: Upload artifacts (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: release/
+          retention-days: 7
+
+  # ==========================================================================
+  # Summary job
+  # ==========================================================================
+  release-summary:
+    name: Release Summary
+    needs: [generate-bindings, publish-pubdev, publish-npm, github-release]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Summary
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ needs.generate-bindings.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Publish Status" >> $GITHUB_STEP_SUMMARY
+          echo "- pub.dev: ${{ needs.publish-pubdev.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- npm: ${{ needs.publish-npm.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- GitHub Release: ${{ needs.github-release.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Usage" >> $GITHUB_STEP_SUMMARY
+          echo '```yaml' >> $GITHUB_STEP_SUMMARY
+          echo "# Flutter (pubspec.yaml)" >> $GITHUB_STEP_SUMMARY
+          echo "dependencies:" >> $GITHUB_STEP_SUMMARY
+          echo "  fula_client: ^${{ needs.generate-bindings.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "# JavaScript/WASM" >> $GITHUB_STEP_SUMMARY
+          echo "npm install @functionland/fula-client@${{ needs.generate-bindings.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
