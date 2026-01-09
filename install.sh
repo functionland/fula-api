@@ -286,7 +286,12 @@ collect_configuration() {
             log_warn "Users can still pin via per-request headers (X-Pinning-Service, X-Pinning-Token)"
         fi
     fi
-    
+
+    # Storage API for balance checking (optional)
+    echo ""
+    log_info "Storage API Configuration (optional - for balance/quota checking)"
+    prompt_env "STORAGE_API_URL" "Storage API URL (e.g., http://127.0.0.1:3001)" "${STORAGE_API_URL:-}"
+
     # Gateway port
     prompt_env "GATEWAY_PORT" "Gateway internal port" "${GATEWAY_PORT:-$DEFAULT_GATEWAY_PORT}"
     
@@ -353,6 +358,9 @@ IPFS_URL=http://localhost:5001
 # Pinning Service (optional - gateway-level pinning for all uploads)
 PINNING_SERVICE_ENDPOINT=${PINNING_SERVICE_ENDPOINT:-}
 PINNING_SERVICE_TOKEN=${PINNING_SERVICE_TOKEN:-}
+
+# Storage API for balance checking (optional)
+STORAGE_API_URL=${STORAGE_API_URL:-}
 EOF
 
     chmod 640 "${ENV_FILE}"
@@ -379,14 +387,8 @@ services:
     build:
       context: /opt/fula-api
       dockerfile: Dockerfile
-    environment:
-      - FULA_HOST=0.0.0.0
-      - FULA_PORT=${GATEWAY_PORT}
-      - IPFS_API_URL=http://localhost:5001
-      - CLUSTER_API_URL=http://localhost:9094
-      - JWT_SECRET=\${JWT_SECRET:-development-secret-change-in-production}
-      - FULA_NO_AUTH=\${FULA_NO_AUTH:-false}
-      - RUST_LOG=info,fula_cli=debug
+    env_file:
+      - .env
     volumes:
       - gateway-data:/var/lib/fula-gateway
     network_mode: host

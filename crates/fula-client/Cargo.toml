@@ -9,20 +9,12 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# Internal
-fula-crypto = { path = "../fula-crypto" }
-
-# HTTP client
-reqwest = { workspace = true }
-
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
 quick-xml = { workspace = true }
 
 # Async
-tokio = { workspace = true }
-async-trait = { workspace = true }
 futures = { workspace = true }
 
 # Time
@@ -36,10 +28,25 @@ tracing = { workspace = true }
 url = "2.5"
 base64 = { workspace = true }
 hex = { workspace = true }
-uuid = { workspace = true }
 mime_guess = "2.0"
 
+# Platform-specific dependencies
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Native: use default features (includes tokio-runtime)
+fula-crypto = { path = "../fula-crypto" }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# WASM: disable default features (no tokio), enable wasm feature
+fula-crypto = { path = "../fula-crypto", default-features = false, features = ["wasm"] }
+# For WASM: no default features, no stream (which pulls in tokio)
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# uuid needs js feature for WASM randomness
+uuid = { version = "1.11", features = ["v4", "serde", "js"] }
+
 [dev-dependencies]
+tokio = { workspace = true }
 tokio-test = "0.4"
 wiremock = { workspace = true }
 tempfile = { workspace = true }
@@ -48,5 +55,5 @@ tempfile = { workspace = true }
 default = []
 # Enable client-side encryption
 encryption = []
-# Enable WASM support for web browsers
-wasm = ["reqwest/rustls-tls"]
+# Enable WASM support for web browsers (automatic via target config)
+wasm = []

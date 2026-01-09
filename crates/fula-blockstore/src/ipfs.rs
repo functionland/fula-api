@@ -7,7 +7,7 @@ use cid::Cid;
 use reqwest::{Client, multipart};
 use serde::Deserialize;
 use std::time::Duration;
-use tracing::{instrument, warn};
+use tracing::{debug, instrument};
 
 /// Maximum size for a single IPFS block (slightly under 1MB to be safe)
 /// Data larger than this MUST use UnixFS chunking via /api/v0/add
@@ -138,10 +138,23 @@ impl IpfsBlockStore {
     }
 
     /// Get block by CID
+    ///
+    /// For raw blocks (codec 0x55), uses /api/v0/block/get directly.
+    /// For UnixFS/dag-pb blocks (codec 0x70), uses /api/v0/cat to traverse
+    /// the DAG and return the complete file content.
     #[instrument(skip(self))]
     pub async fn get_block_raw(&self, cid: &Cid) -> Result<Bytes> {
+        // DAG-PB codec (0x70) indicates a UnixFS file that may have been chunked.
+        // We must use /api/v0/cat to traverse the DAG and get the full content.
+        // Using block/get on a dag-pb CID returns only the protobuf metadata, not the file.
+        const DAG_PB_CODEC: u64 = 0x70;
+
+        if cid.codec() == DAG_PB_CODEC {
+            return self.cat_unixfs(cid).await;
+        }
+
         let url = format!("{}/api/v0/block/get?arg={}", self.config.api_url, cid);
-        
+
         let response = self.client.post(&url).send().await?;
 
         if !response.status().is_success() {
@@ -161,6 +174,33 @@ impl IpfsBlockStore {
             .map_err(|e| BlockStoreError::IpfsApi(e.to_string()))
     }
 
+    /// Retrieve UnixFS content by traversing the DAG
+    ///
+    /// Uses /api/v0/cat which automatically handles chunked files by
+    /// following links in the DAG structure and reassembling the content.
+    #[instrument(skip(self))]
+    async fn cat_unixfs(&self, cid: &Cid) -> Result<Bytes> {
+        let url = format!("{}/api/v0/cat?arg={}", self.config.api_url, cid);
+
+        let response = self.client.post(&url).send().await?;
+
+        if !response.status().is_success() {
+            if response.status().as_u16() == 404 {
+                return Err(BlockStoreError::NotFound(*cid));
+            }
+            let error = response.text().await.unwrap_or_default();
+            return Err(BlockStoreError::IpfsApi(format!(
+                "Failed to cat UnixFS content: {}",
+                error
+            )));
+        }
+
+        response
+            .bytes()
+            .await
+            .map_err(|e| BlockStoreError::IpfsApi(e.to_string()))
+    }
+
     /// Put a raw block
     /// Note: Raw blocks (file chunks) are NOT pinned inline to avoid timeouts.
     /// They are protected by the bucket root's recursive pin after flush_forest.
@@ -169,9 +209,10 @@ impl IpfsBlockStore {
     /// stored using UnixFS chunking via /api/v0/add instead of /api/v0/block/put.
     #[instrument(skip(self, data), fields(size = data.len()))]
     pub async fn put_block_raw(&self, data: &[u8]) -> Result<Cid> {
-        // CRITICAL: IPFS block/put has a 1MB limit. Use UnixFS add for larger data.
+        // IPFS block/put has a 1MB limit. Use UnixFS add for larger data.
+        // This is handled gracefully - retrieval uses /api/v0/cat for dag-pb CIDs.
         if data.len() > MAX_BLOCK_SIZE {
-            warn!(
+            debug!(
                 size = data.len(),
                 max = MAX_BLOCK_SIZE,
                 "Data exceeds IPFS block limit, using UnixFS chunking"
@@ -551,5 +592,81 @@ mod tests {
         let _ = store.put_block(&large).await.expect("unixfs add");
 
         add_mock.assert_hits_async(1).await;
+    }
+
+    #[tokio::test]
+    async fn get_block_uses_block_get_for_raw_cid() {
+        let server = MockServer::start_async().await;
+
+        // Mock /api/v0/id probe
+        let _id_mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/v0/id");
+                then.status(200).body("{}");
+            })
+            .await;
+
+        // Create a raw CID (codec 0x55)
+        let raw_cid = "bafkreigh2akiscaildc6v5q2xg34x5sqo5djznnha64x4jn3fjvu3j6jci";
+
+        // Expect block/get to be called for raw CIDs
+        let block_get = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/v0/block/get")
+                    .query_param("arg", raw_cid);
+                then.status(200).body("hello world");
+            })
+            .await;
+
+        let store = IpfsBlockStore::new(IpfsConfig::with_url(server.base_url()))
+            .await
+            .expect("ipfs store init");
+
+        let cid: Cid = raw_cid.parse().expect("parse cid");
+        let data = store.get_block(&cid).await.expect("get block");
+
+        assert_eq!(&data[..], b"hello world");
+        block_get.assert_hits_async(1).await;
+    }
+
+    #[tokio::test]
+    async fn get_block_uses_cat_for_dagpb_cid() {
+        let server = MockServer::start_async().await;
+
+        // Mock /api/v0/id probe
+        let _id_mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/v0/id");
+                then.status(200).body("{}");
+            })
+            .await;
+
+        // Create a dag-pb CID (codec 0x70)
+        // This is a CIDv1 with dag-pb codec - represents UnixFS chunked file
+        let dagpb_cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+
+        // Expect /api/v0/cat to be called for dag-pb CIDs (not block/get)
+        let cat_mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/v0/cat")
+                    .query_param("arg", dagpb_cid);
+                then.status(200).body("large file content reassembled from chunks");
+            })
+            .await;
+
+        let store = IpfsBlockStore::new(IpfsConfig::with_url(server.base_url()))
+            .await
+            .expect("ipfs store init");
+
+        let cid: Cid = dagpb_cid.parse().expect("parse cid");
+        // Verify this is indeed a dag-pb CID
+        assert_eq!(cid.codec(), 0x70, "CID should have dag-pb codec");
+
+        let data = store.get_block(&cid).await.expect("get block via cat");
+
+        assert_eq!(&data[..], b"large file content reassembled from chunks");
+        cat_mock.assert_hits_async(1).await;
     }
 }

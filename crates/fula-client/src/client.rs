@@ -24,11 +24,14 @@ impl FulaClient {
             config.user_agent.parse().unwrap(),
         );
 
-        let http = Client::builder()
-            .timeout(config.timeout)
-            .default_headers(headers)
-            .build()
-            .map_err(ClientError::Http)?;
+        let builder = Client::builder()
+            .default_headers(headers);
+
+        // Timeout is not supported on WASM
+        #[cfg(not(target_arch = "wasm32"))]
+        let builder = builder.timeout(config.timeout);
+
+        let http = builder.build().map_err(ClientError::Http)?;
 
         Ok(Self { config, http })
     }

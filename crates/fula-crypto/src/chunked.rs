@@ -373,14 +373,19 @@ pub fn should_use_chunked(size: usize) -> bool {
 // ═══════════════════════════════════════════════════════════════════════════
 // ASYNC STREAMING SUPPORT
 // True streaming with AsyncRead - processes data as it arrives
+// Only available with tokio-runtime feature (not WASM compatible)
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "tokio-runtime")]
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Async streaming encoder for large files
-/// 
+///
 /// Accepts an `AsyncRead` source and yields encrypted chunks as they're ready.
 /// Memory usage is O(chunk_size) regardless of file size.
+///
+/// Only available with `tokio-runtime` feature (not WASM compatible).
+#[cfg(feature = "tokio-runtime")]
 pub struct AsyncStreamingEncoder {
     dek: DekKey,
     chunk_size: usize,
@@ -390,6 +395,7 @@ pub struct AsyncStreamingEncoder {
     bytes_processed: u64,
 }
 
+#[cfg(feature = "tokio-runtime")]
 impl AsyncStreamingEncoder {
     /// Create a new async streaming encoder
     pub fn new(dek: DekKey) -> Self {
@@ -640,6 +646,7 @@ mod tests {
         assert!(should_use_chunked(100 * 1024 * 1024)); // 100 MB
     }
 
+    #[cfg(feature = "tokio-runtime")]
     #[tokio::test]
     async fn test_async_streaming_encoder() {
         let dek = DekKey::generate();
@@ -665,6 +672,7 @@ mod tests {
         assert_eq!(recovered.as_ref(), original.as_slice());
     }
 
+    #[cfg(feature = "tokio-runtime")]
     #[tokio::test]
     async fn test_verified_streaming_decoder() {
         let dek = DekKey::generate();
@@ -691,6 +699,7 @@ mod tests {
         assert!(verified);
     }
 
+    #[cfg(feature = "tokio-runtime")]
     #[tokio::test]
     async fn test_verified_decoder_detects_corruption() {
         let dek = DekKey::generate();

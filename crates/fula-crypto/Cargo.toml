@@ -8,6 +8,14 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["tokio-runtime"]
+# Enable WASM support (requires getrandom/js for browser randomness)
+# Note: wasm feature excludes tokio-runtime (incompatible)
+wasm = ["getrandom/js"]
+# Enable tokio-based async streaming (not WASM compatible)
+tokio-runtime = ["tokio", "async-trait"]
+
 [dependencies]
 # Core crypto
 blake3 = { workspace = true }
@@ -22,8 +30,9 @@ md-5 = { workspace = true }
 x25519-dalek = { workspace = true }
 ed25519-dalek = { workspace = true }
 
-# Post-Quantum Cryptography (NIST ML-KEM / Kyber)
-pqc_kyber = { version = "0.7", features = ["kyber768", "90s"] }
+# Post-Quantum Cryptography (NIST FIPS 203 ML-KEM)
+# Using Cryspen's formally verified implementation for WASM + native support
+libcrux-ml-kem = { version = "0.0.4", default-features = false, features = ["mlkem768"] }
 hkdf = "0.12"
 
 # Serialization
@@ -32,9 +41,9 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 
-# Async
-tokio = { workspace = true }
-async-trait = { workspace = true }
+# Async (tokio is optional for WASM compatibility)
+tokio = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
 futures = { workspace = true }
 
 # IPLD/CID

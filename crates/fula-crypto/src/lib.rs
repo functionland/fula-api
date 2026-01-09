@@ -84,7 +84,9 @@ pub mod streaming;
 pub mod subtree_keys;
 pub mod symmetric;
 
-pub use chunked::{ChunkedEncoder, ChunkedDecoder, ChunkedFileMetadata, EncryptedChunk, should_use_chunked, CHUNKED_THRESHOLD, AsyncStreamingEncoder, VerifiedStreamingDecoder};
+pub use chunked::{ChunkedEncoder, ChunkedDecoder, ChunkedFileMetadata, EncryptedChunk, should_use_chunked, CHUNKED_THRESHOLD, VerifiedStreamingDecoder};
+#[cfg(feature = "tokio-runtime")]
+pub use chunked::AsyncStreamingEncoder;
 pub use chunked::DEFAULT_CHUNK_SIZE as CHUNKED_DEFAULT_SIZE;
 pub use error::{CryptoError, Result};
 pub use hamt_index::{HamtIndex, HamtNode, ShardedIndex};

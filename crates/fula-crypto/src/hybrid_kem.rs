@@ -36,48 +36,17 @@
 
 use crate::{CryptoError, Result};
 use hkdf::Hkdf;
-use pqc_kyber::{
-    keypair as kyber_keypair,
-    encapsulate as kyber_encapsulate,
-    decapsulate as kyber_decapsulate,
-    KYBER_PUBLICKEYBYTES,
-    KYBER_SECRETKEYBYTES,
-    KYBER_CIPHERTEXTBYTES,
-    KYBER_SSBYTES,
+use libcrux_ml_kem::mlkem768::{
+    generate_key_pair as mlkem_generate_key_pair,
+    encapsulate as mlkem_encapsulate,
+    decapsulate as mlkem_decapsulate,
+    MlKem768PublicKey,
+    MlKem768PrivateKey,
+    MlKem768Ciphertext,
 };
-use rand::rngs::OsRng;
 use sha2::Sha256;
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public, StaticSecret};
+use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
-
-/// RNG wrapper that bridges getrandom to pqc_kyber's expected rand_core traits
-/// pqc_kyber re-exports rand_core 0.6 traits from rand crate
-struct KyberRng;
-
-impl pqc_kyber::RngCore for KyberRng {
-    fn next_u32(&mut self) -> u32 {
-        let mut buf = [0u8; 4];
-        getrandom::getrandom(&mut buf).expect("getrandom failed");
-        u32::from_le_bytes(buf)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).expect("getrandom failed");
-        u64::from_le_bytes(buf)
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        getrandom::getrandom(dest).expect("getrandom failed");
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> core::result::Result<(), rand::Error> {
-        getrandom::getrandom(dest)
-            .map_err(|_| rand::Error::new(std::io::Error::new(std::io::ErrorKind::Other, "getrandom failed")))
-    }
-}
-
-impl pqc_kyber::CryptoRng for KyberRng {}
 
 /// Size of the X25519 public key
 pub const X25519_PUBLIC_KEY_SIZE: usize = 32;
@@ -85,14 +54,14 @@ pub const X25519_PUBLIC_KEY_SIZE: usize = 32;
 /// Size of the X25519 secret key
 pub const X25519_SECRET_KEY_SIZE: usize = 32;
 
-/// Size of the ML-KEM-768 public key
-pub const MLKEM_PUBLIC_KEY_SIZE: usize = KYBER_PUBLICKEYBYTES;
+/// Size of the ML-KEM-768 public key (FIPS 203)
+pub const MLKEM_PUBLIC_KEY_SIZE: usize = 1184;
 
-/// Size of the ML-KEM-768 secret key  
-pub const MLKEM_SECRET_KEY_SIZE: usize = KYBER_SECRETKEYBYTES;
+/// Size of the ML-KEM-768 secret key (FIPS 203)
+pub const MLKEM_SECRET_KEY_SIZE: usize = 2400;
 
-/// Size of the ML-KEM-768 ciphertext
-pub const MLKEM_CIPHERTEXT_SIZE: usize = KYBER_CIPHERTEXTBYTES;
+/// Size of the ML-KEM-768 ciphertext (FIPS 203)
+pub const MLKEM_CIPHERTEXT_SIZE: usize = 1088;
 
 /// Size of the hybrid public key (X25519 + ML-KEM-768)
 pub const HYBRID_PUBLIC_KEY_SIZE: usize = X25519_PUBLIC_KEY_SIZE + MLKEM_PUBLIC_KEY_SIZE;
@@ -188,24 +157,34 @@ pub struct HybridSecretKey {
 impl HybridSecretKey {
     /// Generate a new random hybrid key pair
     pub fn generate() -> (Self, HybridPublicKey) {
-        // Generate X25519 keypair
-        let x25519_secret = StaticSecret::random_from_rng(OsRng);
+        // Generate X25519 keypair using getrandom (WASM compatible)
+        let mut x25519_bytes = [0u8; 32];
+        getrandom::getrandom(&mut x25519_bytes).expect("getrandom failed");
+        let x25519_secret = StaticSecret::from(x25519_bytes);
         let x25519_public = X25519Public::from(&x25519_secret);
-        
-        // Generate ML-KEM-768 keypair using pqc_kyber's internal RNG wrapper
-        let kyber_keys = kyber_keypair(&mut KyberRng)
-            .expect("Kyber keypair generation failed");
-        
+
+        // Generate ML-KEM-768 keypair using libcrux (FIPS 203)
+        // libcrux uses explicit 64-byte randomness instead of callback RNG
+        let mut keygen_randomness = [0u8; 64];
+        getrandom::getrandom(&mut keygen_randomness).expect("getrandom failed");
+        let mlkem_keypair = mlkem_generate_key_pair(keygen_randomness);
+
+        // Extract raw bytes from libcrux types
+        let mut mlkem_pk = [0u8; MLKEM_PUBLIC_KEY_SIZE];
+        let mut mlkem_sk = [0u8; MLKEM_SECRET_KEY_SIZE];
+        mlkem_pk.copy_from_slice(mlkem_keypair.public_key().as_ref());
+        mlkem_sk.copy_from_slice(mlkem_keypair.private_key().as_ref());
+
         let secret = Self {
             x25519: x25519_secret.to_bytes(),
-            mlkem: kyber_keys.secret,
+            mlkem: mlkem_sk,
         };
-        
+
         let public = HybridPublicKey {
             x25519: *x25519_public.as_bytes(),
-            mlkem: kyber_keys.public,
+            mlkem: mlkem_pk,
         };
-        
+
         (secret, public)
     }
     
@@ -372,30 +351,40 @@ impl std::fmt::Debug for HybridEncapsulatedKey {
 ///
 /// Returns the encapsulated key (to send to recipient) and the shared secret
 pub fn encapsulate(recipient_public: &HybridPublicKey) -> Result<(HybridEncapsulatedKey, [u8; SHARED_SECRET_SIZE])> {
-    // X25519: Generate ephemeral keypair and perform ECDH
-    let x25519_ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+    // X25519: Generate ephemeral keypair using getrandom (WASM compatible)
+    let mut ephemeral_bytes = [0u8; 32];
+    getrandom::getrandom(&mut ephemeral_bytes).expect("getrandom failed");
+    let x25519_ephemeral_secret = StaticSecret::from(ephemeral_bytes);
     let x25519_ephemeral_public = X25519Public::from(&x25519_ephemeral_secret);
     let x25519_recipient_public = X25519Public::from(recipient_public.x25519);
     let x25519_shared = x25519_ephemeral_secret.diffie_hellman(&x25519_recipient_public);
-    
-    // ML-KEM-768: Encapsulate using our RNG wrapper
-    let (mlkem_ciphertext, mlkem_shared) = kyber_encapsulate(&recipient_public.mlkem, &mut KyberRng)
-        .map_err(|e| CryptoError::Encryption(format!("ML-KEM encapsulation failed: {:?}", e)))?;
-    
+
+    // ML-KEM-768: Encapsulate using libcrux (FIPS 203)
+    // libcrux uses explicit 32-byte randomness instead of callback RNG
+    let mut encaps_randomness = [0u8; 32];
+    getrandom::getrandom(&mut encaps_randomness).expect("getrandom failed");
+
+    let mlkem_pk = MlKem768PublicKey::from(recipient_public.mlkem);
+    let (ct, mlkem_shared_secret) = mlkem_encapsulate(&mlkem_pk, encaps_randomness);
+
+    // Extract raw bytes from libcrux types
+    let mut mlkem_ciphertext = [0u8; MLKEM_CIPHERTEXT_SIZE];
+    mlkem_ciphertext.copy_from_slice(ct.as_ref());
+
     // Combine shared secrets using HKDF-SHA256
     // IKM = X25519_shared || ML-KEM_shared
-    let mut ikm = Vec::with_capacity(32 + KYBER_SSBYTES);
+    let mut ikm = Vec::with_capacity(32 + SHARED_SECRET_SIZE);
     ikm.extend_from_slice(x25519_shared.as_bytes());
-    ikm.extend_from_slice(&mlkem_shared);
-    
+    ikm.extend_from_slice(&mlkem_shared_secret);
+
     let hk = Hkdf::<Sha256>::new(None, &ikm);
     let mut shared_secret = [0u8; SHARED_SECRET_SIZE];
     hk.expand(HKDF_INFO, &mut shared_secret)
         .map_err(|e| CryptoError::Encryption(format!("HKDF expansion failed: {:?}", e)))?;
-    
+
     // Zero out intermediate secrets
     ikm.zeroize();
-    
+
     let encapsulated = HybridEncapsulatedKey {
         x25519_ephemeral: *x25519_ephemeral_public.as_bytes(),
         mlkem_ciphertext,
@@ -418,24 +407,26 @@ pub fn decapsulate(
     let x25519_secret = StaticSecret::from(recipient_secret.x25519);
     let x25519_ephemeral_public = X25519Public::from(encapsulated.x25519_ephemeral);
     let x25519_shared = x25519_secret.diffie_hellman(&x25519_ephemeral_public);
-    
-    // ML-KEM-768: Decapsulate
-    let mlkem_shared = kyber_decapsulate(&encapsulated.mlkem_ciphertext, &recipient_secret.mlkem)
-        .map_err(|e| CryptoError::Decryption(format!("ML-KEM decapsulation failed: {:?}", e)))?;
-    
+
+    // ML-KEM-768: Decapsulate using libcrux (FIPS 203)
+    // Note: libcrux argument order is (private_key, ciphertext) - swapped from pqc_kyber
+    let mlkem_sk = MlKem768PrivateKey::from(recipient_secret.mlkem);
+    let mlkem_ct = MlKem768Ciphertext::from(encapsulated.mlkem_ciphertext);
+    let mlkem_shared_secret = mlkem_decapsulate(&mlkem_sk, &mlkem_ct);
+
     // Combine shared secrets using HKDF-SHA256 (same as encapsulation)
-    let mut ikm = Vec::with_capacity(32 + KYBER_SSBYTES);
+    let mut ikm = Vec::with_capacity(32 + SHARED_SECRET_SIZE);
     ikm.extend_from_slice(x25519_shared.as_bytes());
-    ikm.extend_from_slice(&mlkem_shared);
-    
+    ikm.extend_from_slice(&mlkem_shared_secret);
+
     let hk = Hkdf::<Sha256>::new(None, &ikm);
     let mut shared_secret = [0u8; SHARED_SECRET_SIZE];
     hk.expand(HKDF_INFO, &mut shared_secret)
         .map_err(|e| CryptoError::Decryption(format!("HKDF expansion failed: {:?}", e)))?;
-    
+
     // Zero out intermediate secrets
     ikm.zeroize();
-    
+
     Ok(shared_secret)
 }
 
