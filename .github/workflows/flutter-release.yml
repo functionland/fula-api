@@ -121,7 +121,13 @@ jobs:
           EOF
 
       - name: Build
-        run: cargo build -p fula-flutter --target ${{ matrix.target }} --release
+        run: |
+          # Set CC and AR for ring/rustls cross-compilation
+          # Convert target name to env var format (replace - with _)
+          TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
+          export CC_${TARGET_ENV}="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target }}24-clang"
+          export AR_${TARGET_ENV}="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          cargo build -p fula-flutter --target ${{ matrix.target }} --release
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
