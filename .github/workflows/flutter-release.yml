@@ -62,6 +62,10 @@ jobs:
           mkdir -p packages/fula_client/android/src/main/jniLibs
           mkdir -p packages/fula_client/ios
 
+      - name: Install dependencies
+        working-directory: packages/fula_client
+        run: flutter pub get
+
       - name: Generate Dart bindings
         run: |
           # flutter_rust_bridge v2 - use config file from repo root
