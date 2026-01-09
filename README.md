@@ -435,6 +435,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 ~/fula-api# git pull
 ~/fula-api# rsync -a --delete /root/fula-api/ /opt/fula-api/
 ~/fula-api# cp docker-compose.yml /etc/fula/
+cd /opt/fula-api
 /opt/fula-api# docker-compose -f /etc/fula/docker-compose.yml build --no-cache gateway
 systemctl restart fula-gateway
 ```
