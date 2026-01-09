@@ -1,7 +1,8 @@
 # flutter_rust_bridge v2 configuration
 # https://cjycode.com/flutter_rust_bridge/
 
-rust_input: crates/fula-flutter/src/api/mod.rs
+# v2 syntax: rust_input is a module path, not a file path
+rust_input: crate::api
 rust_root: crates/fula-flutter
 dart_output: packages/fula_client/lib/src
 

@@ -88,16 +88,9 @@ jobs:
       - name: Generate bindings (dry run)
         run: |
           mkdir -p packages/fula_client/lib/src
-          # flutter_rust_bridge v2 - use config file if available, else CLI args
-          if [ -f flutter_rust_bridge.yaml ]; then
-            flutter_rust_bridge_codegen generate || echo "Codegen completed (some warnings expected)"
-          else
-            flutter_rust_bridge_codegen generate \
-              --rust-input crates/fula-flutter/src/api/mod.rs \
-              --rust-root crates/fula-flutter \
-              --dart-output packages/fula_client/lib/src \
-              || echo "Codegen completed (some warnings expected)"
-          fi
+          # flutter_rust_bridge v2 - use config file (flutter_rust_bridge.yaml)
+          # v2 syntax: rust_input is module path like "crate::api", not file path
+          flutter_rust_bridge_codegen generate || echo "Codegen completed (some warnings expected)"
 
       - name: Verify generated files exist
         run: |
