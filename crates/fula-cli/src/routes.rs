@@ -26,6 +26,20 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     // Public routes that must bypass auth (e.g., container health checks)
     let public = Router::new().route("/healthz", get(handlers::healthz));
 
+    // Admin routes (protected by admin middleware)
+    let admin = Router::new()
+        .route("/admin/users/{user_id}/buckets", get(handlers::list_user_buckets))
+        .route("/admin/users/{user_id}", delete(handlers::delete_user))
+        .route("/admin/pins/{cid}", delete(handlers::unpin_cid))
+        .route("/admin/gc", post(handlers::trigger_gc))
+        .layer(axum_middleware::from_fn(middleware::request_id_middleware))
+        .layer(axum_middleware::from_fn(middleware::logging_middleware))
+        .layer(axum_middleware::from_fn_with_state(
+            Arc::clone(&state),
+            middleware::admin_auth_middleware,
+        ))
+        .with_state(state.clone());
+
     // Private (authenticated) routes
     let private = Router::new()
         // Service endpoints
@@ -62,9 +76,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         ))
         .with_state(state.clone());
 
-    // Combine public and private, then apply shared layers
+    // Combine public, admin, and private, then apply shared layers
     Router::new()
         .merge(public)
+        .merge(admin)
         .merge(private)
         .layer(cors)
         .layer(TraceLayer::new_for_http())

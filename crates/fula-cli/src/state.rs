@@ -183,3 +183,27 @@ impl UserSession {
         self.hashed_user_id == bucket_owner_id || self.is_admin()
     }
 }
+
+/// Admin session information
+#[derive(Clone, Debug)]
+pub struct AdminSession {
+    /// Admin ID (from JWT sub claim)
+    pub admin_id: String,
+    /// Expiration time
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl AdminSession {
+    /// Create a new admin session
+    pub fn new(admin_id: String, expires_at: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            admin_id,
+            expires_at,
+        }
+    }
+
+    /// Check if the session has expired
+    pub fn is_expired(&self) -> bool {
+        chrono::Utc::now() > self.expires_at
+    }
+}

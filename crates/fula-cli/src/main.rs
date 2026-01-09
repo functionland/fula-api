@@ -52,6 +52,14 @@ struct Args {
     /// Disable authentication (for development only!)
     #[arg(long, env = "FULA_NO_AUTH")]
     no_auth: bool,
+
+    /// Admin JWT secret for admin API authentication (separate from user JWT)
+    #[arg(long, env = "ADMIN_JWT_SECRET")]
+    admin_jwt_secret: Option<String>,
+
+    /// Enable admin API endpoints
+    #[arg(long, env = "FULA_ADMIN_API")]
+    admin_api: bool,
 }
 
 #[tokio::main]
@@ -95,6 +103,14 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("⚠️  Authentication is DISABLED - for development only!");
     }
 
+    if args.admin_api {
+        if args.admin_jwt_secret.is_some() {
+            tracing::info!("Admin API: enabled");
+        } else {
+            tracing::warn!("⚠️  Admin API enabled but ADMIN_JWT_SECRET not set - admin endpoints will reject all requests");
+        }
+    }
+
     // Build configuration
     let config = GatewayConfig {
         host: args.host,
@@ -107,6 +123,8 @@ async fn main() -> anyhow::Result<()> {
         use_memory_store: args.memory_store,
         jwt_secret: args.jwt_secret,
         auth_enabled: !args.no_auth,
+        admin_jwt_secret: args.admin_jwt_secret,
+        admin_api_enabled: args.admin_api,
         ..Default::default()
     };
 

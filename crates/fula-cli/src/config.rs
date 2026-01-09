@@ -39,6 +39,10 @@ pub struct GatewayConfig {
     pub registry_cid_path: Option<String>,
     /// Storage API URL for balance/quota checking before uploads
     pub storage_api_url: Option<String>,
+    /// Admin JWT secret for admin API authentication (separate from user JWT)
+    pub admin_jwt_secret: Option<String>,
+    /// Enable admin API endpoints
+    pub admin_api_enabled: bool,
 }
 
 impl Default for GatewayConfig {
@@ -61,6 +65,8 @@ impl Default for GatewayConfig {
             cors_origins: vec!["*".to_string()],
             registry_cid_path: Some("/var/lib/fula-gateway/registry.cid".to_string()),
             storage_api_url: None,
+            admin_jwt_secret: None,
+            admin_api_enabled: false,
         }
     }
 }

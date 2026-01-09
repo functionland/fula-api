@@ -340,6 +340,63 @@ pub fn extract_token_from_header(auth_header: &str, headers: &HeaderMap) -> Resu
     ))
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADMIN AUTHENTICATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Admin JWT claims structure
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminClaims {
+    /// Subject (admin user ID)
+    pub sub: String,
+    /// Expiration time (required for admin tokens)
+    pub exp: Option<i64>,
+    /// Issued at
+    pub iat: Option<i64>,
+    /// Scope (must include "admin" or "*")
+    #[serde(default)]
+    pub scope: String,
+}
+
+impl AdminClaims {
+    /// Check if this token has admin privileges
+    pub fn is_valid_admin(&self) -> bool {
+        self.scope
+            .split_whitespace()
+            .any(|s| s == "admin" || s == "*")
+    }
+}
+
+/// Validate an admin JWT token and extract claims
+pub fn validate_admin_token(token: &str, secret: &str) -> Result<AdminClaims, ApiError> {
+    let key = DecodingKey::from_secret(secret.as_bytes());
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = true; // Admin tokens MUST have valid expiration
+    validation.leeway = 60; // 1 minute leeway for clock skew
+
+    let claims = decode::<AdminClaims>(token, &key, &validation)
+        .map(|data| data.claims)
+        .map_err(|e| {
+            tracing::debug!("Admin token validation failed: {}", e);
+            ApiError::s3(S3ErrorCode::InvalidToken, "Invalid or expired admin token")
+        })?;
+
+    // Verify admin scope
+    if !claims.is_valid_admin() {
+        tracing::warn!(
+            admin_id = %claims.sub,
+            scope = %claims.scope,
+            "Admin token missing required 'admin' scope"
+        );
+        return Err(ApiError::s3(
+            S3ErrorCode::AccessDenied,
+            "Token does not have admin privileges",
+        ));
+    }
+
+    Ok(claims)
+}
+
 /// Hash a user ID for storage (privacy)
 pub fn hash_user_id(user_id: &str) -> String {
     use fula_crypto::hashing::hash;

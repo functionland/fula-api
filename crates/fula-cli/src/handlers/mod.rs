@@ -1,5 +1,6 @@
 //! S3 API request handlers
 
+pub mod admin;
 pub mod batch;
 pub mod bucket;
 pub mod multipart;
@@ -7,6 +8,7 @@ pub mod object;
 pub mod service;
 pub mod tagging;
 
+pub use admin::*;
 pub use batch::*;
 pub use bucket::*;
 pub use multipart::*;

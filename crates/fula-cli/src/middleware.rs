@@ -8,8 +8,9 @@
 //! by embedding the JWT in the access key with a `JWT:` prefix.
 
 use crate::{ApiError, S3ErrorCode, AppState};
-use crate::auth::{extract_token_from_header, validate_token, claims_to_session, dev_session};
-use crate::state::UserSession;
+use crate::auth::{extract_token_from_header, validate_token, claims_to_session, dev_session, extract_bearer_token, validate_admin_token};
+use crate::state::{UserSession, AdminSession};
+use chrono::{DateTime, Utc};
 use axum::{
     body::Body,
     extract::State,
@@ -81,6 +82,80 @@ pub async fn auth_middleware(
     }
 
     // Store session in request extensions
+    request.extensions_mut().insert(session);
+
+    Ok(next.run(request).await)
+}
+
+/// Admin authentication middleware
+///
+/// Validates admin JWT tokens using a separate secret from user JWT.
+/// Admin tokens must have:
+/// - Valid expiration (exp claim)
+/// - Admin scope ("admin" or "*")
+///
+/// The admin API must be explicitly enabled via FULA_ADMIN_API=true.
+pub async fn admin_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Result<Response, ApiError> {
+    // Check if admin API is enabled
+    if !state.config.admin_api_enabled {
+        tracing::warn!("Admin API request rejected: admin API is not enabled");
+        return Err(ApiError::s3(
+            S3ErrorCode::AccessDenied,
+            "Admin API is not enabled",
+        ));
+    }
+
+    // Get admin JWT secret
+    let admin_secret = state.config.admin_jwt_secret.as_ref()
+        .ok_or_else(|| {
+            tracing::error!("Admin API enabled but ADMIN_JWT_SECRET not configured");
+            ApiError::s3(S3ErrorCode::InternalError, "Admin API not properly configured")
+        })?;
+
+    // Extract token from Authorization header (Bearer only for admin)
+    let auth_header = request
+        .headers()
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .ok_or_else(|| ApiError::s3(
+            S3ErrorCode::AccessDenied,
+            "Admin authentication required. Use 'Bearer <admin_jwt>'"
+        ))?;
+
+    let token = extract_bearer_token(auth_header)
+        .ok_or_else(|| ApiError::s3(
+            S3ErrorCode::InvalidToken,
+            "Invalid Authorization header. Use 'Bearer <admin_jwt>'"
+        ))?;
+
+    // Validate admin token
+    let claims = validate_admin_token(token, admin_secret)?;
+
+    // Create admin session
+    let expires_at = claims.exp
+        .and_then(|exp| DateTime::from_timestamp(exp, 0))
+        .unwrap_or_else(|| Utc::now());
+
+    let session = AdminSession::new(claims.sub.clone(), expires_at);
+
+    // Check session expiration
+    if session.is_expired() {
+        return Err(ApiError::s3(S3ErrorCode::InvalidToken, "Admin token has expired"));
+    }
+
+    // Log admin action
+    tracing::info!(
+        admin_id = %claims.sub,
+        path = %request.uri().path(),
+        method = %request.method(),
+        "Admin API request"
+    );
+
+    // Store admin session in request extensions
     request.extensions_mut().insert(session);
 
     Ok(next.run(request).await)
