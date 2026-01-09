@@ -10,6 +10,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, Copy)]
 pub enum S3ErrorCode {
     AccessDenied,
+    AccountProblem,
     BucketAlreadyExists,
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
@@ -37,6 +38,7 @@ pub enum S3ErrorCode {
     PreconditionFailed,
     RequestTimeout,
     RequestTimeTooSkewed,
+    ServiceUnavailable,
     SignatureDoesNotMatch,
     SlowDown,
     TooManyBuckets,
@@ -47,6 +49,7 @@ impl S3ErrorCode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AccessDenied => "AccessDenied",
+            Self::AccountProblem => "AccountProblem",
             Self::BucketAlreadyExists => "BucketAlreadyExists",
             Self::BucketAlreadyOwnedByYou => "BucketAlreadyOwnedByYou",
             Self::BucketNotEmpty => "BucketNotEmpty",
@@ -74,6 +77,7 @@ impl S3ErrorCode {
             Self::PreconditionFailed => "PreconditionFailed",
             Self::RequestTimeout => "RequestTimeout",
             Self::RequestTimeTooSkewed => "RequestTimeTooSkewed",
+            Self::ServiceUnavailable => "ServiceUnavailable",
             Self::SignatureDoesNotMatch => "SignatureDoesNotMatch",
             Self::SlowDown => "SlowDown",
             Self::TooManyBuckets => "TooManyBuckets",
@@ -83,7 +87,7 @@ impl S3ErrorCode {
     /// Get the HTTP status code
     pub fn status_code(&self) -> StatusCode {
         match self {
-            Self::AccessDenied => StatusCode::FORBIDDEN,
+            Self::AccessDenied | Self::AccountProblem => StatusCode::FORBIDDEN,
             Self::BucketAlreadyExists | Self::BucketAlreadyOwnedByYou => StatusCode::CONFLICT,
             Self::BucketNotEmpty => StatusCode::CONFLICT,
             Self::EntityTooLarge | Self::EntityTooSmall => StatusCode::BAD_REQUEST,
@@ -107,6 +111,7 @@ impl S3ErrorCode {
             Self::OperationAborted | Self::PreconditionFailed => StatusCode::CONFLICT,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::RequestTimeTooSkewed => StatusCode::FORBIDDEN,
+            Self::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::SlowDown => StatusCode::TOO_MANY_REQUESTS,
             Self::TooManyBuckets => StatusCode::BAD_REQUEST,
         }

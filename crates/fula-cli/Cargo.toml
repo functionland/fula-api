@@ -72,6 +72,9 @@ clap = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 
+# HTTP client (for balance check API)
+reqwest = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 test-log = { workspace = true }

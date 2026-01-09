@@ -10,7 +10,11 @@
 use axum::http::HeaderMap;
 use cid::Cid;
 use fula_blockstore::{Pin, PinningServiceClient, PinningServiceConfig};
-use tracing::{info, warn};
+use serde::Deserialize;
+use std::time::Duration;
+use tracing::{debug, info, warn};
+
+use crate::ApiError;
 
 /// Header name for pinning service endpoint
 pub const HEADER_PINNING_SERVICE: &str = "x-pinning-service";
@@ -267,6 +271,100 @@ pub async fn unpin_for_user(headers: &HeaderMap, cid: &Cid) {
             }
         });
     }
+}
+
+/// Get a header value, checking the direct header first, then the x-amz-meta-* prefixed version
+fn get_pinning_header(headers: &HeaderMap, direct: &str, amz_meta: &str) -> Option<String> {
+    headers
+        .get(direct)
+        .or_else(|| headers.get(amz_meta))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Response from storage API balance check
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StorageStatus {
+    can_upload: bool,
+    // Other fields are ignored
+}
+
+/// Check if user can upload (has sufficient balance/quota)
+///
+/// This function checks the user's storage quota/balance by calling the storage API.
+/// It should be called BEFORE storing data to avoid storing data that can't be pinned.
+///
+/// Returns:
+/// - `Ok(true)` if upload is allowed
+/// - `Ok(false)` if upload is not allowed (insufficient credits)
+/// - `Err(...)` if there was an API error (caller should decide how to handle)
+///
+/// If no storage_api_url is configured or no pinning token is provided, returns `Ok(true)`
+/// to allow local-only uploads without balance checking.
+pub async fn check_can_upload(
+    headers: &HeaderMap,
+    storage_api_url: Option<&str>,
+) -> Result<bool, ApiError> {
+    // If no storage API configured, skip check (allow upload)
+    let api_url = match storage_api_url {
+        Some(url) => url,
+        None => return Ok(true),
+    };
+
+    // Get token from headers (same headers as pinning)
+    let token = match get_pinning_header(headers, HEADER_PINNING_TOKEN, HEADER_AMZ_PINNING_TOKEN) {
+        Some(t) => t,
+        None => {
+            debug!("No pinning token provided, skipping balance check");
+            return Ok(true); // No token = no remote pinning = skip check
+        }
+    };
+
+    // Build the storage API URL
+    let url = format!("{}/api/v1/storage", api_url.trim_end_matches('/'));
+    debug!(url = %url, "Checking storage balance");
+
+    // Call storage API
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Failed to check storage balance");
+            // Fail open: allow upload if we can't reach the balance service
+            // Return Ok(true) instead of error to avoid blocking users
+        });
+
+    let response = match response {
+        Ok(r) => r,
+        Err(_) => {
+            warn!("Balance check failed, allowing upload (fail-open)");
+            return Ok(true);
+        }
+    };
+
+    if !response.status().is_success() {
+        warn!(status = %response.status(), "Storage API returned error, allowing upload (fail-open)");
+        return Ok(true);
+    }
+
+    let status: StorageStatus = match response.json().await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "Failed to parse storage status, allowing upload (fail-open)");
+            return Ok(true);
+        }
+    };
+
+    if !status.can_upload {
+        info!("User cannot upload: insufficient credits or quota exceeded");
+    }
+
+    Ok(status.can_upload)
 }
 
 #[cfg(test)]

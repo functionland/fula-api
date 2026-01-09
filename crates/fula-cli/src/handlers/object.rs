@@ -1,6 +1,6 @@
 //! Object operation handlers
 
-use crate::pinning::pin_for_user;
+use crate::pinning::{check_can_upload, pin_for_user};
 use crate::{AppState, ApiError, S3ErrorCode};
 use crate::state::UserSession;
 use crate::xml;
@@ -28,6 +28,19 @@ pub async fn put_object(
 ) -> Result<Response, ApiError> {
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
+    }
+
+    // Check balance BEFORE storing data (if remote pinning is configured)
+    let can_upload = check_can_upload(
+        &headers,
+        state.config.storage_api_url.as_deref(),
+    ).await?;
+
+    if !can_upload {
+        return Err(ApiError::s3(
+            S3ErrorCode::AccountProblem,
+            "Insufficient credits. Please add FULA credits to continue.",
+        ));
     }
 
     // Store the data

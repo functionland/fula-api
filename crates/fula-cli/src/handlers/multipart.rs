@@ -1,7 +1,7 @@
 //! Multipart upload handlers
 
 use crate::{AppState, ApiError, S3ErrorCode};
-use crate::pinning::pin_for_user;
+use crate::pinning::{check_can_upload, pin_for_user};
 use crate::state::UserSession;
 use crate::multipart::UploadPart;
 use crate::xml;
@@ -146,6 +146,19 @@ pub async fn complete_multipart_upload(
 ) -> Result<Response, ApiError> {
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
+    }
+
+    // Check balance BEFORE completing the upload (if remote pinning is configured)
+    let can_upload = check_can_upload(
+        &headers,
+        state.config.storage_api_url.as_deref(),
+    ).await?;
+
+    if !can_upload {
+        return Err(ApiError::s3(
+            S3ErrorCode::AccountProblem,
+            "Insufficient credits. Please add FULA credits to continue.",
+        ));
     }
 
     let upload_id = params.upload_id

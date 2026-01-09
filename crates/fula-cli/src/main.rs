@@ -33,6 +33,10 @@ struct Args {
     #[arg(long, env = "PINNING_SERVICE_TOKEN")]
     pinning_service_token: Option<String>,
 
+    /// Storage API URL for balance/quota checking (e.g., https://cloud.fx.land)
+    #[arg(long, env = "STORAGE_API_URL")]
+    storage_api_url: Option<String>,
+
     /// Use in-memory storage (for testing, data will not persist)
     #[arg(long, env = "FULA_MEMORY_STORE")]
     memory_store: bool,
@@ -79,6 +83,10 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Cluster API: {}", args.cluster_url);
     }
 
+    if let Some(ref storage_url) = args.storage_api_url {
+        tracing::info!("Storage API (balance check): {}", storage_url);
+    }
+
     if args.memory_store {
         tracing::warn!("⚠️  Using in-memory storage - data will NOT persist!");
     }
@@ -95,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
         cluster_url: args.cluster_url,
         pinning_service_endpoint: args.pinning_service_endpoint,
         pinning_service_token: args.pinning_service_token,
+        storage_api_url: args.storage_api_url,
         use_memory_store: args.memory_store,
         jwt_secret: args.jwt_secret,
         auth_enabled: !args.no_auth,
