@@ -62,6 +62,11 @@ jobs:
           mkdir -p packages/fula_client/android/src/main/jniLibs
           mkdir -p packages/fula_client/ios
 
+      - name: Clean old generated files
+        run: |
+          rm -f packages/fula_client/lib/src/frb_generated*.dart
+          rm -f packages/fula_client/lib/src/api/*.freezed.dart
+
       - name: Install dependencies
         working-directory: packages/fula_client
         run: flutter pub get
@@ -70,6 +75,16 @@ jobs:
         run: |
           # flutter_rust_bridge v2 - use config file from repo root
           flutter_rust_bridge_codegen generate
+
+      - name: Verify generated files
+        run: |
+          echo "=== Generated files ==="
+          ls -la packages/fula_client/lib/src/
+          echo "=== Checking frb_generated.dart ==="
+          head -100 packages/fula_client/lib/src/frb_generated.dart || true
+          echo "=== Checking for wire methods ==="
+          grep -c "wire__" packages/fula_client/lib/src/frb_generated.io.dart || echo "No wire methods in io.dart"
+          grep -c "wire__" packages/fula_client/lib/src/frb_generated.web.dart || echo "No wire methods in web.dart"
 
       - name: Update version in pubspec.yaml
         run: |

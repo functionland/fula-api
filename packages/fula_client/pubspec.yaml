@@ -7,8 +7,8 @@ issue_tracker: https://github.com/functionland/fula-api/issues
 documentation: https://functionland.github.io/fula-api/
 
 environment:
-  sdk: '>=3.0.0 <4.0.0'
-  flutter: '>=3.0.0'
+  sdk: '>=3.3.0 <4.0.0'
+  flutter: '>=3.19.0'
 
 dependencies:
   flutter:
