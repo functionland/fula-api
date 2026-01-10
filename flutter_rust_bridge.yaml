@@ -1,16 +1,17 @@
 # flutter_rust_bridge v2 configuration
 # https://cjycode.com/flutter_rust_bridge/
 
-# v2 syntax: rust_input is a module path, not a file path
+# Rust input module path (v2 syntax)
 rust_input: crate::api
+
+# Rust crate directory
 rust_root: crates/fula-flutter
+
+# Dart output directory
 dart_output: packages/fula_client/lib/src
 
-# Generate for both FFI (mobile) and WASM (web)
-web: true
-
-# Use Dart 3 features
-dart3: true
-
-# Generate full dependencies
+# Full dependency mode
 full_dep: true
+
+# Dump intermediate info for debugging
+dump_all: true
