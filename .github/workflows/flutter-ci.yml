@@ -132,6 +132,7 @@ jobs:
           targets: aarch64-linux-android
 
       - name: Setup Android NDK
+        id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r25c
@@ -141,12 +142,14 @@ jobs:
 
       - name: Configure Cargo for Android
         run: |
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
           echo "[target.aarch64-linux-android]" >> ~/.cargo/config.toml
-          echo "linker = \"$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang\"" >> ~/.cargo/config.toml
+          echo "linker = \"$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang\"" >> ~/.cargo/config.toml
 
       - name: Build for Android (arm64)
         run: |
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
           # Set CC and AR for ring/rustls cross-compilation
-          export CC_aarch64_linux_android="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
-          export AR_aarch64_linux_android="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          export CC_aarch64_linux_android="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
           cargo build -p fula-flutter --target aarch64-linux-android --release

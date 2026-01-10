@@ -107,6 +107,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Setup Android NDK
+        id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r25c
@@ -118,19 +119,21 @@ jobs:
 
       - name: Configure Cargo for Android
         run: |
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
           mkdir -p ~/.cargo
           cat >> ~/.cargo/config.toml << EOF
           [target.${{ matrix.target }}]
-          linker = "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target }}24-clang"
+          linker = "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target }}24-clang"
           EOF
 
       - name: Build
         run: |
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
           # Set CC and AR for ring/rustls cross-compilation
           # Convert target name to env var format (replace - with _)
           TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
-          export CC_${TARGET_ENV}="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target }}24-clang"
-          export AR_${TARGET_ENV}="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          export CC_${TARGET_ENV}="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target }}24-clang"
+          export AR_${TARGET_ENV}="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
           cargo build -p fula-flutter --target ${{ matrix.target }} --release
 
       - name: Upload artifact
