@@ -56,13 +56,35 @@ impl Default for EncryptionConfig {
 }
 
 /// Obfuscation mode for file name privacy
+///
+/// Controls how file paths are obfuscated before sending to the server.
+/// This affects what the server can learn about your file structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ObfuscationMode {
-    /// Same input always produces same output (allows deduplication)
+    /// Hash the key with a secret prefix (deterministic - same key = same hash)
+    /// Allows server-side deduplication but reveals if same file uploaded twice.
+    /// Server sees: `e/a7c3f9b2e8d14a6f` (reveals "e/" prefix)
     #[default]
     Deterministic,
-    /// Random obfuscation (maximum privacy)
+    /// Random UUID for each upload (non-deterministic)
+    /// Maximum privacy but no dedup.
+    /// Server sees: `e/random-uuid-here`
     Random,
+    /// Flat namespace - complete structure hiding (RECOMMENDED)
+    ///
+    /// Inspired by WNFS and Peergos:
+    /// - All keys look like random CID-style hashes
+    /// - No prefixes or structure hints
+    /// - File tree stored in encrypted index (PrivateForest)
+    /// - Server cannot determine folder structure, parent/child relationships
+    ///
+    /// Server sees: `QmX7a8f3e2d1c9b4a5e6f7d8c9a0b1e2f3a4b5c6d7e8f9`
+    FlatNamespace,
+    /// Preserve path structure but hash filenames
+    /// e.g., "/photos/vacation/" + hash(filename)
+    /// Allows folder-like organization while hiding filenames.
+    /// Server sees: `/photos/vacation/e_a7c3f9b2`
+    PreserveStructure,
 }
 
 /// Configuration for IPFS pinning service

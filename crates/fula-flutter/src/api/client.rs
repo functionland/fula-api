@@ -69,6 +69,12 @@ pub fn create_encrypted_client(
         ObfuscationMode::Random => {
             enc_config.with_obfuscation_mode(fula_client::KeyObfuscation::RandomUuid)
         }
+        ObfuscationMode::FlatNamespace => {
+            enc_config.with_obfuscation_mode(fula_client::KeyObfuscation::FlatNamespace)
+        }
+        ObfuscationMode::PreserveStructure => {
+            enc_config.with_obfuscation_mode(fula_client::KeyObfuscation::PreserveStructure)
+        }
     };
 
     let client = fula_client::EncryptedClient::new(inner_config, enc_config)?;
@@ -110,6 +116,20 @@ pub fn create_encrypted_client_with_pinning(
     };
 
     let enc_config = enc_config.with_metadata_privacy(encryption.enable_metadata_privacy);
+    let enc_config = match encryption.obfuscation_mode {
+        ObfuscationMode::Deterministic => {
+            enc_config.with_obfuscation_mode(fula_client::KeyObfuscation::DeterministicHash)
+        }
+        ObfuscationMode::Random => {
+            enc_config.with_obfuscation_mode(fula_client::KeyObfuscation::RandomUuid)
+        }
+        ObfuscationMode::FlatNamespace => {
+            enc_config.with_obfuscation_mode(fula_client::KeyObfuscation::FlatNamespace)
+        }
+        ObfuscationMode::PreserveStructure => {
+            enc_config.with_obfuscation_mode(fula_client::KeyObfuscation::PreserveStructure)
+        }
+    };
 
     let pinning_creds = fula_client::PinningCredentials::new(
         pinning.endpoint,

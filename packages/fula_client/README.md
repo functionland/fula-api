@@ -37,9 +37,10 @@ Future<void> main() async {
     accessToken: 'your-jwt-token',
   );
 
+  // FlatNamespace is RECOMMENDED for maximum privacy
   final encConfig = EncryptionConfig(
     enableMetadataPrivacy: true,
-    obfuscationMode: ObfuscationMode.deterministic,
+    obfuscationMode: ObfuscationMode.flatNamespace,
   );
 
   final client = await createEncryptedClient(config, encConfig);
@@ -133,6 +134,39 @@ application/wasm
 - `exportSecretKey(client)` - Export encryption key for backup
 - `createRotationManager(client)` - Create key rotation manager
 - `rotateBucket(client, bucket, manager)` - Rotate all keys in bucket
+
+## Obfuscation Modes
+
+The SDK supports 4 obfuscation modes for metadata privacy:
+
+| Mode | Server Sees | Privacy Level | Use Case |
+|------|-------------|---------------|----------|
+| `flatNamespace` | `QmX7a8f3e2d1c9b4...` | **Highest** | Default, recommended |
+| `deterministic` | `e/a7c3f9b2e8d14a6f` | Medium | Server deduplication |
+| `random` | `e/random-uuid-here` | High | Max privacy, no dedup |
+| `preserveStructure` | `/photos/vacation/e_a7c3` | Low | Folder organization |
+
+```dart
+// FlatNamespace (RECOMMENDED) - complete structure hiding
+final encConfig = EncryptionConfig(
+  obfuscationMode: ObfuscationMode.flatNamespace,
+);
+
+// Deterministic - same file = same hash (allows deduplication)
+final encConfig = EncryptionConfig(
+  obfuscationMode: ObfuscationMode.deterministic,
+);
+
+// Random - new UUID for each upload (maximum privacy)
+final encConfig = EncryptionConfig(
+  obfuscationMode: ObfuscationMode.random,
+);
+
+// PreserveStructure - keep folder paths, hash filenames
+final encConfig = EncryptionConfig(
+  obfuscationMode: ObfuscationMode.preserveStructure,
+);
+```
 
 ## Documentation
 

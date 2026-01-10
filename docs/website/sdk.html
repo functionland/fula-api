@@ -883,10 +883,11 @@ Future&lt;void&gt; main() async {
     maxRetries: 3,
   );
 
+  // FlatNamespace is RECOMMENDED for maximum privacy
   final encConfig = EncryptionConfig(
     secretKey: null, // Generate new key
     enableMetadataPrivacy: true,
-    obfuscationMode: ObfuscationMode.deterministic,
+    obfuscationMode: ObfuscationMode.flatNamespace,
   );
 
   final client = await createEncryptedClient(config, encConfig);
@@ -984,6 +985,36 @@ final sharedData = await getWithShare(
   'shared-bucket',
   storageKey,
   acceptedShare,
+);</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Obfuscation Modes</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-dart">// Available obfuscation modes for metadata privacy:
+
+// FlatNamespace (RECOMMENDED) - complete structure hiding
+// Server sees: QmX7a8f3e2d1c9b4... (CID-like hash)
+final encConfig = EncryptionConfig(
+  obfuscationMode: ObfuscationMode.flatNamespace,
+);
+
+// Deterministic - same path = same hash (allows server deduplication)
+// Server sees: e/a7c3f9b2e8d14a6f
+final encConfig = EncryptionConfig(
+  obfuscationMode: ObfuscationMode.deterministic,
+);
+
+// Random - new UUID for each upload (max privacy, no dedup)
+// Server sees: e/random-uuid-here
+final encConfig = EncryptionConfig(
+  obfuscationMode: ObfuscationMode.random,
+);
+
+// PreserveStructure - keep folder paths, hash filenames only
+// Server sees: /photos/vacation/e_a7c3f9b2
+final encConfig = EncryptionConfig(
+  obfuscationMode: ObfuscationMode.preserveStructure,
 );</code></pre>
                 </div>
             </div>
