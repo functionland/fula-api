@@ -99,7 +99,7 @@ jobs:
           echo "=== Config file ==="
           cat flutter_rust_bridge.yaml
           echo "=== Running codegen ==="
-          flutter_rust_bridge_codegen generate --verbose 2>&1 || {
+          flutter_rust_bridge_codegen generate 2>&1 || {
             echo "Codegen failed, checking for errors..."
             exit 1
           }
