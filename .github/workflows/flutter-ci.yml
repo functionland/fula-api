@@ -83,7 +83,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install flutter_rust_bridge_codegen
-        run: cargo install flutter_rust_bridge_codegen@2.0.0
+        run: cargo install flutter_rust_bridge_codegen
+
+      - name: Clean old generated files
+        run: |
+          rm -f packages/fula_client/lib/src/frb_generated*.dart
+          rm -f packages/fula_client/lib/src/api/*.freezed.dart
 
       - name: Install dependencies
         working-directory: packages/fula_client
@@ -95,9 +100,11 @@ jobs:
           # flutter_rust_bridge v2 - use config file (flutter_rust_bridge.yaml)
           flutter_rust_bridge_codegen generate
 
-      - name: Verify generated files exist
+      - name: Verify generated files
         run: |
-          ls -la packages/fula_client/lib/src/ || echo "Generated files not found (expected in dry run)"
+          ls -la packages/fula_client/lib/src/
+          echo "=== Checking for wire methods ==="
+          grep -c "wire__" packages/fula_client/lib/src/frb_generated.io.dart || echo "No wire methods in io.dart"
 
   # Check Flutter package structure
   check-flutter:
