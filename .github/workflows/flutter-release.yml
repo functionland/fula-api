@@ -94,10 +94,13 @@ jobs:
         include:
           - target: aarch64-linux-android
             abi: arm64-v8a
+            ndk_target: aarch64-linux-android
           - target: armv7-linux-androideabi
             abi: armeabi-v7a
+            ndk_target: armv7a-linux-androideabi
           - target: x86_64-linux-android
             abi: x86_64
+            ndk_target: x86_64-linux-android
     steps:
       - uses: actions/checkout@v4
 
@@ -123,16 +126,17 @@ jobs:
           mkdir -p ~/.cargo
           cat >> ~/.cargo/config.toml << EOF
           [target.${{ matrix.target }}]
-          linker = "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target }}24-clang"
+          linker = "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.ndk_target }}24-clang"
           EOF
 
       - name: Build
         run: |
           NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
           # Set CC and AR for ring/rustls cross-compilation
-          # Convert target name to env var format (replace - with _)
+          # Convert Rust target name to env var format (replace - with _)
           TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
-          export CC_${TARGET_ENV}="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target }}24-clang"
+          # Use NDK target name for the actual compiler (armv7a vs armv7)
+          export CC_${TARGET_ENV}="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.ndk_target }}24-clang"
           export AR_${TARGET_ENV}="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
           cargo build -p fula-flutter --target ${{ matrix.target }} --release
 
