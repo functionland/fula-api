@@ -4,7 +4,6 @@
 //! encrypted files with other users.
 
 use crate::api::types::*;
-use crate::api::error::{FulaError, FulaResult};
 
 // ============================================================================
 // Share Token Creation
@@ -22,22 +21,20 @@ use crate::api::error::{FulaError, FulaResult};
 /// * `expires_at` - Optional expiration timestamp (Unix epoch seconds)
 ///
 /// Returns a JSON-serialized share token that can be sent to the recipient.
-pub fn create_share_token(
+pub async fn create_share_token(
     client: &EncryptedClientHandle,
     storage_key: String,
     recipient_public_key: Vec<u8>,
     expires_at: Option<i64>,
-) -> FulaResult<String> {
+) -> anyhow::Result<String> {
     use fula_crypto::sharing::ShareBuilder;
 
     // Validate recipient public key length
     if recipient_public_key.len() != 32 {
-        return Err(FulaError::InvalidConfig(
-            "Recipient public key must be exactly 32 bytes".to_string()
-        ));
+        anyhow::bail!("Recipient public key must be exactly 32 bytes");
     }
 
-    let guard = client.inner.read();
+    let guard = client.inner.read().await;
     let enc_config = guard.encryption_config();
 
     // Get owner's keypair and derive DEK for the storage key
@@ -48,7 +45,7 @@ pub fn create_share_token(
     let mut pk_bytes = [0u8; 32];
     pk_bytes.copy_from_slice(&recipient_public_key);
     let recipient_pk = fula_crypto::PublicKey::from_bytes(&pk_bytes)
-        .map_err(|e| FulaError::ShareError(format!("Invalid recipient public key: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Invalid recipient public key: {}", e))?;
 
     // Build share token
     let mut builder = ShareBuilder::new(keypair, &recipient_pk, &dek)
@@ -59,10 +56,10 @@ pub fn create_share_token(
     }
 
     let token = builder.build()
-        .map_err(|e| FulaError::ShareError(format!("Failed to build share token: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Failed to build share token: {}", e))?;
 
     let json = serde_json::to_string(&token)
-        .map_err(|e| FulaError::ShareError(format!("Failed to serialize token: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Failed to serialize token: {}", e))?;
 
     Ok(json)
 }
@@ -78,23 +75,21 @@ pub fn create_share_token(
 ///
 /// Note: Snapshot mode requires additional binding data. This function defaults
 /// to temporal mode for Snapshot shares since we don't have content hash info.
-pub fn create_share_token_with_mode(
+pub async fn create_share_token_with_mode(
     client: &EncryptedClientHandle,
     storage_key: String,
     recipient_public_key: Vec<u8>,
     mode: ShareMode,
     expires_at: Option<i64>,
-) -> FulaResult<String> {
+) -> anyhow::Result<String> {
     use fula_crypto::sharing::ShareBuilder;
 
     // Validate recipient public key length
     if recipient_public_key.len() != 32 {
-        return Err(FulaError::InvalidConfig(
-            "Recipient public key must be exactly 32 bytes".to_string()
-        ));
+        anyhow::bail!("Recipient public key must be exactly 32 bytes");
     }
 
-    let guard = client.inner.read();
+    let guard = client.inner.read().await;
     let enc_config = guard.encryption_config();
 
     // Get owner's keypair and derive DEK for the storage key
@@ -105,7 +100,7 @@ pub fn create_share_token_with_mode(
     let mut pk_bytes = [0u8; 32];
     pk_bytes.copy_from_slice(&recipient_public_key);
     let recipient_pk = fula_crypto::PublicKey::from_bytes(&pk_bytes)
-        .map_err(|e| FulaError::ShareError(format!("Invalid recipient public key: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Invalid recipient public key: {}", e))?;
 
     // Build share token with appropriate mode
     let builder = ShareBuilder::new(keypair, &recipient_pk, &dek)
@@ -131,10 +126,10 @@ pub fn create_share_token_with_mode(
     };
 
     let token = builder.build()
-        .map_err(|e| FulaError::ShareError(format!("Failed to build share token: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Failed to build share token: {}", e))?;
 
     let json = serde_json::to_string(&token)
-        .map_err(|e| FulaError::ShareError(format!("Failed to serialize token: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Failed to serialize token: {}", e))?;
 
     Ok(json)
 }
@@ -144,13 +139,13 @@ pub fn create_share_token_with_mode(
 // ============================================================================
 
 /// Accept a share token received from another user
-pub fn accept_share(client: &EncryptedClientHandle, token_json: String) -> FulaResult<AcceptedShareHandle> {
+pub async fn accept_share(client: &EncryptedClientHandle, token_json: String) -> anyhow::Result<AcceptedShareHandle> {
     let token: fula_crypto::ShareToken = serde_json::from_str(&token_json)
-        .map_err(|e| FulaError::ShareError(format!("Invalid token format: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Invalid token format: {}", e))?;
 
-    let guard = client.inner.read();
+    let guard = client.inner.read().await;
     let accepted = guard.accept_share(&token)
-        .map_err(|e| FulaError::ShareError(e.to_string()))?;
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     Ok(AcceptedShareHandle { inner: accepted })
 }
@@ -161,8 +156,8 @@ pub async fn get_with_share(
     bucket: String,
     storage_key: String,
     share: &AcceptedShareHandle,
-) -> FulaResult<Vec<u8>> {
-    let guard = client.inner.read();
+) -> anyhow::Result<Vec<u8>> {
+    let guard = client.inner.read().await;
     let data = guard.get_object_with_share(&bucket, &storage_key, &share.inner).await?;
     Ok(data.to_vec())
 }
@@ -173,11 +168,11 @@ pub async fn get_with_token(
     bucket: String,
     storage_key: String,
     token_json: String,
-) -> FulaResult<Vec<u8>> {
+) -> anyhow::Result<Vec<u8>> {
     let token: fula_crypto::ShareToken = serde_json::from_str(&token_json)
-        .map_err(|e| FulaError::ShareError(format!("Invalid token format: {}", e)))?;
+        .map_err(|e| anyhow::anyhow!("Invalid token format: {}", e))?;
 
-    let guard = client.inner.read();
+    let guard = client.inner.read().await;
     let data = guard.get_object_with_token(&bucket, &storage_key, &token).await?;
     Ok(data.to_vec())
 }

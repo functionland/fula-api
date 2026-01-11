@@ -9,6 +9,9 @@ use thiserror::Error;
 ///
 /// This enum covers all possible errors from the underlying libraries
 /// in a format that's easy to handle in Dart code.
+///
+/// Note: FulaResult uses anyhow::Result for FRB compatibility.
+/// Errors are converted to strings on the Dart side.
 #[derive(Debug, Clone, Error)]
 pub enum FulaError {
     /// Network/HTTP error
@@ -72,7 +75,8 @@ pub enum FulaError {
 }
 
 /// Result type alias for Fula operations
-pub type FulaResult<T> = Result<T, FulaError>;
+/// Uses anyhow::Result for flutter_rust_bridge compatibility
+pub type FulaResult<T> = anyhow::Result<T>;
 
 // ============================================================================
 // Conversions from internal error types

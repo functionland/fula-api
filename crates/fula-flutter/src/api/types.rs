@@ -4,7 +4,17 @@
 //! and compatible with flutter_rust_bridge code generation.
 
 use std::sync::Arc;
-use parking_lot::RwLock;
+
+// Use tokio::sync on native, async_lock on WASM
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::sync::RwLock;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::sync::Mutex;
+
+#[cfg(target_arch = "wasm32")]
+use async_lock::RwLock;
+#[cfg(target_arch = "wasm32")]
+use async_lock::Mutex;
 
 // ============================================================================
 // Configuration Types
@@ -397,7 +407,7 @@ pub struct RotationManagerHandle {
 /// Handle to an ongoing multipart upload
 #[derive(Clone)]
 pub struct MultipartHandle {
-    pub(crate) inner: Arc<parking_lot::Mutex<fula_client::MultipartUpload>>,
+    pub(crate) inner: Arc<Mutex<fula_client::MultipartUpload>>,
     #[allow(dead_code)]
     pub(crate) client: Arc<fula_client::FulaClient>,
 }

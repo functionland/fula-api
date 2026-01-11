@@ -1883,6 +1883,7 @@ name = "fula-flutter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-lock",
  "bytes",
  "chrono",
  "flutter_rust_bridge",
@@ -1893,6 +1894,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+ "tokio",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
 ]

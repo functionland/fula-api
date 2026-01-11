@@ -4,9 +4,9 @@
 //! for organized file storage with human-readable paths.
 
 use bytes::Bytes;
+use anyhow::Context;
 
 use crate::api::types::*;
-use crate::api::error::{FulaError, FulaResult};
 
 // ============================================================================
 // Forest Management
@@ -16,8 +16,8 @@ use crate::api::error::{FulaError, FulaResult};
 pub async fn load_forest(
     client: &EncryptedClientHandle,
     bucket: String,
-) -> FulaResult<()> {
-    let guard = client.inner.write();
+) -> anyhow::Result<()> {
+    let guard = client.inner.write().await;
     guard.load_forest(&bucket).await?;
     Ok(())
 }
@@ -29,8 +29,8 @@ pub async fn load_forest(
 pub async fn save_forest(
     client: &EncryptedClientHandle,
     bucket: String,
-) -> FulaResult<()> {
-    let guard = client.inner.read();
+) -> anyhow::Result<()> {
+    let guard = client.inner.read().await;
     guard.flush_forest(&bucket).await?;
     Ok(())
 }
@@ -39,15 +39,15 @@ pub async fn save_forest(
 pub async fn flush_forest(
     client: &EncryptedClientHandle,
     bucket: String,
-) -> FulaResult<()> {
-    let guard = client.inner.write();
+) -> anyhow::Result<()> {
+    let guard = client.inner.write().await;
     guard.flush_forest(&bucket).await?;
     Ok(())
 }
 
 /// Check if there are pending (unsaved) forest changes
-pub fn has_pending_changes(client: &EncryptedClientHandle, bucket: String) -> bool {
-    let guard = client.inner.read();
+pub async fn has_pending_changes(client: &EncryptedClientHandle, bucket: String) -> bool {
+    let guard = client.inner.read().await;
     guard.has_pending_forest_changes(&bucket)
 }
 
@@ -65,8 +65,8 @@ pub async fn put_flat(
     path: String,
     data: Vec<u8>,
     content_type: Option<String>,
-) -> FulaResult<PutResult> {
-    let guard = client.inner.write();
+) -> anyhow::Result<PutResult> {
+    let guard = client.inner.write().await;
     let result = guard.put_object_flat(
         &bucket,
         &path,
@@ -86,8 +86,8 @@ pub async fn put_flat_deferred(
     path: String,
     data: Vec<u8>,
     content_type: Option<String>,
-) -> FulaResult<PutResult> {
-    let guard = client.inner.write();
+) -> anyhow::Result<PutResult> {
+    let guard = client.inner.write().await;
     let result = guard.put_object_flat_deferred(
         &bucket,
         &path,
@@ -102,8 +102,8 @@ pub async fn get_flat(
     client: &EncryptedClientHandle,
     bucket: String,
     path: String,
-) -> FulaResult<Vec<u8>> {
-    let guard = client.inner.read();
+) -> anyhow::Result<Vec<u8>> {
+    let guard = client.inner.read().await;
     let data = guard.get_object_flat(&bucket, &path).await?;
     Ok(data.to_vec())
 }
@@ -113,8 +113,8 @@ pub async fn delete_flat(
     client: &EncryptedClientHandle,
     bucket: String,
     path: String,
-) -> FulaResult<()> {
-    let guard = client.inner.write();
+) -> anyhow::Result<()> {
+    let guard = client.inner.write().await;
     guard.delete_object_flat(&bucket, &path).await?;
     Ok(())
 }
@@ -126,8 +126,8 @@ pub async fn delete_flat(
 pub async fn list_from_forest(
     client: &EncryptedClientHandle,
     bucket: String,
-) -> FulaResult<Vec<FileMetadata>> {
-    let guard = client.inner.read();
+) -> anyhow::Result<Vec<FileMetadata>> {
+    let guard = client.inner.read().await;
     let result = guard.list_files_from_forest(&bucket).await?;
     Ok(result.into_iter().map(|m| m.into()).collect())
 }
@@ -144,13 +144,13 @@ pub async fn get_forest_subtree(
     client: &EncryptedClientHandle,
     bucket: String,
     prefix: String,
-) -> FulaResult<ForestSubtree> {
-    let guard = client.inner.read();
+) -> anyhow::Result<ForestSubtree> {
+    let guard = client.inner.read().await;
     let subtree = guard.get_forest_subtree(&bucket, &prefix).await?;
 
     // Serialize the subtree
     let serialized = serde_json::to_vec(&subtree)
-        .map_err(|e| FulaError::ForestError(format!("Failed to serialize subtree: {}", e)))?;
+        .context("Failed to serialize subtree")?;
 
     Ok(ForestSubtree { serialized })
 }

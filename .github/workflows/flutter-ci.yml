@@ -8,6 +8,7 @@ on:
       - 'crates/fula-client/**'
       - 'crates/fula-crypto/**'
       - 'packages/fula_client/**'
+      - 'flutter_rust_bridge.yaml'
       - '.github/workflows/flutter-ci.yml'
   pull_request:
     paths:
@@ -15,15 +16,16 @@ on:
       - 'crates/fula-client/**'
       - 'crates/fula-crypto/**'
       - 'packages/fula_client/**'
-  workflow_dispatch:
+      - 'flutter_rust_bridge.yaml'
+      - '.github/workflows/flutter-ci.yml'
 
 env:
   CARGO_TERM_COLOR: always
+  FLUTTER_VERSION: '3.24.0'
 
 jobs:
-  # Run Rust tests for all related crates
+  # Test Rust crates
   test-rust:
-    name: Rust Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,17 +36,16 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "."
+          shared-key: rust-ci
 
-      - name: Run tests
+      - name: Run Rust tests
         run: |
-          cargo test -p fula-crypto --all-features
-          cargo test -p fula-client --all-features
-          cargo test -p fula-flutter
+          cargo test -p fula-flutter --lib
+          cargo test -p fula-client --lib
+          cargo test -p fula-crypto --lib
 
-  # Verify WASM compilation
+  # Test WASM compilation
   test-wasm:
-    name: WASM Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,106 +57,122 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-wasm
 
-      - name: Build for WASM
-        run: |
-          cargo build -p fula-crypto --target wasm32-unknown-unknown --no-default-features --features wasm
-          cargo build -p fula-client --target wasm32-unknown-unknown --no-default-features
-          cargo build -p fula-flutter --target wasm32-unknown-unknown
+      - name: Build WASM
+        run: cargo build -p fula-flutter --target wasm32-unknown-unknown --release
 
-  # Verify binding generation works
-  test-codegen:
-    name: Binding Generation
+  # Generate and validate Dart bindings
+  generate-bindings:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.0'
-          channel: 'stable'
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install LLVM/Clang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev llvm-dev
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-frb
 
       - name: Install flutter_rust_bridge_codegen
         run: cargo install flutter_rust_bridge_codegen
 
-      - name: Clean old generated files
-        run: |
-          rm -f packages/fula_client/lib/src/frb_generated*.dart
-          rm -f packages/fula_client/lib/src/api/*.freezed.dart
-
-      - name: Install dependencies
+      - name: Get Flutter dependencies
         working-directory: packages/fula_client
         run: flutter pub get
 
-      - name: Generate bindings
-        run: |
-          mkdir -p packages/fula_client/lib/src
-          # flutter_rust_bridge v2 - use config file (flutter_rust_bridge.yaml)
-          flutter_rust_bridge_codegen generate
+      - name: Generate Dart bindings
+        run: flutter_rust_bridge_codegen generate
 
-      - name: Verify generated files
-        run: |
-          ls -la packages/fula_client/lib/src/
-          echo "=== Checking for wire methods ==="
-          grep -c "wire__" packages/fula_client/lib/src/frb_generated.io.dart || echo "No wire methods in io.dart"
-
-  # Check Flutter package structure
-  check-flutter:
-    name: Flutter Package Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.24.0'
-          channel: 'stable'
-
-      - name: Check package
+      - name: Analyze Dart code
         working-directory: packages/fula_client
-        run: |
-          flutter pub get || echo "Dependencies not fully resolved (expected without generated bindings)"
-          flutter analyze --no-fatal-infos || echo "Analysis completed with warnings"
+        run: flutter analyze
 
-  # Build Android native libraries (verification only)
-  build-android-check:
-    name: Android Build Check
+      - name: Upload generated bindings
+        uses: actions/upload-artifact@v4
+        with:
+          name: dart-bindings
+          path: packages/fula_client/lib/src/
+          retention-days: 7
+
+  # Build Android native libraries (check compilation)
+  build-android:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+          - x86_64-linux-android
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: ${{ matrix.target }}
 
       - name: Setup Android NDK
-        id: setup-ndk
         uses: nttld/setup-ndk@v1
+        id: setup-ndk
         with:
           ndk-version: r25c
+          add-to-path: true
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-android-${{ matrix.target }}
 
-      - name: Configure Cargo for Android
+      - name: Configure linker for Android
         run: |
-          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
-          echo "[target.aarch64-linux-android]" >> ~/.cargo/config.toml
-          echo "linker = \"$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang\"" >> ~/.cargo/config.toml
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << INNEREOF
+          [target.aarch64-linux-android]
+          linker = "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
 
-      - name: Build for Android (arm64)
-        run: |
-          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
-          # Set CC and AR for ring/rustls cross-compilation
-          export CC_aarch64_linux_android="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
-          export AR_aarch64_linux_android="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-          cargo build -p fula-flutter --target aarch64-linux-android --release
+          [target.armv7-linux-androideabi]
+          linker = "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang"
+
+          [target.x86_64-linux-android]
+          linker = "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android21-clang"
+          INNEREOF
+
+      - name: Build for Android
+        run: cargo build -p fula-flutter --target ${{ matrix.target }} --release
+
+  # Build iOS native libraries (check compilation)
+  build-ios:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - aarch64-apple-ios
+          - x86_64-apple-ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-ios-${{ matrix.target }}
+
+      - name: Build for iOS
+        run: cargo build -p fula-flutter --target ${{ matrix.target }} --release

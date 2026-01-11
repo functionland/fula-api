@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use crate::api::types::*;
-use crate::api::error::FulaResult;
 
 // ============================================================================
 // Rotation Manager
@@ -16,8 +15,8 @@ use crate::api::error::FulaResult;
 ///
 /// The rotation manager handles the key rotation process,
 /// including tracking which keys have been rotated.
-pub fn create_rotation_manager(client: &EncryptedClientHandle) -> RotationManagerHandle {
-    let guard = client.inner.read();
+pub async fn create_rotation_manager(client: &EncryptedClientHandle) -> RotationManagerHandle {
+    let guard = client.inner.read().await;
     let manager = guard.create_rotation_manager();
     RotationManagerHandle {
         inner: Arc::new(manager),
@@ -35,8 +34,8 @@ pub async fn get_kek_version(
     client: &EncryptedClientHandle,
     bucket: String,
     storage_key: String,
-) -> FulaResult<Option<u32>> {
-    let guard = client.inner.read();
+) -> anyhow::Result<Option<u32>> {
+    let guard = client.inner.read().await;
     let version = guard.get_object_kek_version(&bucket, &storage_key).await?;
     Ok(version)
 }
@@ -49,8 +48,8 @@ pub async fn rewrap_object(
     bucket: String,
     storage_key: String,
     manager: &RotationManagerHandle,
-) -> FulaResult<u32> {
-    let guard = client.inner.write();
+) -> anyhow::Result<u32> {
+    let guard = client.inner.write().await;
     let version = guard.rewrap_object_dek(&bucket, &storage_key, &manager.inner).await?;
     Ok(version)
 }
@@ -63,8 +62,8 @@ pub async fn rotate_bucket(
     client: &EncryptedClientHandle,
     bucket: String,
     manager: &RotationManagerHandle,
-) -> FulaResult<RotationReport> {
-    let guard = client.inner.read();
+) -> anyhow::Result<RotationReport> {
+    let guard = client.inner.read().await;
     let report = guard.rotate_bucket(&bucket, &manager.inner).await?;
 
     // Manual conversion since fula_client::encryption::RotationReport is not exported

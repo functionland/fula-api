@@ -4,7 +4,6 @@
 //! Files above a certain threshold are automatically split into chunks.
 
 use crate::api::types::*;
-use crate::api::error::FulaResult;
 
 /// Default chunk size (256 KB)
 pub const DEFAULT_CHUNK_SIZE: u32 = 256 * 1024;
@@ -26,8 +25,8 @@ pub async fn put_chunked(
     key: String,
     data: Vec<u8>,
     chunk_size: Option<u32>,
-) -> FulaResult<PutResult> {
-    let guard = client.inner.read();
+) -> anyhow::Result<PutResult> {
+    let guard = client.inner.read().await;
     let chunk_size = chunk_size.map(|s| s as usize);
     let result = guard.put_object_chunked(&bucket, &key, &data, chunk_size).await?;
     Ok(result.into())
@@ -40,8 +39,8 @@ pub async fn get_chunked(
     client: &EncryptedClientHandle,
     bucket: String,
     key: String,
-) -> FulaResult<Vec<u8>> {
-    let guard = client.inner.read();
+) -> anyhow::Result<Vec<u8>> {
+    let guard = client.inner.read().await;
     let data = guard.get_object_chunked(&bucket, &key).await?;
     Ok(data.to_vec())
 }
@@ -56,8 +55,8 @@ pub async fn get_range(
     key: String,
     offset: u64,
     length: u64,
-) -> FulaResult<Vec<u8>> {
-    let guard = client.inner.read();
+) -> anyhow::Result<Vec<u8>> {
+    let guard = client.inner.read().await;
     let data = guard.get_object_range(&bucket, &key, offset, length).await?;
     Ok(data.to_vec())
 }

@@ -1,5 +1,23 @@
+# Rust
 /target
+**/target
+
+# Secrets
 .env
-/target/release
+*.pem
+*.key
+
+# Claude Code
 /.claude
-/target
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# WASM build output (not the Flutter package)
+/wasm-package

@@ -5,16 +5,22 @@
 use std::sync::Arc;
 use std::time::Duration;
 use bytes::Bytes;
+use anyhow::Context;
+
+// Use tokio::sync on native, async_lock on WASM
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::sync::RwLock;
+#[cfg(target_arch = "wasm32")]
+use async_lock::RwLock;
 
 use crate::api::types::*;
-use crate::api::error::{FulaError, FulaResult};
 
 // ============================================================================
 // Client Creation
 // ============================================================================
 
 /// Create a new Fula client with the given configuration
-pub fn create_client(config: FulaConfig) -> FulaResult<FulaClientHandle> {
+pub fn create_client(config: FulaConfig) -> anyhow::Result<FulaClientHandle> {
     let inner_config = fula_client::Config::new(&config.endpoint)
         .with_timeout(Duration::from_secs(config.timeout_seconds));
 
@@ -35,7 +41,7 @@ pub fn create_client(config: FulaConfig) -> FulaResult<FulaClientHandle> {
 pub fn create_encrypted_client(
     config: FulaConfig,
     encryption: EncryptionConfig,
-) -> FulaResult<EncryptedClientHandle> {
+) -> anyhow::Result<EncryptedClientHandle> {
     let inner_config = fula_client::Config::new(&config.endpoint)
         .with_timeout(Duration::from_secs(config.timeout_seconds));
 
@@ -48,14 +54,12 @@ pub fn create_encrypted_client(
     // Create encryption config
     let enc_config = if let Some(secret_key) = encryption.secret_key {
         if secret_key.len() != 32 {
-            return Err(FulaError::InvalidConfig(
-                "Secret key must be exactly 32 bytes".to_string()
-            ));
+            anyhow::bail!("Secret key must be exactly 32 bytes");
         }
         let mut key_bytes = [0u8; 32];
         key_bytes.copy_from_slice(&secret_key);
         let secret = fula_crypto::SecretKey::from_bytes(&key_bytes)
-            .map_err(|e| FulaError::Encryption(e.to_string()))?;
+            .context("Encryption error")?;
         fula_client::EncryptionConfig::from_secret_key(secret)
     } else {
         fula_client::EncryptionConfig::new()
@@ -80,7 +84,7 @@ pub fn create_encrypted_client(
     let client = fula_client::EncryptedClient::new(inner_config, enc_config)?;
 
     Ok(EncryptedClientHandle {
-        inner: Arc::new(parking_lot::RwLock::new(client)),
+        inner: Arc::new(RwLock::new(client)),
     })
 }
 
@@ -89,7 +93,7 @@ pub fn create_encrypted_client_with_pinning(
     config: FulaConfig,
     encryption: EncryptionConfig,
     pinning: PinningConfig,
-) -> FulaResult<EncryptedClientHandle> {
+) -> anyhow::Result<EncryptedClientHandle> {
     let inner_config = fula_client::Config::new(&config.endpoint)
         .with_timeout(Duration::from_secs(config.timeout_seconds));
 
@@ -102,14 +106,12 @@ pub fn create_encrypted_client_with_pinning(
     // Create encryption config
     let enc_config = if let Some(secret_key) = encryption.secret_key {
         if secret_key.len() != 32 {
-            return Err(FulaError::InvalidConfig(
-                "Secret key must be exactly 32 bytes".to_string()
-            ));
+            anyhow::bail!("Secret key must be exactly 32 bytes");
         }
         let mut key_bytes = [0u8; 32];
         key_bytes.copy_from_slice(&secret_key);
         let secret = fula_crypto::SecretKey::from_bytes(&key_bytes)
-            .map_err(|e| FulaError::Encryption(e.to_string()))?;
+            .context("Encryption error")?;
         fula_client::EncryptionConfig::from_secret_key(secret)
     } else {
         fula_client::EncryptionConfig::new()
@@ -143,7 +145,7 @@ pub fn create_encrypted_client_with_pinning(
     )?;
 
     Ok(EncryptedClientHandle {
-        inner: Arc::new(parking_lot::RwLock::new(client)),
+        inner: Arc::new(RwLock::new(client)),
     })
 }
 
@@ -152,25 +154,25 @@ pub fn create_encrypted_client_with_pinning(
 // ============================================================================
 
 /// List all buckets
-pub async fn list_buckets(client: &FulaClientHandle) -> FulaResult<Vec<BucketInfo>> {
+pub async fn list_buckets(client: &FulaClientHandle) -> anyhow::Result<Vec<BucketInfo>> {
     let result = client.inner.list_buckets().await?;
     Ok(result.buckets.into_iter().map(|b| b.into()).collect())
 }
 
 /// Create a new bucket
-pub async fn create_bucket(client: &FulaClientHandle, name: String) -> FulaResult<()> {
+pub async fn create_bucket(client: &FulaClientHandle, name: String) -> anyhow::Result<()> {
     client.inner.create_bucket(&name).await?;
     Ok(())
 }
 
 /// Delete a bucket
-pub async fn delete_bucket(client: &FulaClientHandle, name: String) -> FulaResult<()> {
+pub async fn delete_bucket(client: &FulaClientHandle, name: String) -> anyhow::Result<()> {
     client.inner.delete_bucket(&name).await?;
     Ok(())
 }
 
 /// Check if a bucket exists
-pub async fn bucket_exists(client: &FulaClientHandle, name: String) -> FulaResult<bool> {
+pub async fn bucket_exists(client: &FulaClientHandle, name: String) -> anyhow::Result<bool> {
     Ok(client.inner.bucket_exists(&name).await?)
 }
 
@@ -184,7 +186,7 @@ pub async fn put_object(
     bucket: String,
     key: String,
     data: Vec<u8>,
-) -> FulaResult<PutResult> {
+) -> anyhow::Result<PutResult> {
     let result = client.inner.put_object(&bucket, &key, Bytes::from(data)).await?;
     Ok(result.into())
 }
@@ -196,7 +198,7 @@ pub async fn put_object_with_metadata(
     key: String,
     data: Vec<u8>,
     metadata: ObjectMetadata,
-) -> FulaResult<PutResult> {
+) -> anyhow::Result<PutResult> {
     let result = client.inner.put_object_with_metadata(
         &bucket,
         &key,
@@ -211,7 +213,7 @@ pub async fn get_object(
     client: &FulaClientHandle,
     bucket: String,
     key: String,
-) -> FulaResult<Vec<u8>> {
+) -> anyhow::Result<Vec<u8>> {
     let data = client.inner.get_object(&bucket, &key).await?;
     Ok(data.to_vec())
 }
@@ -221,7 +223,7 @@ pub async fn get_object_with_metadata(
     client: &FulaClientHandle,
     bucket: String,
     key: String,
-) -> FulaResult<GetObjectResult> {
+) -> anyhow::Result<GetObjectResult> {
     let result = client.inner.get_object_with_metadata(&bucket, &key).await?;
     Ok(result.into())
 }
@@ -231,7 +233,7 @@ pub async fn head_object(
     client: &FulaClientHandle,
     bucket: String,
     key: String,
-) -> FulaResult<HeadResult> {
+) -> anyhow::Result<HeadResult> {
     let result = client.inner.head_object(&bucket, &key).await?;
     Ok(result.into())
 }
@@ -241,7 +243,7 @@ pub async fn delete_object(
     client: &FulaClientHandle,
     bucket: String,
     key: String,
-) -> FulaResult<()> {
+) -> anyhow::Result<()> {
     client.inner.delete_object(&bucket, &key).await?;
     Ok(())
 }
@@ -251,7 +253,7 @@ pub async fn object_exists(
     client: &FulaClientHandle,
     bucket: String,
     key: String,
-) -> FulaResult<bool> {
+) -> anyhow::Result<bool> {
     Ok(client.inner.object_exists(&bucket, &key).await?)
 }
 
@@ -262,7 +264,7 @@ pub async fn copy_object(
     src_key: String,
     dst_bucket: String,
     dst_key: String,
-) -> FulaResult<CopyResult> {
+) -> anyhow::Result<CopyResult> {
     let result = client.inner.copy_object(&src_bucket, &src_key, &dst_bucket, &dst_key).await?;
     Ok(result.into())
 }
@@ -272,7 +274,7 @@ pub async fn list_objects(
     client: &FulaClientHandle,
     bucket: String,
     options: ListOptions,
-) -> FulaResult<ListObjectsResult> {
+) -> anyhow::Result<ListObjectsResult> {
     let result = client.inner.list_objects(&bucket, Some(options.into())).await?;
     Ok(result.into())
 }

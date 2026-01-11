@@ -5,10 +5,14 @@
 
 use std::sync::Arc;
 use bytes::Bytes;
-use parking_lot::Mutex;
+
+// Use tokio::sync on native, async_lock on WASM
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::sync::Mutex;
+#[cfg(target_arch = "wasm32")]
+use async_lock::Mutex;
 
 use crate::api::types::*;
-use crate::api::error::{FulaError, FulaResult};
 
 // ============================================================================
 // Multipart Upload Operations
@@ -21,7 +25,7 @@ pub async fn start_multipart(
     client: &FulaClientHandle,
     bucket: String,
     key: String,
-) -> FulaResult<MultipartHandle> {
+) -> anyhow::Result<MultipartHandle> {
     let upload = fula_client::MultipartUpload::start(
         client.inner.clone(),
         &bucket,
@@ -42,8 +46,8 @@ pub async fn upload_part(
     handle: &MultipartHandle,
     part_number: u32,
     data: Vec<u8>,
-) -> FulaResult<()> {
-    let mut upload = handle.inner.lock();
+) -> anyhow::Result<()> {
+    let mut upload = handle.inner.lock().await;
     upload.upload_part(part_number, Bytes::from(data)).await?;
     Ok(())
 }
@@ -52,9 +56,9 @@ pub async fn upload_part(
 ///
 /// Assembles all uploaded parts into the final object.
 /// Returns the ETag of the completed object.
-pub async fn complete_multipart(handle: MultipartHandle) -> FulaResult<String> {
+pub async fn complete_multipart(handle: MultipartHandle) -> anyhow::Result<String> {
     let upload = Arc::try_unwrap(handle.inner)
-        .map_err(|_| FulaError::Internal("Cannot complete: handle still in use".to_string()))?
+        .map_err(|_| anyhow::anyhow!("Cannot complete: handle still in use"))?
         .into_inner();
 
     let etag = upload.complete().await?;
@@ -64,9 +68,9 @@ pub async fn complete_multipart(handle: MultipartHandle) -> FulaResult<String> {
 /// Abort the multipart upload
 ///
 /// Cancels the upload and removes any uploaded parts.
-pub async fn abort_multipart(handle: MultipartHandle) -> FulaResult<()> {
+pub async fn abort_multipart(handle: MultipartHandle) -> anyhow::Result<()> {
     let upload = Arc::try_unwrap(handle.inner)
-        .map_err(|_| FulaError::Internal("Cannot abort: handle still in use".to_string()))?
+        .map_err(|_| anyhow::anyhow!("Cannot abort: handle still in use"))?
         .into_inner();
 
     upload.abort().await?;
@@ -74,14 +78,14 @@ pub async fn abort_multipart(handle: MultipartHandle) -> FulaResult<()> {
 }
 
 /// Get the upload ID
-pub fn get_upload_id(handle: &MultipartHandle) -> String {
-    let upload = handle.inner.lock();
+pub async fn get_upload_id(handle: &MultipartHandle) -> String {
+    let upload = handle.inner.lock().await;
     upload.upload_id().to_string()
 }
 
 /// Get the number of completed parts
-pub fn get_completed_parts(handle: &MultipartHandle) -> u32 {
-    let upload = handle.inner.lock();
+pub async fn get_completed_parts(handle: &MultipartHandle) -> u32 {
+    let upload = handle.inner.lock().await;
     upload.completed_parts() as u32
 }
 
@@ -102,7 +106,7 @@ pub async fn upload_large_file_simple(
     key: String,
     data: Vec<u8>,
     chunk_size: Option<u32>,
-) -> FulaResult<String> {
+) -> anyhow::Result<String> {
     let chunk_size = chunk_size.unwrap_or(5 * 1024 * 1024) as usize; // 5MB default
     let total_size = data.len();
 

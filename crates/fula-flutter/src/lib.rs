@@ -19,6 +19,7 @@
 //! The generated Dart bindings provide a type-safe API for Flutter apps.
 
 pub mod api;
+mod frb_generated;
 
 // Re-export the main API types at crate root for convenience
 pub use api::*;

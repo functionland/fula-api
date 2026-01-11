@@ -1,7 +1,7 @@
-// Android build configuration for fula_flutter
+// Android build configuration for fula_client
 // This plugin uses FFI to load the native Rust library
 
-group 'land.fx.fula_flutter'
+group 'land.fx.fula_client'
 version '1.0'
 
 buildscript {
@@ -27,7 +27,7 @@ apply plugin: 'com.android.library'
 android {
     // Specify API level for FFI
     if (project.android.hasProperty("namespace")) {
-        namespace 'land.fx.fula_flutter'
+        namespace 'land.fx.fula_client'
     }
 
     compileSdkVersion 33
