@@ -1,14 +1,14 @@
 name: fula_client
 description: Flutter SDK for Fula decentralized storage with client-side encryption, metadata privacy, and secure sharing.
-version: 0.2.6
+version: 0.2.7
 homepage: https://fx.land
 repository: https://github.com/functionland/fula-api
 issue_tracker: https://github.com/functionland/fula-api/issues
 documentation: https://functionland.github.io/fula-api/
 
 environment:
-  sdk: '>=3.3.0 <4.0.0'
-  flutter: '>=3.19.0'
+  sdk: '>=3.6.0 <4.0.0'
+  flutter: '>=3.27.0'
 
 dependencies:
   flutter:
