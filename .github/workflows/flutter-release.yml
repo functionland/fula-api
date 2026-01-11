@@ -117,6 +117,11 @@ jobs:
           AR: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.ar }}
         run: cargo build -p fula-flutter --target ${{ matrix.target }} --release
 
+      - name: Strip debug symbols
+        run: |
+          ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
+            target/${{ matrix.target }}/release/libfula_flutter.so
+
       - name: Prepare artifact
         run: |
           mkdir -p android-libs/${{ matrix.lib_dir }}
@@ -154,17 +159,23 @@ jobs:
       - name: Build for iOS arm64 simulator
         run: cargo build -p fula-flutter --target aarch64-apple-ios-sim --release
 
+      - name: Strip debug symbols from iOS libraries
+        run: |
+          strip -S target/aarch64-apple-ios/release/libfula_flutter.a
+          strip -S target/x86_64-apple-ios/release/libfula_flutter.a
+          strip -S target/aarch64-apple-ios-sim/release/libfula_flutter.a
+
       - name: Create XCFramework
         run: |
           mkdir -p ios-libs
-          
+
           # Create simulator universal library
           mkdir -p target/ios-sim-universal
           lipo -create \
             target/x86_64-apple-ios/release/libfula_flutter.a \
             target/aarch64-apple-ios-sim/release/libfula_flutter.a \
             -output target/ios-sim-universal/libfula_flutter.a
-          
+
           # Create XCFramework
           xcodebuild -create-xcframework \
             -library target/aarch64-apple-ios/release/libfula_flutter.a \
