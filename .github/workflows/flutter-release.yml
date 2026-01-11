@@ -1,22 +1,49 @@
 name: Flutter Release
 
+# Workflow: Create GitHub Release first (with tag v*), then run this workflow manually
+# pub.dev OIDC only works with 'push' or 'workflow_dispatch' events, not 'release'
 on:
-  release:
-    types: [created]
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to publish (e.g., 0.2.0)'
-        required: true
+        description: 'Version to publish (leave empty to use latest release tag)'
+        required: false
         type: string
+      dry_run:
+        description: 'Dry run (do not actually publish)'
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
   FLUTTER_VERSION: '3.24.0'
 
 jobs:
+  # Get version from input or latest release
+  get-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Get version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "Using provided version: ${{ inputs.version }}"
+          else
+            # Get latest release tag and strip 'v' prefix
+            LATEST=$(gh release view --repo ${{ github.repository }} --json tagName -q '.tagName' | sed 's/^v//')
+            echo "version=$LATEST" >> $GITHUB_OUTPUT
+            echo "Using latest release version: $LATEST"
+          fi
+
   # Generate Dart bindings
   generate-bindings:
+    needs: get-version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -61,6 +88,7 @@ jobs:
 
   # Build Android native libraries
   build-android:
+    needs: get-version
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -136,6 +164,7 @@ jobs:
 
   # Build iOS native libraries
   build-ios:
+    needs: get-version
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -191,6 +220,7 @@ jobs:
 
   # Build WASM package
   build-wasm:
+    needs: get-version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -213,22 +243,13 @@ jobs:
           cd crates/fula-flutter
           wasm-pack build --release --target web --out-dir ../../wasm-package
 
-      - name: Get version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
-          fi
-
       - name: Create npm package.json
         run: |
           cd wasm-package
           cat > package.json << INNEREOF
           {
             "name": "@functionland/fula-client",
-            "version": "${{ steps.version.outputs.version }}",
+            "version": "${{ needs.get-version.outputs.version }}",
             "description": "Fula encrypted storage SDK for JavaScript/WASM",
             "main": "fula_flutter.js",
             "types": "fula_flutter.d.ts",
@@ -305,11 +326,12 @@ jobs:
           du -sh packages/fula_client/
 
       - name: Publish to pub.dev (dry run)
+        if: inputs.dry_run
         working-directory: packages/fula_client
         run: flutter pub publish --dry-run
 
       - name: Publish to pub.dev
-        if: github.event_name == 'release'
+        if: ${{ !inputs.dry_run }}
         working-directory: packages/fula_client
         run: flutter pub publish --force
 
@@ -337,23 +359,24 @@ jobs:
           cat wasm-package/package.json
 
       - name: Publish to npm (dry run)
+        if: inputs.dry_run
         working-directory: wasm-package
         run: npm publish --access public --dry-run
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish to npm
-        if: github.event_name == 'release'
+        if: ${{ !inputs.dry_run }}
         working-directory: wasm-package
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-  # Create GitHub Release artifacts
-  github-release:
-    needs: [build-android, build-ios, build-wasm]
+  # Upload artifacts to existing GitHub Release
+  upload-release-assets:
+    needs: [get-version, build-android, build-ios, build-wasm]
     runs-on: ubuntu-latest
-    if: github.event_name == 'release'
+    if: ${{ !inputs.dry_run }}
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -382,6 +405,7 @@ jobs:
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: v${{ needs.get-version.outputs.version }}
           files: |
             artifacts/android-libs.zip
             artifacts/ios-libs.zip
