@@ -250,9 +250,9 @@ jobs:
           path: wasm-package/
           retention-days: 1
 
-  # Publish to pub.dev
+  # Publish to pub.dev (Android only - iOS downloads from GitHub Releases)
   publish-pubdev:
-    needs: [generate-bindings, build-android, build-ios]
+    needs: [generate-bindings, build-android]
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for pub.dev OIDC authentication
@@ -281,11 +281,8 @@ jobs:
           name: android-x86_64
           path: packages/fula_client/android/src/main/jniLibs/
 
-      - name: Download iOS XCFramework
-        uses: actions/download-artifact@v4
-        with:
-          name: ios-xcframework
-          path: packages/fula_client/ios/Frameworks/
+      # iOS binaries are NOT included - they're downloaded via podspec from GitHub Releases
+      # This keeps the pub.dev package under 100MB limit
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -304,8 +301,8 @@ jobs:
           echo "Android libs:"
           ls -la packages/fula_client/android/src/main/jniLibs/ || echo "No jniLibs"
           echo ""
-          echo "iOS frameworks:"
-          ls -la packages/fula_client/ios/Frameworks/ || echo "No Frameworks"
+          echo "Package size estimate:"
+          du -sh packages/fula_client/
 
       - name: Publish to pub.dev (dry run)
         working-directory: packages/fula_client
@@ -366,17 +363,19 @@ jobs:
       - name: Package artifacts
         run: |
           cd artifacts
-          
+
           # Package Android libs
           mkdir -p android-libs
           cp -r android-arm64-v8a/* android-libs/
           cp -r android-armeabi-v7a/* android-libs/
           cp -r android-x86_64/* android-libs/
           zip -r android-libs.zip android-libs/
-          
-          # Package iOS libs
-          zip -r ios-libs.zip ios-xcframework/
-          
+
+          # Package iOS libs (must match podspec expected structure: Frameworks/FulaFlutter.xcframework)
+          mkdir -p ios-package/Frameworks
+          cp -r ios-xcframework/* ios-package/Frameworks/
+          cd ios-package && zip -r ../ios-libs.zip Frameworks/ && cd ..
+
           # Package WASM
           zip -r wasm-package.zip wasm-package/
 

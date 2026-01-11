@@ -1,13 +1,12 @@
 #
 # CocoaPods specification for fula_client
 #
-# This spec packages the pre-built Rust XCFramework for iOS.
-# The library is built by the CI/CD pipeline and included in the package.
+# Downloads pre-built XCFramework from GitHub Releases to keep pub.dev package small.
 #
 
 Pod::Spec.new do |s|
   s.name             = 'fula_client'
-  s.version          = '0.2.2'
+  s.version          = '0.2.3'
   s.summary          = 'Flutter SDK for Fula decentralized storage'
   s.description      = <<-DESC
     A Flutter plugin providing client-side encryption, metadata privacy,
@@ -29,7 +28,14 @@ Pod::Spec.new do |s|
   }
   s.swift_version = '5.0'
 
-  # Include the pre-built XCFramework (supports device + simulator)
+  # Download XCFramework from GitHub Releases during pod install
+  s.prepare_command = <<-CMD
+    curl -L "https://github.com/functionland/fula-api/releases/download/v#{s.version}/ios-libs.zip" -o ios-libs.zip
+    unzip -o ios-libs.zip -d .
+    rm ios-libs.zip
+  CMD
+
+  # Include the downloaded XCFramework
   s.vendored_frameworks = 'Frameworks/FulaFlutter.xcframework'
 
   # Link required system frameworks
