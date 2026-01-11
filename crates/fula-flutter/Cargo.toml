@@ -56,3 +56,10 @@ wasm-bindgen-test = "0.3"
 
 [features]
 default = []
+
+# Disable wasm-opt which fails with bulk memory operations
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false
