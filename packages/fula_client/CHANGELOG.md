@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-01-11
+
+### Added
+
+- GitHub Actions CI workflow for automated testing
+- GitHub Actions release workflow for publishing to pub.dev and npm
+- iOS XCFramework support for device and simulator builds
+
+### Changed
+
+- Switched from parking_lot to tokio::sync for async-safe locks
+- Made async runtime conditional: tokio on native, async-lock on WASM
+- Updated iOS podspec to use XCFramework instead of static library
+- Improved flutter_rust_bridge compatibility with anyhow::Result
+
+### Fixed
+
+- WASM build now compiles correctly without tokio OS-specific dependencies
+- Android namespace updated from fula_flutter to fula_client
+- Fixed flutter_rust_bridge codegen configuration
+
 ## [0.2.0] - 2026-01-10
 
 ### Added
