@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Minimum Flutter version raised to 3.38.0 (Dart 3.10.x)
 - Minimum Dart SDK raised to 3.8.0 (required for freezed ^3.2.0)
 - CI/CD workflows updated to use Flutter 3.38.0 stable
+- Web plugin updated to use `package:web` and `dart:js_interop` (replacing deprecated `dart:html` and `dart:js`)
 
 ## [0.2.7] - 2026-01-11
 
