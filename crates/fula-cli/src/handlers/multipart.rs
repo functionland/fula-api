@@ -150,8 +150,8 @@ pub async fn complete_multipart_upload(
 
     // Check balance BEFORE completing the upload (if remote pinning is configured)
     let can_upload = check_can_upload(
-        &headers,
         state.config.storage_api_url.as_deref(),
+        Some(&session.jwt_token),
     ).await?;
 
     if !can_upload {

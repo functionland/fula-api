@@ -1,11 +1,13 @@
 //! Per-user pinning service support
 //!
-//! Users provide their own pinning service credentials via request headers:
-//! - `X-Pinning-Service`: Pinning service endpoint URL
-//! - `X-Pinning-Token`: Bearer token for authentication
+//! The user's JWT (from S3 authentication) is automatically used for pinning service
+//! authentication. The same token is forwarded to the pinning service.
 //!
-//! This allows each user to pin data to their own preferred pinning service
-//! (Pinata, Web3.Storage, etc.) without the gateway storing credentials.
+//! Optional header overrides:
+//! - `X-Pinning-Service`: Override the pinning service endpoint URL
+//! - `X-Pinning-Name`: Custom name for the pin
+//!
+//! The server's default endpoint is configured via `PINNING_SERVICE_ENDPOINT`.
 
 use axum::http::HeaderMap;
 use cid::Cid;
@@ -65,10 +67,10 @@ impl PinningCredentials {
     /// - If user provides only token + no server default: returns None
     pub fn from_headers_with_default(headers: &HeaderMap, default_endpoint: Option<&str>) -> Option<Self> {
         let token = Self::get_header_value(headers, HEADER_PINNING_TOKEN, HEADER_AMZ_PINNING_TOKEN)?;
-        
+
         // Check if user provided their own endpoint
         let user_endpoint = Self::get_header_value(headers, HEADER_PINNING_SERVICE, HEADER_AMZ_PINNING_SERVICE);
-        
+
         let endpoint = if let Some(ep) = user_endpoint {
             // User provided endpoint - must validate for SSRF protection
             if !Self::is_valid_pinning_endpoint(&ep) {
@@ -94,6 +96,39 @@ impl PinningCredentials {
         Some(Self {
             endpoint,
             token,
+            name,
+        })
+    }
+
+    /// Create credentials from JWT token and endpoint
+    ///
+    /// The JWT from S3 authentication is used directly as the pinning token.
+    /// Users can optionally override the endpoint via X-Pinning-Service header.
+    pub fn from_jwt(headers: &HeaderMap, jwt: &str, default_endpoint: &str) -> Option<Self> {
+        if jwt.is_empty() {
+            return None;
+        }
+
+        // Check if user wants to override the endpoint
+        let user_endpoint = Self::get_header_value(headers, HEADER_PINNING_SERVICE, HEADER_AMZ_PINNING_SERVICE);
+
+        let endpoint = if let Some(ep) = user_endpoint {
+            // User provided endpoint - must validate for SSRF protection
+            if !Self::is_valid_pinning_endpoint(&ep) {
+                warn!("Rejected invalid pinning endpoint (must be https, no private IPs)");
+                return None;
+            }
+            ep
+        } else {
+            default_endpoint.to_string()
+        };
+
+        // Optional: pin name from header
+        let name = Self::get_header_value(headers, HEADER_PINNING_NAME, HEADER_AMZ_PINNING_NAME);
+
+        Some(Self {
+            endpoint,
+            token: jwt.to_string(),
             name,
         })
     }
@@ -158,159 +193,149 @@ impl PinningCredentials {
     }
 }
 
-/// Pin a CID to the user's pinning service (if credentials provided)
+/// Pin a CID to the user's pinning service
 ///
 /// This is a fire-and-forget operation - pinning happens asynchronously
 /// and errors are logged but don't fail the main request.
 ///
-/// If `default_endpoint` is provided, users can send only X-Pinning-Token
-/// and the server's endpoint will be used. This enables local pinning services.
-///
-/// If `default_token` is provided (typically the user's JWT from S3 auth), it will be used
-/// as the authentication token when no X-Pinning-Token header is present.
+/// The user's JWT (from S3 authentication) is used as the pinning token.
+/// Users can optionally override the endpoint via X-Pinning-Service header.
 pub async fn pin_for_user(
     headers: &HeaderMap,
     cid: &Cid,
     object_key: Option<&str>,
     default_endpoint: Option<&str>,
-    default_token: Option<&str>,
+    jwt_token: Option<&str>,
 ) {
-    // Security audit fix #2: Don't log header VALUES (contains tokens)
-    // Only log presence of headers, never their values
-    // Check both direct and x-amz-meta-* prefixed headers
-    let has_service = headers.get(HEADER_PINNING_SERVICE).is_some()
+    // Need both endpoint and JWT to pin
+    let (endpoint, jwt) = match (default_endpoint, jwt_token) {
+        (Some(ep), Some(jwt)) if !jwt.is_empty() => (ep, jwt),
+        _ => {
+            tracing::debug!("No pinning endpoint or JWT configured, skipping remote pinning");
+            return;
+        }
+    };
+
+    // Check if user wants to override the endpoint
+    let has_custom_endpoint = headers.get(HEADER_PINNING_SERVICE).is_some()
         || headers.get(HEADER_AMZ_PINNING_SERVICE).is_some();
-    let has_token = headers.get(HEADER_PINNING_TOKEN).is_some()
-        || headers.get(HEADER_AMZ_PINNING_TOKEN).is_some();
-    let has_default_token = default_token.map(|t| !t.is_empty()).unwrap_or(false);
     tracing::debug!(
-        has_pinning_service = has_service,
-        has_pinning_token = has_token,
-        has_default_endpoint = default_endpoint.is_some(),
-        has_default_token = has_default_token,
-        "Checking for pinning credentials (direct or x-amz-meta-* headers)"
+        has_custom_endpoint = has_custom_endpoint,
+        "Pinning with session JWT"
     );
 
-    // Try to get credentials from headers first, then fall back to defaults
-    let creds = PinningCredentials::from_headers_with_default(headers, default_endpoint)
-        .or_else(|| {
-            // If no header credentials, try using default endpoint + default token
-            if let (Some(endpoint), Some(token)) = (default_endpoint, default_token) {
-                if !token.is_empty() {
-                    tracing::debug!("Using default endpoint and session JWT for pinning");
-                    Some(PinningCredentials {
-                        endpoint: endpoint.to_string(),
-                        token: token.to_string(),
-                        name: None,
-                    })
+    // Create credentials using JWT
+    let creds = match PinningCredentials::from_jwt(headers, jwt, endpoint) {
+        Some(c) => c,
+        None => {
+            tracing::debug!("Failed to create pinning credentials");
+            return;
+        }
+    };
+
+    tracing::info!(
+        endpoint = %creds.endpoint,
+        "Pinning to remote service with session JWT"
+    );
+
+    // Spawn a task to pin asynchronously (don't block the response)
+    let cid = *cid;
+    let name = object_key.map(|s| s.to_string()).or(creds.name.clone());
+    let endpoint_for_log = creds.endpoint.clone();
+
+    tokio::spawn(async move {
+        match creds.create_client() {
+            Ok(client) => {
+                let pin = if let Some(n) = name {
+                    Pin::new(cid.to_string()).with_name(n)
                 } else {
-                    None
-                }
-            } else {
-                None
-            }
-        });
+                    Pin::new(cid.to_string())
+                };
 
-    if let Some(creds) = creds {
-        tracing::info!(
-            endpoint = %creds.endpoint,
-            "Remote pinning credentials found, will pin to user's service"
-        );
-        // Spawn a task to pin asynchronously (don't block the response)
-        let cid = *cid;
-        let name = object_key.map(|s| s.to_string()).or(creds.name.clone());
-        let endpoint = creds.endpoint.clone();
-
-        tokio::spawn(async move {
-            match creds.create_client() {
-                Ok(client) => {
-                    let pin = if let Some(n) = name {
-                        Pin::new(cid.to_string()).with_name(n)
-                    } else {
-                        Pin::new(cid.to_string())
-                    };
-
-                    match client.add_pin(pin).await {
-                        Ok(status) => {
-                            info!(
-                                cid = %cid,
-                                request_id = %status.request_id,
-                                service = %endpoint,
-                                "CID pinned to user's pinning service"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                cid = %cid,
-                                service = %endpoint,
-                                error = %e,
-                                "Failed to pin to user's pinning service"
-                            );
-                        }
+                match client.add_pin(pin).await {
+                    Ok(status) => {
+                        info!(
+                            cid = %cid,
+                            request_id = %status.request_id,
+                            service = %endpoint_for_log,
+                            "CID pinned successfully"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            cid = %cid,
+                            service = %endpoint_for_log,
+                            error = %e,
+                            "Failed to pin CID"
+                        );
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        service = %endpoint,
-                        error = %e,
-                        "Failed to create pinning client"
-                    );
-                }
             }
-        });
-    } else {
-        tracing::debug!("No pinning credentials available, skipping remote pinning");
-    }
+            Err(e) => {
+                warn!(
+                    service = %endpoint_for_log,
+                    error = %e,
+                    "Failed to create pinning client"
+                );
+            }
+        }
+    });
 }
 
-/// Unpin a CID from the user's pinning service (if credentials provided)
-pub async fn unpin_for_user(headers: &HeaderMap, cid: &Cid) {
-    if let Some(creds) = PinningCredentials::from_headers(headers) {
-        let cid = *cid;
+/// Unpin a CID from the user's pinning service
+///
+/// The user's JWT (from S3 authentication) is used as the pinning token.
+pub async fn unpin_for_user(
+    headers: &HeaderMap,
+    cid: &Cid,
+    default_endpoint: Option<&str>,
+    jwt_token: Option<&str>,
+) {
+    // Need both endpoint and JWT to unpin
+    let (endpoint, jwt) = match (default_endpoint, jwt_token) {
+        (Some(ep), Some(jwt)) if !jwt.is_empty() => (ep, jwt),
+        _ => return,
+    };
 
-        tokio::spawn(async move {
-            match creds.create_client() {
-                Ok(client) => {
-                    // Find the pin by CID and delete it
-                    match client.get_pin_by_cid(&cid.to_string()).await {
-                        Ok(Some(status)) => {
-                            if let Err(e) = client.delete_pin(&status.request_id).await {
-                                warn!(
-                                    cid = %cid,
-                                    error = %e,
-                                    "Failed to unpin from user's pinning service"
-                                );
-                            } else {
-                                info!(cid = %cid, "CID unpinned from user's pinning service");
-                            }
-                        }
-                        Ok(None) => {
-                            // Not pinned, nothing to do
-                        }
-                        Err(e) => {
+    let creds = match PinningCredentials::from_jwt(headers, jwt, endpoint) {
+        Some(c) => c,
+        None => return,
+    };
+
+    let cid = *cid;
+    tokio::spawn(async move {
+        match creds.create_client() {
+            Ok(client) => {
+                // Find the pin by CID and delete it
+                match client.get_pin_by_cid(&cid.to_string()).await {
+                    Ok(Some(status)) => {
+                        if let Err(e) = client.delete_pin(&status.request_id).await {
                             warn!(
                                 cid = %cid,
                                 error = %e,
-                                "Failed to find pin in user's pinning service"
+                                "Failed to unpin"
                             );
+                        } else {
+                            info!(cid = %cid, "CID unpinned");
                         }
                     }
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to create pinning client for unpin");
+                    Ok(None) => {
+                        // Not pinned, nothing to do
+                    }
+                    Err(e) => {
+                        warn!(
+                            cid = %cid,
+                            error = %e,
+                            "Failed to find pin"
+                        );
+                    }
                 }
             }
-        });
-    }
-}
-
-/// Get a header value, checking the direct header first, then the x-amz-meta-* prefixed version
-fn get_pinning_header(headers: &HeaderMap, direct: &str, amz_meta: &str) -> Option<String> {
-    headers
-        .get(direct)
-        .or_else(|| headers.get(amz_meta))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
+            Err(e) => {
+                warn!(error = %e, "Failed to create pinning client for unpin");
+            }
+        }
+    });
 }
 
 /// Response from storage API balance check
@@ -331,11 +356,13 @@ struct StorageStatus {
 /// - `Ok(false)` if upload is not allowed (insufficient credits)
 /// - `Err(...)` if there was an API error (caller should decide how to handle)
 ///
-/// If no storage_api_url is configured or no pinning token is provided, returns `Ok(true)`
+/// If no storage_api_url is configured or no JWT token is provided, returns `Ok(true)`
 /// to allow local-only uploads without balance checking.
+///
+/// The `jwt_token` parameter should be the user's session JWT (from S3 authentication).
 pub async fn check_can_upload(
-    headers: &HeaderMap,
     storage_api_url: Option<&str>,
+    jwt_token: Option<&str>,
 ) -> Result<bool, ApiError> {
     // If no storage API configured, skip check (allow upload)
     let api_url = match storage_api_url {
@@ -343,12 +370,12 @@ pub async fn check_can_upload(
         None => return Ok(true),
     };
 
-    // Get token from headers (same headers as pinning)
-    let token = match get_pinning_header(headers, HEADER_PINNING_TOKEN, HEADER_AMZ_PINNING_TOKEN) {
-        Some(t) => t,
-        None => {
-            debug!("No pinning token provided, skipping balance check");
-            return Ok(true); // No token = no remote pinning = skip check
+    // Use the session JWT for authentication
+    let token = match jwt_token {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            debug!("No JWT token provided, skipping balance check");
+            return Ok(true); // No token = skip check
         }
     };
 
