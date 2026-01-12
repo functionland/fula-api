@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.8] - 2026-01-11
+
+### Changed
+
+- Minimum Flutter version raised to 3.38.0 (Dart 3.10.x)
+- Minimum Dart SDK raised to 3.8.0 (required for freezed ^3.2.0)
+- CI/CD workflows updated to use Flutter 3.38.0 stable
+
 ## [0.2.7] - 2026-01-11
 
 ### Changed
