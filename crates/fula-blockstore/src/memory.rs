@@ -100,6 +100,11 @@ impl PinStore for MemoryBlockStore {
         Ok(())
     }
 
+    async fn pin_with_token(&self, _cid: &Cid, _name: Option<&str>, _token: &str) -> Result<()> {
+        // Memory store doesn't need real pinning - all blocks are kept in memory
+        Ok(())
+    }
+
     async fn unpin(&self, _cid: &Cid) -> Result<()> {
         // Memory store doesn't need real unpinning
         Ok(())
