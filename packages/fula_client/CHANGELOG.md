@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bumped version to 0.2.9
+
+## [0.2.8] - 2026-01-11
+
+### Changed
+
 - Minimum Flutter version raised to 3.38.0 (Dart 3.10.x)
 - Minimum Dart SDK raised to 3.8.0 (required for freezed ^3.2.0)
 - CI/CD workflows updated to use Flutter 3.38.0 stable
