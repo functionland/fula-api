@@ -405,8 +405,19 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
         Ok(count)
     }
 
-    /// Persist the bucket registry to IPFS
+    /// Persist the bucket registry to IPFS (uses local pinning, no remote auth)
     pub async fn persist_registry(&self) -> Result<Cid> {
+        self.persist_registry_internal(None).await
+    }
+
+    /// Persist the bucket registry to IPFS with user-provided authentication token
+    /// This forwards the user's JWT to the remote pinning service
+    pub async fn persist_registry_with_token(&self, token: &str) -> Result<Cid> {
+        self.persist_registry_internal(Some(token)).await
+    }
+
+    /// Internal implementation for registry persistence
+    async fn persist_registry_internal(&self, token: Option<&str>) -> Result<Cid> {
         // Collect all bucket metadata
         let buckets: Vec<BucketMetadata> = self.buckets.iter().map(|r| r.value().clone()).collect();
         let registry = BucketRegistry::new(buckets);
@@ -418,10 +429,16 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
             CoreError::StorageError(format!("Failed to store registry in IPFS: {}", e))
         })?;
 
-        // Pin the registry for persistence
-        self.store.pin(&cid, Some("fula-bucket-registry")).await.map_err(|e| {
-            CoreError::StorageError(format!("Failed to pin registry: {}", e))
-        })?;
+        // Pin the registry for persistence (with or without user token)
+        if let Some(t) = token {
+            self.store.pin_with_token(&cid, Some("fula-bucket-registry"), t).await.map_err(|e| {
+                CoreError::StorageError(format!("Failed to pin registry: {}", e))
+            })?;
+        } else {
+            self.store.pin(&cid, Some("fula-bucket-registry")).await.map_err(|e| {
+                CoreError::StorageError(format!("Failed to pin registry: {}", e))
+            })?;
+        }
 
         // Save CID to local file if path is configured
         if let Some(ref path) = self.registry_cid_path {

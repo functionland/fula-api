@@ -165,22 +165,53 @@ impl PinningCredentials {
 ///
 /// If `default_endpoint` is provided, users can send only X-Pinning-Token
 /// and the server's endpoint will be used. This enables local pinning services.
-pub async fn pin_for_user(headers: &HeaderMap, cid: &Cid, object_key: Option<&str>, default_endpoint: Option<&str>) {
+///
+/// If `default_token` is provided (typically the user's JWT from S3 auth), it will be used
+/// as the authentication token when no X-Pinning-Token header is present.
+pub async fn pin_for_user(
+    headers: &HeaderMap,
+    cid: &Cid,
+    object_key: Option<&str>,
+    default_endpoint: Option<&str>,
+    default_token: Option<&str>,
+) {
     // Security audit fix #2: Don't log header VALUES (contains tokens)
     // Only log presence of headers, never their values
     // Check both direct and x-amz-meta-* prefixed headers
-    let has_service = headers.get(HEADER_PINNING_SERVICE).is_some() 
+    let has_service = headers.get(HEADER_PINNING_SERVICE).is_some()
         || headers.get(HEADER_AMZ_PINNING_SERVICE).is_some();
     let has_token = headers.get(HEADER_PINNING_TOKEN).is_some()
         || headers.get(HEADER_AMZ_PINNING_TOKEN).is_some();
+    let has_default_token = default_token.map(|t| !t.is_empty()).unwrap_or(false);
     tracing::debug!(
         has_pinning_service = has_service,
         has_pinning_token = has_token,
         has_default_endpoint = default_endpoint.is_some(),
+        has_default_token = has_default_token,
         "Checking for pinning credentials (direct or x-amz-meta-* headers)"
     );
-    
-    if let Some(creds) = PinningCredentials::from_headers_with_default(headers, default_endpoint) {
+
+    // Try to get credentials from headers first, then fall back to defaults
+    let creds = PinningCredentials::from_headers_with_default(headers, default_endpoint)
+        .or_else(|| {
+            // If no header credentials, try using default endpoint + default token
+            if let (Some(endpoint), Some(token)) = (default_endpoint, default_token) {
+                if !token.is_empty() {
+                    tracing::debug!("Using default endpoint and session JWT for pinning");
+                    Some(PinningCredentials {
+                        endpoint: endpoint.to_string(),
+                        token: token.to_string(),
+                        name: None,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+    if let Some(creds) = creds {
         tracing::info!(
             endpoint = %creds.endpoint,
             "Remote pinning credentials found, will pin to user's service"
@@ -189,7 +220,7 @@ pub async fn pin_for_user(headers: &HeaderMap, cid: &Cid, object_key: Option<&st
         let cid = *cid;
         let name = object_key.map(|s| s.to_string()).or(creds.name.clone());
         let endpoint = creds.endpoint.clone();
-        
+
         tokio::spawn(async move {
             match creds.create_client() {
                 Ok(client) => {
@@ -228,7 +259,7 @@ pub async fn pin_for_user(headers: &HeaderMap, cid: &Cid, object_key: Option<&st
             }
         });
     } else {
-        tracing::debug!("No pinning credentials in headers, skipping remote pinning");
+        tracing::debug!("No pinning credentials available, skipping remote pinning");
     }
 }
 

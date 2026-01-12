@@ -278,13 +278,10 @@ collect_configuration() {
     # Pinning service (optional)
     echo ""
     log_info "Pinning Service (optional)"
+    log_info "Note: Authentication uses the user's JWT from S3 requests - no server token needed"
     prompt_env "PINNING_SERVICE_ENDPOINT" "Pinning service endpoint" "${PINNING_SERVICE_ENDPOINT:-}"
     if [[ -n "${PINNING_SERVICE_ENDPOINT}" ]]; then
-        prompt_env "PINNING_SERVICE_TOKEN" "Pinning service token" "${PINNING_SERVICE_TOKEN:-}" true
-        if [[ -z "${PINNING_SERVICE_TOKEN}" ]]; then
-            log_warn "Pinning service endpoint provided without token - SERVER-LEVEL pinning will be DISABLED"
-            log_warn "Users can still pin via per-request headers (X-Pinning-Service, X-Pinning-Token)"
-        fi
+        log_info "Pinning service configured - user JWTs will be forwarded for authentication"
     fi
 
     # Storage API for balance checking (optional)
@@ -355,9 +352,9 @@ REQUEST_TIMEOUT=${REQUEST_TIMEOUT}
 # IPFS Configuration
 IPFS_URL=http://localhost:5001
 
-# Pinning Service (optional - gateway-level pinning for all uploads)
+# Pinning Service (optional)
+# Note: Authentication uses the user's JWT from S3 requests, not a server token
 PINNING_SERVICE_ENDPOINT=${PINNING_SERVICE_ENDPOINT:-}
-PINNING_SERVICE_TOKEN=${PINNING_SERVICE_TOKEN:-}
 
 # Storage API for balance checking (optional)
 STORAGE_API_URL=${STORAGE_API_URL:-}

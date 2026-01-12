@@ -102,7 +102,8 @@ pub fn validate_token_with_config(
 }
 
 /// Convert claims to a user session
-pub fn claims_to_session(claims: Claims) -> UserSession {
+/// The jwt_token parameter is the raw JWT for forwarding to pinning service
+pub fn claims_to_session(claims: Claims, jwt_token: String) -> UserSession {
     let scopes: Vec<String> = claims.scope
         .split_whitespace()
         .map(|s| s.to_string())
@@ -113,7 +114,7 @@ pub fn claims_to_session(claims: Claims) -> UserSession {
         .unwrap_or_else(|| Utc::now() + Duration::hours(1));
 
     // Security audit fix A3: Use UserSession::new() to auto-hash user ID
-    UserSession::new(claims.sub, claims.name, scopes, expires_at)
+    UserSession::new(claims.sub, claims.name, scopes, expires_at, jwt_token)
 }
 
 /// Extract bearer token from Authorization header
@@ -412,11 +413,13 @@ pub fn anonymous_user_id() -> String {
 /// Create a development/test session
 pub fn dev_session() -> UserSession {
     // Security audit fix A3: Use UserSession::new() to auto-hash user ID
+    // Note: dev session has empty JWT token since auth is disabled
     UserSession::new(
         "dev-user".to_string(),
         Some("Development User".to_string()),
         vec!["storage:*".to_string()],
         Utc::now() + Duration::days(365),
+        String::new(), // No JWT in dev mode
     )
 }
 
@@ -485,9 +488,10 @@ mod tests {
             name: Some("Test User".to_string()),
         };
 
-        let session = claims_to_session(claims);
+        let session = claims_to_session(claims, "test-jwt-token".to_string());
 
         assert_eq!(session.user_id, "user123");
+        assert_eq!(session.jwt_token, "test-jwt-token");
         assert!(session.can_read());
         assert!(session.can_write());
     }

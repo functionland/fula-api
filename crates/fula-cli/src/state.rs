@@ -107,16 +107,16 @@ impl AppState {
         })
     }
 
-    /// Create IPFS block store with optional pinning service
+    /// Create IPFS block store with optional pinning service endpoint
+    /// Note: The pinning service token is provided per-request (from user's JWT),
+    /// not at startup. Only the endpoint is configured at the server level.
     async fn create_ipfs_store(config: &GatewayConfig) -> anyhow::Result<IpfsPinningBlockStore> {
         let mut ipfs_config = IpfsPinningConfig::with_ipfs(&config.ipfs_url);
 
-        // Add pinning service if configured
-        if let (Some(endpoint), Some(token)) = (
-            &config.pinning_service_endpoint,
-            &config.pinning_service_token,
-        ) {
-            ipfs_config = ipfs_config.with_pinning_service(endpoint, token);
+        // Store the pinning service endpoint if configured
+        // The token will be provided per-request from the user's JWT
+        if let Some(endpoint) = &config.pinning_service_endpoint {
+            ipfs_config = ipfs_config.with_pinning_endpoint(endpoint);
         }
 
         let store = IpfsPinningBlockStore::new(ipfs_config).await?;
@@ -137,11 +137,13 @@ pub struct UserSession {
     pub scopes: Vec<String>,
     /// Expiration time
     pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// Raw JWT token for forwarding to pinning service
+    pub jwt_token: String,
 }
 
 impl UserSession {
     /// Create a new user session with automatic ID hashing
-    pub fn new(user_id: String, display_name: Option<String>, scopes: Vec<String>, expires_at: chrono::DateTime<chrono::Utc>) -> Self {
+    pub fn new(user_id: String, display_name: Option<String>, scopes: Vec<String>, expires_at: chrono::DateTime<chrono::Utc>, jwt_token: String) -> Self {
         let hashed_user_id = hash_user_id(&user_id);
         Self {
             user_id,
@@ -149,6 +151,7 @@ impl UserSession {
             display_name,
             scopes,
             expires_at,
+            jwt_token,
         }
     }
 

@@ -97,6 +97,10 @@ pub trait PinStore: BlockStore {
     /// Pin a CID for persistence
     async fn pin(&self, cid: &Cid, name: Option<&str>) -> Result<()>;
 
+    /// Pin a CID with a user-provided authentication token
+    /// This allows per-request authentication to remote pinning services
+    async fn pin_with_token(&self, cid: &Cid, name: Option<&str>, token: &str) -> Result<()>;
+
     /// Unpin a CID
     async fn unpin(&self, cid: &Cid) -> Result<()>;
 

@@ -108,7 +108,8 @@ pub async fn put_object(
         })?;
 
     // Persist the bucket registry so the new root CID survives restarts
-    if let Err(e) = state.bucket_manager.persist_registry().await {
+    // Use the user's JWT for pinning service authentication
+    if let Err(e) = state.bucket_manager.persist_registry_with_token(&session.jwt_token).await {
         tracing::warn!(error = %e, "Failed to persist bucket registry after put_object");
     }
 
@@ -118,8 +119,9 @@ pub async fn put_object(
     {
         let block_store = Arc::clone(&state.block_store);
         let pin_name = format!("bucket:{}", bucket_name);
+        let jwt_token = session.jwt_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = block_store.pin(&bucket_root_cid, Some(&pin_name)).await {
+            if let Err(e) = block_store.pin_with_token(&bucket_root_cid, Some(&pin_name), &jwt_token).await {
                 tracing::warn!(cid = %bucket_root_cid, error = %e, "Failed to pin bucket root CID");
             } else {
                 tracing::info!(cid = %bucket_root_cid, bucket = %pin_name, "Bucket root CID pinned (recursive)");
@@ -128,9 +130,8 @@ pub async fn put_object(
     }
 
     // Also pin to user's external pinning service if credentials provided
-    // Headers: X-Pinning-Service, X-Pinning-Token
-    // Users can send only X-Pinning-Token if server has a default endpoint configured
-    pin_for_user(&headers, &cid, Some(&key), state.config.pinning_service_endpoint.as_deref()).await;
+    // The session JWT is used as the default token if no X-Pinning-Token header is provided
+    pin_for_user(&headers, &cid, Some(&key), state.config.pinning_service_endpoint.as_deref(), Some(&session.jwt_token)).await;
 
     Ok((
         StatusCode::OK,
@@ -350,7 +351,8 @@ pub async fn delete_object(
     bucket.flush().await?;
 
     // Persist the bucket registry so the updated root CID survives restarts
-    if let Err(e) = state.bucket_manager.persist_registry().await {
+    // Use the user's JWT for pinning service authentication
+    if let Err(e) = state.bucket_manager.persist_registry_with_token(&session.jwt_token).await {
         tracing::warn!(error = %e, "Failed to persist bucket registry after delete_object");
     }
 
@@ -407,7 +409,8 @@ pub async fn copy_object(
     dest_bucket_handle.flush().await?;
 
     // Persist the bucket registry so the updated root CID survives restarts
-    if let Err(e) = state.bucket_manager.persist_registry().await {
+    // Use the user's JWT for pinning service authentication
+    if let Err(e) = state.bucket_manager.persist_registry_with_token(&session.jwt_token).await {
         tracing::warn!(error = %e, "Failed to persist bucket registry after copy_object");
     }
 

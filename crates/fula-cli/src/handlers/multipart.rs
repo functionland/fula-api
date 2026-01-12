@@ -214,15 +214,22 @@ pub async fn complete_multipart_upload(
     bucket_handle.put_object(key.clone(), metadata).await?;
     let bucket_root_cid = bucket_handle.flush().await?;
 
+    // Persist the bucket registry so the new root CID survives restarts
+    // Use the user's JWT for pinning service authentication
+    if let Err(e) = state.bucket_manager.persist_registry_with_token(&session.jwt_token).await {
+        tracing::warn!(error = %e, "Failed to persist bucket registry after complete_multipart_upload");
+    }
+
     // Pin the BUCKET ROOT CID to ensure tree structure survives GC.
     // This recursively pins all tree nodes AND all referenced object data (including parts).
     // NOTE: Pinning is async (fire-and-forget) to avoid blocking the response.
     {
         let block_store = Arc::clone(&state.block_store);
         let pin_bucket = bucket.clone();
+        let jwt_token = session.jwt_token.clone();
         tokio::spawn(async move {
             let pin_name = format!("bucket:{}", pin_bucket);
-            if let Err(e) = block_store.pin(&bucket_root_cid, Some(&pin_name)).await {
+            if let Err(e) = block_store.pin_with_token(&bucket_root_cid, Some(&pin_name), &jwt_token).await {
                 tracing::warn!(cid = %bucket_root_cid, error = %e, "Failed to pin bucket root CID");
             } else {
                 tracing::info!(cid = %bucket_root_cid, bucket = %pin_name, "Bucket root CID pinned (recursive)");
@@ -231,9 +238,8 @@ pub async fn complete_multipart_upload(
     }
 
     // Also pin to user's external pinning service if credentials provided
-    // Pin the first part CID as the representative (or all parts)
-    // Users can send only X-Pinning-Token if server has a default endpoint configured
-    pin_for_user(&headers, &first_part_cid, Some(&key), state.config.pinning_service_endpoint.as_deref()).await;
+    // The session JWT is used as the default token if no X-Pinning-Token header is provided
+    pin_for_user(&headers, &first_part_cid, Some(&key), state.config.pinning_service_endpoint.as_deref(), Some(&session.jwt_token)).await;
 
     let location = format!("/{}/{}", bucket, key);
     let xml_response = xml::complete_multipart_upload_result(

@@ -26,12 +26,9 @@ struct Args {
     cluster_url: String,
 
     /// IPFS Pinning Service API endpoint (e.g., https://api.pinata.cloud/psa)
+    /// Note: The token is provided per-request from the user's JWT, not configured here.
     #[arg(long, env = "PINNING_SERVICE_ENDPOINT")]
     pinning_service_endpoint: Option<String>,
-
-    /// IPFS Pinning Service access token
-    #[arg(long, env = "PINNING_SERVICE_TOKEN")]
-    pinning_service_token: Option<String>,
 
     /// Storage API URL for balance/quota checking (e.g., https://cloud.fx.land)
     #[arg(long, env = "STORAGE_API_URL")]
@@ -118,7 +115,6 @@ async fn main() -> anyhow::Result<()> {
         ipfs_url: args.ipfs_url,
         cluster_url: args.cluster_url,
         pinning_service_endpoint: args.pinning_service_endpoint,
-        pinning_service_token: args.pinning_service_token,
         storage_api_url: args.storage_api_url,
         use_memory_store: args.memory_store,
         jwt_secret: args.jwt_secret,

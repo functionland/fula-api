@@ -27,7 +27,12 @@ pub struct IpfsPinningConfig {
     /// IPFS configuration
     pub ipfs: IpfsConfig,
     /// Pinning service configuration (optional - if None, uses local IPFS pinning)
+    /// Note: This is for server-configured pinning. For per-request pinning with user JWT,
+    /// use pin_with_token() instead.
     pub pinning_service: Option<PinningServiceConfig>,
+    /// Pinning service endpoint URL (for per-request token-based pinning)
+    /// When set, pin_with_token() will use this endpoint with the provided token
+    pub pinning_endpoint: Option<String>,
     /// Whether to wait for pinning to complete before returning
     pub wait_for_pin: bool,
     /// Timeout for waiting for pin completion
@@ -45,6 +50,7 @@ impl Default for IpfsPinningConfig {
         Self {
             ipfs: IpfsConfig::default(),
             pinning_service: None,
+            pinning_endpoint: None,
             wait_for_pin: false,
             pin_timeout: Duration::from_secs(300), // 5 minutes
             pin_poll_interval: Duration::from_secs(5),
@@ -63,7 +69,9 @@ impl IpfsPinningConfig {
         }
     }
 
-    /// Add pinning service
+    /// Add pinning service with static credentials (server-level configuration)
+    /// Note: For per-request authentication, use with_pinning_endpoint() instead
+    /// and call pin_with_token() with the user's JWT
     pub fn with_pinning_service(
         mut self,
         endpoint: impl Into<String>,
@@ -73,10 +81,23 @@ impl IpfsPinningConfig {
         self
     }
 
+    /// Set pinning service endpoint only (for per-request token-based auth)
+    /// The token will be provided per-request via pin_with_token()
+    pub fn with_pinning_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.pinning_endpoint = Some(endpoint.into());
+        self
+    }
+
     /// Set whether to wait for pin completion
     pub fn with_wait_for_pin(mut self, wait: bool) -> Self {
         self.wait_for_pin = wait;
         self
+    }
+
+    /// Get the pinning endpoint (from either pinning_service or pinning_endpoint)
+    pub fn get_pinning_endpoint(&self) -> Option<&str> {
+        self.pinning_endpoint.as_deref()
+            .or(self.pinning_service.as_ref().map(|s| s.endpoint.as_str()))
     }
 }
 
@@ -128,19 +149,18 @@ impl IpfsPinningBlockStore {
     }
 
     /// Create from environment variables
+    /// Note: Only reads PINNING_SERVICE_ENDPOINT, not TOKEN.
+    /// Authentication is provided per-request via pin_with_token() using the user's JWT.
     pub async fn from_env() -> Result<Self> {
         let ipfs_url = std::env::var("IPFS_API_URL")
             .unwrap_or_else(|_| "http://localhost:5001".to_string());
 
         let mut config = IpfsPinningConfig::with_ipfs(ipfs_url);
 
-        // Check for pinning service configuration
-        if let (Ok(endpoint), Ok(token)) = (
-            std::env::var("PINNING_SERVICE_ENDPOINT"),
-            std::env::var("PINNING_SERVICE_TOKEN"),
-        ) {
-            config = config.with_pinning_service(endpoint, token);
-            info!("Pinning service configured");
+        // Check for pinning service endpoint (token is provided per-request)
+        if let Ok(endpoint) = std::env::var("PINNING_SERVICE_ENDPOINT") {
+            config = config.with_pinning_endpoint(endpoint);
+            info!("Pinning service endpoint configured (auth via per-request JWT)");
         }
 
         Self::new(config).await
@@ -193,6 +213,57 @@ impl IpfsPinningBlockStore {
 
             info!(cid = %cid, "CID pinned to local IPFS");
         }
+
+        Ok(())
+    }
+
+    /// Pin a CID with a user-provided authentication token
+    /// Creates a temporary pinning client using the configured endpoint and provided token
+    #[instrument(skip(self, token))]
+    async fn pin_cid_with_token(&self, cid: &Cid, name: Option<&str>, token: &str) -> Result<()> {
+        let cid_str = cid.to_string();
+
+        // Get the pinning endpoint
+        let endpoint = self.config.get_pinning_endpoint()
+            .ok_or_else(|| BlockStoreError::PinFailed(
+                "No pinning service endpoint configured".to_string()
+            ))?;
+
+        // Skip if token is empty (e.g., dev mode)
+        if token.is_empty() {
+            warn!(cid = %cid, "Empty token provided, falling back to local IPFS pinning");
+            return self.pin_cid(cid, name).await;
+        }
+
+        // Create a temporary pinning client with the user's token
+        let config = PinningServiceConfig::new(endpoint, token);
+        let client = PinningServiceClient::new(config)?;
+
+        // Create pin request
+        let pin = if let Some(n) = name {
+            Pin::new(&cid_str).with_name(n)
+        } else {
+            Pin::new(&cid_str)
+        };
+
+        let response = client.add_pin(pin).await?;
+
+        // Store the request ID for tracking
+        self.pin_requests
+            .insert(cid_str.clone(), response.request_id.clone());
+
+        // Optionally wait for pin to complete
+        if self.config.wait_for_pin {
+            client
+                .wait_for_pin(
+                    &response.request_id,
+                    self.config.pin_timeout,
+                    self.config.pin_poll_interval,
+                )
+                .await?;
+        }
+
+        info!(cid = %cid, request_id = %response.request_id, endpoint = %endpoint, "CID pinned with user token");
 
         Ok(())
     }
@@ -321,6 +392,10 @@ impl BlockStore for IpfsPinningBlockStore {
 impl PinStore for IpfsPinningBlockStore {
     async fn pin(&self, cid: &Cid, name: Option<&str>) -> Result<()> {
         self.pin_cid(cid, name).await
+    }
+
+    async fn pin_with_token(&self, cid: &Cid, name: Option<&str>, token: &str) -> Result<()> {
+        self.pin_cid_with_token(cid, name, token).await
     }
 
     async fn unpin(&self, cid: &Cid) -> Result<()> {
@@ -498,6 +573,16 @@ impl PinStore for FlexibleBlockStore {
     async fn pin(&self, cid: &Cid, name: Option<&str>) -> Result<()> {
         match self {
             Self::IpfsPinning(store) => store.pin(cid, name).await,
+            Self::Memory(_) => {
+                // Memory store doesn't need pinning, just succeed silently
+                Ok(())
+            }
+        }
+    }
+
+    async fn pin_with_token(&self, cid: &Cid, name: Option<&str>, token: &str) -> Result<()> {
+        match self {
+            Self::IpfsPinning(store) => store.pin_with_token(cid, name, token).await,
             Self::Memory(_) => {
                 // Memory store doesn't need pinning, just succeed silently
                 Ok(())

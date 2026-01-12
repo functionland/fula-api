@@ -61,16 +61,17 @@ pub async fn auth_middleware(
         Some(header) => {
             // Extract JWT from either Bearer token or AWS Sig V4 format
             let token = extract_token_from_header(header, request.headers())?;
-            
+
             let secret = state.config.jwt_secret.as_ref()
                 .ok_or_else(|| ApiError::s3(S3ErrorCode::InternalError, "JWT secret not configured"))?;
-            
+
             let claims = validate_token(&token, secret)?;
-            claims_to_session(claims)
+            // Pass the raw JWT token to the session for forwarding to pinning service
+            claims_to_session(claims, token)
         }
         None => {
             return Err(ApiError::s3(
-                S3ErrorCode::AccessDenied, 
+                S3ErrorCode::AccessDenied,
                 "Authentication required. Use 'Bearer <jwt>' or AWS Signature V4 with 'JWT:<jwt>' as access key"
             ));
         }
