@@ -1240,6 +1240,7 @@ impl EncryptedClient {
     ///
     /// # Note
     /// Handles both single-block and chunked files automatically.
+    /// Uses nonce from share token if available, otherwise falls back to metadata headers.
     pub async fn get_object_with_share(
         &self,
         bucket: &str,
@@ -1269,7 +1270,35 @@ impl EncryptedClient {
             ));
         }
 
-        // Fetch the object
+        // Check if share token includes encryption metadata (nonce or chunked info)
+        // If so, we can decrypt using just the raw data without needing S3 metadata headers
+        if accepted_share.chunked_metadata.is_some() {
+            // CHUNKED FILE: Use chunked metadata from share token
+            return self.get_object_chunked_with_share_token(bucket, storage_key, accepted_share).await;
+        }
+
+        if let Some(ref nonce_b64) = accepted_share.nonce {
+            // SINGLE FILE: Use nonce from share token - fetch raw data only
+            let data = self.inner.get_object(bucket, storage_key).await?;
+
+            let nonce_bytes = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                nonce_b64,
+            ).map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(format!("Invalid nonce in share token: {}", e))
+            ))?;
+            let nonce = Nonce::from_bytes(&nonce_bytes)
+                .map_err(ClientError::Encryption)?;
+
+            let aead = Aead::new_default(&accepted_share.dek);
+            let plaintext = aead.decrypt(&nonce, &data)
+                .map_err(ClientError::Encryption)?;
+
+            return Ok(Bytes::from(plaintext));
+        }
+
+        // FALLBACK: Share token doesn't have encryption metadata, try to get it from S3 headers
+        // This is for backwards compatibility with old share tokens
         let result = self.inner.get_object_with_metadata(bucket, storage_key).await?;
 
         // Check if encrypted
@@ -1288,11 +1317,11 @@ impl EncryptedClient {
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        // Parse encryption metadata
+        // Parse encryption metadata from S3 headers
         let enc_metadata_str = result.metadata
             .get("x-fula-encryption")
             .ok_or_else(|| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption("Missing encryption metadata".to_string())
+                fula_crypto::CryptoError::Decryption("Missing encryption metadata (not in share token or S3 headers)".to_string())
             ))?;
 
         let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
@@ -1302,12 +1331,12 @@ impl EncryptedClient {
 
         if is_chunked {
             // CHUNKED DOWNLOAD: Download and decrypt each chunk using the share's DEK
-            self.get_object_chunked_with_share(bucket, storage_key, &enc_metadata, &accepted_share.dek).await
+            self.get_object_chunked_with_share_metadata(bucket, storage_key, &enc_metadata, &accepted_share.dek).await
         } else {
             // SINGLE OBJECT: Decrypt directly
             let nonce_b64 = enc_metadata["nonce"].as_str()
                 .ok_or_else(|| ClientError::Encryption(
-                    fula_crypto::CryptoError::Decryption("Missing nonce".to_string())
+                    fula_crypto::CryptoError::Decryption("Missing nonce in encryption metadata".to_string())
                 ))?;
             let nonce_bytes = base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
@@ -1327,8 +1356,46 @@ impl EncryptedClient {
         }
     }
 
-    /// Internal: Download and decrypt a chunked file using a share's DEK
-    async fn get_object_chunked_with_share(
+    /// Internal: Download and decrypt a chunked file using metadata from share token
+    async fn get_object_chunked_with_share_token(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        accepted_share: &AcceptedShare,
+    ) -> Result<Bytes> {
+        let chunked_json = accepted_share.chunked_metadata.as_ref()
+            .ok_or_else(|| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption("Missing chunked metadata in share token".to_string())
+            ))?;
+
+        let chunked_meta: ChunkedFileMetadata = serde_json::from_str(chunked_json)
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(format!("Invalid chunked metadata in share token: {}", e))
+            ))?;
+
+        // Create decoder
+        let mut decoder = fula_crypto::ChunkedDecoder::new(accepted_share.dek.clone(), chunked_meta.clone());
+
+        // Pre-allocate result buffer
+        let mut plaintext = Vec::with_capacity(chunked_meta.total_size as usize);
+
+        // Download and decrypt each chunk in order
+        for chunk_index in 0..chunked_meta.num_chunks {
+            let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk_index);
+
+            let chunk_result = self.inner.get_object(bucket, &chunk_key).await?;
+
+            let chunk_plaintext = decoder.decrypt_chunk(chunk_index, &chunk_result)
+                .map_err(ClientError::Encryption)?;
+
+            plaintext.extend_from_slice(&chunk_plaintext);
+        }
+
+        Ok(Bytes::from(plaintext))
+    }
+
+    /// Internal: Download and decrypt a chunked file using metadata from S3 headers
+    async fn get_object_chunked_with_share_metadata(
         &self,
         bucket: &str,
         storage_key: &str,

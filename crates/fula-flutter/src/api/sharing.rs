@@ -78,6 +78,18 @@ pub async fn create_share_token(
         builder = builder.expires_at(ts);
     }
 
+    // Include nonce in share token so recipient can decrypt without S3 metadata headers
+    if let Some(nonce_str) = enc_metadata["nonce"].as_str() {
+        builder = builder.nonce(nonce_str);
+    }
+
+    // Include chunked metadata for large files (> 768KB)
+    if enc_metadata.get("chunked").is_some() {
+        let chunked_json = serde_json::to_string(&enc_metadata["chunked"])
+            .map_err(|e| anyhow::anyhow!("Failed to serialize chunked metadata: {}", e))?;
+        builder = builder.chunked_metadata(chunked_json);
+    }
+
     let token = builder.build()
         .map_err(|e| anyhow::anyhow!("Failed to build share token: {}", e))?;
 
@@ -167,6 +179,22 @@ pub async fn create_share_token_with_mode(
     // Apply expiration if provided
     let builder = if let Some(ts) = expires_at {
         builder.expires_at(ts)
+    } else {
+        builder
+    };
+
+    // Include nonce in share token so recipient can decrypt without S3 metadata headers
+    let builder = if let Some(nonce_str) = enc_metadata["nonce"].as_str() {
+        builder.nonce(nonce_str)
+    } else {
+        builder
+    };
+
+    // Include chunked metadata for large files (> 768KB)
+    let builder = if enc_metadata.get("chunked").is_some() {
+        let chunked_json = serde_json::to_string(&enc_metadata["chunked"])
+            .map_err(|e| anyhow::anyhow!("Failed to serialize chunked metadata: {}", e))?;
+        builder.chunked_metadata(chunked_json)
     } else {
         builder
     };

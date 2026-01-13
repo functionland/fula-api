@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.17] - 2026-01-13
+
+### Fixed
+
+- **CRITICAL: Share tokens missing encryption nonce - decryption produces garbage**
+  - Share tokens only contained wrapped DEK but not the nonce needed for decryption
+  - Web UI proxy doesn't forward S3 metadata headers (`x-fula-encryption`)
+  - Without the nonce, decryption "succeeds" but produces garbage data
+  - **Fix**: Share tokens now include `nonce` (for single-block files) and `chunked_metadata` (for chunked files)
+  - Recipients can now decrypt using just the share token without needing S3 metadata headers
+
+### Changed
+
+- `ShareToken` struct now includes optional `nonce` and `chunked_metadata` fields
+- `ShareBuilder` has new `.nonce()` and `.chunked_metadata()` builder methods
+- `AcceptedShare` now carries nonce and chunked metadata through to decryption
+- `get_object_with_share` uses nonce from share token if available, falls back to S3 headers for backwards compatibility
+- Share token version bumped to 3
+
+### Migration Guide for FxFiles
+
+Share tokens created with v0.2.17+ will automatically include the nonce.
+No code changes needed - just rebuild FxFiles with the new fula_client SDK.
+
+Old share tokens (without nonce) will continue to work if the proxy forwards S3 headers correctly.
+
 ## [0.2.16] - 2026-01-13
 
 ### Fixed

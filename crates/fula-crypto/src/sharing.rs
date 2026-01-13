@@ -160,6 +160,13 @@ pub struct ShareToken {
     /// Snapshot binding (required for Snapshot mode)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_binding: Option<SnapshotBinding>,
+    /// Encryption nonce (base64 encoded) - included so recipient can decrypt
+    /// without needing to fetch metadata headers from S3
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
+    /// Chunked file metadata (JSON) - for files > 768KB that use per-chunk nonces
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunked_metadata: Option<String>,
 }
 
 impl ShareToken {
@@ -264,6 +271,10 @@ pub struct ShareBuilder<'a> {
     permissions: SharePermissions,
     mode: ShareMode,
     snapshot_binding: Option<SnapshotBinding>,
+    /// Encryption nonce (base64) for single-block files
+    nonce: Option<String>,
+    /// Chunked file metadata (JSON) for files > 768KB
+    chunked_metadata: Option<String>,
 }
 
 impl<'a> ShareBuilder<'a> {
@@ -282,7 +293,23 @@ impl<'a> ShareBuilder<'a> {
             permissions: SharePermissions::read_only(),
             mode: ShareMode::Temporal,
             snapshot_binding: None,
+            nonce: None,
+            chunked_metadata: None,
         }
+    }
+
+    /// Set the encryption nonce (base64 encoded) for single-block files
+    /// This allows recipients to decrypt without needing S3 metadata headers
+    pub fn nonce(mut self, nonce_b64: impl Into<String>) -> Self {
+        self.nonce = Some(nonce_b64.into());
+        self
+    }
+
+    /// Set chunked file metadata (JSON) for files > 768KB
+    /// This allows recipients to decrypt chunked files without needing S3 metadata headers
+    pub fn chunked_metadata(mut self, metadata_json: impl Into<String>) -> Self {
+        self.chunked_metadata = Some(metadata_json.into());
+        self
     }
 
     /// Set the path scope for this share
@@ -381,9 +408,11 @@ impl<'a> ShareBuilder<'a> {
             expires_at: self.expires_at,
             created_at: current_timestamp(),
             permissions: self.permissions,
-            version: 2, // Bump version for new format with mode
+            version: 3, // Bump version for new format with nonce
             mode: self.mode,
             snapshot_binding: self.snapshot_binding,
+            nonce: self.nonce,
+            chunked_metadata: self.chunked_metadata,
         })
     }
 }
@@ -543,6 +572,8 @@ impl ShareRecipient {
             path_scope: token.path_scope.clone(),
             expires_at: token.expires_at,
             permissions: token.permissions,
+            nonce: token.nonce.clone(),
+            chunked_metadata: token.chunked_metadata.clone(),
         })
     }
 }
@@ -557,6 +588,10 @@ pub struct AcceptedShare {
     pub expires_at: Option<i64>,
     /// Permissions
     pub permissions: SharePermissions,
+    /// Encryption nonce (base64 encoded) - for single-block files
+    pub nonce: Option<String>,
+    /// Chunked file metadata (JSON) - for files > 768KB
+    pub chunked_metadata: Option<String>,
 }
 
 impl AcceptedShare {
