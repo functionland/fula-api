@@ -14,6 +14,7 @@ import 'types.dart';
 ///
 /// # Arguments
 /// * `client` - The encrypted client handle
+/// * `bucket` - The bucket containing the file
 /// * `storage_key` - The storage key of the file to share
 /// * `recipient_public_key` - The recipient's public key (32 bytes)
 /// * `expires_at` - Optional expiration timestamp (Unix epoch seconds)
@@ -21,11 +22,13 @@ import 'types.dart';
 /// Returns a JSON-serialized share token that can be sent to the recipient.
 Future<String> createShareToken(
         {required EncryptedClientHandle client,
+        required String bucket,
         required String storageKey,
         required List<int> recipientPublicKey,
         PlatformInt64? expiresAt}) =>
     RustLib.instance.api.crateApiSharingCreateShareToken(
         client: client,
+        bucket: bucket,
         storageKey: storageKey,
         recipientPublicKey: recipientPublicKey,
         expiresAt: expiresAt);
@@ -34,6 +37,7 @@ Future<String> createShareToken(
 ///
 /// # Arguments
 /// * `client` - The encrypted client handle
+/// * `bucket` - The bucket containing the file
 /// * `storage_key` - The storage key of the file to share
 /// * `recipient_public_key` - The recipient's public key (32 bytes)
 /// * `mode` - Share mode (Temporal or Snapshot)
@@ -43,12 +47,14 @@ Future<String> createShareToken(
 /// to temporal mode for Snapshot shares since we don't have content hash info.
 Future<String> createShareTokenWithMode(
         {required EncryptedClientHandle client,
+        required String bucket,
         required String storageKey,
         required List<int> recipientPublicKey,
         required ShareMode mode,
         PlatformInt64? expiresAt}) =>
     RustLib.instance.api.crateApiSharingCreateShareTokenWithMode(
         client: client,
+        bucket: bucket,
         storageKey: storageKey,
         recipientPublicKey: recipientPublicKey,
         mode: mode,

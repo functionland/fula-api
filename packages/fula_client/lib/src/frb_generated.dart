@@ -125,12 +125,14 @@ abstract class RustLibApi extends BaseApi {
 
   Future<String> crateApiSharingCreateShareToken(
       {required EncryptedClientHandle client,
+      required String bucket,
       required String storageKey,
       required List<int> recipientPublicKey,
       PlatformInt64? expiresAt});
 
   Future<String> crateApiSharingCreateShareTokenWithMode(
       {required EncryptedClientHandle client,
+      required String bucket,
       required String storageKey,
       required List<int> recipientPublicKey,
       required ShareMode mode,
@@ -744,6 +746,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @override
   Future<String> crateApiSharingCreateShareToken(
       {required EncryptedClientHandle client,
+      required String bucket,
       required String storageKey,
       required List<int> recipientPublicKey,
       PlatformInt64? expiresAt}) {
@@ -752,18 +755,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         var arg0 =
             cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
                 client);
-        var arg1 = cst_encode_String(storageKey);
-        var arg2 = cst_encode_list_prim_u_8_loose(recipientPublicKey);
-        var arg3 = cst_encode_opt_box_autoadd_i_64(expiresAt);
+        var arg1 = cst_encode_String(bucket);
+        var arg2 = cst_encode_String(storageKey);
+        var arg3 = cst_encode_list_prim_u_8_loose(recipientPublicKey);
+        var arg4 = cst_encode_opt_box_autoadd_i_64(expiresAt);
         return wire.wire__crate__api__sharing__create_share_token(
-            port_, arg0, arg1, arg2, arg3);
+            port_, arg0, arg1, arg2, arg3, arg4);
       },
       codec: DcoCodec(
         decodeSuccessData: dco_decode_String,
         decodeErrorData: dco_decode_AnyhowException,
       ),
       constMeta: kCrateApiSharingCreateShareTokenConstMeta,
-      argValues: [client, storageKey, recipientPublicKey, expiresAt],
+      argValues: [client, bucket, storageKey, recipientPublicKey, expiresAt],
       apiImpl: this,
     ));
   }
@@ -771,12 +775,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiSharingCreateShareTokenConstMeta =>
       const TaskConstMeta(
         debugName: "create_share_token",
-        argNames: ["client", "storageKey", "recipientPublicKey", "expiresAt"],
+        argNames: ["client", "bucket", "storageKey", "recipientPublicKey", "expiresAt"],
       );
 
   @override
   Future<String> crateApiSharingCreateShareTokenWithMode(
       {required EncryptedClientHandle client,
+      required String bucket,
       required String storageKey,
       required List<int> recipientPublicKey,
       required ShareMode mode,
@@ -786,19 +791,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         var arg0 =
             cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
                 client);
-        var arg1 = cst_encode_String(storageKey);
-        var arg2 = cst_encode_list_prim_u_8_loose(recipientPublicKey);
-        var arg3 = cst_encode_share_mode(mode);
-        var arg4 = cst_encode_opt_box_autoadd_i_64(expiresAt);
+        var arg1 = cst_encode_String(bucket);
+        var arg2 = cst_encode_String(storageKey);
+        var arg3 = cst_encode_list_prim_u_8_loose(recipientPublicKey);
+        var arg4 = cst_encode_share_mode(mode);
+        var arg5 = cst_encode_opt_box_autoadd_i_64(expiresAt);
         return wire.wire__crate__api__sharing__create_share_token_with_mode(
-            port_, arg0, arg1, arg2, arg3, arg4);
+            port_, arg0, arg1, arg2, arg3, arg4, arg5);
       },
       codec: DcoCodec(
         decodeSuccessData: dco_decode_String,
         decodeErrorData: dco_decode_AnyhowException,
       ),
       constMeta: kCrateApiSharingCreateShareTokenWithModeConstMeta,
-      argValues: [client, storageKey, recipientPublicKey, mode, expiresAt],
+      argValues: [client, bucket, storageKey, recipientPublicKey, mode, expiresAt],
       apiImpl: this,
     ));
   }
@@ -808,6 +814,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         debugName: "create_share_token_with_mode",
         argNames: [
           "client",
+          "bucket",
           "storageKey",
           "recipientPublicKey",
           "mode",

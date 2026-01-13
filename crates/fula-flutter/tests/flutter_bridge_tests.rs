@@ -585,3 +585,261 @@ fn test_obfuscation_mode_eq() {
     assert_eq!(ObfuscationMode::Random, ObfuscationMode::Random);
     assert_ne!(ObfuscationMode::Deterministic, ObfuscationMode::Random);
 }
+
+// ============================================================================
+// Sharing Crypto Tests - Verify DEK handling in share tokens
+// ============================================================================
+
+/// Test that ShareBuilder correctly uses the provided DEK
+#[test]
+fn test_share_token_uses_provided_dek() {
+    use fula_crypto::keys::{KekKeyPair, DekKey};
+    use fula_crypto::sharing::{ShareBuilder, ShareRecipient};
+
+    let owner = KekKeyPair::generate();
+    let recipient = KekKeyPair::generate();
+
+    // Generate a specific DEK (simulating what happens during upload)
+    let upload_dek = DekKey::generate();
+    let original_dek_bytes = upload_dek.as_bytes().to_vec();
+
+    // Create share token with the SAME DEK used during upload
+    let token = ShareBuilder::new(&owner, recipient.public_key(), &upload_dek)
+        .path_scope("/test/file.txt")
+        .build()
+        .unwrap();
+
+    // Recipient accepts the share
+    let recipient_handler = ShareRecipient::new(&recipient);
+    let accepted = recipient_handler.accept_share(&token).unwrap();
+
+    // CRITICAL: The DEK recipient receives must match upload DEK
+    assert_eq!(
+        accepted.dek.as_bytes().to_vec(),
+        original_dek_bytes,
+        "Share token must contain the SAME DEK used during encryption"
+    );
+}
+
+/// Test that different files get different DEKs (random generation)
+#[test]
+fn test_different_files_get_different_deks() {
+    use fula_crypto::keys::DekKey;
+
+    // Simulate what happens during upload - each file gets a NEW random DEK
+    let dek1 = DekKey::generate();
+    let dek2 = DekKey::generate();
+    let dek3 = DekKey::generate();
+
+    // All DEKs must be different
+    assert_ne!(dek1.as_bytes(), dek2.as_bytes(), "Each file should have unique DEK");
+    assert_ne!(dek2.as_bytes(), dek3.as_bytes(), "Each file should have unique DEK");
+    assert_ne!(dek1.as_bytes(), dek3.as_bytes(), "Each file should have unique DEK");
+}
+
+/// Test that derive_path_key produces DETERMINISTIC output (NOT suitable for FlatNamespace)
+#[test]
+fn test_derive_path_key_is_deterministic() {
+    use fula_crypto::keys::{KekKeyPair, KeyManager};
+
+    let keypair = KekKeyPair::generate();
+    let key_manager = KeyManager::from_secret_key(keypair.secret_key().clone());
+
+    let path = "test/file.txt";
+
+    // Derive DEK twice from same path
+    let derived1 = key_manager.derive_path_key(path);
+    let derived2 = key_manager.derive_path_key(path);
+
+    // Derived keys should be IDENTICAL (deterministic)
+    assert_eq!(
+        derived1.as_bytes(),
+        derived2.as_bytes(),
+        "derive_path_key should be deterministic"
+    );
+}
+
+/// Test that random DEK differs from derived DEK
+/// This is the core of the bug we fixed - upload uses random, share MUST NOT use derived
+#[test]
+fn test_random_dek_differs_from_derived() {
+    use fula_crypto::keys::{KekKeyPair, DekKey, KeyManager};
+
+    let keypair = KekKeyPair::generate();
+    let key_manager = KeyManager::from_secret_key(keypair.secret_key().clone());
+
+    let path = "test/file.txt";
+
+    // Generate random DEK (what upload does in FlatNamespace mode)
+    let random_dek = DekKey::generate();
+
+    // Derive DEK from path (what the OLD buggy share code did)
+    let derived_dek = key_manager.derive_path_key(path);
+
+    // These MUST be different - if they're the same, decryption would fail
+    assert_ne!(
+        random_dek.as_bytes(),
+        derived_dek.as_bytes(),
+        "Random DEK and derived DEK must be different - sharing bug would cause decryption failure"
+    );
+}
+
+/// Test end-to-end encryption/decryption with share token
+#[test]
+fn test_share_token_decryption_roundtrip() {
+    use fula_crypto::keys::{KekKeyPair, DekKey};
+    use fula_crypto::symmetric::{Aead, Nonce};
+    use fula_crypto::sharing::{ShareBuilder, ShareRecipient};
+
+    let owner = KekKeyPair::generate();
+    let recipient = KekKeyPair::generate();
+
+    // Simulate file upload: generate random DEK and encrypt
+    let upload_dek = DekKey::generate();
+    let plaintext = b"Secret file contents that only authorized recipient should see";
+
+    let nonce = Nonce::generate();
+    let aead = Aead::new_default(&upload_dek);
+    let ciphertext = aead.encrypt(&nonce, plaintext).unwrap();
+
+    // Create share token with the upload DEK
+    let token = ShareBuilder::new(&owner, recipient.public_key(), &upload_dek)
+        .path_scope("/shared/secret.txt")
+        .build()
+        .unwrap();
+
+    // Recipient accepts share and decrypts
+    let recipient_handler = ShareRecipient::new(&recipient);
+    let accepted = recipient_handler.accept_share(&token).unwrap();
+
+    // Decrypt with the DEK from share token
+    let decrypt_aead = Aead::new_default(&accepted.dek);
+    let decrypted = decrypt_aead.decrypt(&nonce, &ciphertext).unwrap();
+
+    assert_eq!(decrypted, plaintext.to_vec(), "Decryption with shared DEK must succeed");
+}
+
+/// Test that sharing one file does NOT expose other files
+#[test]
+fn test_share_isolation() {
+    use fula_crypto::keys::{KekKeyPair, DekKey};
+    use fula_crypto::symmetric::{Aead, Nonce};
+    use fula_crypto::sharing::{ShareBuilder, ShareRecipient};
+
+    let owner = KekKeyPair::generate();
+    let recipient = KekKeyPair::generate();
+
+    // Upload two files with DIFFERENT random DEKs
+    let file1_dek = DekKey::generate();
+    let file2_dek = DekKey::generate();
+
+    let file1_plaintext = b"File 1: This IS shared";
+    let file2_plaintext = b"File 2: This is NOT shared - private!";
+
+    let nonce1 = Nonce::generate();
+    let nonce2 = Nonce::generate();
+
+    let aead1 = Aead::new_default(&file1_dek);
+    let aead2 = Aead::new_default(&file2_dek);
+
+    let file1_ciphertext = aead1.encrypt(&nonce1, file1_plaintext).unwrap();
+    let file2_ciphertext = aead2.encrypt(&nonce2, file2_plaintext).unwrap();
+
+    // Share ONLY file1
+    let token = ShareBuilder::new(&owner, recipient.public_key(), &file1_dek)
+        .path_scope("/shared/file1.txt")
+        .build()
+        .unwrap();
+
+    // Recipient accepts share
+    let recipient_handler = ShareRecipient::new(&recipient);
+    let accepted = recipient_handler.accept_share(&token).unwrap();
+
+    // Recipient CAN decrypt file1
+    let decrypt_aead1 = Aead::new_default(&accepted.dek);
+    let decrypted1 = decrypt_aead1.decrypt(&nonce1, &file1_ciphertext).unwrap();
+    assert_eq!(decrypted1, file1_plaintext.to_vec(), "Shared file should decrypt");
+
+    // Recipient CANNOT decrypt file2 (different DEK)
+    let decrypt_result = decrypt_aead1.decrypt(&nonce2, &file2_ciphertext);
+    assert!(
+        decrypt_result.is_err(),
+        "Non-shared file must NOT be decryptable with shared DEK"
+    );
+}
+
+/// Test that wrong recipient cannot use share token
+#[test]
+fn test_share_token_wrong_recipient_fails() {
+    use fula_crypto::keys::{KekKeyPair, DekKey};
+    use fula_crypto::sharing::{ShareBuilder, ShareRecipient};
+
+    let owner = KekKeyPair::generate();
+    let intended_recipient = KekKeyPair::generate();
+    let attacker = KekKeyPair::generate();
+
+    let dek = DekKey::generate();
+
+    // Create token for intended_recipient
+    let token = ShareBuilder::new(&owner, intended_recipient.public_key(), &dek)
+        .path_scope("/secret/")
+        .build()
+        .unwrap();
+
+    // Attacker tries to use the token
+    let attacker_handler = ShareRecipient::new(&attacker);
+    let result = attacker_handler.accept_share(&token);
+
+    assert!(result.is_err(), "Wrong recipient must not be able to decrypt share token");
+}
+
+/// Test share path scope enforcement
+#[test]
+fn test_share_path_scope() {
+    use fula_crypto::keys::{KekKeyPair, DekKey};
+    use fula_crypto::sharing::ShareBuilder;
+
+    let owner = KekKeyPair::generate();
+    let recipient = KekKeyPair::generate();
+    let dek = DekKey::generate();
+
+    // Share only /photos/vacation/
+    let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+        .path_scope("/photos/vacation/")
+        .build()
+        .unwrap();
+
+    // Token should be valid for paths within scope
+    assert!(token.is_valid_for_path("/photos/vacation/beach.jpg"));
+    assert!(token.is_valid_for_path("/photos/vacation/subfolder/image.png"));
+
+    // Token should NOT be valid for paths outside scope
+    assert!(!token.is_valid_for_path("/photos/other/secret.jpg"));
+    assert!(!token.is_valid_for_path("/documents/private.pdf"));
+    assert!(!token.is_valid_for_path("/photos/vacatio")); // Partial match not allowed
+}
+
+/// Test share expiration
+#[test]
+fn test_share_expiration() {
+    use fula_crypto::keys::{KekKeyPair, DekKey};
+    use fula_crypto::sharing::{ShareBuilder, ShareRecipient, current_timestamp};
+
+    let owner = KekKeyPair::generate();
+    let recipient = KekKeyPair::generate();
+    let dek = DekKey::generate();
+
+    // Create already-expired token
+    let expired_token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+        .path_scope("/test/")
+        .expires_at(current_timestamp() - 100) // Already expired
+        .build()
+        .unwrap();
+
+    assert!(expired_token.is_expired(), "Token should be expired");
+
+    // Recipient should not be able to accept expired token
+    let recipient_handler = ShareRecipient::new(&recipient);
+    let result = recipient_handler.accept_share(&expired_token);
+    assert!(result.is_err(), "Expired token should be rejected");
+}

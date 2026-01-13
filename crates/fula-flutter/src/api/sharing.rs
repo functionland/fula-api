@@ -16,6 +16,7 @@ use crate::api::types::*;
 ///
 /// # Arguments
 /// * `client` - The encrypted client handle
+/// * `bucket` - The bucket containing the file
 /// * `storage_key` - The storage key of the file to share
 /// * `recipient_public_key` - The recipient's public key (32 bytes)
 /// * `expires_at` - Optional expiration timestamp (Unix epoch seconds)
@@ -23,11 +24,13 @@ use crate::api::types::*;
 /// Returns a JSON-serialized share token that can be sent to the recipient.
 pub async fn create_share_token(
     client: &EncryptedClientHandle,
+    bucket: String,
     storage_key: String,
     recipient_public_key: Vec<u8>,
     expires_at: Option<i64>,
 ) -> anyhow::Result<String> {
     use fula_crypto::sharing::ShareBuilder;
+    use fula_crypto::hpke::{Decryptor, EncryptedData};
 
     // Validate recipient public key length
     if recipient_public_key.len() != 32 {
@@ -37,9 +40,29 @@ pub async fn create_share_token(
     let guard = client.inner.read().await;
     let enc_config = guard.encryption_config();
 
-    // Get owner's keypair and derive DEK for the storage key
+    // Get owner's keypair
     let keypair = enc_config.key_manager().keypair();
-    let dek = enc_config.key_manager().derive_path_key(&storage_key);
+
+    // Fetch object metadata to get the actual wrapped DEK
+    let head_result = guard.inner().head_object(&bucket, &storage_key).await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch object metadata: {}", e))?;
+
+    // Parse encryption metadata
+    let enc_metadata_str = head_result.metadata
+        .get("x-fula-encryption")
+        .ok_or_else(|| anyhow::anyhow!("Object is not encrypted or missing encryption metadata"))?;
+
+    let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse encryption metadata: {}", e))?;
+
+    // Extract and unwrap the actual DEK used during upload
+    let wrapped_key: EncryptedData = serde_json::from_value(
+        enc_metadata["wrapped_key"].clone()
+    ).map_err(|e| anyhow::anyhow!("Failed to parse wrapped_key: {}", e))?;
+
+    let decryptor = Decryptor::new(keypair);
+    let dek = decryptor.decrypt_dek(&wrapped_key)
+        .map_err(|e| anyhow::anyhow!("Failed to unwrap DEK: {}", e))?;
 
     // Parse recipient public key
     let mut pk_bytes = [0u8; 32];
@@ -47,7 +70,7 @@ pub async fn create_share_token(
     let recipient_pk = fula_crypto::PublicKey::from_bytes(&pk_bytes)
         .map_err(|e| anyhow::anyhow!("Invalid recipient public key: {}", e))?;
 
-    // Build share token
+    // Build share token with the ACTUAL DEK from upload
     let mut builder = ShareBuilder::new(keypair, &recipient_pk, &dek)
         .path_scope(&storage_key);
 
@@ -68,6 +91,7 @@ pub async fn create_share_token(
 ///
 /// # Arguments
 /// * `client` - The encrypted client handle
+/// * `bucket` - The bucket containing the file
 /// * `storage_key` - The storage key of the file to share
 /// * `recipient_public_key` - The recipient's public key (32 bytes)
 /// * `mode` - Share mode (Temporal or Snapshot)
@@ -77,12 +101,14 @@ pub async fn create_share_token(
 /// to temporal mode for Snapshot shares since we don't have content hash info.
 pub async fn create_share_token_with_mode(
     client: &EncryptedClientHandle,
+    bucket: String,
     storage_key: String,
     recipient_public_key: Vec<u8>,
     mode: ShareMode,
     expires_at: Option<i64>,
 ) -> anyhow::Result<String> {
     use fula_crypto::sharing::ShareBuilder;
+    use fula_crypto::hpke::{Decryptor, EncryptedData};
 
     // Validate recipient public key length
     if recipient_public_key.len() != 32 {
@@ -92,9 +118,29 @@ pub async fn create_share_token_with_mode(
     let guard = client.inner.read().await;
     let enc_config = guard.encryption_config();
 
-    // Get owner's keypair and derive DEK for the storage key
+    // Get owner's keypair
     let keypair = enc_config.key_manager().keypair();
-    let dek = enc_config.key_manager().derive_path_key(&storage_key);
+
+    // Fetch object metadata to get the actual wrapped DEK
+    let head_result = guard.inner().head_object(&bucket, &storage_key).await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch object metadata: {}", e))?;
+
+    // Parse encryption metadata
+    let enc_metadata_str = head_result.metadata
+        .get("x-fula-encryption")
+        .ok_or_else(|| anyhow::anyhow!("Object is not encrypted or missing encryption metadata"))?;
+
+    let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse encryption metadata: {}", e))?;
+
+    // Extract and unwrap the actual DEK used during upload
+    let wrapped_key: EncryptedData = serde_json::from_value(
+        enc_metadata["wrapped_key"].clone()
+    ).map_err(|e| anyhow::anyhow!("Failed to parse wrapped_key: {}", e))?;
+
+    let decryptor = Decryptor::new(keypair);
+    let dek = decryptor.decrypt_dek(&wrapped_key)
+        .map_err(|e| anyhow::anyhow!("Failed to unwrap DEK: {}", e))?;
 
     // Parse recipient public key
     let mut pk_bytes = [0u8; 32];
@@ -102,7 +148,7 @@ pub async fn create_share_token_with_mode(
     let recipient_pk = fula_crypto::PublicKey::from_bytes(&pk_bytes)
         .map_err(|e| anyhow::anyhow!("Invalid recipient public key: {}", e))?;
 
-    // Build share token with appropriate mode
+    // Build share token with the ACTUAL DEK from upload
     let builder = ShareBuilder::new(keypair, &recipient_pk, &dek)
         .path_scope(&storage_key);
 

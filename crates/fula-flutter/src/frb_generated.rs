@@ -440,6 +440,7 @@ fn wire__crate__api__sharing__create_share_token_impl(
             flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EncryptedClientHandle>,
         >,
     >,
+    bucket: impl CstDecode<String>,
     storage_key: impl CstDecode<String>,
     recipient_public_key: impl CstDecode<Vec<u8>>,
     expires_at: impl CstDecode<Option<i64>>,
@@ -452,6 +453,7 @@ fn wire__crate__api__sharing__create_share_token_impl(
         },
         move || {
             let api_client = client.cst_decode();
+            let api_bucket = bucket.cst_decode();
             let api_storage_key = storage_key.cst_decode();
             let api_recipient_public_key = recipient_public_key.cst_decode();
             let api_expires_at = expires_at.cst_decode();
@@ -479,6 +481,7 @@ fn wire__crate__api__sharing__create_share_token_impl(
                         let api_client_guard = api_client_guard.unwrap();
                         let output_ok = crate::api::sharing::create_share_token(
                             &*api_client_guard,
+                            api_bucket,
                             api_storage_key,
                             api_recipient_public_key,
                             api_expires_at,
@@ -499,6 +502,7 @@ fn wire__crate__api__sharing__create_share_token_with_mode_impl(
             flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EncryptedClientHandle>,
         >,
     >,
+    bucket: impl CstDecode<String>,
     storage_key: impl CstDecode<String>,
     recipient_public_key: impl CstDecode<Vec<u8>>,
     mode: impl CstDecode<crate::api::types::ShareMode>,
@@ -512,6 +516,7 @@ fn wire__crate__api__sharing__create_share_token_with_mode_impl(
         },
         move || {
             let api_client = client.cst_decode();
+            let api_bucket = bucket.cst_decode();
             let api_storage_key = storage_key.cst_decode();
             let api_recipient_public_key = recipient_public_key.cst_decode();
             let api_mode = mode.cst_decode();
@@ -540,6 +545,7 @@ fn wire__crate__api__sharing__create_share_token_with_mode_impl(
                         let api_client_guard = api_client_guard.unwrap();
                         let output_ok = crate::api::sharing::create_share_token_with_mode(
                             &*api_client_guard,
+                            api_bucket,
                             api_storage_key,
                             api_recipient_public_key,
                             api_mode,
@@ -6862,6 +6868,7 @@ mod io {
     pub extern "C" fn frbgen_fula_client_wire__crate__api__sharing__create_share_token(
         port_: i64,
         client: usize,
+        bucket: *mut wire_cst_list_prim_u_8_strict,
         storage_key: *mut wire_cst_list_prim_u_8_strict,
         recipient_public_key: *mut wire_cst_list_prim_u_8_loose,
         expires_at: *mut i64,
@@ -6869,6 +6876,7 @@ mod io {
         wire__crate__api__sharing__create_share_token_impl(
             port_,
             client,
+            bucket,
             storage_key,
             recipient_public_key,
             expires_at,
@@ -6879,6 +6887,7 @@ mod io {
     pub extern "C" fn frbgen_fula_client_wire__crate__api__sharing__create_share_token_with_mode(
         port_: i64,
         client: usize,
+        bucket: *mut wire_cst_list_prim_u_8_strict,
         storage_key: *mut wire_cst_list_prim_u_8_strict,
         recipient_public_key: *mut wire_cst_list_prim_u_8_loose,
         mode: i32,
@@ -6887,6 +6896,7 @@ mod io {
         wire__crate__api__sharing__create_share_token_with_mode_impl(
             port_,
             client,
+            bucket,
             storage_key,
             recipient_public_key,
             mode,
@@ -9122,6 +9132,7 @@ mod web {
     pub fn wire__crate__api__sharing__create_share_token(
         port_: flutter_rust_bridge::for_generated::MessagePort,
         client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        bucket: String,
         storage_key: String,
         recipient_public_key: Box<[u8]>,
         expires_at: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
@@ -9129,6 +9140,7 @@ mod web {
         wire__crate__api__sharing__create_share_token_impl(
             port_,
             client,
+            bucket,
             storage_key,
             recipient_public_key,
             expires_at,
@@ -9139,6 +9151,7 @@ mod web {
     pub fn wire__crate__api__sharing__create_share_token_with_mode(
         port_: flutter_rust_bridge::for_generated::MessagePort,
         client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        bucket: String,
         storage_key: String,
         recipient_public_key: Box<[u8]>,
         mode: i32,
@@ -9147,6 +9160,7 @@ mod web {
         wire__crate__api__sharing__create_share_token_with_mode_impl(
             port_,
             client,
+            bucket,
             storage_key,
             recipient_public_key,
             mode,

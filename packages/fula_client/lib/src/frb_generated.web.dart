@@ -1410,21 +1410,23 @@ class RustLibWire implements BaseWire {
   void wire__crate__api__sharing__create_share_token(
           NativePortType port_,
           int client,
+          String bucket,
           String storage_key,
           JSAny recipient_public_key,
           JSAny? expires_at) =>
       wasmModule.wire__crate__api__sharing__create_share_token(
-          port_, client, storage_key, recipient_public_key, expires_at);
+          port_, client, bucket, storage_key, recipient_public_key, expires_at);
 
   void wire__crate__api__sharing__create_share_token_with_mode(
           NativePortType port_,
           int client,
+          String bucket,
           String storage_key,
           JSAny recipient_public_key,
           int mode,
           JSAny? expires_at) =>
       wasmModule.wire__crate__api__sharing__create_share_token_with_mode(
-          port_, client, storage_key, recipient_public_key, mode, expires_at);
+          port_, client, bucket, storage_key, recipient_public_key, mode, expires_at);
 
   void wire__crate__api__client__delete_bucket(
           NativePortType port_, int client, String name) =>
@@ -1858,6 +1860,7 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
   external void wire__crate__api__sharing__create_share_token(
       NativePortType port_,
       int client,
+      String bucket,
       String storage_key,
       JSAny recipient_public_key,
       JSAny? expires_at);
@@ -1865,6 +1868,7 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
   external void wire__crate__api__sharing__create_share_token_with_mode(
       NativePortType port_,
       int client,
+      String bucket,
       String storage_key,
       JSAny recipient_public_key,
       int mode,

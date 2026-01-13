@@ -1740,6 +1740,7 @@ class RustLibWire implements BaseWire {
   void wire__crate__api__sharing__create_share_token(
     int port_,
     int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> bucket,
     ffi.Pointer<wire_cst_list_prim_u_8_strict> storage_key,
     ffi.Pointer<wire_cst_list_prim_u_8_loose> recipient_public_key,
     ffi.Pointer<ffi.Int64> expires_at,
@@ -1747,6 +1748,7 @@ class RustLibWire implements BaseWire {
     return _wire__crate__api__sharing__create_share_token(
       port_,
       client,
+      bucket,
       storage_key,
       recipient_public_key,
       expires_at,
@@ -1759,6 +1761,7 @@ class RustLibWire implements BaseWire {
                   ffi.Int64,
                   ffi.UintPtr,
                   ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+                  ffi.Pointer<wire_cst_list_prim_u_8_strict>,
                   ffi.Pointer<wire_cst_list_prim_u_8_loose>,
                   ffi.Pointer<ffi.Int64>)>>(
       'frbgen_fula_client_wire__crate__api__sharing__create_share_token');
@@ -1768,12 +1771,14 @@ class RustLibWire implements BaseWire {
               int,
               int,
               ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
               ffi.Pointer<wire_cst_list_prim_u_8_loose>,
               ffi.Pointer<ffi.Int64>)>();
 
   void wire__crate__api__sharing__create_share_token_with_mode(
     int port_,
     int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> bucket,
     ffi.Pointer<wire_cst_list_prim_u_8_strict> storage_key,
     ffi.Pointer<wire_cst_list_prim_u_8_loose> recipient_public_key,
     int mode,
@@ -1782,6 +1787,7 @@ class RustLibWire implements BaseWire {
     return _wire__crate__api__sharing__create_share_token_with_mode(
       port_,
       client,
+      bucket,
       storage_key,
       recipient_public_key,
       mode,
@@ -1795,6 +1801,7 @@ class RustLibWire implements BaseWire {
                   ffi.Int64,
                   ffi.UintPtr,
                   ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+                  ffi.Pointer<wire_cst_list_prim_u_8_strict>,
                   ffi.Pointer<wire_cst_list_prim_u_8_loose>,
                   ffi.Int32,
                   ffi.Pointer<ffi.Int64>)>>(
@@ -1804,6 +1811,7 @@ class RustLibWire implements BaseWire {
           void Function(
               int,
               int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
               ffi.Pointer<wire_cst_list_prim_u_8_strict>,
               ffi.Pointer<wire_cst_list_prim_u_8_loose>,
               int,

@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.12] - 2026-01-13
+
+### Fixed
+
+- **CRITICAL: Share token DEK mismatch bug**: Fixed share tokens using derived DEK instead of actual uploaded DEK
+  - In FlatNamespace mode, files are encrypted with random DEKs stored in metadata
+  - Share token creation was incorrectly deriving DEK from path instead of fetching actual DEK from metadata
+  - This caused all shared files to fail decryption on recipient side (garbage output)
+  - Fix: `create_share_token` and `create_share_token_with_mode` now fetch wrapped DEK from object metadata
+
+### Changed
+
+- **API Breaking Change**: `createShareToken` and `createShareTokenWithMode` now require `bucket` parameter
+  - Flutter: `createShareToken(bucket: 'mybucket', storageKey: '...', ...)`
+  - This is needed to fetch object metadata containing the actual DEK
+
+### Added
+
+- Comprehensive sharing tests verifying:
+  - Share token uses correct (uploaded) DEK
+  - Different files have different random DEKs (isolation)
+  - Sharing one file does not expose other files
+  - Wrong recipient cannot decrypt share tokens
+  - Path scope enforcement
+  - Expiration handling
+
 ## [0.2.11] - 2026-01-13
 
 ### Fixed
