@@ -163,6 +163,48 @@ pub async fn get_public_key(client: &EncryptedClientHandle) -> Vec<u8> {
     guard.encryption_config().public_key().as_bytes().to_vec()
 }
 
+/// Derive X25519 public key from private key bytes
+///
+/// **IMPORTANT**: Use this function instead of Dart's X25519 public key derivation
+/// to ensure compatibility between Flutter and Web/WASM clients.
+///
+/// This ensures that both FxFiles and Web UI derive the exact same public key
+/// from the same private key bytes, avoiding cryptographic mismatches.
+///
+/// # Arguments
+/// * `secret_key_bytes` - 32-byte X25519 private key (raw bytes, not clamped)
+///
+/// # Returns
+/// * `Ok(Vec<u8>)` - 32-byte X25519 public key
+/// * `Err` - If secret_key_bytes is not exactly 32 bytes
+///
+/// # Example
+/// ```dart
+/// // In Flutter/Dart, generate random 32 bytes:
+/// final secretKeyBytes = Uint8List(32);
+/// Random.secure().nextBytes(secretKeyBytes);
+///
+/// // Derive public key using Rust (ensures cross-platform compatibility):
+/// final publicKeyBytes = await derivePublicKeyFromSecret(secretKeyBytes);
+///
+/// // Now use publicKeyBytes for createShareToken
+/// // and secretKeyBytes in the share URL
+/// ```
+pub fn derive_public_key_from_secret(secret_key_bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    if secret_key_bytes.len() != 32 {
+        anyhow::bail!("Secret key must be exactly 32 bytes, got {}", secret_key_bytes.len());
+    }
+
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&secret_key_bytes);
+
+    let secret = fula_crypto::SecretKey::from_bytes(&arr)
+        .map_err(|e| anyhow::anyhow!("Invalid secret key: {}", e))?;
+    let public = secret.public_key();
+
+    Ok(public.as_bytes().to_vec())
+}
+
 /// Check if client uses FlatNamespace mode
 pub async fn is_flat_namespace(client: &EncryptedClientHandle) -> bool {
     let guard = client.inner.read().await;

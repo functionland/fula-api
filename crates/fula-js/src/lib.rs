@@ -467,6 +467,34 @@ pub fn derive_key(context: &str, input: &[u8]) -> Vec<u8> {
     fula_crypto::hashing::derive_key(context, input).as_bytes().to_vec()
 }
 
+/// Derive X25519 public key from private key bytes
+///
+/// **IMPORTANT**: Use this function to ensure compatibility between
+/// Flutter/Native and Web/WASM clients when sharing files.
+///
+/// This ensures both sender and receiver derive the exact same public key
+/// from the same private key bytes, avoiding cryptographic mismatches.
+///
+/// @param secretKeyBytes - 32-byte X25519 private key (Uint8Array)
+/// @returns 32-byte X25519 public key (Uint8Array)
+#[wasm_bindgen(js_name = derivePublicKeyFromSecret)]
+pub fn derive_public_key_from_secret(secret_key_bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+    if secret_key_bytes.len() != 32 {
+        return Err(JsError::new(&format!(
+            "Secret key must be exactly 32 bytes, got {}", secret_key_bytes.len()
+        )));
+    }
+
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(secret_key_bytes);
+
+    let secret = fula_crypto::SecretKey::from_bytes(&arr)
+        .map_err(|e| JsError::new(&format!("Invalid secret key: {}", e)))?;
+    let public = secret.public_key();
+
+    Ok(public.as_bytes().to_vec())
+}
+
 // ============================================================================
 // Sharing
 // ============================================================================

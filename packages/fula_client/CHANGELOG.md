@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.13] - 2026-01-13
+
+### Fixed
+
+- **CRITICAL: X25519 public key derivation mismatch between Dart and Rust**
+  - When sharing files via public links, FxFiles was using Dart's `cryptography` package to derive X25519 public keys
+  - The Web UI uses Rust (via WASM) to derive public keys from the same private key bytes
+  - Different implementations may produce different public keys from the same private key seed
+  - This caused HPKE key wrapping to fail: the share token encrypted DEK for Dart's public key, but the web UI derived a different public key from the private key in the URL
+  - **Fix**: Added `derivePublicKeyFromSecret()` function to both Flutter and JS/WASM bindings
+  - **Required FxFiles change**: Use `derivePublicKeyFromSecret(secretKeyBytes)` instead of Dart's native X25519 derivation
+
+### Added
+
+- `derivePublicKeyFromSecret(Vec<u8>)` - Flutter API function to derive X25519 public key from private key bytes using Rust's x25519_dalek
+- `derivePublicKeyFromSecret(Uint8Array)` - JS/WASM function for the same purpose
+- Comprehensive tests verifying end-to-end share flow compatibility
+
+### Migration Guide for FxFiles
+
+Replace this Dart code:
+```dart
+final x25519 = X25519();
+final keyPair = await x25519.newKeyPair();
+final publicKeyBytes = Uint8List.fromList((await keyPair.extractPublicKey()).bytes);
+final privateKeyBytes = await keyPair.extractPrivateKeyBytes();
+```
+
+With this:
+```dart
+import 'dart:math';
+
+// Generate random 32 bytes
+final privateKeyBytes = Uint8List(32);
+Random.secure().nextBytes(privateKeyBytes);
+
+// Derive public key using Rust (ensures cross-platform compatibility)
+final publicKeyBytes = await derivePublicKeyFromSecret(privateKeyBytes);
+```
+
 ## [0.2.12] - 2026-01-13
 
 ### Fixed

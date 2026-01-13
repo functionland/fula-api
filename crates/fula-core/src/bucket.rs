@@ -923,41 +923,45 @@ mod tests {
     #[tokio::test]
     async fn test_bucket_manager_persistence() {
         use tempfile::tempdir;
-        
+
         let temp_dir = tempdir().unwrap();
         let cid_path = temp_dir.path().join("registry.cid");
-        
+
         // Create a shared store that simulates IPFS persistence
         let store = Arc::new(MemoryBlockStore::new());
-        
+
+        // Use a consistent user_id for testing (this matches production flow)
+        let user_id = "user123";
+
         // Create manager with persistence and add buckets
         {
             let manager = BucketManager::with_persistence(Arc::clone(&store), &cid_path);
-            
-            let owner = Owner::new("user123");
-            manager.create_bucket("persist-bucket1".to_string(), owner.clone()).await.unwrap();
-            manager.create_bucket("persist-bucket2".to_string(), owner).await.unwrap();
-            
+
+            let owner = Owner::new(user_id);
+            // Use create_bucket_for_user to match production behavior (per-user bucket isolation)
+            manager.create_bucket_for_user(user_id, "persist-bucket1".to_string(), owner.clone()).await.unwrap();
+            manager.create_bucket_for_user(user_id, "persist-bucket2".to_string(), owner).await.unwrap();
+
             assert_eq!(manager.list_buckets().len(), 2);
-            
+
             // Verify CID file was created
             assert!(cid_path.exists(), "Registry CID file should exist");
         }
-        
+
         // Create a new manager and load the registry
         {
             let manager = BucketManager::with_persistence(Arc::clone(&store), &cid_path);
-            
+
             // Initially empty
             assert_eq!(manager.list_buckets().len(), 0);
-            
+
             // Load from persisted registry
             let loaded_count = manager.load_registry().await.unwrap();
             assert_eq!(loaded_count, 2, "Should load 2 buckets from registry");
-            
-            // Verify buckets are restored
-            assert!(manager.bucket_exists("persist-bucket1"));
-            assert!(manager.bucket_exists("persist-bucket2"));
+
+            // Verify buckets are restored (use user-scoped check to match how they were created)
+            assert!(manager.bucket_exists_for_user(user_id, "persist-bucket1"));
+            assert!(manager.bucket_exists_for_user(user_id, "persist-bucket2"));
             assert_eq!(manager.list_buckets().len(), 2);
         }
     }

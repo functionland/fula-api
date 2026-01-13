@@ -1014,4 +1014,162 @@ mod tests {
         assert_eq!(binding.content_hash, "hash");
         assert_eq!(binding.size, 512);
     }
+
+    /// Test that simulates the exact FxFiles → Web UI share flow:
+    /// 1. Generate random bytes (like Dart's X25519().newKeyPair().extractPrivateKeyBytes())
+    /// 2. Create public key from those bytes (Rust derives public key)
+    /// 3. Create share token with that public key
+    /// 4. Serialize to JSON, transmit, deserialize (simulating URL transmission)
+    /// 5. Accept share using SecretKey from same bytes
+    /// 6. Verify DEK matches
+    /// 7. Use DEK to decrypt test content
+    #[test]
+    fn test_fxfiles_to_webui_share_flow() {
+        use crate::symmetric::{Aead, Nonce};
+
+        // === STEP 1: FxFiles side - generate disposable keypair ===
+        // This simulates: final x25519 = X25519(); final keyPair = await x25519.newKeyPair();
+        let mut disposable_secret_bytes = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut disposable_secret_bytes);
+
+        // === STEP 2: Create SecretKey and derive PublicKey ===
+        // This simulates: final publicKeyBytes = Uint8List.fromList(publicKeyData.bytes);
+        let disposable_secret = SecretKey::from_bytes(&disposable_secret_bytes).unwrap();
+        let disposable_public = disposable_secret.public_key();
+
+        println!("Disposable secret key: {:?}", hex::encode(&disposable_secret_bytes));
+        println!("Derived public key: {:?}", hex::encode(disposable_public.as_bytes()));
+
+        // === STEP 3: Owner creates share token ===
+        // Original file was encrypted with this DEK
+        let owner_keypair = KekKeyPair::generate();
+        let original_dek = DekKey::generate();
+
+        // Encrypt some test content
+        let plaintext = b"This is a test JPEG file. Should start with FF D8 FF in real case.";
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(&original_dek);
+        let ciphertext = aead.encrypt(&nonce, plaintext).unwrap();
+
+        // Create share token with disposable public key
+        let token = ShareBuilder::new(&owner_keypair, &disposable_public, &original_dek)
+            .path_scope("/test/file.jpg")
+            .build()
+            .unwrap();
+
+        // === STEP 4: Serialize token for transmission ===
+        // This simulates: base64Encode(jsonEncode(token))
+        let token_json = serde_json::to_string(&token).unwrap();
+        println!("Share token JSON length: {}", token_json.len());
+
+        // === STEP 5: Web UI side - deserialize token ===
+        // This simulates: jsonDecode(base64Decode(payload.t))
+        let received_token: ShareToken = serde_json::from_str(&token_json).unwrap();
+
+        // === STEP 6: Web UI creates SecretKey from URL's sk bytes ===
+        // This simulates: createEncryptedClient({ secretKey: base64Decode(payload.sk) })
+        let web_secret = SecretKey::from_bytes(&disposable_secret_bytes).unwrap();
+        let web_derived_public = web_secret.public_key();
+
+        println!("Web derived public key: {:?}", hex::encode(web_derived_public.as_bytes()));
+
+        // CRITICAL CHECK: The derived public key must match!
+        assert_eq!(
+            disposable_public.as_bytes(),
+            web_derived_public.as_bytes(),
+            "Public key derived on web side must match the one used for token creation"
+        );
+
+        // === STEP 7: Accept the share ===
+        let recipient = ShareRecipient::from_secret_key(web_secret);
+        let accepted = recipient.accept_share(&received_token).unwrap();
+
+        println!("Original DEK first 4 bytes: {:02x}{:02x}{:02x}{:02x}",
+            original_dek.as_bytes()[0], original_dek.as_bytes()[1],
+            original_dek.as_bytes()[2], original_dek.as_bytes()[3]);
+        println!("Accepted DEK first 4 bytes: {:02x}{:02x}{:02x}{:02x}",
+            accepted.dek.as_bytes()[0], accepted.dek.as_bytes()[1],
+            accepted.dek.as_bytes()[2], accepted.dek.as_bytes()[3]);
+
+        // CRITICAL CHECK: DEK must match!
+        assert_eq!(
+            original_dek.as_bytes(),
+            accepted.dek.as_bytes(),
+            "Decrypted DEK must match the original DEK"
+        );
+
+        // === STEP 8: Decrypt the content ===
+        let recipient_aead = Aead::new_default(&accepted.dek);
+        let decrypted = recipient_aead.decrypt(&nonce, &ciphertext).unwrap();
+
+        assert_eq!(
+            plaintext.as_slice(),
+            decrypted.as_slice(),
+            "Decrypted content must match original plaintext"
+        );
+
+        println!("SUCCESS: Full share flow works correctly!");
+    }
+
+    /// Test share with SecretKey bytes that look like what Dart might produce
+    /// (testing various edge cases in key format)
+    #[test]
+    fn test_share_with_various_key_formats() {
+        // Test with bytes that have various patterns
+        let test_cases: Vec<[u8; 32]> = vec![
+            // All zeros (will be clamped)
+            [0u8; 32],
+            // All ones (will be clamped)
+            [0xFFu8; 32],
+            // Sequential bytes
+            {
+                let mut arr = [0u8; 32];
+                for (i, b) in arr.iter_mut().enumerate() {
+                    *b = i as u8;
+                }
+                arr
+            },
+            // Random bytes (typical case)
+            {
+                let mut arr = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut arr);
+                arr
+            },
+        ];
+
+        for (i, secret_bytes) in test_cases.iter().enumerate() {
+            println!("\n=== Test case {} ===", i);
+
+            let owner = KekKeyPair::generate();
+            let dek = DekKey::generate();
+
+            // Create disposable keypair from raw bytes
+            let disposable_secret = SecretKey::from_bytes(secret_bytes).unwrap();
+            let disposable_public = disposable_secret.public_key();
+
+            // Create share token
+            let token = ShareBuilder::new(&owner, &disposable_public, &dek)
+                .path_scope("/test")
+                .build()
+                .unwrap();
+
+            // Serialize and deserialize (round-trip)
+            let json = serde_json::to_string(&token).unwrap();
+            let restored_token: ShareToken = serde_json::from_str(&json).unwrap();
+
+            // Accept share using same secret bytes
+            let recipient_secret = SecretKey::from_bytes(secret_bytes).unwrap();
+            let recipient = ShareRecipient::from_secret_key(recipient_secret);
+            let accepted = recipient.accept_share(&restored_token).unwrap();
+
+            // DEK must match
+            assert_eq!(
+                dek.as_bytes(),
+                accepted.dek.as_bytes(),
+                "Test case {}: DEK mismatch", i
+            );
+
+            println!("Test case {}: PASSED", i);
+        }
+    }
 }
