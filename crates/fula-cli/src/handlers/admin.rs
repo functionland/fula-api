@@ -504,6 +504,10 @@ pub async fn trigger_gc(
 /// Usage:
 /// Web frontend's backend calls this endpoint to fetch encrypted content
 /// for share recipients who don't have S3 credentials.
+///
+/// Chunked files:
+/// For large files stored as chunks, this endpoint automatically detects
+/// the chunked format and assembles all chunks before returning.
 pub async fn admin_fetch_object(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
@@ -549,21 +553,110 @@ pub async fn admin_fetch_object(
             ApiError::s3(S3ErrorCode::InternalError, format!("Failed to fetch block: {}", e))
         })?;
 
-    // 4. Build response with appropriate headers
-    let content_type = metadata.content_type
-        .as_deref()
-        .unwrap_or("application/octet-stream");
+    // 4. Check if this is a chunked file by examining x-fula-chunked metadata
+    let is_chunked = metadata.user_metadata
+        .get("x-fula-chunked")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    let final_data = if is_chunked {
+        // CHUNKED FILE: Parse metadata and fetch all chunks
+        info!(
+            bucket = %bucket_name,
+            key = %key,
+            "Detected chunked file, assembling chunks"
+        );
+
+        // Parse the metadata JSON to get chunk info
+        let metadata_json: serde_json::Value = serde_json::from_slice(&data)
+            .map_err(|e| {
+                error!(error = %e, "Failed to parse chunked metadata JSON");
+                ApiError::s3(S3ErrorCode::InternalError, format!("Invalid chunked metadata: {}", e))
+            })?;
+
+        let chunked_info = metadata_json.get("chunked")
+            .ok_or_else(|| ApiError::s3(S3ErrorCode::InternalError, "Missing 'chunked' field in metadata"))?;
+
+        let num_chunks = chunked_info.get("num_chunks")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| ApiError::s3(S3ErrorCode::InternalError, "Missing 'num_chunks' in chunked metadata"))? as u32;
+
+        info!(
+            bucket = %bucket_name,
+            key = %key,
+            num_chunks = num_chunks,
+            "Fetching {} chunks",
+            num_chunks
+        );
+
+        // Fetch all chunks and concatenate
+        let mut assembled_data = Vec::new();
+        for chunk_index in 0..num_chunks {
+            // Generate chunk key: {base_key}.chunks/{index:08}
+            let chunk_key = format!("{}.chunks/{:08}", key, chunk_index);
+
+            // Find the chunk object
+            let chunk_metadata = state.bucket_manager
+                .find_object_in_bucket(&bucket_name, &chunk_key)
+                .await
+                .ok_or_else(|| {
+                    error!(chunk_key = %chunk_key, "Chunk not found");
+                    ApiError::s3_with_resource(
+                        S3ErrorCode::NoSuchKey,
+                        format!("Chunk {} not found", chunk_index),
+                        format!("{}/{}", bucket_name, chunk_key),
+                    )
+                })?;
+
+            // Fetch chunk data
+            let chunk_data = state.block_store.get_block(&chunk_metadata.cid).await
+                .map_err(|e| {
+                    error!(cid = %chunk_metadata.cid, chunk_index = chunk_index, error = %e, "Failed to fetch chunk");
+                    ApiError::s3(S3ErrorCode::InternalError, format!("Failed to fetch chunk {}: {}", chunk_index, e))
+                })?;
+
+            assembled_data.extend_from_slice(&chunk_data);
+        }
+
+        info!(
+            bucket = %bucket_name,
+            key = %key,
+            total_size = assembled_data.len(),
+            "Assembled {} bytes from {} chunks",
+            assembled_data.len(),
+            num_chunks
+        );
+
+        assembled_data
+    } else {
+        // NON-CHUNKED FILE: Return data directly
+        data.to_vec()
+    };
+
+    // 5. Build response with appropriate headers
+    let content_type = if is_chunked {
+        // For chunked files, the index object has content-type application/json
+        // but the actual content is encrypted binary
+        "application/octet-stream"
+    } else {
+        metadata.content_type.as_deref().unwrap_or("application/octet-stream")
+    };
 
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
-        .header(header::CONTENT_LENGTH, data.len().to_string())
+        .header(header::CONTENT_LENGTH, final_data.len().to_string())
         .header("x-amz-meta-encrypted", "true");
+
+    // Add chunked indicator header
+    if is_chunked {
+        response = response.header("x-fula-chunked", "true");
+    }
 
     // Add ETag if available
     if !metadata.etag.is_empty() {
         response = response.header(header::ETAG, format!("\"{}\"", metadata.etag));
     }
 
-    Ok(response.body(Body::from(data.to_vec())).unwrap())
+    Ok(response.body(Body::from(final_data)).unwrap())
 }
