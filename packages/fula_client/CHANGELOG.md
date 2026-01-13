@@ -5,18 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.18] - 2026-01-13
+## [0.2.19] - 2026-01-13
 
 ### Fixed
 
 - **Android 16KB page size support for Android 15+ (API 35)**
   - Native libraries (.so files) now compiled with 16KB page alignment
-  - Added `-Wl,-z,max-page-size=16384` linker flag to all Android targets
+  - Added `-Wl,-z,max-page-size=16384` linker flag to all Android targets in CI
   - Apps can now target Android 15 without Google Play warnings
-
-### Added
-
-- `.cargo/config.toml` with Android 16KB page alignment configuration
 
 ## [0.2.17] - 2026-01-13
 
