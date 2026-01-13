@@ -723,7 +723,7 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
                 ).await {
                     Ok(bucket) => {
                         // List first few objects for debugging
-                        if let Ok(list_result) = bucket.list_objects(None, None, Some(10), None).await {
+                        if let Ok(list_result) = bucket.list_objects(None, None, None, Some(10)).await {
                             let object_keys: Vec<&str> = list_result.objects.iter()
                                 .map(|o| o.key.as_str())
                                 .collect();
