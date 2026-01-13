@@ -688,23 +688,97 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
     ///
     /// Returns the object metadata if found.
     pub async fn find_object_in_bucket(&self, display_name: &str, key: &str) -> Option<crate::metadata::ObjectMetadata> {
+        let bucket_count = self.buckets.len();
+        let bucket_names: Vec<String> = self.buckets.iter()
+            .map(|r| format!("{} (key={})", r.value().name.clone(), r.key().clone()))
+            .collect();
+        tracing::debug!(
+            target_bucket = %display_name,
+            target_key = %key,
+            total_buckets = bucket_count,
+            available_buckets = ?bucket_names,
+            "Searching for object in bucket"
+        );
+
         // Iterate through all buckets
+        let mut matching_buckets = 0;
         for entry in self.buckets.iter() {
             let metadata = entry.value();
             if metadata.name == display_name {
+                matching_buckets += 1;
+                tracing::debug!(
+                    internal_key = %entry.key(),
+                    bucket_name = %metadata.name,
+                    root_cid = %metadata.root_cid,
+                    object_count = metadata.object_count,
+                    "Found matching bucket, attempting to load"
+                );
+
                 // Try to load this bucket and find the object
-                if let Ok(bucket) = Bucket::load(
+                match Bucket::load(
                     metadata.clone(),
                     Arc::clone(&self.store),
                     self.default_config.clone(),
                     None, // Don't need cache updates for read-only
                 ).await {
-                    if let Ok(Some(obj_meta)) = bucket.get_object(key).await {
-                        return Some(obj_meta);
+                    Ok(bucket) => {
+                        // List first few objects for debugging
+                        if let Ok(list_result) = bucket.list_objects(None, None, Some(10), None).await {
+                            let object_keys: Vec<&str> = list_result.objects.iter()
+                                .map(|o| o.key.as_str())
+                                .collect();
+                            tracing::debug!(
+                                bucket = %display_name,
+                                object_keys = ?object_keys,
+                                "Sample of objects in bucket"
+                            );
+                        }
+
+                        match bucket.get_object(key).await {
+                            Ok(Some(obj_meta)) => {
+                                tracing::debug!(
+                                    bucket = %display_name,
+                                    key = %key,
+                                    cid = %obj_meta.cid,
+                                    "Found object"
+                                );
+                                return Some(obj_meta);
+                            }
+                            Ok(None) => {
+                                tracing::debug!(
+                                    bucket = %display_name,
+                                    key = %key,
+                                    "Object not found in this bucket"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    bucket = %display_name,
+                                    key = %key,
+                                    error = %e,
+                                    "Error getting object from bucket"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            bucket = %display_name,
+                            internal_key = %entry.key(),
+                            error = %e,
+                            "Failed to load bucket"
+                        );
                     }
                 }
             }
         }
+
+        tracing::debug!(
+            target_bucket = %display_name,
+            target_key = %key,
+            matching_buckets = matching_buckets,
+            "Object not found in any matching bucket"
+        );
         None
     }
 }
