@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'crates/fula-flutter/**'
+      - 'crates/fula-js/**'
       - 'crates/fula-client/**'
       - 'crates/fula-crypto/**'
       - 'packages/fula_client/**'
@@ -13,6 +14,7 @@ on:
   pull_request:
     paths:
       - 'crates/fula-flutter/**'
+      - 'crates/fula-js/**'
       - 'crates/fula-client/**'
       - 'crates/fula-crypto/**'
       - 'packages/fula_client/**'
@@ -41,10 +43,11 @@ jobs:
       - name: Run Rust tests
         run: |
           cargo test -p fula-flutter --lib
+          cargo test -p fula-js --lib
           cargo test -p fula-client --lib
           cargo test -p fula-crypto --lib
 
-  # Test WASM compilation
+  # Test WASM compilation (fula-js npm package)
   test-wasm:
     runs-on: ubuntu-latest
     steps:
@@ -60,8 +63,21 @@ jobs:
         with:
           shared-key: rust-wasm
 
-      - name: Build WASM
-        run: cargo build -p fula-flutter --target wasm32-unknown-unknown --release
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
+
+      - name: Build WASM (fula-js)
+        run: |
+          cd crates/fula-js
+          wasm-pack build --release --target web
+
+      - name: Verify WASM package exports
+        run: |
+          echo "Checking TypeScript definitions..."
+          grep -q "createEncryptedClient" crates/fula-js/pkg/fula_js.d.ts
+          grep -q "getDecrypted" crates/fula-js/pkg/fula_js.d.ts
+          grep -q "deriveKey" crates/fula-js/pkg/fula_js.d.ts
+          echo "All expected exports found!"
 
   # Generate and validate Dart bindings
   generate-bindings:

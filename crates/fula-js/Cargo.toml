@@ -1,0 +1,50 @@
+[package]
+name = "fula-js"
+description = "JavaScript/TypeScript SDK for Fula decentralized storage - WASM bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Internal crates (WASM-compatible configuration)
+fula-client = { path = "../fula-client" }
+fula-crypto = { path = "../fula-crypto", default-features = false, features = ["wasm"] }
+
+# WASM bindings
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+# Serialization for JS interop
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-wasm-bindgen = "0.6"
+
+# Error handling
+console_error_panic_hook = "0.1"
+
+# Random number generation for WASM
+getrandom = { version = "0.2", features = ["js"] }
+
+# Utilities
+bytes = { workspace = true }
+base64 = { workspace = true }
+
+# Async (WASM-compatible)
+futures = { workspace = true }
+
+[dependencies.web-sys]
+version = "0.3"
+features = ["console"]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

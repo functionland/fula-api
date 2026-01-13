@@ -209,7 +209,7 @@ jobs:
           path: ios-libs/
           retention-days: 1
 
-  # Build WASM package
+  # Build WASM package (fula-js with high-level wasm-bindgen APIs)
   build-wasm:
     needs: get-version
     runs-on: ubuntu-latest
@@ -229,29 +229,32 @@ jobs:
       - name: Install wasm-pack
         run: cargo install wasm-pack
 
-      - name: Build WASM
+      - name: Build WASM (fula-js)
         run: |
-          cd crates/fula-flutter
+          cd crates/fula-js
           wasm-pack build --release --target web --out-dir ../../wasm-package
 
-      - name: Create npm package.json
+      - name: Update package.json with version
         run: |
           cd wasm-package
+          # Update version from tag and ensure correct package name
           cat > package.json << INNEREOF
           {
             "name": "@functionland/fula-client",
             "version": "${{ needs.get-version.outputs.version }}",
-            "description": "Fula encrypted storage SDK for JavaScript/WASM",
-            "main": "fula_flutter.js",
-            "types": "fula_flutter.d.ts",
-            "files": ["*.js", "*.wasm", "*.d.ts", "snippets/**"],
+            "type": "module",
+            "description": "JavaScript/TypeScript SDK for Fula decentralized storage - client-side encryption with cross-platform key compatibility",
+            "main": "fula_js.js",
+            "types": "fula_js.d.ts",
+            "files": ["fula_js_bg.wasm", "fula_js.js", "fula_js.d.ts"],
             "repository": {
               "type": "git",
               "url": "https://github.com/functionland/fula-api"
             },
-            "keywords": ["fula", "storage", "encryption", "wasm", "decentralized"],
-            "author": "Functionland",
-            "license": "Apache-2.0"
+            "homepage": "https://github.com/functionland/fula-api#readme",
+            "keywords": ["fula", "ipfs", "decentralized", "storage", "encryption", "wasm", "web3"],
+            "author": "Functionland <contact@functionland.com>",
+            "license": "MIT OR Apache-2.0"
           }
           INNEREOF
 

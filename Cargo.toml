@@ -7,6 +7,7 @@ members = [
     "crates/fula-cli",
     "crates/fula-client",
     "crates/fula-flutter",
+    "crates/fula-js",
 ]
 
 # Root package for examples
@@ -73,7 +74,7 @@ name = "encrypted_upload_test"
 path = "examples/encrypted_upload_test.rs"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.10"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/functionland/fula-api"
