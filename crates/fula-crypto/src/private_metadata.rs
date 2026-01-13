@@ -15,6 +15,7 @@ use crate::{
     CryptoError, Result,
     keys::DekKey,
     symmetric::{Aead, Nonce},
+    time::now_timestamp,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -45,11 +46,8 @@ pub struct PrivateMetadata {
 impl PrivateMetadata {
     /// Create new private metadata
     pub fn new(original_key: impl Into<String>, actual_size: u64) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        
+        let now = now_timestamp();
+
         Self {
             original_key: original_key.into(),
             actual_size,

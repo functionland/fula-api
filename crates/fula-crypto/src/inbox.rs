@@ -43,17 +43,14 @@ use crate::{
     hpke::{EncryptedData, Encryptor, Decryptor, SharePermissions},
     keys::{DekKey, KekKeyPair, PublicKey, SecretKey},
     sharing::{ShareToken, ShareMode, SnapshotBinding},
+    time::now_timestamp,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Get current Unix timestamp in seconds
+/// Get current Unix timestamp in seconds (WASM-compatible)
 fn current_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    now_timestamp()
 }
 
 /// Generate a unique inbox entry ID

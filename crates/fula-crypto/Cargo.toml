@@ -57,6 +57,10 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 zeroize = { version = "1.8", features = ["derive"] }
 
+# WASM-specific dependencies
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }

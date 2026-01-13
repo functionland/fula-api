@@ -83,6 +83,7 @@ pub mod sharing;
 pub mod streaming;
 pub mod subtree_keys;
 pub mod symmetric;
+pub mod time;
 
 pub use chunked::{ChunkedEncoder, ChunkedDecoder, ChunkedFileMetadata, EncryptedChunk, should_use_chunked, CHUNKED_THRESHOLD, VerifiedStreamingDecoder};
 #[cfg(feature = "tokio-runtime")]

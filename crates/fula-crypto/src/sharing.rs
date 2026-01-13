@@ -11,10 +11,10 @@ use crate::{
     CryptoError, Result,
     hpke::{Encryptor, Decryptor, EncryptedData, SharePermissions},
     keys::{DekKey, KekKeyPair, PublicKey, SecretKey},
+    time::now_timestamp,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SHARE MODE (WNFS-Inspired Snapshot vs Temporal Semantics)
@@ -130,12 +130,11 @@ pub enum SnapshotVerification {
     TimestampChanged,
 }
 
-/// Get current Unix timestamp in seconds
+/// Get current Unix timestamp in seconds (WASM-compatible)
+///
+/// This function works in both native and WASM environments.
 pub fn current_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    now_timestamp()
 }
 
 /// A share token that grants access to encrypted content
