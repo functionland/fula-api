@@ -395,10 +395,18 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
         }
 
         // Populate the in-memory cache
+        // IMPORTANT: Use the same key format as create_bucket_for_user: {owner_id}:{name}
+        // This ensures buckets from different users with the same name don't collide
         let count = registry.buckets.len();
         for bucket_meta in registry.buckets {
-            info!(bucket = %bucket_meta.name, "Restoring bucket from registry");
-            self.buckets.insert(bucket_meta.name.clone(), bucket_meta);
+            let internal_key = Self::scoped_bucket_key(&bucket_meta.owner_id, &bucket_meta.name);
+            info!(
+                bucket = %bucket_meta.name,
+                owner_id = %bucket_meta.owner_id,
+                internal_key = %internal_key,
+                "Restoring bucket from registry"
+            );
+            self.buckets.insert(internal_key, bucket_meta);
         }
 
         info!(bucket_count = count, "Bucket registry loaded successfully");
