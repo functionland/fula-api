@@ -206,6 +206,12 @@ pub async fn request_id_middleware(
 #[derive(Clone)]
 pub struct RequestId(pub String);
 
+/// Check if an IP address is localhost/loopback
+/// Used to restrict admin endpoints to local access only
+pub fn is_localhost(addr: &std::net::SocketAddr) -> bool {
+    addr.ip().is_loopback() // Covers 127.0.0.1 and ::1
+}
+
 /// Logging middleware
 pub async fn logging_middleware(
     request: Request<Body>,

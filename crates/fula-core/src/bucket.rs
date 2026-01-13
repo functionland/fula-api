@@ -680,6 +680,33 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
             .map(|r| r.value().clone())
             .collect()
     }
+
+    /// Find a bucket by display name that contains a specific object key
+    ///
+    /// Searches all users' buckets for one with matching display name that contains the key.
+    /// This is used by admin endpoints where the user context is not known.
+    ///
+    /// Returns the object metadata if found.
+    pub async fn find_object_in_bucket(&self, display_name: &str, key: &str) -> Option<crate::metadata::ObjectMetadata> {
+        // Iterate through all buckets
+        for entry in self.buckets.iter() {
+            let metadata = entry.value();
+            if metadata.name == display_name {
+                // Try to load this bucket and find the object
+                if let Ok(bucket) = Bucket::load(
+                    metadata.clone(),
+                    Arc::clone(&self.store),
+                    self.default_config.clone(),
+                    None, // Don't need cache updates for read-only
+                ).await {
+                    if let Ok(Some(obj_meta)) = bucket.get_object(key).await {
+                        return Some(obj_meta);
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Validate bucket name according to S3 rules

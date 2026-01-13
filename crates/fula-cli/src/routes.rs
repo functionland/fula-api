@@ -32,6 +32,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/admin/users/{user_id}", delete(handlers::delete_user))
         .route("/admin/pins/{cid}", delete(handlers::unpin_cid))
         .route("/admin/gc", post(handlers::trigger_gc))
+        // Fetch object for share recipients (localhost only)
+        .route("/admin/fetch/{bucket}/{*key}", get(handlers::admin_fetch_object))
         .layer(axum_middleware::from_fn(middleware::request_id_middleware))
         .layer(axum_middleware::from_fn(middleware::logging_middleware))
         .layer(axum_middleware::from_fn_with_state(

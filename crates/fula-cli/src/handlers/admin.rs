@@ -8,20 +8,23 @@
 //! - DELETE /admin/users/{user_id} - Delete all user data and unpin CIDs
 //! - DELETE /admin/pins/{cid} - Manually unpin a specific CID
 //! - POST /admin/gc - Trigger garbage collection scan
+//! - GET /admin/fetch/{bucket}/{key} - Fetch object for share recipients (localhost only)
 
 use crate::{AppState, ApiError, S3ErrorCode};
 use crate::state::AdminSession;
 use crate::auth::hash_user_id;
 use crate::pinning::PinningCredentials;
 use axum::{
-    extract::{Extension, Path, State},
-    http::{HeaderMap, StatusCode},
+    body::Body,
+    extract::{ConnectInfo, Extension, Path, State},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     Json,
 };
 use cid::Cid;
-use fula_blockstore::PinStore;
+use fula_blockstore::{BlockStore, PinStore};
 use serde::Serialize;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{info, warn, error};
@@ -485,4 +488,82 @@ pub async fn trigger_gc(
     );
 
     Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// GET /admin/fetch/{bucket}/{key}
+///
+/// Fetch an object for share recipients. This endpoint is **localhost-only**
+/// to prevent unauthorized access from the internet.
+///
+/// Security model:
+/// - Only accepts requests from 127.0.0.1 or ::1 (loopback)
+/// - Requires valid admin JWT
+/// - Returns encrypted content (client must decrypt with share token DEK)
+/// - Does not validate share_id (mapping doesn't exist in current architecture)
+///
+/// Usage:
+/// Web frontend's backend calls this endpoint to fetch encrypted content
+/// for share recipients who don't have S3 credentials.
+pub async fn admin_fetch_object(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Extension(admin): Extension<AdminSession>,
+    Path((bucket_name, key)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    // 1. Reject non-localhost requests (critical security check)
+    if !crate::middleware::is_localhost(&addr) {
+        warn!(
+            remote_ip = %addr.ip(),
+            bucket = %bucket_name,
+            key = %key,
+            "Admin fetch rejected: not localhost"
+        );
+        return Err(ApiError::s3(
+            S3ErrorCode::AccessDenied,
+            "This endpoint is localhost-only",
+        ));
+    }
+
+    info!(
+        admin_id = %admin.admin_id,
+        bucket = %bucket_name,
+        key = %key,
+        "Admin fetch object (localhost)"
+    );
+
+    // 2. Find the object in any bucket with matching name
+    // (bucket names are scoped per-user, so we search all)
+    let metadata = state.bucket_manager
+        .find_object_in_bucket(&bucket_name, &key)
+        .await
+        .ok_or_else(|| ApiError::s3_with_resource(
+            S3ErrorCode::NoSuchKey,
+            "Object not found",
+            format!("{}/{}", bucket_name, key),
+        ))?;
+
+    // 3. Fetch content from block store
+    let data = state.block_store.get_block(&metadata.cid).await
+        .map_err(|e| {
+            error!(cid = %metadata.cid, error = %e, "Failed to fetch block");
+            ApiError::s3(S3ErrorCode::InternalError, format!("Failed to fetch block: {}", e))
+        })?;
+
+    // 4. Build response with appropriate headers
+    let content_type = metadata.content_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, data.len().to_string())
+        .header("x-amz-meta-encrypted", "true");
+
+    // Add ETag if available
+    if !metadata.etag.is_empty() {
+        response = response.header(header::ETAG, format!("\"{}\"", metadata.etag));
+    }
+
+    Ok(response.body(Body::from(data.to_vec())).unwrap())
 }

@@ -1,6 +1,7 @@
 //! Server startup and lifecycle
 
 use crate::{AppState, GatewayConfig, routes};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -20,8 +21,8 @@ pub async fn run_server(config: GatewayConfig) -> anyhow::Result<()> {
     info!("🚀 Fula Gateway listening on http://{}", addr);
     info!("📦 S3-compatible API ready for requests");
 
-    // Run the server
-    axum::serve(listener, app).await?;
+    // Run the server with ConnectInfo to enable client IP extraction
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
     Ok(())
 }
@@ -39,7 +40,8 @@ pub async fn run_server_with_shutdown(
 
     info!("🚀 Fula Gateway listening on http://{}", addr);
 
-    axum::serve(listener, app)
+    // Run the server with ConnectInfo to enable client IP extraction
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal)
         .await?;
 
