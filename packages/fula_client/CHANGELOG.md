@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.16] - 2026-01-13
+
+### Fixed
+
+- **CRITICAL: Share decryption fails for chunked files (files > 768KB)**
+  - `get_object_with_share` was using single-block decryption for all files
+  - Chunked files store each chunk with its own nonce in `{storage_key}.chunks/{index}`
+  - Share flow was ignoring chunked file metadata and trying to decrypt assembled bytes as single block
+  - **Result**: Large shared files (images, videos) returned garbage data instead of correct content
+  - **Fix**: `get_object_with_share` now checks `x-fula-chunked` metadata and uses `ChunkedDecoder` with per-chunk nonces when needed
+
+### Technical Details
+
+- Added `get_object_chunked_with_share()` internal method for chunked file handling in share flow
+- Downloads each chunk from `{storage_key}.chunks/{index}`, decrypts with chunk-specific nonce
+- Concatenates decrypted chunks and returns complete plaintext
+- Works identically to normal `get_object_decrypted_by_storage_key()` but uses share's DEK
+
 ## [0.2.15] - 2026-01-13
 
 ### Fixed
