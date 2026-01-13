@@ -5,9 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.14] - 2026-01-13
+## [0.2.15] - 2026-01-13
 
 ### Fixed
+
+- **CRITICAL: flutter_rust_bridge content hash mismatch in CI**
+  - `build-android` and `build-ios` jobs were building native libraries from committed `frb_generated.rs`
+  - `generate-bindings` job was creating fresh `frb_generated.dart` with different content hash
+  - This caused "Content hash on Dart side is different from Rust side" error
+  - **Fix**: Both Android and iOS build jobs now run `flutter_rust_bridge_codegen generate` before building
 
 - **CRITICAL: X25519 public key derivation mismatch between Dart and Rust**
   - When sharing files via public links, FxFiles was using Dart's `cryptography` package to derive X25519 public keys
