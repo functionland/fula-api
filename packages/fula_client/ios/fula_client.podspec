@@ -6,7 +6,7 @@
 
 Pod::Spec.new do |s|
   s.name             = 'fula_client'
-  s.version          = '0.2.20'
+  s.version          = '0.2.21'
   s.summary          = 'Flutter SDK for Fula decentralized storage'
   s.description      = <<-DESC
     A Flutter plugin providing client-side encryption, metadata privacy,
@@ -22,9 +22,12 @@ Pod::Spec.new do |s|
   s.platform = :ios, '12.0'
 
   # Flutter.framework does not contain a i386 slice
+  # -force_load ensures all FFI symbols are included even if they appear "unused"
+  # (they're called from Dart, not from Objective-C/Swift, so linker would strip them)
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
-    'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386'
+    'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
+    'OTHER_LDFLAGS' => '$(inherited) -force_load "${PODS_XCFRAMEWORKS_BUILD_DIR}/fula_client/libfula_flutter.a"'
   }
   s.swift_version = '5.0'
 
