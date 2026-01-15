@@ -74,7 +74,7 @@ name = "encrypted_upload_test"
 path = "examples/encrypted_upload_test.rs"
 
 [workspace.package]
-version = "0.2.19"
+version = "0.2.20"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/functionland/fula-api"
@@ -174,7 +174,9 @@ rstest = "0.23"
 mockall = "0.13"
 
 [profile.release]
-lto = true
+# LTO disabled to preserve FFI symbols in iOS static libraries
+# With lto = true, the linker removes "unused" extern "C" functions
+lto = false
 opt-level = 3
 codegen-units = 1
 # Use "debuginfo" instead of "true" to preserve FFI symbols in static libraries
