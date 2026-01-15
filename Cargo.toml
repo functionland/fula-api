@@ -74,7 +74,7 @@ name = "encrypted_upload_test"
 path = "examples/encrypted_upload_test.rs"
 
 [workspace.package]
-version = "0.2.18"
+version = "0.2.19"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/functionland/fula-api"
@@ -177,7 +177,9 @@ mockall = "0.13"
 lto = true
 opt-level = 3
 codegen-units = 1
-strip = true
+# Use "debuginfo" instead of "true" to preserve FFI symbols in static libraries
+# Full stripping removes symbols needed for iOS static library linking
+strip = "debuginfo"
 
 [profile.dev]
 opt-level = 0
