@@ -6,7 +6,7 @@
 
 Pod::Spec.new do |s|
   s.name             = 'fula_client'
-  s.version          = '0.2.22'
+  s.version          = '0.2.23'
   s.summary          = 'Flutter SDK for Fula decentralized storage'
   s.description      = <<-DESC
     A Flutter plugin providing client-side encryption, metadata privacy,
@@ -31,8 +31,10 @@ Pod::Spec.new do |s|
   # it needs to apply to the main app target that does the final linking.
   # This ensures all FFI symbols are included even if they appear "unused"
   # (they're called from Dart, not from Objective-C/Swift, so linker would strip them)
+  # Use SDK-specific paths because XCFramework has different directories for device vs simulator
   s.user_target_xcconfig = {
-    'OTHER_LDFLAGS' => '$(inherited) -force_load "${PODS_XCFRAMEWORKS_BUILD_DIR}/fula_client/libfula_flutter.a"'
+    'OTHER_LDFLAGS[sdk=iphoneos*]' => '$(inherited) -force_load "${PODS_ROOT}/../.symlinks/plugins/fula_client/ios/Frameworks/FulaFlutter.xcframework/ios-arm64/libfula_flutter.a"',
+    'OTHER_LDFLAGS[sdk=iphonesimulator*]' => '$(inherited) -force_load "${PODS_ROOT}/../.symlinks/plugins/fula_client/ios/Frameworks/FulaFlutter.xcframework/ios-arm64_x86_64-simulator/libfula_flutter.a"'
   }
   s.swift_version = '5.0'
 
