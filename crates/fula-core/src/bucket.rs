@@ -380,10 +380,41 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
 
         info!(cid = %cid, "Loading bucket registry from IPFS");
 
-        // Fetch registry from IPFS
-        let registry: BucketRegistry = self.store.get_ipld(&cid).await.map_err(|e| {
-            CoreError::StorageError(format!("Failed to load registry from IPFS: {}", e))
-        })?;
+        // Fetch registry from IPFS with retry logic and exponential backoff
+        let max_attempts = 5;
+        let mut attempts = 0;
+        let mut delay = std::time::Duration::from_secs(1);
+
+        let registry: BucketRegistry = loop {
+            match self.store.get_ipld(&cid).await {
+                Ok(reg) => break reg,
+                Err(e) if attempts < max_attempts - 1 => {
+                    attempts += 1;
+                    warn!(
+                        attempt = attempts,
+                        max_attempts = max_attempts,
+                        delay_secs = delay.as_secs(),
+                        error = %e,
+                        cid = %cid,
+                        "Failed to fetch registry from IPFS, retrying..."
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay *= 2; // Exponential backoff
+                }
+                Err(e) => {
+                    error!(
+                        cid = %cid,
+                        error = %e,
+                        attempts = max_attempts,
+                        "Failed to load registry from IPFS after all retry attempts"
+                    );
+                    return Err(CoreError::StorageError(format!(
+                        "Failed to load registry from IPFS after {} attempts: {}",
+                        max_attempts, e
+                    )));
+                }
+            }
+        };
 
         // Validate version
         if registry.version > BucketRegistry::CURRENT_VERSION {
@@ -460,6 +491,23 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
                             e
                         ))
                     })?;
+                }
+            }
+
+            // Backup existing CID file before overwriting to prevent data loss
+            if path.exists() {
+                let backup_path = path.with_extension("cid.bak");
+                if let Err(e) = std::fs::copy(path, &backup_path) {
+                    warn!(
+                        error = %e,
+                        backup_path = %backup_path.display(),
+                        "Failed to backup registry CID file"
+                    );
+                } else {
+                    info!(
+                        backup_path = %backup_path.display(),
+                        "Backed up previous registry CID"
+                    );
                 }
             }
 

@@ -91,7 +91,15 @@ impl AppState {
                 info!("Starting with empty bucket registry");
             }
             Err(e) => {
-                warn!("Failed to load bucket registry: {}. Starting fresh.", e);
+                // CRITICAL: Don't continue with empty registry if load failed!
+                // This prevents overwriting the CID file with an empty registry.
+                return Err(anyhow::anyhow!(
+                    "Failed to load bucket registry: {}. \
+                     Refusing to start to prevent data loss. \
+                     Ensure IPFS is running and the registry block is available, \
+                     then restart the gateway.",
+                    e
+                ));
             }
         }
 
