@@ -14,7 +14,7 @@ services:
     env_file:
       - .env
     volumes:
-      - gateway-data:/var/lib/fula-gateway
+      - /opt/fula-api/data/fula-gateway:/var/lib/fula-gateway
     network_mode: host
     restart: unless-stopped
     healthcheck:
@@ -89,7 +89,6 @@ networks:
 # Volumes
 # ============================================
 volumes:
-  gateway-data:
   redis-data:
   prometheus-data:
   grafana-data:
