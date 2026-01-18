@@ -197,11 +197,64 @@ where
     hasher.finalize()
 }
 
-/// Derive a key from the given input and context
+/// Derive a key from the given input and context using BLAKE3 KDF
+///
+/// Note: For password-based or credential-based key derivation where brute-force
+/// resistance is needed, use `derive_key_argon2id` instead.
 pub fn derive_key(context: &str, input: &[u8]) -> Blake3Hash {
     let mut hasher = IncrementalHasher::new_derive_key(context);
     hasher.update(input);
     hasher.finalize()
+}
+
+/// Derive a key from the given input and context using Argon2id
+///
+/// This provides brute-force resistance for credential-based key derivation.
+/// Uses memory-hard Argon2id algorithm with secure parameters:
+/// - Memory: 64 MiB
+/// - Iterations: 3
+/// - Parallelism: 1 (for cross-platform consistency)
+/// - Output: 32 bytes
+///
+/// The context string is used as the salt to provide domain separation.
+///
+/// # Example
+/// ```
+/// use fula_crypto::hashing::derive_key_argon2id;
+///
+/// let key = derive_key_argon2id("fula-files-v1", b"google:123456:user@example.com");
+/// assert_eq!(key.len(), 32);
+/// ```
+pub fn derive_key_argon2id(context: &str, input: &[u8]) -> [u8; 32] {
+    use argon2::{Argon2, Algorithm, Version, Params};
+
+    // Secure parameters for credential-based key derivation
+    // Memory: 64 MiB (65536 KiB) - provides memory-hardness
+    // Iterations: 3 - time cost
+    // Parallelism: 1 - for consistent cross-platform results
+    let params = Params::new(65536, 3, 1, Some(32))
+        .expect("Invalid Argon2 parameters");
+
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+    let mut output = [0u8; 32];
+
+    // Use context as salt for domain separation
+    // Pad or hash the context to ensure minimum 8-byte salt requirement
+    let salt = if context.len() >= 8 {
+        context.as_bytes().to_vec()
+    } else {
+        // Pad short contexts with zeros
+        let mut padded = vec![0u8; 8];
+        padded[..context.len()].copy_from_slice(context.as_bytes());
+        padded
+    };
+
+    argon2
+        .hash_password_into(input, &salt, &mut output)
+        .expect("Argon2 hashing failed");
+
+    output
 }
 
 /// Calculate an MD5 hash for S3 ETag compatibility
@@ -307,5 +360,31 @@ mod tests {
         let key1 = derive_key("context1", b"input");
         let key2 = derive_key("context2", b"input");
         assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_derive_key_argon2id() {
+        // Test basic functionality
+        let key1 = derive_key_argon2id("fula-files-v1", b"google:123456:user@example.com");
+        assert_eq!(key1.len(), 32);
+
+        // Test consistency - same input produces same output
+        let key2 = derive_key_argon2id("fula-files-v1", b"google:123456:user@example.com");
+        assert_eq!(key1, key2);
+
+        // Test different context produces different key
+        let key3 = derive_key_argon2id("fula-files-v2", b"google:123456:user@example.com");
+        assert_ne!(key1, key3);
+
+        // Test different input produces different key
+        let key4 = derive_key_argon2id("fula-files-v1", b"google:789012:other@example.com");
+        assert_ne!(key1, key4);
+    }
+
+    #[test]
+    fn test_derive_key_argon2id_short_context() {
+        // Test with short context (< 8 bytes) - should still work
+        let key = derive_key_argon2id("short", b"input");
+        assert_eq!(key.len(), 32);
     }
 }

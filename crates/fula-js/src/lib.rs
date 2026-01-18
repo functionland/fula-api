@@ -456,15 +456,24 @@ pub async fn get_public_key(client: &EncryptedClient) -> Vec<u8> {
     guard.encryption_config().public_key().as_bytes().to_vec()
 }
 
-/// Derive a 32-byte key from context and input
+/// Derive a 32-byte key from context and input using Argon2id (memory-hard KDF)
 ///
-/// Use this to derive encryption keys from Google credentials:
+/// Use this to derive encryption keys from Google credentials with brute-force resistance:
 /// ```javascript
-/// const key = deriveKey('my-app-v1', new TextEncoder().encode(userId + email));
+/// const key = deriveKey('fula-files-v1', new TextEncoder().encode(`google:${userId}:${email}`));
 /// ```
+///
+/// Parameters:
+/// - Memory: 64 MiB
+/// - Iterations: 3
+/// - Parallelism: 1 (for cross-platform consistency)
+///
+/// @param context - Context string used as salt (e.g., "fula-files-v1")
+/// @param input - Input bytes (e.g., UTF-8 encoded credentials)
+/// @returns 32-byte derived key
 #[wasm_bindgen(js_name = deriveKey)]
 pub fn derive_key(context: &str, input: &[u8]) -> Vec<u8> {
-    fula_crypto::hashing::derive_key(context, input).as_bytes().to_vec()
+    fula_crypto::hashing::derive_key_argon2id(context, input).to_vec()
 }
 
 /// Derive X25519 public key from private key bytes
@@ -611,14 +620,15 @@ mod tests {
     wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen_test]
-    fn test_derive_key() {
-        let key1 = derive_key("test-context", b"input1");
-        let key2 = derive_key("test-context", b"input2");
-        let key3 = derive_key("test-context", b"input1");
+    fn test_derive_key_argon2id() {
+        // Test Argon2id key derivation
+        let key1 = derive_key("fula-files-v1", b"google:123:user@test.com");
+        let key2 = derive_key("fula-files-v1", b"google:456:other@test.com");
+        let key3 = derive_key("fula-files-v1", b"google:123:user@test.com");
 
         assert_eq!(key1.len(), 32);
-        assert_ne!(key1, key2);
-        assert_eq!(key1, key3); // Deterministic
+        assert_ne!(key1, key2); // Different input -> different key
+        assert_eq!(key1, key3); // Same input -> same key (deterministic)
     }
 
     #[wasm_bindgen_test]

@@ -52,6 +52,8 @@ pub use encrypted::{
     list_directory,
     export_secret_key,
     get_public_key,
+    derive_key,
+    derive_public_key_from_secret,
     is_flat_namespace,
     enc_list_buckets,
     enc_create_bucket,

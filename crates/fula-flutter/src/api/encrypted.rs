@@ -205,6 +205,38 @@ pub fn derive_public_key_from_secret(secret_key_bytes: Vec<u8>) -> anyhow::Resul
     Ok(public.as_bytes().to_vec())
 }
 
+/// Derive a 32-byte key using Argon2id (memory-hard KDF)
+///
+/// **IMPORTANT**: Use this function to derive encryption keys from user credentials
+/// instead of platform-specific PBKDF2 implementations.
+///
+/// This ensures both FxFiles (Flutter) and WebUI (WASM) derive the exact same key
+/// from the same inputs, with brute-force resistance from Argon2id's memory-hardness.
+///
+/// Parameters:
+/// - Memory: 64 MiB
+/// - Iterations: 3
+/// - Parallelism: 1 (for cross-platform consistency)
+///
+/// # Arguments
+/// * `context` - A context string used as salt (e.g., "fula-files-v1")
+/// * `input` - The input bytes (e.g., UTF-8 encoded "google:{userId}:{email}")
+///
+/// # Returns
+/// * 32-byte derived key
+///
+/// # Example
+/// ```dart
+/// // Derive encryption key from Google credentials (same as WebUI):
+/// final input = utf8.encode('google:${userId}:${email}');
+/// final secretKey = await deriveKey(context: 'fula-files-v1', input: input);
+///
+/// // Use secretKey for createEncryptedClient
+/// ```
+pub fn derive_key(context: String, input: Vec<u8>) -> Vec<u8> {
+    fula_crypto::hashing::derive_key_argon2id(&context, &input).to_vec()
+}
+
 /// Check if client uses FlatNamespace mode
 pub async fn is_flat_namespace(client: &EncryptedClientHandle) -> bool {
     let guard = client.inner.read().await;

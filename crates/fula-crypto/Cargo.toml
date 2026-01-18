@@ -29,6 +29,7 @@ sha2 = { workspace = true }
 md-5 = { workspace = true }
 x25519-dalek = { workspace = true }
 ed25519-dalek = { workspace = true }
+argon2 = "0.5"
 
 # Post-Quantum Cryptography (NIST FIPS 203 ML-KEM)
 # Using Cryspen's formally verified implementation for WASM + native support
