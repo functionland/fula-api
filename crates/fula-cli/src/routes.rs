@@ -261,12 +261,17 @@ async fn object_post_handler(
 /// If origins contains "*", allows any origin (development mode)
 /// Otherwise, only allows specified origins
 fn create_cors_layer(origins: &[String]) -> CorsLayer {
-    // Standard S3-compatible headers we need to expose
+    // Standard S3-compatible headers + Fula encryption headers we need to expose
+    // Note: These headers are ALREADY sent by the server. This just allows browsers to read them.
     let expose_headers = vec![
         header::ETAG,
         header::CONTENT_LENGTH,
         header::CONTENT_TYPE,
         header::LAST_MODIFIED,
+        // Fula encryption headers (already sent, just need CORS visibility for WASM)
+        header::HeaderName::from_static("x-amz-meta-x-fula-encrypted"),
+        header::HeaderName::from_static("x-amz-meta-x-fula-encryption"),
+        header::HeaderName::from_static("x-amz-meta-x-fula-chunked"),
     ];
     
     // S3-compatible methods
