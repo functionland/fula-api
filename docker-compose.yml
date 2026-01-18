@@ -14,7 +14,7 @@ services:
     env_file:
       - .env
     volumes:
-      - /opt/fula-api/data/fula-gateway:/var/lib/fula-gateway
+      - /var/lib/fula-gateway:/var/lib/fula-gateway
     network_mode: host
     restart: unless-stopped
     healthcheck:
