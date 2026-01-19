@@ -528,10 +528,16 @@ server {
         proxy_hide_header 'Access-Control-Max-Age';
 
         # CORS - allow all origins
+        # IMPORTANT: Wildcards in Access-Control-Expose-Headers do NOT work for
+        # credentialed requests (requests with Authorization header). The browser
+        # ignores wildcards and won't expose custom headers to JavaScript/WASM.
+        # This caused FxFiles encryption to fail in WebUI - files appeared as
+        # non-encrypted because x-amz-meta-x-fula-* headers were not visible.
+        # See: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Expose-Headers
         add_header 'Access-Control-Allow-Origin' '*' always;
         add_header 'Access-Control-Allow-Methods' 'GET, HEAD, PUT, POST, DELETE, OPTIONS' always;
         add_header 'Access-Control-Allow-Headers' '*' always;
-        add_header 'Access-Control-Expose-Headers' 'ETag, x-amz-meta-*' always;
+        add_header 'Access-Control-Expose-Headers' 'ETag, Content-Length, Content-Type, Last-Modified, x-amz-meta-x-fula-encrypted, x-amz-meta-x-fula-encryption, x-amz-meta-x-fula-chunked, x-amz-meta-x-fula-forest, x-amz-meta-content-type' always;
         add_header 'Access-Control-Max-Age' '3600' always;
 
         proxy_pass http://fula_gateway;
