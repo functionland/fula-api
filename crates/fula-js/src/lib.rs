@@ -609,6 +609,218 @@ pub fn get_version() -> String {
 }
 
 // ============================================================================
+// HPKE Test Functions (for cross-platform verification)
+// ============================================================================
+
+/// Encrypt a DEK using HPKE with the given public key
+///
+/// This simulates what FxFiles does when encrypting a file.
+/// Returns JSON string containing the EncryptedData (wrapped DEK).
+///
+/// @param publicKeyBytes - 32-byte X25519 public key
+/// @param dekBytes - 32-byte DEK to encrypt
+/// @returns JSON string with {version, encapsulated_key, ciphertext}
+#[wasm_bindgen(js_name = testHpkeEncryptDek)]
+pub fn test_hpke_encrypt_dek(
+    public_key_bytes: &[u8],
+    dek_bytes: &[u8],
+) -> Result<String, JsError> {
+    if public_key_bytes.len() != 32 {
+        return Err(JsError::new(&format!(
+            "Public key must be 32 bytes, got {}", public_key_bytes.len()
+        )));
+    }
+    if dek_bytes.len() != 32 {
+        return Err(JsError::new(&format!(
+            "DEK must be 32 bytes, got {}", dek_bytes.len()
+        )));
+    }
+
+    let mut pk_arr = [0u8; 32];
+    pk_arr.copy_from_slice(public_key_bytes);
+    let public_key = fula_crypto::PublicKey::from_bytes(&pk_arr)
+        .map_err(|e| JsError::new(&format!("Invalid public key: {}", e)))?;
+
+    let mut dek_arr = [0u8; 32];
+    dek_arr.copy_from_slice(dek_bytes);
+    let dek = fula_crypto::keys::DekKey::from_bytes(&dek_arr)
+        .map_err(|e| JsError::new(&format!("Invalid DEK: {}", e)))?;
+
+    let encryptor = fula_crypto::hpke::Encryptor::new(&public_key);
+    let wrapped = encryptor.encrypt_dek(&dek)
+        .map_err(|e| JsError::new(&format!("HPKE encryption failed: {}", e)))?;
+
+    serde_json::to_string(&wrapped)
+        .map_err(|e| JsError::new(&format!("JSON serialization failed: {}", e)))
+}
+
+/// Decrypt a wrapped DEK using HPKE with the given secret key
+///
+/// This simulates what WebUI WASM should do when decrypting a file.
+///
+/// @param secretKeyBytes - 32-byte X25519 secret key
+/// @param wrappedDekJson - JSON string from testHpkeEncryptDek
+/// @returns 32-byte decrypted DEK
+#[wasm_bindgen(js_name = testHpkeDecryptDek)]
+pub fn test_hpke_decrypt_dek(
+    secret_key_bytes: &[u8],
+    wrapped_dek_json: &str,
+) -> Result<Vec<u8>, JsError> {
+    if secret_key_bytes.len() != 32 {
+        return Err(JsError::new(&format!(
+            "Secret key must be 32 bytes, got {}", secret_key_bytes.len()
+        )));
+    }
+
+    let mut sk_arr = [0u8; 32];
+    sk_arr.copy_from_slice(secret_key_bytes);
+    let secret = fula_crypto::SecretKey::from_bytes(&sk_arr)
+        .map_err(|e| JsError::new(&format!("Invalid secret key: {}", e)))?;
+
+    let key_manager = fula_crypto::keys::KeyManager::from_secret_key(secret);
+    let wrapped: fula_crypto::hpke::EncryptedData = serde_json::from_str(wrapped_dek_json)
+        .map_err(|e| JsError::new(&format!("Invalid wrapped DEK JSON: {}", e)))?;
+
+    let decryptor = fula_crypto::hpke::Decryptor::new(key_manager.keypair());
+    let dek = decryptor.decrypt_dek(&wrapped)
+        .map_err(|e| JsError::new(&format!("HPKE decryption failed: {}", e)))?;
+
+    Ok(dek.as_bytes().to_vec())
+}
+
+/// AES-256-GCM encrypt data with a DEK
+///
+/// @param dekBytes - 32-byte DEK
+/// @param plaintext - Data to encrypt
+/// @returns JSON string with {nonce, ciphertext} (both base64 encoded)
+#[wasm_bindgen(js_name = testAesGcmEncrypt)]
+pub fn test_aes_gcm_encrypt(
+    dek_bytes: &[u8],
+    plaintext: &[u8],
+) -> Result<String, JsError> {
+    if dek_bytes.len() != 32 {
+        return Err(JsError::new(&format!(
+            "DEK must be 32 bytes, got {}", dek_bytes.len()
+        )));
+    }
+
+    let mut dek_arr = [0u8; 32];
+    dek_arr.copy_from_slice(dek_bytes);
+    let dek = fula_crypto::keys::DekKey::from_bytes(&dek_arr)
+        .map_err(|e| JsError::new(&format!("Invalid DEK: {}", e)))?;
+
+    let nonce = fula_crypto::symmetric::Nonce::generate();
+    let aead = fula_crypto::symmetric::Aead::new_default(&dek);
+    let ciphertext = aead.encrypt(&nonce, plaintext)
+        .map_err(|e| JsError::new(&format!("AES-GCM encryption failed: {}", e)))?;
+
+    use base64::Engine;
+    let result = serde_json::json!({
+        "nonce": base64::engine::general_purpose::STANDARD.encode(nonce.as_bytes()),
+        "ciphertext": base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+    });
+
+    serde_json::to_string(&result)
+        .map_err(|e| JsError::new(&format!("JSON serialization failed: {}", e)))
+}
+
+/// AES-256-GCM decrypt data with a DEK
+///
+/// @param dekBytes - 32-byte DEK
+/// @param nonceBase64 - Base64 encoded 12-byte nonce
+/// @param ciphertextBase64 - Base64 encoded ciphertext
+/// @returns Decrypted plaintext
+#[wasm_bindgen(js_name = testAesGcmDecrypt)]
+pub fn test_aes_gcm_decrypt(
+    dek_bytes: &[u8],
+    nonce_base64: &str,
+    ciphertext_base64: &str,
+) -> Result<Vec<u8>, JsError> {
+    if dek_bytes.len() != 32 {
+        return Err(JsError::new(&format!(
+            "DEK must be 32 bytes, got {}", dek_bytes.len()
+        )));
+    }
+
+    use base64::Engine;
+    let nonce_bytes = base64::engine::general_purpose::STANDARD.decode(nonce_base64)
+        .map_err(|e| JsError::new(&format!("Invalid nonce base64: {}", e)))?;
+    let ciphertext = base64::engine::general_purpose::STANDARD.decode(ciphertext_base64)
+        .map_err(|e| JsError::new(&format!("Invalid ciphertext base64: {}", e)))?;
+
+    let mut dek_arr = [0u8; 32];
+    dek_arr.copy_from_slice(dek_bytes);
+    let dek = fula_crypto::keys::DekKey::from_bytes(&dek_arr)
+        .map_err(|e| JsError::new(&format!("Invalid DEK: {}", e)))?;
+
+    let nonce = fula_crypto::symmetric::Nonce::from_bytes(&nonce_bytes)
+        .map_err(|e| JsError::new(&format!("Invalid nonce: {}", e)))?;
+    let aead = fula_crypto::symmetric::Aead::new_default(&dek);
+    let plaintext = aead.decrypt(&nonce, &ciphertext)
+        .map_err(|e| JsError::new(&format!("AES-GCM decryption failed: {}", e)))?;
+
+    Ok(plaintext)
+}
+
+/// Full encryption round-trip test
+///
+/// This tests the EXACT flow: derive key -> encrypt DEK with HPKE -> encrypt data with AES-GCM
+/// then decrypt in reverse order. If this works, the WASM crypto is correct.
+///
+/// @param context - Key derivation context (e.g., "fula-files-v1")
+/// @param input - Key derivation input (e.g., credentials)
+/// @param plaintext - Data to encrypt and decrypt
+/// @returns Original plaintext if successful (proves round-trip works)
+#[wasm_bindgen(js_name = testFullEncryptionRoundtrip)]
+pub fn test_full_encryption_roundtrip(
+    context: &str,
+    input: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    // Step 1: Derive key using Argon2id
+    let secret_bytes = fula_crypto::hashing::derive_key_argon2id(context, input);
+
+    // Step 2: Create keypair
+    let secret = fula_crypto::SecretKey::from_bytes(&secret_bytes)
+        .map_err(|e| JsError::new(&format!("Invalid derived key: {}", e)))?;
+    let public = secret.public_key();
+
+    // Step 3: Generate random DEK
+    let dek = fula_crypto::keys::DekKey::generate();
+
+    // Step 4: Encrypt DEK with HPKE (simulating FxFiles upload)
+    let encryptor = fula_crypto::hpke::Encryptor::new(&public);
+    let wrapped_dek = encryptor.encrypt_dek(&dek)
+        .map_err(|e| JsError::new(&format!("HPKE DEK encryption failed: {}", e)))?;
+
+    // Step 5: Encrypt plaintext with AES-GCM
+    let nonce = fula_crypto::symmetric::Nonce::generate();
+    let aead = fula_crypto::symmetric::Aead::new_default(&dek);
+    let ciphertext = aead.encrypt(&nonce, plaintext)
+        .map_err(|e| JsError::new(&format!("AES-GCM encryption failed: {}", e)))?;
+
+    // --- Simulating WebUI decryption ---
+
+    // Step 6: Derive key again (same as WebUI would do)
+    let secret_bytes_2 = fula_crypto::hashing::derive_key_argon2id(context, input);
+    let secret_2 = fula_crypto::SecretKey::from_bytes(&secret_bytes_2)
+        .map_err(|e| JsError::new(&format!("Invalid derived key on decrypt: {}", e)))?;
+
+    // Step 7: Decrypt DEK with HPKE (simulating WebUI WASM)
+    let key_manager = fula_crypto::keys::KeyManager::from_secret_key(secret_2);
+    let decryptor = fula_crypto::hpke::Decryptor::new(key_manager.keypair());
+    let decrypted_dek = decryptor.decrypt_dek(&wrapped_dek)
+        .map_err(|e| JsError::new(&format!("HPKE DEK decryption failed: {}", e)))?;
+
+    // Step 8: Decrypt plaintext with AES-GCM
+    let aead_decrypt = fula_crypto::symmetric::Aead::new_default(&decrypted_dek);
+    let decrypted = aead_decrypt.decrypt(&nonce, &ciphertext)
+        .map_err(|e| JsError::new(&format!("AES-GCM decryption failed: {}", e)))?;
+
+    Ok(decrypted)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
