@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
+    <title>x402 AI Agent Storage - Fula API Documentation</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="css/security.css">
+    <link rel="stylesheet" href="css/i18n.css">
+    <script>
+        (function() {
+            const savedTheme = localStorage.getItem('fula-docs-theme');
+            if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
+            const savedLang = localStorage.getItem('fula-docs-language');
+            if (savedLang && ['fa', 'ar'].includes(savedLang)) {
+                document.documentElement.setAttribute('dir', 'rtl');
+                document.documentElement.setAttribute('lang', savedLang);
+            }
+        })();
+    </script>
+    <style>
+        .x402-hero {
+            text-align: center;
+            padding: 40px 20px;
+        }
+        .x402-hero img {
+            max-width: 100%;
+            height: auto;
+            max-height: 200px;
+            border-radius: 12px;
+            margin-bottom: 24px;
+        }
+        .x402-section {
+            padding: 40px 20px;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        .x402-section h2 {
+            color: var(--text-heading);
+            font-size: 1.6rem;
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid var(--accent-blue);
+        }
+        .x402-section h3 {
+            color: var(--text-heading);
+            font-size: 1.2rem;
+            margin-top: 24px;
+            margin-bottom: 12px;
+        }
+        .x402-section p, .x402-section li {
+            color: var(--text-primary);
+            line-height: 1.7;
+            margin-bottom: 10px;
+        }
+        .x402-section ul {
+            padding-left: 20px;
+            margin-bottom: 16px;
+        }
+        .endpoint-card {
+            background: var(--bg-code);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+        .endpoint-card h4 {
+            color: var(--text-heading);
+            margin-bottom: 8px;
+        }
+        .endpoint-card .method {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 4px;
+            font-weight: 700;
+            font-size: 0.8rem;
+            margin-right: 8px;
+            color: #fff;
+        }
+        .method-get { background: var(--method-get); }
+        .method-put { background: var(--method-put); }
+        .method-post { background: var(--method-post); }
+        .method-delete { background: var(--method-delete); }
+        .method-head { background: var(--method-head); }
+        .endpoint-card .path {
+            font-family: monospace;
+            color: var(--accent-blue);
+            font-size: 0.95rem;
+        }
+        .endpoint-card p {
+            margin-top: 8px;
+            font-size: 0.9rem;
+        }
+        .code-block {
+            background: var(--bg-code);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            overflow-x: auto;
+            margin: 12px 0 20px;
+        }
+        .code-block pre {
+            margin: 0;
+            font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+            font-size: 0.875rem;
+            line-height: 1.6;
+            color: var(--code-text);
+        }
+        .test-card {
+            background: var(--bg-code);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .test-card h4 {
+            color: var(--accent-green);
+            margin-bottom: 8px;
+        }
+        .test-card p {
+            font-size: 0.9rem;
+            margin-bottom: 12px;
+        }
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+            margin: 20px 0;
+        }
+        .info-card {
+            background: var(--bg-code);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+        }
+        .info-card h4 {
+            color: var(--text-heading);
+            margin-bottom: 8px;
+        }
+        .info-card p {
+            font-size: 0.9rem;
+        }
+        .pricing-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0;
+        }
+        .pricing-table th, .pricing-table td {
+            padding: 10px 14px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .pricing-table th {
+            color: var(--text-heading);
+            font-weight: 600;
+            background: var(--bg-sidebar);
+        }
+        .pricing-table td {
+            color: var(--text-primary);
+        }
+        .pricing-table code {
+            background: var(--bg-code);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+        }
+        .flow-diagram {
+            background: var(--bg-code);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            margin: 16px 0;
+            overflow-x: auto;
+        }
+        .flow-diagram pre {
+            font-family: 'SFMono-Regular', Consolas, monospace;
+            font-size: 0.85rem;
+            line-height: 1.5;
+            color: var(--code-text);
+        }
+        .note-box {
+            background: rgba(88, 166, 255, 0.1);
+            border-left: 4px solid var(--accent-blue);
+            padding: 14px 18px;
+            border-radius: 0 8px 8px 0;
+            margin: 16px 0;
+        }
+        .note-box p {
+            margin: 0;
+            font-size: 0.9rem;
+        }
+        .warning-box {
+            background: rgba(210, 153, 34, 0.1);
+            border-left: 4px solid var(--accent-yellow);
+            padding: 14px 18px;
+            border-radius: 0 8px 8px 0;
+            margin: 16px 0;
+        }
+        .warning-box p {
+            margin: 0;
+            font-size: 0.9rem;
+        }
+        a.ext-link {
+            color: var(--accent-blue);
+            text-decoration: none;
+        }
+        a.ext-link:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <!-- Mobile Header -->
+    <header class="mobile-header">
+        <button class="hamburger" aria-label="Toggle menu">
+            <span></span>
+            <span></span>
+            <span></span>
+        </button>
+        <span class="logo-text">Fula API</span>
+        <div class="mobile-header-actions">
+            <button class="theme-toggle" aria-label="Toggle theme">
+                <span class="icon-sun">☀️</span>
+                <span class="icon-moon">🌙</span>
+            </button>
+        </div>
+    </header>
+
+    <div class="sidebar-overlay"></div>
+
+    <nav class="sidebar">
+        <div class="sidebar-header">
+            <div class="logo">
+                <h1>Fula API</h1>
+                <span class="version">v0.1.0</span>
+            </div>
+            <button class="theme-toggle" aria-label="Toggle theme">
+                <span class="icon-sun">☀️</span>
+                <span class="icon-moon">🌙</span>
+            </button>
+        </div>
+        <div class="nav-section">
+            <h3>Documentation</h3>
+            <ul>
+                <li><a href="index.html">Introduction</a></li>
+                <li><a href="security.html">Security & Encryption</a></li>
+                <li><a href="api.html">API Reference</a></li>
+                <li><a href="sdk.html">SDK Examples</a></li>
+                <li><a href="platforms.html">Platform Guides</a></li>
+                <li><a href="x402.html" class="active">x402 AI Agent Storage</a></li>
+            </ul>
+        </div>
+        <div class="nav-section">
+            <h3>On This Page</h3>
+            <ul>
+                <li><a href="#overview">Overview</a></li>
+                <li><a href="#how-it-works">How It Works</a></li>
+                <li><a href="#endpoints">API Endpoints</a></li>
+                <li><a href="#pricing">Pricing</a></li>
+                <li><a href="#getting-started">Getting Started</a></li>
+                <li><a href="#test-upload">Upload Test</a></li>
+                <li><a href="#test-download">Download Test</a></li>
+                <li><a href="#test-credit">Credit Test</a></li>
+                <li><a href="#test-delete">Delete Test</a></li>
+                <li><a href="#openapi-spec">OpenAPI Spec</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <main class="content security-content">
+        <!-- Hero Section -->
+        <section class="x402-hero">
+            <img src="assets/skale-horizontal.jpg" alt="SKALE Network x Fula">
+            <h1>x402 AI Agent Storage</h1>
+            <p class="hero-subtitle">Seamless Decentralized Storage for AI Agents on SKALE Network</p>
+            <div class="hero-badges">
+                <span class="badge-item">🤖 AI-Native Payments</span>
+                <span class="badge-item">🌐 Decentralized Storage</span>
+                <span class="badge-item">📦 S3-Compatible</span>
+                <span class="badge-item">⛓️ SKALE Network</span>
+            </div>
+        </section>
+
+        <!-- Overview -->
+        <section id="overview" class="x402-section">
+            <h2>Overview</h2>
+            <p>x402 provides an easy way for AI agents to store data on the Fula network. By leveraging the <a href="https://www.x402.org/" class="ext-link">x402 payment protocol</a> on the SKALE network, AI agents can autonomously pay for and manage decentralized storage without any human interaction.</p>
+            <p>Data stored on Fula is <strong>decentralized</strong> &mdash; it is distributed across a peer-to-peer network backed by IPFS, meaning no single entity controls your data. Every file is content-addressed using cryptographic hashes, ensuring data integrity and tamper resistance. The Fula S3-compatible gateway makes it trivially easy for any application or agent that speaks the S3 protocol to upload, download, and manage objects in this decentralized layer.</p>
+
+            <div class="info-grid">
+                <div class="info-card">
+                    <h4>🤖 Built for AI Agents</h4>
+                    <p>AI agents send a request, receive a payment requirement via HTTP 402, sign a transaction on-chain, and complete the upload &mdash; all programmatically with zero human intervention.</p>
+                </div>
+                <div class="info-card">
+                    <h4>🌐 Decentralized by Default</h4>
+                    <p>Files are stored on the Fula peer-to-peer network powered by IPFS. No centralized servers, no single point of failure. Each object is content-addressed and verifiable.</p>
+                </div>
+                <div class="info-card">
+                    <h4>📦 S3-Compatible API</h4>
+                    <p>Use familiar S3 operations (PUT, GET, DELETE) with bucket-based organization. Any S3 client or SDK can interact with the x402 gateway.</p>
+                </div>
+                <div class="info-card">
+                    <h4>⛓️ SKALE Network Payments</h4>
+                    <p>Payments are settled on the SKALE network with near-zero gas fees. The x402 protocol handles payment negotiation and verification automatically.</p>
+                </div>
+            </div>
+
+            <p>The x402 endpoint is available at:</p>
+            <div class="code-block">
+                <pre>https://x402.api.cloud.fx.land/</pre>
+            </div>
+        </section>
+
+        <!-- How It Works -->
+        <section id="how-it-works" class="x402-section">
+            <h2>How It Works</h2>
+            <p>The x402 payment protocol uses HTTP status code <strong>402 Payment Required</strong> to negotiate payments between clients and the storage gateway. Here is the flow:</p>
+
+            <div class="flow-diagram">
+                <pre>
+  AI Agent                         x402 Gateway                     SKALE Network
+     │                                  │                                │
+     │  1. PUT /bucket/file.txt         │                                │
+     │ ─────────────────────────────────>│                                │
+     │                                  │                                │
+     │  2. HTTP 402 Payment Required    │                                │
+     │     { amount, token, payTo }     │                                │
+     │ <─────────────────────────────────│                                │
+     │                                  │                                │
+     │  3. Sign & send USDC payment     │                                │
+     │ ──────────────────────────────────────────────────────────────────>│
+     │                                  │                                │
+     │  4. PUT /bucket/file.txt         │                                │
+     │     X-PAYMENT: [signed receipt]  │                                │
+     │ ─────────────────────────────────>│                                │
+     │                                  │  5. Verify payment on-chain    │
+     │                                  │ ──────────────────────────────>│
+     │                                  │                                │
+     │                                  │  6. Payment confirmed          │
+     │                                  │ <──────────────────────────────│
+     │                                  │                                │
+     │  7. HTTP 200 OK                  │                                │
+     │     { cid, expires_at, tx_hash } │                                │
+     │ <─────────────────────────────────│                                │
+     │                                  │                                │
+     │  Downloads are FREE              │                                │
+     │  GET /bucket/file.txt            │                                │
+     │ ─────────────────────────────────>│                                │
+     │  HTTP 200 OK + file data         │                                │
+     │ <─────────────────────────────────│                                │
+                </pre>
+            </div>
+
+            <div class="note-box">
+                <p><strong>Note:</strong> Only the uploader (identified by their wallet address) can download their uploaded files. Downloads and deletes are free &mdash; no payment is required.</p>
+            </div>
+        </section>
+
+        <!-- API Endpoints -->
+        <section id="endpoints" class="x402-section">
+            <h2>API Endpoints</h2>
+            <p>The following endpoints are available on the x402 gateway. All file operations use the S3-style <code>/{bucket}/{key}</code> path convention where the bucket acts as a folder namespace.</p>
+
+            <h3>Health & Service</h3>
+
+            <div class="endpoint-card">
+                <h4><span class="method method-get">GET</span> <span class="path">/</span></h4>
+                <p>Returns basic service information, version, and documentation links.</p>
+            </div>
+
+            <div class="endpoint-card">
+                <h4><span class="method method-get">GET</span> <span class="path">/health</span></h4>
+                <p>Health check reporting service status, database connectivity, version, and uptime.</p>
+            </div>
+
+            <div class="endpoint-card">
+                <h4><span class="method method-get">GET</span> <span class="path">/health/detailed</span></h4>
+                <p>Detailed health check including cleanup statistics and ephemeral object counts.</p>
+            </div>
+
+            <div class="endpoint-card">
+                <h4><span class="method method-get">GET</span> <span class="path">/health/pricing</span></h4>
+                <p>Returns current pricing configuration with example cost calculations.</p>
+            </div>
+
+            <h3>File Operations</h3>
+
+            <div class="endpoint-card">
+                <h4><span class="method method-put">PUT</span> <span class="path">/{bucket}/{key}</span></h4>
+                <p><strong>Upload a file.</strong> Requires x402 payment. Returns <code>402</code> with payment requirements on first request. Include the <code>X-PAYMENT</code> header (base64-encoded signed receipt) on retry. Optionally set <code>X-Fula-TTL</code> (60&ndash;2,592,000 seconds) to control storage duration.</p>
+                <p>Response: <code>{ success, cid, bucket, key, size_bytes, expires_at, tx_hash, gateway_url }</code></p>
+            </div>
+
+            <div class="endpoint-card">
+                <h4><span class="method method-get">GET</span> <span class="path">/{bucket}/{key}</span></h4>
+                <p><strong>Download a file.</strong> Free &mdash; no payment required. Requires wallet identity via <code>X-PAYMENT</code> header or JWT. Only the original uploader can access the file. Returns the file binary with Content-Type, Content-Length, and ETag headers.</p>
+            </div>
+
+            <div class="endpoint-card">
+                <h4><span class="method method-head">HEAD</span> <span class="path">/{bucket}/{key}</span></h4>
+                <p><strong>Check file existence.</strong> Free. Returns metadata headers (Content-Length, ETag, expiry) without downloading the file body.</p>
+            </div>
+
+            <div class="endpoint-card">
+                <h4><span class="method method-delete">DELETE</span> <span class="path">/{bucket}/{key}</span></h4>
+                <p><strong>Delete a file.</strong> Free. Requires wallet verification via <code>X-PAYMENT</code> or JWT. Only the original uploader can delete their files.</p>
+            </div>
+
+            <h3>Credit Management</h3>
+
+            <div class="endpoint-card">
+                <h4><span class="method method-post">POST</span> <span class="path">/credit</span></h4>
+                <p><strong>Top up FULA credits.</strong> Add credits to your account via x402 payment to extend storage duration before the system deletes objects due to low credit. Returns <code>402</code> with minimum payment amount on first request.</p>
+                <p>Response: <code>{ success, creditsAdded, newBalance, amountPaidUsdc, tx_hash }</code></p>
+            </div>
+        </section>
+
+        <!-- Pricing -->
+        <section id="pricing" class="x402-section">
+            <h2>Pricing</h2>
+            <p>Storage pricing is calculated based on file size and storage duration, paid in USDC on the SKALE network.</p>
+
+            <table class="pricing-table">
+                <thead>
+                    <tr>
+                        <th>Parameter</th>
+                        <th>Value</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Base price</td>
+                        <td><code>$0.01 USDC</code> per MB per hour</td>
+                    </tr>
+                    <tr>
+                        <td>Minimum charge</td>
+                        <td><code>$0.001 USDC</code></td>
+                    </tr>
+                    <tr>
+                        <td>Formula</td>
+                        <td><code>ceil(sizeMB × hours × $0.01)</code> in micro USDC</td>
+                    </tr>
+                    <tr>
+                        <td>Default TTL</td>
+                        <td>24 hours (configurable via <code>X-Fula-TTL</code> header, 60s&ndash;2,592,000s)</td>
+                    </tr>
+                    <tr>
+                        <td>Downloads</td>
+                        <td>Free</td>
+                    </tr>
+                    <tr>
+                        <td>Deletes</td>
+                        <td>Free</td>
+                    </tr>
+                    <tr>
+                        <td>Gas fees</td>
+                        <td>Near-zero (SKALE network)</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="note-box">
+                <p><strong>Automatic cleanup:</strong> Expired objects are deleted every 60 seconds. Unpaid uploads (pending payment) are cleaned up after 30 minutes.</p>
+            </div>
+        </section>
+
+        <!-- Getting Started -->
+        <section id="getting-started" class="x402-section">
+            <h2>Getting Started</h2>
+            <p>To test the x402 endpoints, clone the pinning service repository and run the provided test scripts. You will need a wallet private key with some USDC on the SKALE network.</p>
+
+            <div class="code-block">
+                <pre>git clone https://github.com/functionland/pinning-service
+cd pinning-service/x402-skale/scripts</pre>
+            </div>
+
+            <p>Test scripts and examples are available at: <a href="https://github.com/functionland/pinning-service/tree/main/x402-skale/scripts" class="ext-link">github.com/functionland/pinning-service/x402-skale/scripts</a></p>
+
+            <div class="warning-box">
+                <p><strong>Prerequisites:</strong> You need Node.js installed and a wallet private key with USDC balance on the SKALE network.</p>
+            </div>
+
+            <!-- Upload Test -->
+            <div id="test-upload" class="test-card">
+                <h4>Upload Test</h4>
+                <p>Sends a request to the x402 gateway, receives the required payment amount, creates and sends a test file to be uploaded, settles the payment on-chain, and then downloads and verifies the uploaded file. The API uses S3 conventions where <code>bucket-name</code> acts as a folder. The test script uses <code>test-bucket</code> as default and creates a "hello world" test file to upload.</p>
+                <div class="code-block">
+                    <pre>npx tsx test-x402-upload.ts [wallet-private-key] https://x402.api.cloud.fx.land</pre>
+                </div>
+            </div>
+
+            <!-- Download Test -->
+            <div id="test-download" class="test-card">
+                <h4>Download Test</h4>
+                <p>Downloads an already uploaded file. No payment is needed. Note that only the original uploader can read the uploaded file.</p>
+                <div class="code-block">
+                    <pre>npx tsx test-x402-download.ts [uploader-private-key] "[bucket-name]" "[file-name]" https://x402.api.cloud.fx.land</pre>
+                </div>
+            </div>
+
+            <!-- Credit Test -->
+            <div id="test-credit" class="test-card">
+                <h4>Credit Test</h4>
+                <p>Adds credit to the user's account in case the user wants to extend the storage time before the system deletes objects due to low credit. The amount is specified in micro USDC (e.g., <code>10000</code> = $0.01).</p>
+                <div class="code-block">
+                    <pre>npx tsx test-x402-credit.ts [uploader-private-key] https://x402.api.cloud.fx.land [micro-USDC-amount]</pre>
+                </div>
+            </div>
+
+            <!-- Delete Test -->
+            <div id="test-delete" class="test-card">
+                <h4>Delete Test</h4>
+                <p>Tests the delete endpoint to remove an uploaded file. Deleting is free and requires the uploader's wallet for identity verification.</p>
+                <div class="code-block">
+                    <pre>npx tsx test-x402-delete.ts [uploader-private-key] "[bucket-name]" "[file-name]" https://x402.api.cloud.fx.land</pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- OpenAPI Spec -->
+        <section id="openapi-spec" class="x402-section">
+            <h2>OpenAPI Specification</h2>
+            <p>The full OpenAPI specification for the x402 storage gateway is available at:</p>
+            <div class="code-block">
+                <pre><a href="https://raw.githubusercontent.com/functionland/pinning-service/refs/heads/main/x402-skale/openapi.json" class="ext-link">https://raw.githubusercontent.com/functionland/pinning-service/refs/heads/main/x402-skale/openapi.json</a></pre>
+            </div>
+            <p>You can import this specification into tools like <a href="https://editor.swagger.io/" class="ext-link">Swagger Editor</a> or <a href="https://www.postman.com/" class="ext-link">Postman</a> to explore and test all available endpoints interactively.</p>
+        </section>
+
+        <footer>
+            <p>Fula API x402 Documentation &bull; Built with ❤️ for decentralized AI agent storage</p>
+            <p class="footer-links">
+                <a href="https://github.com/functionland/fula-api">GitHub</a> &bull;
+                <a href="https://fx.land">Functionland</a>
+            </p>
+        </footer>
+    </main>
+
+    <script src="js/i18n.js"></script>
+    <script src="js/translations.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
