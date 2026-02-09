@@ -22,3 +22,4 @@ Thumbs.db
 # WASM build output (not the Flutter package)
 /wasm-package
 /target
+/__pycache__
