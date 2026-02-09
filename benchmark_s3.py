@@ -1354,6 +1354,14 @@ def _error_explanation(category: str) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
+# Default output goes to docs/website/ so the benchmark page can load it
+# directly without any manual copying.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_OUTPUT = os.path.join(
+    _SCRIPT_DIR, "docs", "website", "assets", "benchmark", "benchmark_results.md"
+)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="S3-Compatible Benchmark for Fula API",
@@ -1380,8 +1388,11 @@ Examples:
     )
     parser.add_argument(
         "--output",
-        default="benchmark_results.md",
-        help="Output markdown report path (default: benchmark_results.md)",
+        default=_DEFAULT_OUTPUT,
+        help=(
+            "Output markdown report path "
+            "(default: docs/website/assets/benchmark/benchmark_results.md)"
+        ),
     )
     return parser.parse_args()
 
@@ -1391,6 +1402,10 @@ async def async_main():
     bucket = args.bucket or f"benchmark-{int(time.time())}"
     endpoint = args.endpoint.rstrip("/")
     output = args.output
+
+    # Ensure the output directory exists
+    output_dir = os.path.dirname(os.path.abspath(output))
+    os.makedirs(output_dir, exist_ok=True)
 
     print(
         f"Fula S3 Benchmark\n"
@@ -1413,7 +1428,10 @@ async def async_main():
     report.generate()
 
     print(f"Report saved to {output}", file=sys.stderr, flush=True)
-    print("4 chart PNGs generated alongside report.", file=sys.stderr, flush=True)
+    print(
+        f"4 chart PNGs generated in {output_dir}/",
+        file=sys.stderr, flush=True,
+    )
 
 
 def main():

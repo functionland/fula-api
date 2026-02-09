@@ -1,0 +1,318 @@
+/* Benchmark page styles */
+
+.benchmark-hero {
+    text-align: center;
+    padding: 40px 20px 30px;
+}
+
+.benchmark-hero h1 {
+    font-size: 2.2rem;
+    background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple, #a78bfa));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin-bottom: 12px;
+}
+
+.benchmark-hero p {
+    color: var(--text-secondary);
+    font-size: 1.1rem;
+    max-width: 700px;
+    margin: 0 auto;
+    line-height: 1.6;
+}
+
+.benchmark-section {
+    padding: 30px 20px;
+    max-width: 960px;
+    margin: 0 auto;
+}
+
+.benchmark-section h2 {
+    color: var(--text-heading);
+    font-size: 1.5rem;
+    margin-bottom: 14px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--accent-blue);
+}
+
+.benchmark-section h3 {
+    color: var(--text-heading);
+    font-size: 1.2rem;
+    margin-top: 20px;
+    margin-bottom: 10px;
+}
+
+.benchmark-section p,
+.benchmark-section li {
+    color: var(--text-primary);
+    line-height: 1.7;
+    margin-bottom: 10px;
+}
+
+.benchmark-section ul {
+    padding-left: 20px;
+    margin-bottom: 16px;
+}
+
+.benchmark-section code {
+    background: var(--bg-code);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.9em;
+    color: var(--accent-blue);
+}
+
+.benchmark-section pre {
+    background: var(--bg-code);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 16px;
+    overflow-x: auto;
+    margin-bottom: 16px;
+    font-size: 0.9rem;
+    line-height: 1.5;
+}
+
+.benchmark-section pre code {
+    background: none;
+    padding: 0;
+    color: var(--text-primary);
+}
+
+.script-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 18px;
+    background: var(--bg-code);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--accent-blue);
+    text-decoration: none;
+    font-weight: 600;
+    transition: border-color 0.2s, background 0.2s;
+    margin-top: 8px;
+}
+
+.script-link:hover {
+    border-color: var(--accent-blue);
+    background: rgba(96, 165, 250, 0.08);
+}
+
+/* Rendered markdown container */
+#benchmark-report {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 0 20px 40px;
+}
+
+#benchmark-report h1 {
+    color: var(--text-heading);
+    font-size: 1.8rem;
+    margin-top: 30px;
+    margin-bottom: 14px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--accent-blue);
+}
+
+#benchmark-report h2 {
+    color: var(--text-heading);
+    font-size: 1.4rem;
+    margin-top: 28px;
+    margin-bottom: 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+#benchmark-report h3 {
+    color: var(--text-heading);
+    font-size: 1.15rem;
+    margin-top: 22px;
+    margin-bottom: 10px;
+}
+
+#benchmark-report p {
+    color: var(--text-primary);
+    line-height: 1.7;
+    margin-bottom: 12px;
+}
+
+#benchmark-report li {
+    color: var(--text-primary);
+    line-height: 1.7;
+    margin-bottom: 6px;
+}
+
+#benchmark-report ul {
+    padding-left: 20px;
+    margin-bottom: 14px;
+}
+
+#benchmark-report code {
+    background: var(--bg-code);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.9em;
+    color: var(--accent-blue);
+}
+
+#benchmark-report pre {
+    background: var(--bg-code);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 16px;
+    overflow-x: auto;
+    margin-bottom: 16px;
+}
+
+#benchmark-report pre code {
+    background: none;
+    padding: 0;
+    color: var(--text-primary);
+}
+
+#benchmark-report blockquote {
+    border-left: 4px solid var(--accent-blue);
+    margin: 16px 0;
+    padding: 12px 16px;
+    background: rgba(96, 165, 250, 0.05);
+    border-radius: 0 8px 8px 0;
+}
+
+#benchmark-report blockquote p {
+    margin-bottom: 4px;
+}
+
+#benchmark-report table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 20px;
+    font-size: 0.9rem;
+    overflow-x: auto;
+    display: block;
+}
+
+#benchmark-report thead {
+    display: table;
+    width: 100%;
+    table-layout: fixed;
+}
+
+#benchmark-report tbody {
+    display: table;
+    width: 100%;
+    table-layout: fixed;
+}
+
+#benchmark-report th {
+    background: var(--bg-code);
+    color: var(--text-heading);
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 12px;
+    border: 1px solid var(--border-color);
+    white-space: nowrap;
+}
+
+#benchmark-report td {
+    color: var(--text-primary);
+    padding: 8px 12px;
+    border: 1px solid var(--border-color);
+}
+
+#benchmark-report tr:nth-child(even) {
+    background: rgba(255, 255, 255, 0.02);
+}
+
+#benchmark-report img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+    margin: 16px 0;
+    display: block;
+}
+
+#benchmark-report strong {
+    color: var(--text-heading);
+}
+
+#benchmark-report hr {
+    border: none;
+    border-top: 1px solid var(--border-color);
+    margin: 30px 0;
+}
+
+#benchmark-report em {
+    color: var(--text-secondary);
+}
+
+/* Loading / status messages */
+.benchmark-loading {
+    text-align: center;
+    padding: 40px 20px;
+    color: var(--text-secondary);
+}
+
+.benchmark-loading .spinner {
+    display: inline-block;
+    width: 24px;
+    height: 24px;
+    border: 3px solid var(--border-color);
+    border-top-color: var(--accent-blue);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-right: 10px;
+    vertical-align: middle;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.benchmark-placeholder {
+    text-align: center;
+    padding: 40px 20px;
+    background: var(--bg-code);
+    border: 1px dashed var(--border-color);
+    border-radius: 12px;
+    margin: 20px auto;
+    max-width: 700px;
+}
+
+.benchmark-placeholder h3 {
+    color: var(--text-heading);
+    margin-bottom: 10px;
+}
+
+.benchmark-placeholder p {
+    color: var(--text-secondary);
+    line-height: 1.7;
+}
+
+.benchmark-placeholder pre {
+    text-align: left;
+    max-width: 500px;
+    margin: 14px auto;
+    background: var(--bg-dark);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px 16px;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .benchmark-hero h1 {
+        font-size: 1.6rem;
+    }
+
+    #benchmark-report table {
+        font-size: 0.8rem;
+    }
+
+    #benchmark-report th,
+    #benchmark-report td {
+        padding: 6px 8px;
+    }
+}

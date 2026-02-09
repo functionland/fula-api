@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
+    <title>Benchmark - Fula API Documentation</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="css/benchmark.css">
+    <link rel="stylesheet" href="css/i18n.css">
+    <script>
+        (function() {
+            const savedTheme = localStorage.getItem('fula-docs-theme');
+            if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
+            const savedLang = localStorage.getItem('fula-docs-language');
+            if (savedLang && ['fa', 'ar'].includes(savedLang)) {
+                document.documentElement.setAttribute('dir', 'rtl');
+                document.documentElement.setAttribute('lang', savedLang);
+            }
+        })();
+    </script>
+</head>
+<body>
+    <!-- Mobile Header -->
+    <header class="mobile-header">
+        <button class="hamburger" aria-label="Toggle menu">
+            <span></span>
+            <span></span>
+            <span></span>
+        </button>
+        <span class="logo-text">Fula API</span>
+        <div class="mobile-header-actions">
+            <button class="theme-toggle" aria-label="Toggle theme">
+                <span class="icon-sun">☀️</span>
+                <span class="icon-moon">🌙</span>
+            </button>
+        </div>
+    </header>
+
+    <div class="sidebar-overlay"></div>
+
+    <nav class="sidebar">
+        <div class="sidebar-header">
+            <div class="logo">
+                <h1>Fula API</h1>
+                <span class="version">v0.1.0</span>
+            </div>
+            <button class="theme-toggle" aria-label="Toggle theme">
+                <span class="icon-sun">☀️</span>
+                <span class="icon-moon">🌙</span>
+            </button>
+        </div>
+        <div class="nav-section">
+            <h3>Documentation</h3>
+            <ul>
+                <li><a href="index.html">Introduction</a></li>
+                <li><a href="security.html">Security & Encryption</a></li>
+                <li><a href="api.html">API Reference</a></li>
+                <li><a href="sdk.html">SDK Examples</a></li>
+                <li><a href="platforms.html">Platform Guides</a></li>
+                <li><a href="x402.html">x402 AI Agent Storage</a></li>
+                <li><a href="benchmark.html" class="active">Benchmark</a></li>
+            </ul>
+        </div>
+        <div class="nav-section">
+            <h3>On This Page</h3>
+            <ul>
+                <li><a href="#about">About This Benchmark</a></li>
+                <li><a href="#run-it">How to Run</a></li>
+                <li><a href="#results">Benchmark Results</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <main class="content">
+        <!-- Hero -->
+        <section class="benchmark-hero">
+            <h1>S3 Gateway Performance Benchmark</h1>
+            <p>
+                Automated performance testing of the Fula decentralized S3-compatible storage gateway,
+                compared against published industry baselines from AWS S3, IPFS, and Cloudflare R2.
+            </p>
+        </section>
+
+        <!-- About -->
+        <section id="about" class="benchmark-section">
+            <h2>About This Benchmark</h2>
+            <p>
+                The Fula S3 Gateway provides an S3-compatible API backed by decentralized IPFS storage.
+                This benchmark measures real-world upload and download performance across different
+                file sizes and concurrency levels, then compares the results against industry standards.
+            </p>
+            <h3>What is tested</h3>
+            <ul>
+                <li><strong>File sizes:</strong> 64 KB, 1 MB, and 10 MB objects</li>
+                <li><strong>Concurrency:</strong> 1 (sequential), 10, and 50 parallel requests</li>
+                <li><strong>Operations:</strong> Upload (PUT), Download (GET), and Mixed 80/20 read/write</li>
+                <li><strong>Metrics:</strong> Time to First Byte (TTFB), throughput (MB/s), latency percentiles, success rate</li>
+            </ul>
+            <h3>Industry baselines compared</h3>
+            <ul>
+                <li><strong>AWS S3 Standard</strong> &mdash; same-region EC2, published benchmarks</li>
+                <li><strong>IPFS Public Gateways</strong> &mdash; cached and uncached content retrieval</li>
+                <li><strong>Cloudflare R2</strong> &mdash; S3-compatible API latency</li>
+            </ul>
+        </section>
+
+        <!-- How to run -->
+        <section id="run-it" class="benchmark-section">
+            <h2>How to Run the Benchmark</h2>
+            <p>
+                The benchmark is a self-contained Python script that tests any S3-compatible endpoint
+                and generates a detailed markdown report with charts.
+            </p>
+            <h3>Prerequisites</h3>
+            <pre><code>pip install aiohttp matplotlib
+# Python 3.9+ required</code></pre>
+            <h3>Run the benchmark</h3>
+            <pre><code>python benchmark_s3.py --token "YOUR_JWT_TOKEN" --endpoint https://s3.cloud.fx.land</code></pre>
+            <h3>Options</h3>
+            <ul>
+                <li><code>--token</code> &mdash; (required) JWT Bearer token for authentication</li>
+                <li><code>--endpoint</code> &mdash; S3 endpoint URL (default: <code>https://s3.cloud.fx.land</code>)</li>
+                <li><code>--bucket</code> &mdash; Bucket name (default: <code>benchmark-{timestamp}</code>)</li>
+                <li><code>--output</code> &mdash; Output report path (default: <code>benchmark_results.md</code>)</li>
+            </ul>
+            <h3>Output</h3>
+            <p>
+                The script produces a markdown report (<code>benchmark_results.md</code>) and
+                4 chart images (<code>benchmark_*.png</code>) in the same directory.
+                The report shown below is loaded directly from the latest generated results.
+            </p>
+            <a class="script-link"
+               href="https://github.com/functionland/fula-api/blob/main/benchmark_s3.py"
+               target="_blank" rel="noopener">
+                View benchmark_s3.py on GitHub &rarr;
+            </a>
+        </section>
+
+        <!-- Results (loaded dynamically from benchmark_results.md) -->
+        <section id="results" class="benchmark-section">
+            <h2>Benchmark Results</h2>
+        </section>
+
+        <div id="benchmark-report">
+            <div class="benchmark-loading" id="benchmark-loading">
+                <span class="spinner"></span>
+                Loading benchmark results&hellip;
+            </div>
+        </div>
+
+        <footer>
+            <p>Fula API Benchmark Documentation &bull; Built with decentralized storage in mind</p>
+            <p class="footer-links">
+                <a href="https://github.com/functionland/fula-api">GitHub</a> &bull;
+                <a href="https://fx.land">Functionland</a>
+            </p>
+        </footer>
+    </main>
+
+    <script src="js/i18n.js"></script>
+    <script src="js/translations.js"></script>
+    <script src="js/app.js"></script>
+
+    <!-- Marked.js for rendering markdown -->
+    <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
+    <script>
+    (function() {
+        // Paths to try in order (local deploy, then GitHub raw)
+        var REPORT_PATHS = [
+            'assets/benchmark/benchmark_results.md',
+            'https://raw.githubusercontent.com/functionland/fula-api/main/docs/website/assets/benchmark/benchmark_results.md'
+        ];
+
+        var IMAGE_BASES = [
+            'assets/benchmark/',
+            'https://raw.githubusercontent.com/functionland/fula-api/main/docs/website/assets/benchmark/'
+        ];
+
+        var container = document.getElementById('benchmark-report');
+        var loadingEl = document.getElementById('benchmark-loading');
+
+        function rewriteImages(html, base) {
+            // Rewrite relative image src paths to use the same base as the markdown
+            return html.replace(
+                /(<img\s+[^>]*src=")(?!https?:\/\/)([^"]+)(")/g,
+                '$1' + base + '$2$3'
+            );
+        }
+
+        function renderMarkdown(md, imageBase) {
+            if (typeof marked === 'undefined' || typeof marked.parse !== 'function') {
+                container.innerHTML = '<div class="benchmark-placeholder"><p>Markdown renderer not available. ' +
+                    '<a href="https://github.com/functionland/fula-api/blob/main/benchmark_results.md" target="_blank">' +
+                    'View results on GitHub</a></p></div>';
+                return;
+            }
+            var html = marked.parse(md);
+            html = rewriteImages(html, imageBase);
+            container.innerHTML = html;
+        }
+
+        function showPlaceholder() {
+            container.innerHTML =
+                '<div class="benchmark-placeholder">' +
+                '<h3>No benchmark results available yet</h3>' +
+                '<p>Run the benchmark script to generate results:</p>' +
+                '<pre><code>python benchmark_s3.py --token "YOUR_JWT"</code></pre>' +
+                '<p>The generated <code>benchmark_results.md</code> and chart images will appear here automatically.</p>' +
+                '</div>';
+        }
+
+        function tryFetch(index) {
+            if (index >= REPORT_PATHS.length) {
+                showPlaceholder();
+                return;
+            }
+            var url = REPORT_PATHS[index];
+            var imageBase = IMAGE_BASES[index] || '';
+
+            fetch(url)
+                .then(function(resp) {
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                    return resp.text();
+                })
+                .then(function(md) {
+                    // Sanity check: must look like our report
+                    if (md.indexOf('Benchmark') === -1 && md.indexOf('benchmark') === -1) {
+                        throw new Error('Not a benchmark report');
+                    }
+                    renderMarkdown(md, imageBase);
+                })
+                .catch(function() {
+                    tryFetch(index + 1);
+                });
+        }
+
+        // Wait for marked.js to load, then fetch
+        function init() {
+            if (typeof marked !== 'undefined') {
+                tryFetch(0);
+            } else {
+                setTimeout(init, 100);
+            }
+        }
+        init();
+    })();
+    </script>
+</body>
+</html>
