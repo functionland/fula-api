@@ -23,10 +23,21 @@ pub struct DekKey {
 
 impl DekKey {
     /// Generate a new random DEK
+    ///
+    /// # Panics
+    /// Panics if the OS random number generator is unavailable.
     pub fn generate() -> Self {
         let mut key = [0u8; KEY_SIZE];
         rand::RngCore::fill_bytes(&mut OsRng, &mut key);
         Self { key }
+    }
+
+    /// Generate a new random DEK, returning an error if OS entropy is unavailable.
+    pub fn try_generate() -> Result<Self> {
+        let mut key = [0u8; KEY_SIZE];
+        getrandom::getrandom(&mut key)
+            .map_err(|e| CryptoError::KeyGeneration(format!("getrandom failed: {}", e)))?;
+        Ok(Self { key })
     }
 
     /// Create a DEK from raw bytes
@@ -102,10 +113,21 @@ pub struct SecretKey {
 
 impl SecretKey {
     /// Generate a new random secret key
+    ///
+    /// # Panics
+    /// Panics if the OS random number generator is unavailable.
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
         rand::RngCore::fill_bytes(&mut OsRng, &mut bytes);
         Self { bytes }
+    }
+
+    /// Generate a new random secret key, returning an error if OS entropy is unavailable.
+    pub fn try_generate() -> Result<Self> {
+        let mut bytes = [0u8; 32];
+        getrandom::getrandom(&mut bytes)
+            .map_err(|e| CryptoError::KeyGeneration(format!("getrandom failed: {}", e)))?;
+        Ok(Self { bytes })
     }
 
     /// Create from raw bytes
@@ -228,6 +250,15 @@ impl KeyManager {
     }
 
     /// Derive a path-specific key for hierarchical encryption
+    ///
+    /// # Security Note
+    ///
+    /// The KDF input concatenates `secret_key || path` without length encoding.
+    /// This is safe because the secret key is always exactly 32 bytes (X25519),
+    /// so there is no ambiguity in parsing: bytes [0..32] are always the key and
+    /// bytes [32..] are always the path. A variable-length first component could
+    /// allow `(key="AB", path="CD")` to collide with `(key="ABC", path="D")`,
+    /// but the fixed 32-byte key size prevents this.
     pub fn derive_path_key(&self, path: &str) -> DekKey {
         use crate::hashing::derive_key;
         let derived = derive_key(

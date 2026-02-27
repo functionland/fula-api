@@ -18,8 +18,9 @@ use fula_crypto::{
     rotation::{KeyRotationManager, WrappedKeyInfo},
     ChunkedEncoder, ChunkedFileMetadata, should_use_chunked,
 };
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::collections::HashMap;
+use tokio::sync::RwLock;
 
 /// Configuration for client-side encryption
 pub struct EncryptionConfig {
@@ -479,7 +480,10 @@ impl EncryptedClient {
             .map_err(ClientError::Encryption)?;
 
         // Decrypt data
-        let nonce_b64 = enc_metadata["nonce"].as_str().unwrap();
+        let nonce_b64 = enc_metadata["nonce"].as_str()
+            .ok_or_else(|| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption("Missing nonce in encryption metadata".to_string())
+            ))?;
         let nonce_bytes = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
             nonce_b64,
@@ -765,7 +769,7 @@ impl EncryptedClient {
     pub async fn load_forest(&self, bucket: &str) -> Result<PrivateForest> {
         // Check cache first
         {
-            let cache = self.forest_cache.read().unwrap();
+            let cache = self.forest_cache.read().await;
             if let Some(forest) = cache.get(bucket) {
                 return Ok(forest.clone());
             }
@@ -788,19 +792,19 @@ impl EncryptedClient {
                 
                 // Cache it
                 {
-                    let mut cache = self.forest_cache.write().unwrap();
+                    let mut cache = self.forest_cache.write().await;
                     cache.insert(bucket.to_string(), forest.clone());
                 }
-                
+
                 Ok(forest)
             }
             Err(_) => {
                 // No forest exists yet - create empty one
                 let forest = PrivateForest::new();
-                
+
                 // Cache it
                 {
-                    let mut cache = self.forest_cache.write().unwrap();
+                    let mut cache = self.forest_cache.write().await;
                     cache.insert(bucket.to_string(), forest.clone());
                 }
                 
@@ -835,7 +839,7 @@ impl EncryptedClient {
 
         // Update cache
         {
-            let mut cache = self.forest_cache.write().unwrap();
+            let mut cache = self.forest_cache.write().await;
             cache.insert(bucket.to_string(), forest.clone());
         }
 
@@ -966,7 +970,7 @@ impl EncryptedClient {
 
         // Update cache (but don't save to storage yet)
         {
-            let mut cache = self.forest_cache.write().unwrap();
+            let mut cache = self.forest_cache.write().await;
             cache.insert(bucket.to_string(), forest);
         }
 
@@ -1076,7 +1080,7 @@ impl EncryptedClient {
     /// This persists the in-memory forest index to encrypted storage.
     pub async fn flush_forest(&self, bucket: &str) -> Result<()> {
         let forest = {
-            let cache = self.forest_cache.read().unwrap();
+            let cache = self.forest_cache.read().await;
             cache.get(bucket).cloned()
         };
         
@@ -1088,8 +1092,8 @@ impl EncryptedClient {
     }
 
     /// Check if there are unsaved forest changes
-    pub fn has_pending_forest_changes(&self, bucket: &str) -> bool {
-        let cache = self.forest_cache.read().unwrap();
+    pub async fn has_pending_forest_changes(&self, bucket: &str) -> bool {
+        let cache = self.forest_cache.read().await;
         cache.contains_key(bucket)
     }
 
@@ -1717,7 +1721,8 @@ impl EncryptedClient {
         ).await?;
         
         // Update forest cache if we have one
-        if let Ok(mut cache) = self.forest_cache.write() {
+        {
+            let mut cache = self.forest_cache.write().await;
             if let Some(forest) = cache.get_mut(bucket) {
                 let now = chrono::Utc::now().timestamp();
                 forest.upsert_file(ForestFileEntry {

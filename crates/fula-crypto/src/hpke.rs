@@ -15,6 +15,7 @@ use crate::{
     keys::{DekKey, KekKeyPair, PublicKey, SecretKey},
     symmetric::AeadCipher,
 };
+use zeroize::Zeroizing;
 use hpke::{
     Deserializable, Kem, Serializable,
     aead::ChaCha20Poly1305,
@@ -54,7 +55,12 @@ pub const ENCAPSULATED_KEY_SIZE: usize = 32;
 /// HPKE configuration
 #[derive(Clone, Debug, Serialize, SerdeDeserialize)]
 pub struct HpkeConfig {
-    /// The AEAD cipher to use
+    /// The AEAD cipher preference.
+    ///
+    /// **Note:** This field is currently ignored by the HPKE encryption logic.
+    /// The actual AEAD algorithm is hardcoded to ChaCha20Poly1305 as part of the
+    /// RFC 9180 cipher suite (X25519HkdfSha256 + HkdfSha256 + ChaCha20Poly1305).
+    /// This field is retained for forward compatibility and configuration display.
     pub aead: AeadCipher,
     /// Key derivation context
     pub context: String,
@@ -328,7 +334,7 @@ impl Decryptor {
     /// Decrypt a wrapped DEK
     /// Uses AAD context "fula:v2:dek-wrap" (must match encryption)
     pub fn decrypt_dek(&self, encrypted: &EncryptedData) -> Result<DekKey> {
-        let bytes = self.decrypt_with_aad(encrypted, b"fula:v2:dek-wrap")?;
+        let bytes = Zeroizing::new(self.decrypt_with_aad(encrypted, b"fula:v2:dek-wrap")?);
         DekKey::from_bytes(&bytes)
     }
 }

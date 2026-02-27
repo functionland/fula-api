@@ -48,7 +48,7 @@ pub async fn flush_forest(
 /// Check if there are pending (unsaved) forest changes
 pub async fn has_pending_changes(client: &EncryptedClientHandle, bucket: String) -> bool {
     let guard = client.inner.read().await;
-    guard.has_pending_forest_changes(&bucket)
+    guard.has_pending_forest_changes(&bucket).await
 }
 
 // ============================================================================

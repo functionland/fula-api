@@ -149,17 +149,21 @@ impl BaoDecoder {
         }
     }
 
-    /// Verify a chunk of data at the given offset
-    pub fn verify_chunk(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+    /// Track a chunk of data at the given offset for deferred full-file verification.
+    ///
+    /// **Important:** This method does NOT verify the chunk against the Merkle tree.
+    /// The current implementation uses a simplified linear hash list rather than a
+    /// full binary Merkle tree. Only [`verify_all()`](Self::verify_all) performs actual
+    /// integrity verification (by comparing the full-file BLAKE3 hash against the
+    /// expected root hash). This method simply tracks the byte count for progress.
+    pub fn track_chunk(&mut self, offset: u64, data: &[u8]) -> Result<()> {
         let _chunk_index = (offset / BAO_BLOCK_SIZE as u64) as usize;
-        
-        // Simple verification: check that the data produces a valid chunk hash
+
+        // Compute chunk hash for future Merkle verification (not yet implemented)
         let _chunk_hash: Blake3Hash = blake3::hash(data).into();
-        
-        // For now, just verify the overall structure
-        // In a full implementation, we'd verify against the Merkle tree
+
         self.verified_bytes += data.len() as u64;
-        
+
         Ok(())
     }
 
@@ -208,7 +212,7 @@ impl<R: Read> VerifiedStream<R> {
         }
         
         let chunk = self.buffer[..bytes_read].to_vec();
-        self.decoder.verify_chunk(self.position, &chunk)?;
+        self.decoder.track_chunk(self.position, &chunk)?;
         self.position += bytes_read as u64;
         
         Ok(Some(chunk))

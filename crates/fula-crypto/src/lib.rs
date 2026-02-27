@@ -96,6 +96,7 @@ pub use hpke::{Decryptor, EncapsulatedKey, EncryptedData, Encryptor, HpkeConfig,
 pub use hybrid_kem::{
     HybridKeyPair, HybridPublicKey, HybridSecretKey, HybridEncapsulatedKey,
     encapsulate as hybrid_encapsulate, decapsulate as hybrid_decapsulate,
+    try_encapsulate as hybrid_try_encapsulate,
     HYBRID_PUBLIC_KEY_SIZE, HYBRID_SECRET_KEY_SIZE, HYBRID_ENCAPSULATED_KEY_SIZE,
 };
 pub use inbox::{ShareEnvelope, ShareEnvelopeBuilder, InboxEntry, InboxEntryStatus, ShareInbox, INBOX_PREFIX, DEFAULT_INBOX_TTL_SECONDS};

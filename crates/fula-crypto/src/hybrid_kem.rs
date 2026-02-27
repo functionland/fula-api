@@ -156,17 +156,27 @@ pub struct HybridSecretKey {
 
 impl HybridSecretKey {
     /// Generate a new random hybrid key pair
+    ///
+    /// # Panics
+    /// Panics if the OS random number generator is unavailable.
     pub fn generate() -> (Self, HybridPublicKey) {
+        Self::try_generate().expect("getrandom failed during hybrid key generation")
+    }
+
+    /// Generate a new random hybrid key pair, returning an error if OS entropy is unavailable.
+    pub fn try_generate() -> Result<(Self, HybridPublicKey)> {
         // Generate X25519 keypair using getrandom (WASM compatible)
         let mut x25519_bytes = [0u8; 32];
-        getrandom::getrandom(&mut x25519_bytes).expect("getrandom failed");
+        getrandom::getrandom(&mut x25519_bytes)
+            .map_err(|e| CryptoError::KeyGeneration(format!("getrandom failed: {}", e)))?;
         let x25519_secret = StaticSecret::from(x25519_bytes);
         let x25519_public = X25519Public::from(&x25519_secret);
 
         // Generate ML-KEM-768 keypair using libcrux (FIPS 203)
         // libcrux uses explicit 64-byte randomness instead of callback RNG
         let mut keygen_randomness = [0u8; 64];
-        getrandom::getrandom(&mut keygen_randomness).expect("getrandom failed");
+        getrandom::getrandom(&mut keygen_randomness)
+            .map_err(|e| CryptoError::KeyGeneration(format!("getrandom failed: {}", e)))?;
         let mlkem_keypair = mlkem_generate_key_pair(keygen_randomness);
 
         // Extract raw bytes from libcrux types
@@ -185,7 +195,7 @@ impl HybridSecretKey {
             mlkem: mlkem_pk,
         };
 
-        (secret, public)
+        Ok((secret, public))
     }
     
     /// Create from raw bytes
@@ -350,6 +360,10 @@ impl std::fmt::Debug for HybridEncapsulatedKey {
 /// 3. HKDF-SHA256 to derive the final shared secret
 ///
 /// Returns the encapsulated key (to send to recipient) and the shared secret
+///
+/// # Panics
+/// Panics if the OS random number generator is unavailable.
+/// Use [`try_encapsulate()`] for a fallible alternative.
 pub fn encapsulate(recipient_public: &HybridPublicKey) -> Result<(HybridEncapsulatedKey, [u8; SHARED_SECRET_SIZE])> {
     // X25519: Generate ephemeral keypair using getrandom (WASM compatible)
     let mut ephemeral_bytes = [0u8; 32];
@@ -390,6 +404,49 @@ pub fn encapsulate(recipient_public: &HybridPublicKey) -> Result<(HybridEncapsul
         mlkem_ciphertext,
     };
     
+    Ok((encapsulated, shared_secret))
+}
+
+/// Fallible version of [`encapsulate()`] that returns an error instead of panicking
+/// if OS entropy is unavailable.
+pub fn try_encapsulate(recipient_public: &HybridPublicKey) -> Result<(HybridEncapsulatedKey, [u8; SHARED_SECRET_SIZE])> {
+    // X25519: Generate ephemeral keypair
+    let mut ephemeral_bytes = [0u8; 32];
+    getrandom::getrandom(&mut ephemeral_bytes)
+        .map_err(|e| CryptoError::KeyGeneration(format!("getrandom failed: {}", e)))?;
+    let x25519_ephemeral_secret = StaticSecret::from(ephemeral_bytes);
+    let x25519_ephemeral_public = X25519Public::from(&x25519_ephemeral_secret);
+    let x25519_recipient_public = X25519Public::from(recipient_public.x25519);
+    let x25519_shared = x25519_ephemeral_secret.diffie_hellman(&x25519_recipient_public);
+
+    // ML-KEM-768: Encapsulate
+    let mut encaps_randomness = [0u8; 32];
+    getrandom::getrandom(&mut encaps_randomness)
+        .map_err(|e| CryptoError::KeyGeneration(format!("getrandom failed: {}", e)))?;
+
+    let mlkem_pk = MlKem768PublicKey::from(recipient_public.mlkem);
+    let (ct, mlkem_shared_secret) = mlkem_encapsulate(&mlkem_pk, encaps_randomness);
+
+    let mut mlkem_ciphertext = [0u8; MLKEM_CIPHERTEXT_SIZE];
+    mlkem_ciphertext.copy_from_slice(ct.as_ref());
+
+    // Combine shared secrets using HKDF-SHA256
+    let mut ikm = Vec::with_capacity(32 + SHARED_SECRET_SIZE);
+    ikm.extend_from_slice(x25519_shared.as_bytes());
+    ikm.extend_from_slice(&mlkem_shared_secret);
+
+    let hk = Hkdf::<Sha256>::new(None, &ikm);
+    let mut shared_secret = [0u8; SHARED_SECRET_SIZE];
+    hk.expand(HKDF_INFO, &mut shared_secret)
+        .map_err(|e| CryptoError::Encryption(format!("HKDF expansion failed: {:?}", e)))?;
+
+    ikm.zeroize();
+
+    let encapsulated = HybridEncapsulatedKey {
+        x25519_ephemeral: *x25519_ephemeral_public.as_bytes(),
+        mlkem_ciphertext,
+    };
+
     Ok((encapsulated, shared_secret))
 }
 

@@ -109,7 +109,7 @@ fn simulate_webui_wasm_decryption(
 /// Simulates what WebUI's decryptEnvelope() does - WRONG approach!
 /// See: pinning-webui/src/services/encryptionService.ts - decryptEnvelopeV1()
 fn simulate_webui_wrong_decryption(
-    secret_key_bytes: &[u8; 32],
+    _secret_key_bytes: &[u8; 32],
     _ciphertext: &[u8],
     metadata_json: &str,
 ) -> Result<Vec<u8>, String> {

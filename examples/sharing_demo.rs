@@ -249,7 +249,7 @@ fn demo_key_rotation() {
 
     // Initiate rotation
     println!("🔑 Initiating key rotation...");
-    let new_public = fs.rotate();
+    let new_public = fs.rotate().expect("key rotation failed");
     println!("   New public key: {}...", &new_public.to_base64()[..20]);
     
     println!("   Files needing rotation: {}\n", fs.get_keys_needing_rotation().len());

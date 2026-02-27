@@ -87,19 +87,31 @@ impl KeyRotationManager {
     }
 
     /// Rotate to a new KEK
-    /// Returns the new public key
-    pub fn rotate_kek(&mut self) -> &PublicKey {
+    ///
+    /// Returns an error if a previous keypair already exists (i.e., a prior rotation
+    /// has not been fully completed by re-wrapping all DEKs). Call `clear_previous()`
+    /// after all DEKs have been re-wrapped, or use `FileSystemRotation::rotate_all()`
+    /// which handles this automatically.
+    pub fn rotate_kek(&mut self) -> Result<&PublicKey> {
+        if self.previous_keypair.is_some() {
+            return Err(CryptoError::InvalidKey(
+                "Cannot rotate KEK: previous keypair still exists. \
+                 Re-wrap all DEKs and call clear_previous() before rotating again."
+                    .into(),
+            ));
+        }
+
         // Move current to previous
         let old_keypair = std::mem::replace(
             &mut self.current_keypair,
             KekKeyPair::generate(),
         );
-        
+
         self.previous_keypair = Some(old_keypair);
         self.previous_version = Some(self.current_version);
         self.current_version += 1;
 
-        self.current_keypair.public_key()
+        Ok(self.current_keypair.public_key())
     }
 
     /// Re-wrap a single DEK from old KEK to new KEK
@@ -254,8 +266,8 @@ impl FileSystemRotation {
     }
 
     /// Initiate a key rotation
-    /// Returns the new public key
-    pub fn rotate(&mut self) -> &PublicKey {
+    /// Returns the new public key, or an error if a previous rotation is still pending
+    pub fn rotate(&mut self) -> Result<&PublicKey> {
         self.rotation_manager.rotate_kek()
     }
 
@@ -367,7 +379,7 @@ mod tests {
         let wrapped1 = manager.wrap_dek(&dek1, "/file1.txt").unwrap();
 
         // Rotate keys
-        manager.rotate_kek();
+        manager.rotate_kek().unwrap();
         assert_eq!(manager.current_version(), 2);
 
         // Old wrapped key should still be decryptable
@@ -399,7 +411,7 @@ mod tests {
         assert_eq!(fs.rotation_progress(), (25, 25));
 
         // Initiate rotation
-        fs.rotate();
+        fs.rotate().unwrap();
 
         // Now need to rotate all
         assert_eq!(fs.get_keys_needing_rotation().len(), 25);
@@ -430,7 +442,7 @@ mod tests {
         fs.wrap_new_file("/important.txt", &dek).unwrap();
 
         // Rotate keys
-        fs.rotate();
+        fs.rotate().unwrap();
         fs.rotate_all();
 
         // Data should still be accessible
@@ -452,13 +464,16 @@ mod tests {
 
         // Rotate 3 times, re-wrapping each time
         for expected_version in 2..=4 {
-            manager.rotate_kek();
+            manager.rotate_kek().unwrap();
             wrapped = manager.rewrap_dek(&wrapped).unwrap();
             assert_eq!(wrapped.kek_version, expected_version);
 
             // Verify DEK still accessible
             let unwrapped = manager.unwrap_dek(&wrapped).unwrap();
             assert_eq!(dek.as_bytes(), unwrapped.as_bytes());
+
+            // Clear previous to allow next rotation
+            manager.clear_previous();
         }
     }
 
@@ -472,7 +487,7 @@ mod tests {
         let wrapped_v1 = manager.wrap_dek(&dek, "/test.txt").unwrap();
 
         // Rotate
-        manager.rotate_kek();
+        manager.rotate_kek().unwrap();
 
         // Re-wrap to v2
         let wrapped_v2 = manager.rewrap_dek(&wrapped_v1).unwrap();

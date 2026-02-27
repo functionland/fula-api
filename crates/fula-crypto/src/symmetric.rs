@@ -11,6 +11,7 @@ use aes_gcm::{
 use chacha20poly1305::ChaCha20Poly1305;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 /// A nonce for AEAD encryption
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,10 +21,21 @@ pub struct Nonce {
 
 impl Nonce {
     /// Generate a random nonce
+    ///
+    /// # Panics
+    /// Panics if the OS random number generator is unavailable.
     pub fn generate() -> Self {
         let mut bytes = [0u8; NONCE_SIZE];
         rand::RngCore::fill_bytes(&mut OsRng, &mut bytes);
         Self { bytes }
+    }
+
+    /// Generate a random nonce, returning an error if OS entropy is unavailable.
+    pub fn try_generate() -> Result<Self> {
+        let mut bytes = [0u8; NONCE_SIZE];
+        getrandom::getrandom(&mut bytes)
+            .map_err(|e| CryptoError::KeyGeneration(format!("getrandom failed: {}", e)))?;
+        Ok(Self { bytes })
     }
 
     /// Create from raw bytes
@@ -90,9 +102,18 @@ impl AeadCipher {
 }
 
 /// AEAD encryption/decryption interface
+///
+/// The `key` field is zeroized on drop to prevent key material from
+/// persisting in memory after the `Aead` instance is no longer needed.
 pub struct Aead {
     cipher: AeadCipher,
     key: [u8; KEY_SIZE],
+}
+
+impl Drop for Aead {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
 }
 
 impl Aead {

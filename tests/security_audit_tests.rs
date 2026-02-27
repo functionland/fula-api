@@ -460,10 +460,12 @@ mod rotation_integration {
         
         assert_eq!(manager.current_version(), 1);
         
-        manager.rotate_kek();
+        manager.rotate_kek().unwrap();
         assert_eq!(manager.current_version(), 2);
-        
-        manager.rotate_kek();
+
+        // Must clear previous before rotating again
+        manager.clear_previous();
+        manager.rotate_kek().unwrap();
         assert_eq!(manager.current_version(), 3);
     }
     
@@ -490,9 +492,9 @@ mod rotation_integration {
         assert_eq!(wrapped_v1.kek_version, 1);
         
         // Rotate to v2
-        manager.rotate_kek();
+        manager.rotate_kek().unwrap();
         assert_eq!(manager.current_version(), 2);
-        
+
         // Rewrap the DEK
         let wrapped_v2 = manager.rewrap_dek(&wrapped_v1).unwrap();
         assert_eq!(wrapped_v2.kek_version, 2);
@@ -512,8 +514,8 @@ mod rotation_integration {
         let wrapped_v1 = manager.wrap_dek(&dek, "/file.txt").unwrap();
         
         // Rotate to v2
-        manager.rotate_kek();
-        
+        manager.rotate_kek().unwrap();
+
         // Should still be able to unwrap v1 (previous version)
         let unwrapped_v1 = manager.unwrap_dek(&wrapped_v1).unwrap();
         assert_eq!(unwrapped_v1.as_bytes(), dek.as_bytes());
@@ -537,7 +539,7 @@ mod rotation_integration {
         let wrapped_v1 = manager.wrap_dek(&dek, "/file.txt").unwrap();
         
         // Rotate and clear previous
-        manager.rotate_kek();
+        manager.rotate_kek().unwrap();
         manager.clear_previous();
         
         // Should NOT be able to unwrap v1 anymore
