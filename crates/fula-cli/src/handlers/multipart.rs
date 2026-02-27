@@ -5,6 +5,7 @@ use crate::pinning::{check_can_upload, pin_for_user};
 use crate::state::UserSession;
 use crate::multipart::UploadPart;
 use crate::xml;
+use super::object::try_decode_chunked;
 use axum::{
     extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -85,6 +86,7 @@ pub async fn upload_part(
     Extension(session): Extension<UserSession>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<MultipartParams>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     if !session.can_write() {
@@ -93,7 +95,7 @@ pub async fn upload_part(
 
     let upload_id = params.upload_id
         .ok_or_else(|| ApiError::s3(S3ErrorCode::InvalidArgument, "Missing uploadId"))?;
-    
+
     let part_number = params.part_number
         .ok_or_else(|| ApiError::s3(S3ErrorCode::InvalidArgument, "Missing partNumber"))?;
 
@@ -112,6 +114,12 @@ pub async fn upload_part(
     if upload.bucket != bucket || upload.key != key {
         return Err(ApiError::s3(S3ErrorCode::InvalidArgument, "Bucket/key mismatch"));
     }
+
+    // Decode chunked encoding if present (same as put_object)
+    let body = match try_decode_chunked(&headers, &body) {
+        Some(decoded) => decoded,
+        None => body,
+    };
 
     // Store part data
     let cid = state.block_store.put_block(&body).await?;

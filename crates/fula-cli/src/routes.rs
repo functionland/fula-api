@@ -170,7 +170,7 @@ async fn object_put_handler(
             part_number: query.part_number,
             uploads: query.uploads.clone(),
         };
-        handlers::upload_part(state, session, path, axum::extract::Query(mp_params), body).await
+        handlers::upload_part(state, session, path, axum::extract::Query(mp_params), headers, body).await
     } else if query.tagging.is_some() {
         handlers::put_object_tagging(state, session, path, body).await
     } else if headers.contains_key("x-amz-copy-source") {

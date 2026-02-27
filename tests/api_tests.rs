@@ -898,6 +898,160 @@ async fn test_large_compressible_object_no_compression() {
     assert_eq!(body, content);
 }
 
+/// Regression test: PUT with HTTP chunked transfer-encoded body must be decoded.
+///
+/// AWS CLI sends request bodies with chunked transfer encoding that a reverse
+/// proxy (nginx) may forward without decoding. Without decoding, the chunked
+/// framing (e.g., "100000\r\n") gets stored as part of the object data,
+/// corrupting the file.
+#[tokio::test]
+async fn test_put_object_decodes_chunked_body() {
+    let (base_url, _) = spawn_server(false).await;
+    let client = Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .build()
+        .unwrap();
+
+    let bucket = "chunked-decode-bucket";
+    let key = "photo.jpg";
+
+    // Simulate a JPEG file (starts with FF D8 FF)
+    let original_data: Vec<u8> = {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        v.extend_from_slice(&[0x42; 2044]); // 2048 bytes total
+        v
+    };
+
+    // Wrap the data in HTTP chunked transfer encoding framing
+    // This simulates what happens when nginx strips Transfer-Encoding header
+    // but forwards the raw chunked body
+    let chunk_size_hex = format!("{:x}", original_data.len());
+    let mut chunked_body: Vec<u8> = Vec::new();
+    chunked_body.extend_from_slice(chunk_size_hex.as_bytes()); // "800"
+    chunked_body.extend_from_slice(b"\r\n");
+    chunked_body.extend_from_slice(&original_data);
+    chunked_body.extend_from_slice(b"\r\n");
+    chunked_body.extend_from_slice(b"0\r\n\r\n"); // Terminal chunk
+
+    assert_ne!(chunked_body.len(), original_data.len(), "Chunked body should be larger");
+
+    // Create bucket
+    client.put(&format!("{}/{}", base_url, bucket)).send().await.unwrap();
+
+    // Upload the chunked-encoded body (simulating broken proxy behavior)
+    let res = client.put(&format!("{}/{}/{}", base_url, bucket, key))
+        .body(chunked_body)
+        .header("Content-Type", "image/jpeg")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Download and verify the gateway decoded the chunked framing
+    let res = client.get(&format!("{}/{}/{}", base_url, bucket, key))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = res.bytes().await.unwrap();
+    assert_eq!(
+        body.len(), original_data.len(),
+        "Downloaded size ({}) should match original ({}), not chunked body",
+        body.len(), original_data.len()
+    );
+    assert_eq!(
+        &body[..4], &[0xFF, 0xD8, 0xFF, 0xE0],
+        "Body must start with JPEG magic, not chunked framing"
+    );
+    assert_eq!(body.as_ref(), original_data.as_slice(), "Decoded body must match original");
+}
+
+/// Test that chunked decoding handles aws-chunked format (with chunk-signature extensions)
+#[tokio::test]
+async fn test_put_object_decodes_aws_chunked_body() {
+    let (base_url, _) = spawn_server(false).await;
+    let client = Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .build()
+        .unwrap();
+
+    let bucket = "aws-chunked-bucket";
+    let key = "data.bin";
+    let original_data = b"Hello, this is test data for aws-chunked decoding!";
+
+    // Build aws-chunked encoded body:
+    // <hex-size>;chunk-signature=<fake-sig>\r\n<data>\r\n0;chunk-signature=<fake-sig>\r\n\r\n
+    let fake_sig = "a".repeat(64);
+    let mut chunked_body: Vec<u8> = Vec::new();
+    chunked_body.extend_from_slice(format!("{:x};chunk-signature={}\r\n", original_data.len(), fake_sig).as_bytes());
+    chunked_body.extend_from_slice(original_data);
+    chunked_body.extend_from_slice(b"\r\n");
+    chunked_body.extend_from_slice(format!("0;chunk-signature={}\r\n\r\n", fake_sig).as_bytes());
+
+    // Create bucket
+    client.put(&format!("{}/{}", base_url, bucket)).send().await.unwrap();
+
+    // Upload with x-amz-decoded-content-length header (AWS streaming signature signal)
+    let res = client.put(&format!("{}/{}/{}", base_url, bucket, key))
+        .body(chunked_body)
+        .header("Content-Encoding", "aws-chunked")
+        .header("x-amz-decoded-content-length", original_data.len().to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Download and verify
+    let res = client.get(&format!("{}/{}/{}", base_url, bucket, key))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = res.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), original_data, "Body must be decoded aws-chunked content");
+}
+
+/// Test that normal (non-chunked) uploads are NOT affected by chunked decoding
+#[tokio::test]
+async fn test_put_object_normal_body_unaffected() {
+    let (base_url, _) = spawn_server(false).await;
+    let client = Client::new();
+
+    let bucket = "normal-body-bucket";
+    let key = "binary.dat";
+
+    // Binary data that could theoretically look like a chunk header if we're not careful
+    // (starts with bytes that are valid hex chars in ASCII)
+    let original_data: Vec<u8> = vec![0x41, 0x42, 0x43, 0x44, 0x45, 0x46]; // "ABCDEF" in ASCII
+
+    // Create bucket
+    client.put(&format!("{}/{}", base_url, bucket)).send().await.unwrap();
+
+    // Upload normally
+    let res = client.put(&format!("{}/{}/{}", base_url, bucket, key))
+        .body(original_data.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Download - should be identical
+    let res = client.get(&format!("{}/{}/{}", base_url, bucket, key))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = res.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), original_data.as_slice(), "Normal upload must not be modified");
+}
+
 /// Test duplicate bucket creation for same user fails
 #[tokio::test]
 async fn test_multitenant_duplicate_bucket_same_user() {

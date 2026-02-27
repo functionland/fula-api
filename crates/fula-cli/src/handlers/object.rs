@@ -43,6 +43,14 @@ pub async fn put_object(
         ));
     }
 
+    // Decode HTTP chunked transfer encoding if present in the body.
+    // AWS CLI and other S3 clients may send chunked-encoded bodies that a
+    // reverse proxy (e.g., nginx) forwards without decoding.
+    let body = match try_decode_chunked(&headers, &body) {
+        Some(decoded) => decoded,
+        None => body,
+    };
+
     // Store the data
     let cid = state.block_store.put_block(&body).await?;
 
@@ -263,6 +271,115 @@ pub async fn get_object(
     }
 
     Ok(response.body(Body::from(body_data)).unwrap())
+}
+
+/// Attempt to decode HTTP chunked transfer encoding from a request body.
+/// Returns Some(decoded) if the body was chunked-encoded, None otherwise.
+///
+/// This handles two cases:
+/// 1. AWS `Content-Encoding: aws-chunked` with streaming SigV4 signatures
+/// 2. Plain HTTP chunked TE where a reverse proxy stripped the Transfer-Encoding header
+pub(crate) fn try_decode_chunked(headers: &HeaderMap, body: &Bytes) -> Option<Bytes> {
+    let has_decoded_len = headers.get("x-amz-decoded-content-length").is_some();
+    let has_aws_chunked = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("aws-chunked"))
+        .unwrap_or(false);
+
+    if !has_decoded_len && !has_aws_chunked && !looks_like_chunked(body) {
+        return None;
+    }
+
+    decode_chunked_body(body).map(|decoded| {
+        tracing::info!(
+            original_len = body.len(),
+            decoded_len = decoded.len(),
+            has_decoded_len,
+            has_aws_chunked,
+            "Decoded chunked request body"
+        );
+        decoded
+    })
+}
+
+/// Check if a body appears to be HTTP chunked transfer-encoded.
+fn looks_like_chunked(body: &[u8]) -> bool {
+    if body.len() < 4 {
+        return false;
+    }
+
+    // Find first \r\n (chunk-size line delimiter)
+    let crlf_pos = match body.windows(2).position(|w| w == b"\r\n") {
+        Some(pos) if pos > 0 && pos <= 100 => pos,
+        _ => return false,
+    };
+
+    // Extract hex size (before any chunk extensions like ";chunk-signature=...")
+    let size_line = match std::str::from_utf8(&body[..crlf_pos]) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let size_hex = size_line.split(';').next().unwrap_or("");
+
+    let chunk_size = match usize::from_str_radix(size_hex.trim(), 16) {
+        Ok(s) if s > 0 => s,
+        _ => return false,
+    };
+
+    // Chunk data must fit within the remaining body
+    let data_start = crlf_pos + 2;
+    chunk_size <= body.len().saturating_sub(data_start)
+}
+
+/// Decode HTTP chunked transfer encoding from raw bytes.
+/// Handles both plain chunked and aws-chunked (ignoring chunk extensions).
+fn decode_chunked_body(body: &[u8]) -> Option<Bytes> {
+    let mut decoded = Vec::new();
+    let mut pos = 0;
+
+    while pos < body.len() {
+        let remaining = &body[pos..];
+
+        // Find the \r\n ending the chunk-size line
+        let crlf_pos = remaining.windows(2).position(|w| w == b"\r\n")?;
+
+        if crlf_pos == 0 {
+            // Empty line — skip
+            pos += 2;
+            continue;
+        }
+
+        // Parse chunk size (ignore extensions after ';')
+        let size_line = std::str::from_utf8(&remaining[..crlf_pos]).ok()?;
+        let size_hex = size_line.split(';').next()?;
+        let chunk_size = usize::from_str_radix(size_hex.trim(), 16).ok()?;
+
+        if chunk_size == 0 {
+            break; // Terminal chunk
+        }
+
+        let data_start = pos + crlf_pos + 2;
+        let data_end = data_start + chunk_size;
+
+        if data_end > body.len() {
+            return None; // Truncated — probably not chunked after all
+        }
+
+        decoded.extend_from_slice(&body[data_start..data_end]);
+
+        // Skip the \r\n after chunk data
+        pos = data_end;
+        if pos + 2 <= body.len() && body[pos] == b'\r' && body[pos + 1] == b'\n' {
+            pos += 2;
+        }
+    }
+
+    if decoded.is_empty() {
+        None
+    } else {
+        Some(Bytes::from(decoded))
+    }
 }
 
 /// Parse Range header (e.g., "bytes=0-1023" or "bytes=500-" or "bytes=-500")
