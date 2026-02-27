@@ -121,7 +121,7 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 axum = { version = "0.8", features = ["multipart", "tokio"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-full", "limit"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
 hyper = { version = "1.5", features = ["full"] }
 
 # Rate limiting

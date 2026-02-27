@@ -13,6 +13,7 @@ async fn spawn_server(auth_enabled: bool) -> (String, String) {
     config.port = 0; // Random port
     config.auth_enabled = auth_enabled;
     config.use_memory_store = true; // Use memory store for tests (no IPFS dependency)
+    config.registry_cid_path = None; // No persistent registry for tests
 
     // Set a secret for auth tests
     let jwt_secret = "test-secret-123".to_string();
@@ -623,6 +624,278 @@ async fn test_multitenant_new_user_empty() {
     assert!(body.contains("<Buckets></Buckets>") || body.contains("<Buckets/>") ||
             (!body.contains("<Bucket>") && body.contains("<Buckets>")),
             "New user should have no buckets");
+}
+
+// ============================================================================
+// S3 PROTOCOL CORRECTNESS TESTS
+// ============================================================================
+
+/// Regression test: GET object must never be compressed server-side.
+///
+/// Real AWS S3 never applies Content-Encoding to GET responses. When
+/// CompressionLayer was active, it would gzip the body, strip Content-Length,
+/// and force chunked transfer encoding. AWS CLI and other S3 tools that expect
+/// Content-Length would receive corrupted files (chunked framing leaked into
+/// the data).
+///
+/// See: https://github.com/functionland/fula-api/issues/XXX
+#[tokio::test]
+async fn test_get_object_no_server_side_compression() {
+    let (base_url, _) = spawn_server(false).await;
+
+    // Disable reqwest auto-decompression so we can inspect raw headers
+    let client = Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .build()
+        .unwrap();
+
+    let bucket = "compression-test-bucket";
+    let key = "image.jpg";
+
+    // Fake JPEG: starts with FF D8 FF (JPEG SOI + APP0 marker), then random binary
+    let fake_jpeg: Vec<u8> = {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        v.extend_from_slice(&[0x42; 2048]); // 2KB of binary padding
+        v
+    };
+    let original_len = fake_jpeg.len();
+
+    // Create bucket
+    client.put(&format!("{}/{}", base_url, bucket)).send().await.unwrap();
+
+    // Upload the binary object
+    let res = client.put(&format!("{}/{}/{}", base_url, bucket, key))
+        .body(fake_jpeg.clone())
+        .header("Content-Type", "image/jpeg")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Download with Accept-Encoding: gzip (simulates AWS CLI behavior)
+    let res = client.get(&format!("{}/{}/{}", base_url, bucket, key))
+        .header("Accept-Encoding", "gzip, deflate, br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let headers = res.headers();
+
+    // Content-Length MUST be present (S3 protocol requirement)
+    let content_length = headers.get("Content-Length")
+        .expect("Content-Length header must be present on S3 GET responses");
+    assert_eq!(
+        content_length.to_str().unwrap(),
+        original_len.to_string(),
+        "Content-Length must match original object size"
+    );
+
+    // Transfer-Encoding MUST NOT be present
+    assert!(
+        headers.get("Transfer-Encoding").is_none(),
+        "Transfer-Encoding must not be set on S3 GET responses"
+    );
+
+    // Content-Encoding MUST NOT be set (server did not compress)
+    assert!(
+        headers.get("Content-Encoding").is_none(),
+        "Server must not add Content-Encoding to GET responses"
+    );
+
+    // Body must be byte-for-byte identical to the uploaded object
+    let body_bytes = res.bytes().await.unwrap();
+    assert_eq!(body_bytes.len(), original_len, "Body length must match original");
+    assert_eq!(
+        &body_bytes[..4],
+        &[0xFF, 0xD8, 0xFF, 0xE0],
+        "Body must start with JPEG magic bytes, not chunked framing"
+    );
+    assert_eq!(
+        body_bytes.as_ref(),
+        fake_jpeg.as_slice(),
+        "Downloaded bytes must be identical to uploaded bytes"
+    );
+}
+
+/// Test that text objects also aren't compressed (even though they're compressible)
+#[tokio::test]
+async fn test_get_text_object_no_compression() {
+    let (base_url, _) = spawn_server(false).await;
+
+    let client = Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .build()
+        .unwrap();
+
+    let bucket = "text-compression-bucket";
+    let key = "data.json";
+    // Highly compressible content
+    let content = r#"{"key": "value", "repeated": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+
+    client.put(&format!("{}/{}", base_url, bucket)).send().await.unwrap();
+
+    client.put(&format!("{}/{}/{}", base_url, bucket, key))
+        .body(content)
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+        .unwrap();
+
+    let res = client.get(&format!("{}/{}/{}", base_url, bucket, key))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let headers = res.headers();
+    assert!(headers.get("Content-Length").is_some(), "Content-Length must be present");
+    assert!(headers.get("Transfer-Encoding").is_none(), "Transfer-Encoding must not be set");
+    assert!(headers.get("Content-Encoding").is_none(), "Content-Encoding must not be set");
+
+    assert_eq!(res.text().await.unwrap(), content, "Text content must be returned uncompressed");
+}
+
+/// Range requests must preserve Content-Length matching the range, not the full object,
+/// and must never be compressed or chunked.
+#[tokio::test]
+async fn test_range_request_no_compression() {
+    let (base_url, _) = spawn_server(false).await;
+
+    let client = Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .build()
+        .unwrap();
+
+    let bucket = "range-compression-bucket";
+    let key = "largefile.bin";
+    let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect(); // 4KB
+
+    client.put(&format!("{}/{}", base_url, bucket)).send().await.unwrap();
+    client.put(&format!("{}/{}/{}", base_url, bucket, key))
+        .body(data.clone())
+        .send()
+        .await
+        .unwrap();
+
+    // Request bytes 100-199 with Accept-Encoding: gzip
+    let res = client.get(&format!("{}/{}/{}", base_url, bucket, key))
+        .header("Range", "bytes=100-199")
+        .header("Accept-Encoding", "gzip, deflate, br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+
+    let headers = res.headers();
+    let content_length: usize = headers.get("Content-Length")
+        .expect("Content-Length must be present on range responses")
+        .to_str().unwrap().parse().unwrap();
+    assert_eq!(content_length, 100, "Content-Length must equal the range size");
+    assert!(headers.get("Transfer-Encoding").is_none(), "No Transfer-Encoding on range response");
+    assert!(headers.get("Content-Encoding").is_none(), "No Content-Encoding on range response");
+
+    let body = res.bytes().await.unwrap();
+    assert_eq!(body.len(), 100);
+    assert_eq!(body.as_ref(), &data[100..200], "Range bytes must match original slice");
+}
+
+/// HEAD requests must return Content-Length matching the object size, with no body.
+/// Compression middleware historically drops Content-Length on HEAD responses.
+#[tokio::test]
+async fn test_head_request_content_length_preserved() {
+    let (base_url, _) = spawn_server(false).await;
+
+    let client = Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .build()
+        .unwrap();
+
+    let bucket = "head-test-bucket";
+    let key = "document.pdf";
+    let content = vec![0x25, 0x50, 0x44, 0x46]; // %PDF header + padding
+    let mut data = content.clone();
+    data.extend_from_slice(&[0x00; 1024]);
+    let expected_len = data.len();
+
+    client.put(&format!("{}/{}", base_url, bucket)).send().await.unwrap();
+    client.put(&format!("{}/{}/{}", base_url, bucket, key))
+        .body(data)
+        .header("Content-Type", "application/pdf")
+        .send()
+        .await
+        .unwrap();
+
+    let res = client.head(&format!("{}/{}/{}", base_url, bucket, key))
+        .header("Accept-Encoding", "gzip, deflate, br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let headers = res.headers();
+    let content_length: usize = headers.get("Content-Length")
+        .expect("Content-Length must be present on HEAD responses")
+        .to_str().unwrap().parse().unwrap();
+    assert_eq!(content_length, expected_len, "HEAD Content-Length must match object size");
+    assert!(headers.get("Transfer-Encoding").is_none(), "No Transfer-Encoding on HEAD response");
+    assert!(headers.get("Content-Encoding").is_none(), "No Content-Encoding on HEAD response");
+}
+
+/// Large highly-compressible objects must still be returned uncompressed.
+/// Some compression middleware only kicks in above a size threshold.
+#[tokio::test]
+async fn test_large_compressible_object_no_compression() {
+    let (base_url, _) = spawn_server(false).await;
+
+    let client = Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .build()
+        .unwrap();
+
+    let bucket = "large-compression-bucket";
+    let key = "big.txt";
+    // 128KB of repeated 'a' — extremely compressible
+    let content = "a".repeat(128 * 1024);
+    let original_len = content.len();
+
+    client.put(&format!("{}/{}", base_url, bucket)).send().await.unwrap();
+    client.put(&format!("{}/{}/{}", base_url, bucket, key))
+        .body(content.clone())
+        .header("Content-Type", "text/plain")
+        .send()
+        .await
+        .unwrap();
+
+    let res = client.get(&format!("{}/{}/{}", base_url, bucket, key))
+        .header("Accept-Encoding", "gzip, deflate, br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let headers = res.headers();
+    let cl: usize = headers.get("Content-Length")
+        .expect("Content-Length must be present")
+        .to_str().unwrap().parse().unwrap();
+    assert_eq!(cl, original_len, "Content-Length must equal uncompressed size");
+    assert!(headers.get("Transfer-Encoding").is_none(), "No Transfer-Encoding");
+    assert!(headers.get("Content-Encoding").is_none(), "No Content-Encoding");
+
+    let body = res.text().await.unwrap();
+    assert_eq!(body.len(), original_len, "Body must be full uncompressed size");
+    assert_eq!(body, content);
 }
 
 /// Test duplicate bucket creation for same user fails

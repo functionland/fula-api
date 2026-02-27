@@ -11,7 +11,6 @@ use std::sync::Arc;
 use tower_http::{
     cors::{CorsLayer, Any},
     trace::TraceLayer,
-    compression::CompressionLayer,
 };
 use axum::http::{Method, header, HeaderValue};
 
@@ -85,7 +84,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .merge(private)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
-        .layer(CompressionLayer::new())
         .layer(DefaultBodyLimit::max(state.config.max_body_size))
 }
 
