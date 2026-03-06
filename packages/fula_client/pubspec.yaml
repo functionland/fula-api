@@ -32,6 +32,7 @@ platforms:
   android:
   ios:
   web:
+  windows:
 
 flutter:
   plugin:
@@ -39,6 +40,8 @@ flutter:
       android:
         ffiPlugin: true
       ios:
+        ffiPlugin: true
+      windows:
         ffiPlugin: true
       web:
         pluginClass: FulaClientWeb
