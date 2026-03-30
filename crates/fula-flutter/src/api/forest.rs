@@ -133,6 +133,67 @@ pub async fn list_from_forest(
 }
 
 // ============================================================================
+// File-Path-Based Operations (avoids FFI memory overhead for large files)
+// ============================================================================
+
+/// Upload a file from a local path with immediate forest save
+///
+/// Unlike `put_flat`, this reads the file on the Rust side, avoiding the need
+/// to pass the entire file contents across the Flutter-Rust FFI boundary.
+/// This is critical for large files (1GB+) where passing `Vec<u8>` through
+/// FFI would cause out-of-memory errors.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn put_flat_from_path(
+    client: &EncryptedClientHandle,
+    bucket: String,
+    path: String,
+    file_path: String,
+    content_type: Option<String>,
+) -> anyhow::Result<PutResult> {
+    let data = tokio::fs::read(&file_path).await
+        .with_context(|| format!("Failed to read file: {}", file_path))?;
+    let guard = client.inner.write().await;
+    let result = guard.put_object_flat(
+        &bucket,
+        &path,
+        Bytes::from(data),
+        content_type.as_deref(),
+    ).await?;
+    Ok(result.into())
+}
+
+/// Upload a file from a local path without immediate forest save (deferred)
+///
+/// Same as `put_flat_from_path` but defers the forest save for batch efficiency.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn put_flat_from_path_deferred(
+    client: &EncryptedClientHandle,
+    bucket: String,
+    path: String,
+    file_path: String,
+    content_type: Option<String>,
+) -> anyhow::Result<PutResult> {
+    let data = tokio::fs::read(&file_path).await
+        .with_context(|| format!("Failed to read file: {}", file_path))?;
+    let guard = client.inner.write().await;
+    let result = guard.put_object_flat_deferred(
+        &bucket,
+        &path,
+        Bytes::from(data),
+        content_type.as_deref(),
+    ).await?;
+    Ok(result.into())
+}
+
+/// Get the size of a file without reading it into memory
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn get_file_size(file_path: String) -> anyhow::Result<u64> {
+    let metadata = tokio::fs::metadata(&file_path).await
+        .with_context(|| format!("Failed to get file metadata: {}", file_path))?;
+    Ok(metadata.len())
+}
+
+// ============================================================================
 // Subtree Operations (for Sharing)
 // ============================================================================
 

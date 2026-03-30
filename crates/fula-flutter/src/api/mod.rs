@@ -74,6 +74,14 @@ pub use forest::{
     get_forest_subtree,
 };
 
+// Re-export file-path-based functions (native only)
+#[cfg(not(target_arch = "wasm32"))]
+pub use forest::{
+    put_flat_from_path,
+    put_flat_from_path_deferred,
+    get_file_size,
+};
+
 // Re-export sharing functions
 pub use sharing::{
     create_share_token,
