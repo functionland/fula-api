@@ -119,6 +119,9 @@ pub const CRYPTO_VERSION: u8 = 2;
 /// Quantum-safe crypto version (X25519 + ML-KEM-768 hybrid)
 pub const CRYPTO_VERSION_QUANTUM_SAFE: u8 = 3;
 
+/// Content encryption version with AAD binding (storage_key bound to ciphertext)
+pub const CRYPTO_VERSION_CONTENT_AAD: u8 = 4;
+
 /// Default chunk size for streaming encryption (256 KB)
 pub const DEFAULT_CHUNK_SIZE: usize = 256 * 1024;
 

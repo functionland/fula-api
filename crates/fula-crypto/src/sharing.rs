@@ -167,6 +167,10 @@ pub struct ShareToken {
     /// Chunked file metadata (JSON) - for files > 768KB that use per-chunk nonces
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunked_metadata: Option<String>,
+    /// Content encryption version (e.g., 4 = AAD-bound).
+    /// None means legacy (version 2, no AAD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_version: Option<u8>,
 }
 
 impl ShareToken {
@@ -275,6 +279,8 @@ pub struct ShareBuilder<'a> {
     nonce: Option<String>,
     /// Chunked file metadata (JSON) for files > 768KB
     chunked_metadata: Option<String>,
+    /// Content encryption version (e.g., 4 = AAD-bound)
+    encryption_version: Option<u8>,
 }
 
 impl<'a> ShareBuilder<'a> {
@@ -295,7 +301,14 @@ impl<'a> ShareBuilder<'a> {
             snapshot_binding: None,
             nonce: None,
             chunked_metadata: None,
+            encryption_version: None,
         }
+    }
+
+    /// Set the content encryption version (e.g., 4 for AAD-bound encryption)
+    pub fn encryption_version(mut self, version: u8) -> Self {
+        self.encryption_version = Some(version);
+        self
     }
 
     /// Set the encryption nonce (base64 encoded) for single-block files
@@ -413,6 +426,7 @@ impl<'a> ShareBuilder<'a> {
             snapshot_binding: self.snapshot_binding,
             nonce: self.nonce,
             chunked_metadata: self.chunked_metadata,
+            encryption_version: self.encryption_version,
         })
     }
 }
@@ -574,6 +588,7 @@ impl ShareRecipient {
             permissions: token.permissions,
             nonce: token.nonce.clone(),
             chunked_metadata: token.chunked_metadata.clone(),
+            encryption_version: token.encryption_version,
         })
     }
 }
@@ -592,6 +607,8 @@ pub struct AcceptedShare {
     pub nonce: Option<String>,
     /// Chunked file metadata (JSON) - for files > 768KB
     pub chunked_metadata: Option<String>,
+    /// Content encryption version (None = legacy v2, Some(4) = AAD-bound)
+    pub encryption_version: Option<u8>,
 }
 
 impl AcceptedShare {

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use tracing::{debug, instrument};
 
 /// Fula storage client
+#[derive(Clone)]
 pub struct FulaClient {
     config: Config,
     http: Client,

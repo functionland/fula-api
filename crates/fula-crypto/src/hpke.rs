@@ -27,27 +27,50 @@ use hpke::{
 use serde::{Deserialize as SerdeDeserialize, Serialize};
 
 /// Adapter to bridge getrandom to hpke's rand_core 0.9
+///
+/// # Panics
+///
+/// All methods on this adapter call `getrandom::getrandom()` and panic if the
+/// OS entropy source is unavailable. This can happen in degraded environments
+/// (early boot, certain sandboxed WASM runtimes without Web Crypto API).
+///
+/// The `hpke` crate's `RngCore` trait requires infallible `fill_bytes`, so
+/// errors cannot be propagated through this adapter. Callers that need
+/// fallible HPKE operations should call [`check_entropy`] before invoking
+/// [`Encryptor`] or [`Decryptor`] methods.
 struct HpkeRng;
 
 impl RngCore for HpkeRng {
     fn next_u32(&mut self) -> u32 {
         let mut buf = [0u8; 4];
-        getrandom::getrandom(&mut buf).expect("getrandom failed");
+        getrandom::getrandom(&mut buf).expect("getrandom failed: OS entropy source unavailable");
         u32::from_le_bytes(buf)
     }
 
     fn next_u64(&mut self) -> u64 {
         let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).expect("getrandom failed");
+        getrandom::getrandom(&mut buf).expect("getrandom failed: OS entropy source unavailable");
         u64::from_le_bytes(buf)
     }
 
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        getrandom::getrandom(dest).expect("getrandom failed");
+        getrandom::getrandom(dest).expect("getrandom failed: OS entropy source unavailable");
     }
 }
 
 impl CryptoRng for HpkeRng {}
+
+/// Check whether the OS entropy source is available.
+///
+/// Returns `Ok(())` if `getrandom` succeeds, or an error describing the
+/// failure. Call this before HPKE operations in contexts where entropy may
+/// be unavailable (early boot, sandboxed WASM) to get a recoverable error
+/// instead of a panic from [`HpkeRng`].
+pub fn check_entropy() -> crate::Result<()> {
+    let mut buf = [0u8; 1];
+    getrandom::getrandom(&mut buf)
+        .map_err(|e| crate::CryptoError::KeyGeneration(format!("entropy unavailable: {}", e)))
+}
 
 /// Size of encapsulated key
 pub const ENCAPSULATED_KEY_SIZE: usize = 32;
@@ -339,15 +362,16 @@ impl Decryptor {
     }
 }
 
-/// Encrypt data for multiple recipients
-pub fn encrypt_for_multiple(
-    _plaintext: &[u8],
+/// Generate a random DEK and wrap it for multiple recipients.
+///
+/// Returns the plaintext DEK (for content encryption) and one HPKE-wrapped
+/// copy per recipient. Each recipient can unwrap the DEK independently using
+/// their own secret key.
+pub fn wrap_dek_for_multiple(
     recipients: &[PublicKey],
 ) -> Result<(DekKey, Vec<EncryptedData>)> {
-    // Generate a random DEK
     let dek = DekKey::generate();
 
-    // Encrypt the DEK for each recipient
     let mut wrapped_keys = Vec::with_capacity(recipients.len());
     for recipient in recipients {
         let encryptor = Encryptor::new(recipient);
@@ -356,6 +380,15 @@ pub fn encrypt_for_multiple(
     }
 
     Ok((dek, wrapped_keys))
+}
+
+/// Deprecated alias for [`wrap_dek_for_multiple`].
+#[deprecated(since = "0.6.0", note = "renamed to wrap_dek_for_multiple; the _plaintext parameter was unused")]
+pub fn encrypt_for_multiple(
+    _plaintext: &[u8],
+    recipients: &[PublicKey],
+) -> Result<(DekKey, Vec<EncryptedData>)> {
+    wrap_dek_for_multiple(recipients)
 }
 
 /// Create a time-limited sharing link
@@ -451,12 +484,11 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_for_multiple() {
+    fn test_wrap_dek_for_multiple() {
         let recipients: Vec<_> = (0..3).map(|_| KekKeyPair::generate()).collect();
         let public_keys: Vec<_> = recipients.iter().map(|kp| kp.public_key().clone()).collect();
-        let plaintext = b"shared secret";
 
-        let (dek, wrapped_keys) = encrypt_for_multiple(plaintext, &public_keys).unwrap();
+        let (dek, wrapped_keys) = wrap_dek_for_multiple(&public_keys).unwrap();
 
         // Each recipient should be able to decrypt their wrapped key
         for (i, wrapped) in wrapped_keys.iter().enumerate() {

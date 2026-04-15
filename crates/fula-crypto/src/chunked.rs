@@ -154,6 +154,7 @@ pub struct ChunkedEncoder {
     chunks: Vec<EncryptedChunk>,
     current_chunk: Vec<u8>,
     bytes_processed: u64,
+    aad_prefix: Option<Vec<u8>>,
 }
 
 /// An encrypted chunk ready for upload
@@ -183,6 +184,18 @@ impl ChunkedEncoder {
             chunks: Vec::new(),
             current_chunk: Vec::with_capacity(chunk_size),
             bytes_processed: 0,
+            aad_prefix: None,
+        }
+    }
+
+    /// Create a new chunked encoder with AAD prefix for chunk binding
+    ///
+    /// Each chunk will be encrypted with AAD = `"{aad_prefix}:{chunk_index}"`,
+    /// binding ciphertext to both the parent file and the chunk position.
+    pub fn with_aad(dek: DekKey, aad_prefix: impl Into<Vec<u8>>) -> Self {
+        Self {
+            aad_prefix: Some(aad_prefix.into()),
+            ..Self::new(dek)
         }
     }
 
@@ -192,9 +205,12 @@ impl ChunkedEncoder {
     pub fn update(&mut self, data: &[u8]) -> Result<Vec<EncryptedChunk>> {
         let mut ready_chunks = Vec::new();
         
-        for byte in data {
-            self.current_chunk.push(*byte);
-            
+        let mut offset = 0;
+        while offset < data.len() {
+            let remaining = self.chunk_size - self.current_chunk.len();
+            let to_copy = remaining.min(data.len() - offset);
+            self.current_chunk.extend_from_slice(&data[offset..offset + to_copy]);
+            offset += to_copy;
             if self.current_chunk.len() >= self.chunk_size {
                 let chunk = self.encrypt_current_chunk()?;
                 ready_chunks.push(chunk);
@@ -223,7 +239,7 @@ impl ChunkedEncoder {
         // Collect all nonces
         let nonces: Vec<Nonce> = self.chunks.iter().map(|c| c.nonce.clone()).collect();
         
-        let metadata = ChunkedFileMetadata::new(
+        let mut metadata = ChunkedFileMetadata::new(
             self.chunk_size as u32,
             self.chunks.len() as u32,
             self.bytes_processed,
@@ -232,20 +248,29 @@ impl ChunkedEncoder {
             None,
         );
 
+        // Mark as v2 if AAD was used
+        if self.aad_prefix.is_some() {
+            metadata.format = "streaming-v2".to_string();
+        }
+
         Ok((final_chunk, metadata, outboard))
     }
 
     /// Encrypt the current chunk buffer
     fn encrypt_current_chunk(&mut self) -> Result<EncryptedChunk> {
         let chunk_index = self.chunks.len() as u32;
-        
+
         // Generate a unique nonce for this chunk
-        // We derive it from the chunk index to be deterministic for the same DEK
         let nonce = Nonce::generate();
-        
-        // Encrypt the chunk
+
+        // Encrypt the chunk, with AAD if prefix is set
         let aead = Aead::new_default(&self.dek);
-        let ciphertext = aead.encrypt(&nonce, &self.current_chunk)?;
+        let ciphertext = if let Some(ref prefix) = self.aad_prefix {
+            let aad = format!("{}:{}", String::from_utf8_lossy(prefix), chunk_index).into_bytes();
+            aead.encrypt_with_aad(&nonce, &self.current_chunk, &aad)?
+        } else {
+            aead.encrypt(&nonce, &self.current_chunk)?
+        };
         
         let chunk = EncryptedChunk {
             index: chunk_index,
@@ -278,6 +303,7 @@ pub struct ChunkedDecoder {
     metadata: ChunkedFileMetadata,
     /// Collected plaintext chunks
     chunks: Vec<(u32, Vec<u8>)>,
+    aad_prefix: Option<Vec<u8>>,
 }
 
 impl ChunkedDecoder {
@@ -287,6 +313,17 @@ impl ChunkedDecoder {
             dek,
             metadata,
             chunks: Vec::new(),
+            aad_prefix: None,
+        }
+    }
+
+    /// Create a new decoder with AAD prefix for chunk binding verification
+    pub fn with_aad(dek: DekKey, metadata: ChunkedFileMetadata, aad_prefix: impl Into<Vec<u8>>) -> Self {
+        Self {
+            dek,
+            metadata,
+            chunks: Vec::new(),
+            aad_prefix: Some(aad_prefix.into()),
         }
     }
 
@@ -294,7 +331,12 @@ impl ChunkedDecoder {
     pub fn decrypt_chunk(&mut self, index: u32, ciphertext: &[u8]) -> Result<Bytes> {
         let nonce = self.metadata.get_chunk_nonce(index)?;
         let aead = Aead::new_default(&self.dek);
-        let plaintext = aead.decrypt(&nonce, ciphertext)?;
+        let plaintext = if let Some(ref prefix) = self.aad_prefix {
+            let aad = format!("{}:{}", String::from_utf8_lossy(prefix), index).into_bytes();
+            aead.decrypt_with_aad(&nonce, ciphertext, &aad)?
+        } else {
+            aead.decrypt(&nonce, ciphertext)?
+        };
         
         self.chunks.push((index, plaintext.clone()));
         
@@ -393,6 +435,7 @@ pub struct AsyncStreamingEncoder {
     chunk_index: u32,
     nonces: Vec<Nonce>,
     bytes_processed: u64,
+    aad_prefix: Option<Vec<u8>>,
 }
 
 #[cfg(feature = "tokio-runtime")]
@@ -412,6 +455,15 @@ impl AsyncStreamingEncoder {
             chunk_index: 0,
             nonces: Vec::new(),
             bytes_processed: 0,
+            aad_prefix: None,
+        }
+    }
+
+    /// Create with AAD prefix for chunk binding
+    pub fn with_aad(dek: DekKey, aad_prefix: impl Into<Vec<u8>>) -> Self {
+        Self {
+            aad_prefix: Some(aad_prefix.into()),
+            ..Self::new(dek)
         }
     }
 
@@ -458,7 +510,12 @@ impl AsyncStreamingEncoder {
     fn encrypt_chunk(&mut self, data: &[u8]) -> Result<EncryptedChunk> {
         let nonce = Nonce::generate();
         let aead = Aead::new_default(&self.dek);
-        let ciphertext = aead.encrypt(&nonce, data)?;
+        let ciphertext = if let Some(ref prefix) = self.aad_prefix {
+            let aad = format!("{}:{}", String::from_utf8_lossy(prefix), self.chunk_index).into_bytes();
+            aead.encrypt_with_aad(&nonce, data, &aad)?
+        } else {
+            aead.encrypt(&nonce, data)?
+        };
         
         let chunk = EncryptedChunk {
             index: self.chunk_index,
@@ -475,8 +532,8 @@ impl AsyncStreamingEncoder {
     /// Finalize and get metadata
     pub fn finalize(self) -> (ChunkedFileMetadata, BaoOutboard) {
         let outboard = self.bao_encoder.finalize();
-        
-        let metadata = ChunkedFileMetadata::new(
+
+        let mut metadata = ChunkedFileMetadata::new(
             self.chunk_size as u32,
             self.chunk_index,
             self.bytes_processed,
@@ -484,7 +541,11 @@ impl AsyncStreamingEncoder {
             self.nonces,
             None,
         );
-        
+
+        if self.aad_prefix.is_some() {
+            metadata.format = "streaming-v2".to_string();
+        }
+
         (metadata, outboard)
     }
 
@@ -509,6 +570,7 @@ pub struct VerifiedStreamingDecoder {
     expected_hash: Blake3Hash,
     bao_encoder: BaoEncoder,
     verified_bytes: u64,
+    aad_prefix: Option<Vec<u8>>,
 }
 
 impl VerifiedStreamingDecoder {
@@ -521,18 +583,37 @@ impl VerifiedStreamingDecoder {
             expected_hash,
             bao_encoder: BaoEncoder::new(),
             verified_bytes: 0,
+            aad_prefix: None,
+        })
+    }
+
+    /// Create a new verified streaming decoder with AAD prefix
+    pub fn with_aad(dek: DekKey, metadata: ChunkedFileMetadata, aad_prefix: impl Into<Vec<u8>>) -> Result<Self> {
+        let expected_hash = metadata.get_root_hash()?;
+        Ok(Self {
+            dek,
+            metadata,
+            expected_hash,
+            bao_encoder: BaoEncoder::new(),
+            verified_bytes: 0,
+            aad_prefix: Some(aad_prefix.into()),
         })
     }
 
     /// Decrypt and verify a single chunk
-    /// 
+    ///
     /// Returns the plaintext if decryption and verification succeed.
     /// Verification is progressive - each chunk updates the hash state.
     pub fn decrypt_and_verify(&mut self, index: u32, ciphertext: &[u8]) -> Result<Bytes> {
         // Decrypt
         let nonce = self.metadata.get_chunk_nonce(index)?;
         let aead = Aead::new_default(&self.dek);
-        let plaintext = aead.decrypt(&nonce, ciphertext)?;
+        let plaintext = if let Some(ref prefix) = self.aad_prefix {
+            let aad = format!("{}:{}", String::from_utf8_lossy(prefix), index).into_bytes();
+            aead.decrypt_with_aad(&nonce, ciphertext, &aad)?
+        } else {
+            aead.decrypt(&nonce, ciphertext)?
+        };
         
         // Update Bao encoder for verification
         self.bao_encoder.update(&plaintext);

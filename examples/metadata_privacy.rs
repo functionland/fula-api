@@ -30,6 +30,7 @@ fn main() {
 }
 
 /// Demonstrate how file names are obfuscated
+#[allow(deprecated)]
 fn demo_key_obfuscation() {
     println!("📁 DEMO 1: File Name Obfuscation");
     println!("─────────────────────────────────────────\n");
@@ -117,6 +118,7 @@ fn demo_private_metadata_encryption() {
 }
 
 /// Demonstrate what server sees vs what client sees
+#[allow(deprecated)]
 fn demo_server_sees_vs_client_sees() {
     println!("👁️ DEMO 3: Server View vs. Client View");
     println!("─────────────────────────────────────────\n");

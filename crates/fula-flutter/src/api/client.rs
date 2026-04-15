@@ -66,6 +66,7 @@ pub fn create_encrypted_client(
     };
 
     let enc_config = enc_config.with_metadata_privacy(encryption.enable_metadata_privacy);
+    #[allow(deprecated)]
     let enc_config = match encryption.obfuscation_mode {
         ObfuscationMode::Deterministic => {
             enc_config.with_obfuscation_mode(fula_client::KeyObfuscation::DeterministicHash)
@@ -118,6 +119,7 @@ pub fn create_encrypted_client_with_pinning(
     };
 
     let enc_config = enc_config.with_metadata_privacy(encryption.enable_metadata_privacy);
+    #[allow(deprecated)]
     let enc_config = match encryption.obfuscation_mode {
         ObfuscationMode::Deterministic => {
             enc_config.with_obfuscation_mode(fula_client::KeyObfuscation::DeterministicHash)

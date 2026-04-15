@@ -58,6 +58,7 @@ impl Nonce {
     }
 
     /// Increment the nonce (for streaming encryption)
+    #[deprecated(since = "0.6.0", note = "nonce increment risks reuse with same key; use Nonce::generate() instead")]
     pub fn increment(&mut self) {
         for byte in self.bytes.iter_mut().rev() {
             if *byte == 255 {
@@ -302,6 +303,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_nonce_increment() {
         let mut nonce = Nonce::from_bytes(&[0u8; NONCE_SIZE]).unwrap();
         nonce.increment();

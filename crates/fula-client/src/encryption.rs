@@ -20,7 +20,19 @@ use fula_crypto::{
 };
 use std::sync::Arc;
 use std::collections::HashMap;
-use tokio::sync::RwLock;
+use dashmap::DashMap;
+
+/// Default forest cache TTL in seconds
+const DEFAULT_FOREST_CACHE_TTL_SECS: i64 = 60;
+
+/// A cached forest entry with timestamp for TTL-based invalidation
+struct ForestCacheEntry {
+    forest: PrivateForest,
+    /// When this entry was last loaded from (or saved to) storage
+    loaded_at: i64,
+    /// Whether the entry has local modifications not yet persisted to storage
+    dirty: bool,
+}
 
 /// Configuration for client-side encryption
 pub struct EncryptionConfig {
@@ -30,6 +42,8 @@ pub struct EncryptionConfig {
     metadata_privacy: bool,
     /// Key obfuscation mode
     obfuscation_mode: KeyObfuscation,
+    /// TTL for forest cache entries in seconds (default: 60)
+    forest_cache_ttl_secs: i64,
 }
 
 impl EncryptionConfig {
@@ -45,32 +59,36 @@ impl EncryptionConfig {
             key_manager: Arc::new(KeyManager::new()),
             metadata_privacy: true,
             obfuscation_mode: KeyObfuscation::FlatNamespace,
+            forest_cache_ttl_secs: DEFAULT_FOREST_CACHE_TTL_SECS,
         }
     }
 
     /// Create without metadata privacy (filenames visible to server)
+    #[allow(deprecated)]
     pub fn new_without_privacy() -> Self {
         Self {
             key_manager: Arc::new(KeyManager::new()),
             metadata_privacy: false,
             obfuscation_mode: KeyObfuscation::DeterministicHash,
+            forest_cache_ttl_secs: DEFAULT_FOREST_CACHE_TTL_SECS,
         }
     }
 
     /// Create with FlatNamespace mode - RECOMMENDED for maximum privacy
-    /// 
+    ///
     /// This mode provides complete structure hiding:
     /// - Storage keys look like random CID-style hashes (e.g., `QmX7a8f3...`)
     /// - No prefixes or structure hints visible to server
     /// - Server cannot determine folder structure or parent/child relationships
     /// - File tree is stored in an encrypted PrivateForest index
-    /// 
+    ///
     /// Inspired by WNFS (WebNative File System) and Peergos.
     pub fn new_flat_namespace() -> Self {
         Self {
             key_manager: Arc::new(KeyManager::new()),
             metadata_privacy: true,
             obfuscation_mode: KeyObfuscation::FlatNamespace,
+            forest_cache_ttl_secs: DEFAULT_FOREST_CACHE_TTL_SECS,
         }
     }
 
@@ -80,6 +98,7 @@ impl EncryptionConfig {
             key_manager: Arc::new(KeyManager::from_secret_key(secret)),
             metadata_privacy: true,
             obfuscation_mode: KeyObfuscation::FlatNamespace,
+            forest_cache_ttl_secs: DEFAULT_FOREST_CACHE_TTL_SECS,
         }
     }
 
@@ -92,6 +111,15 @@ impl EncryptionConfig {
     /// Set the key obfuscation mode
     pub fn with_obfuscation_mode(mut self, mode: KeyObfuscation) -> Self {
         self.obfuscation_mode = mode;
+        self
+    }
+
+    /// Set the forest cache TTL in seconds
+    ///
+    /// Cached forest indices older than this will be reloaded from storage.
+    /// Default is 60 seconds. Set to 0 to disable caching (always reload).
+    pub fn with_forest_cache_ttl_secs(mut self, secs: i64) -> Self {
+        self.forest_cache_ttl_secs = secs;
         self
     }
 
@@ -145,8 +173,9 @@ impl PinningCredentials {
 pub struct EncryptedClient {
     inner: FulaClient,
     encryption: EncryptionConfig,
-    /// Private forest index for FlatNamespace mode (cached)
-    forest_cache: RwLock<HashMap<String, PrivateForest>>,
+    /// Private forest index for FlatNamespace mode (cached per-bucket with TTL)
+    /// Uses DashMap for per-bucket concurrent access without global write-lock contention
+    forest_cache: DashMap<String, ForestCacheEntry>,
     /// Optional pinning credentials for remote pinning
     pinning: Option<PinningCredentials>,
 }
@@ -158,7 +187,7 @@ impl EncryptedClient {
         Ok(Self { 
             inner, 
             encryption,
-            forest_cache: RwLock::new(HashMap::new()),
+            forest_cache: DashMap::new(),
             pinning: None,
         })
     }
@@ -178,7 +207,7 @@ impl EncryptedClient {
         Ok(Self { 
             inner, 
             encryption,
-            forest_cache: RwLock::new(HashMap::new()),
+            forest_cache: DashMap::new(),
             pinning: Some(pinning),
         })
     }
@@ -208,12 +237,6 @@ impl EncryptedClient {
         // Generate a DEK for this object
         let dek = self.encryption.key_manager.generate_dek();
         
-        // Encrypt the data with the DEK
-        let nonce = Nonce::generate();
-        let aead = Aead::new_default(&dek);
-        let ciphertext = aead.encrypt(&nonce, &data)
-            .map_err(ClientError::Encryption)?;
-
         // Encrypt the DEK with HPKE for the owner
         let encryptor = Encryptor::new(self.encryption.public_key());
         let wrapped_dek = encryptor.encrypt_dek(&dek)
@@ -224,25 +247,32 @@ impl EncryptedClient {
             // Create private metadata with original info
             let private_meta = PrivateMetadata::new(key, original_size)
                 .with_content_type(content_type.unwrap_or("application/octet-stream"));
-            
+
             // Encrypt private metadata with the per-file DEK
             let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
                 .map_err(ClientError::Encryption)?;
-            
+
             // Generate obfuscated storage key using PATH-DERIVED DEK (not per-file DEK)
             // This ensures we can compute the same storage key later for retrieval
             let path_dek = self.encryption.key_manager.derive_path_key(key);
             let storage_key = obfuscate_key(key, &path_dek, self.encryption.obfuscation_mode.clone());
-            
+
             (storage_key, Some(encrypted_meta.to_json().map_err(ClientError::Encryption)?))
         } else {
             (key.to_string(), None)
         };
 
+        // Encrypt the data with the DEK, binding ciphertext to storage_key via AAD
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(&dek);
+        let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
+        let ciphertext = aead.encrypt_with_aad(&nonce, &data, &aad)
+            .map_err(ClientError::Encryption)?;
+
         // Serialize encryption metadata with KEK version
         let kek_version = self.encryption.key_manager.version();
         let mut enc_metadata = serde_json::json!({
-            "version": 2,
+            "version": 4,
             "algorithm": "AES-256-GCM",
             "nonce": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce.as_bytes()),
             "wrapped_key": serde_json::to_value(&wrapped_dek).unwrap(),
@@ -390,14 +420,26 @@ impl EncryptedClient {
                 .map_err(ClientError::Encryption)?;
 
             let aead = Aead::new_default(&dek);
-            let plaintext = aead.decrypt(&nonce, &result.data)
-                .map_err(ClientError::Encryption)?;
+            let version = enc_metadata["version"].as_u64().unwrap_or(2);
+            let plaintext = if version >= 4 {
+                let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
+                aead.decrypt_with_aad(&nonce, &result.data, &aad)
+            } else {
+                aead.decrypt(&nonce, &result.data)
+            }.map_err(ClientError::Encryption)?;
 
             Ok(Bytes::from(plaintext))
         }
     }
 
+    /// Maximum number of concurrent chunk downloads
+    const MAX_CONCURRENT_CHUNK_DOWNLOADS: usize = 16;
+
     /// Internal: Download and decrypt a chunked file
+    ///
+    /// Downloads chunks in parallel (up to MAX_CONCURRENT_CHUNK_DOWNLOADS) for
+    /// significantly improved throughput on large files, then decrypts and
+    /// assembles in index order.
     async fn get_object_chunked_internal(
         &self,
         bucket: &str,
@@ -412,21 +454,74 @@ impl EncryptedClient {
             fula_crypto::CryptoError::Decryption(format!("Invalid chunked metadata: {}", e))
         ))?;
 
-        // Create decoder
-        let mut decoder = fula_crypto::ChunkedDecoder::new(dek.clone(), chunked_meta.clone());
+        let num_chunks = chunked_meta.num_chunks;
 
-        // Pre-allocate result buffer
+        // For small chunk counts, sequential is fine and avoids spawn overhead
+        if num_chunks <= 2 {
+            let mut decoder = if chunked_meta.format == "streaming-v2" {
+                let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
+                fula_crypto::ChunkedDecoder::with_aad(dek.clone(), chunked_meta.clone(), aad_prefix)
+            } else {
+                fula_crypto::ChunkedDecoder::new(dek.clone(), chunked_meta.clone())
+            };
+            let mut plaintext = Vec::with_capacity(chunked_meta.total_size as usize);
+
+            for chunk_index in 0..num_chunks {
+                let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk_index);
+                let chunk_result = self.inner.get_object(bucket, &chunk_key).await?;
+                let chunk_plaintext = decoder.decrypt_chunk(chunk_index, &chunk_result)
+                    .map_err(ClientError::Encryption)?;
+                plaintext.extend_from_slice(&chunk_plaintext);
+            }
+
+            return Ok(Bytes::from(plaintext));
+        }
+
+        // Parallel download: spawn bounded concurrent fetches
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_CHUNK_DOWNLOADS));
+        let mut handles = Vec::with_capacity(num_chunks as usize);
+
+        for chunk_index in 0..num_chunks {
+            let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk_index);
+            let client = self.inner.clone();
+            let bucket = bucket.to_string();
+            let sem = semaphore.clone();
+
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.map_err(|e|
+                    ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
+                )?;
+                let data = client.get_object(&bucket, &chunk_key).await?;
+                Ok::<(u32, Bytes), ClientError>((chunk_index, data))
+            });
+
+            handles.push(handle);
+        }
+
+        // Collect all results
+        let mut downloaded_chunks: Vec<(u32, Bytes)> = Vec::with_capacity(num_chunks as usize);
+        for handle in handles {
+            let (idx, data) = handle.await
+                .map_err(|e| ClientError::Encryption(
+                    fula_crypto::CryptoError::Decryption(format!("Chunk download task failed: {}", e))
+                ))??;
+            downloaded_chunks.push((idx, data));
+        }
+
+        // Sort by index and decrypt in order
+        downloaded_chunks.sort_by_key(|(idx, _)| *idx);
+
+        let mut decoder = if chunked_meta.format == "streaming-v2" {
+            let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
+            fula_crypto::ChunkedDecoder::with_aad(dek.clone(), chunked_meta.clone(), aad_prefix)
+        } else {
+            fula_crypto::ChunkedDecoder::new(dek.clone(), chunked_meta.clone())
+        };
         let mut plaintext = Vec::with_capacity(chunked_meta.total_size as usize);
 
-        // Download and decrypt each chunk in order
-        for chunk_index in 0..chunked_meta.num_chunks {
-            let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk_index);
-            
-            let chunk_result = self.inner.get_object(bucket, &chunk_key).await?;
-            
-            let chunk_plaintext = decoder.decrypt_chunk(chunk_index, &chunk_result)
+        for (chunk_index, chunk_data) in &downloaded_chunks {
+            let chunk_plaintext = decoder.decrypt_chunk(*chunk_index, chunk_data)
                 .map_err(ClientError::Encryption)?;
-            
             plaintext.extend_from_slice(&chunk_plaintext);
         }
 
@@ -494,8 +589,13 @@ impl EncryptedClient {
             .map_err(ClientError::Encryption)?;
 
         let aead = Aead::new_default(&dek);
-        let plaintext = aead.decrypt(&nonce, &result.data)
-            .map_err(ClientError::Encryption)?;
+        let version = enc_metadata["version"].as_u64().unwrap_or(2);
+        let plaintext = if version >= 4 {
+            let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
+            aead.decrypt_with_aad(&nonce, &result.data, &aad)
+        } else {
+            aead.decrypt(&nonce, &result.data)
+        }.map_err(ClientError::Encryption)?;
 
         // Decrypt private metadata if present
         let (original_key, original_size, content_type, user_metadata) = 
@@ -767,12 +867,16 @@ impl EncryptedClient {
     /// The forest contains the encrypted directory structure and path→storage_key mapping.
     /// This is only used in FlatNamespace mode.
     pub async fn load_forest(&self, bucket: &str) -> Result<PrivateForest> {
-        // Check cache first
-        {
-            let cache = self.forest_cache.read().await;
-            if let Some(forest) = cache.get(bucket) {
-                return Ok(forest.clone());
+        // Check cache first (respect TTL for clean entries, always use dirty entries)
+        if let Some(entry) = self.forest_cache.get(bucket) {
+            let now = chrono::Utc::now().timestamp();
+            let is_fresh = (now - entry.loaded_at) < self.encryption.forest_cache_ttl_secs;
+            if is_fresh || entry.dirty {
+                return Ok(entry.forest.clone());
             }
+            // Stale and clean — drop reference before removing
+            drop(entry);
+            self.forest_cache.remove(bucket);
         }
 
         // Security audit fix #8: Use DETERMINISTIC key derivation for forest index
@@ -790,11 +894,13 @@ impl EncryptedClient {
                 let forest = encrypted.decrypt(&forest_dek)
                     .map_err(ClientError::Encryption)?;
                 
-                // Cache it
-                {
-                    let mut cache = self.forest_cache.write().await;
-                    cache.insert(bucket.to_string(), forest.clone());
-                }
+                // Cache it (freshly loaded from storage, not dirty)
+                let now = chrono::Utc::now().timestamp();
+                self.forest_cache.insert(bucket.to_string(), ForestCacheEntry {
+                    forest: forest.clone(),
+                    loaded_at: now,
+                    dirty: false,
+                });
 
                 Ok(forest)
             }
@@ -802,11 +908,13 @@ impl EncryptedClient {
                 // No forest exists yet - create empty one
                 let forest = PrivateForest::new();
 
-                // Cache it
-                {
-                    let mut cache = self.forest_cache.write().await;
-                    cache.insert(bucket.to_string(), forest.clone());
-                }
+                // Cache it (new empty forest, not dirty)
+                let now = chrono::Utc::now().timestamp();
+                self.forest_cache.insert(bucket.to_string(), ForestCacheEntry {
+                    forest: forest.clone(),
+                    loaded_at: now,
+                    dirty: false,
+                });
                 
                 Ok(forest)
             }
@@ -837,11 +945,13 @@ impl EncryptedClient {
             Some(metadata),
         ).await?;
 
-        // Update cache
-        {
-            let mut cache = self.forest_cache.write().await;
-            cache.insert(bucket.to_string(), forest.clone());
-        }
+        // Update cache (just saved to storage, so clean and fresh)
+        let now = chrono::Utc::now().timestamp();
+        self.forest_cache.insert(bucket.to_string(), ForestCacheEntry {
+            forest: forest.clone(),
+            loaded_at: now,
+            dirty: false,
+        });
 
         Ok(())
     }
@@ -929,12 +1039,13 @@ impl EncryptedClient {
             // SINGLE OBJECT: File is small enough for one block
             let nonce = Nonce::generate();
             let aead = Aead::new_default(&dek);
-            let ciphertext = aead.encrypt(&nonce, &data)
+            let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
+            let ciphertext = aead.encrypt_with_aad(&nonce, &data, &aad)
                 .map_err(ClientError::Encryption)?;
 
             // Serialize encryption metadata
             let enc_metadata = serde_json::json!({
-                "version": 2,
+                "version": 4,
                 "algorithm": "AES-256-GCM",
                 "nonce": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce.as_bytes()),
                 "wrapped_key": serde_json::to_value(&wrapped_dek).unwrap(),
@@ -968,11 +1079,13 @@ impl EncryptedClient {
             }
         };
 
-        // Update cache (but don't save to storage yet)
-        {
-            let mut cache = self.forest_cache.write().await;
-            cache.insert(bucket.to_string(), forest);
-        }
+        // Update cache (but don't save to storage yet — mark dirty)
+        let now = chrono::Utc::now().timestamp();
+        self.forest_cache.insert(bucket.to_string(), ForestCacheEntry {
+            forest,
+            loaded_at: now,
+            dirty: true,
+        });
 
         Ok(result)
     }
@@ -988,8 +1101,9 @@ impl EncryptedClient {
         encrypted_meta: &EncryptedPrivateMetadata,
         kek_version: u32,
     ) -> Result<PutObjectResult> {
-        // Create chunked encoder
-        let mut encoder = ChunkedEncoder::new(dek.clone());
+        // Create chunked encoder with AAD binding chunks to storage key
+        let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
+        let mut encoder = ChunkedEncoder::with_aad(dek.clone(), aad_prefix);
         
         // Process all data through encoder
         let mut all_chunks = encoder.update(data)
@@ -1034,7 +1148,7 @@ impl EncryptedClient {
         
         // Create index object with encryption metadata and chunk info
         let enc_metadata = serde_json::json!({
-            "version": 2,
+            "version": 4,
             "algorithm": "AES-256-GCM",
             "wrapped_key": serde_json::to_value(wrapped_dek).unwrap(),
             "kek_version": kek_version,
@@ -1079,22 +1193,37 @@ impl EncryptedClient {
     /// Call this after bulk uploads using `put_object_flat_deferred`.
     /// This persists the in-memory forest index to encrypted storage.
     pub async fn flush_forest(&self, bucket: &str) -> Result<()> {
-        let forest = {
-            let cache = self.forest_cache.read().await;
-            cache.get(bucket).cloned()
-        };
-        
+        let forest = self.forest_cache.get(bucket).map(|entry| entry.forest.clone());
+
         if let Some(forest) = forest {
             self.save_forest(bucket, &forest).await?;
         }
-        
+
         Ok(())
     }
 
     /// Check if there are unsaved forest changes
     pub async fn has_pending_forest_changes(&self, bucket: &str) -> bool {
-        let cache = self.forest_cache.read().await;
-        cache.contains_key(bucket)
+        self.forest_cache
+            .get(bucket)
+            .map(|entry| entry.dirty)
+            .unwrap_or(false)
+    }
+
+    /// Invalidate the forest cache for a specific bucket
+    ///
+    /// Forces the next `load_forest` call to reload from storage.
+    /// Any unsaved changes will be discarded.
+    pub fn invalidate_forest_cache(&self, bucket: &str) {
+        self.forest_cache.remove(bucket);
+    }
+
+    /// Invalidate all cached forests
+    ///
+    /// Forces all subsequent `load_forest` calls to reload from storage.
+    /// Any unsaved changes will be discarded.
+    pub fn invalidate_all_forest_caches(&self) {
+        self.forest_cache.clear();
     }
 
     /// Get an object using FlatNamespace mode
@@ -1295,8 +1424,13 @@ impl EncryptedClient {
                 .map_err(ClientError::Encryption)?;
 
             let aead = Aead::new_default(&accepted_share.dek);
-            let plaintext = aead.decrypt(&nonce, &data)
-                .map_err(ClientError::Encryption)?;
+            let version = accepted_share.encryption_version.unwrap_or(2);
+            let plaintext = if version >= 4 {
+                let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
+                aead.decrypt_with_aad(&nonce, &data, &aad)
+            } else {
+                aead.decrypt(&nonce, &data)
+            }.map_err(ClientError::Encryption)?;
 
             return Ok(Bytes::from(plaintext));
         }
@@ -1353,8 +1487,13 @@ impl EncryptedClient {
 
             // Use the DEK from the accepted share (already decrypted for recipient)
             let aead = Aead::new_default(&accepted_share.dek);
-            let plaintext = aead.decrypt(&nonce, &result.data)
-                .map_err(ClientError::Encryption)?;
+            let version = enc_metadata["version"].as_u64().unwrap_or(2);
+            let plaintext = if version >= 4 {
+                let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
+                aead.decrypt_with_aad(&nonce, &result.data, &aad)
+            } else {
+                aead.decrypt(&nonce, &result.data)
+            }.map_err(ClientError::Encryption)?;
 
             Ok(Bytes::from(plaintext))
         }
@@ -1377,8 +1516,13 @@ impl EncryptedClient {
                 fula_crypto::CryptoError::Decryption(format!("Invalid chunked metadata in share token: {}", e))
             ))?;
 
-        // Create decoder
-        let mut decoder = fula_crypto::ChunkedDecoder::new(accepted_share.dek.clone(), chunked_meta.clone());
+        // Create decoder (format-aware for AAD)
+        let mut decoder = if chunked_meta.format == "streaming-v2" {
+            let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
+            fula_crypto::ChunkedDecoder::with_aad(accepted_share.dek.clone(), chunked_meta.clone(), aad_prefix)
+        } else {
+            fula_crypto::ChunkedDecoder::new(accepted_share.dek.clone(), chunked_meta.clone())
+        };
 
         // Pre-allocate result buffer
         let mut plaintext = Vec::with_capacity(chunked_meta.total_size as usize);
@@ -1413,8 +1557,13 @@ impl EncryptedClient {
             fula_crypto::CryptoError::Decryption(format!("Invalid chunked metadata: {}", e))
         ))?;
 
-        // Create decoder
-        let mut decoder = fula_crypto::ChunkedDecoder::new(dek.clone(), chunked_meta.clone());
+        // Create decoder (format-aware for AAD)
+        let mut decoder = if chunked_meta.format == "streaming-v2" {
+            let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
+            fula_crypto::ChunkedDecoder::with_aad(dek.clone(), chunked_meta.clone(), aad_prefix)
+        } else {
+            fula_crypto::ChunkedDecoder::new(dek.clone(), chunked_meta.clone())
+        };
 
         // Pre-allocate result buffer
         let mut plaintext = Vec::with_capacity(chunked_meta.total_size as usize);
@@ -1721,21 +1870,19 @@ impl EncryptedClient {
         ).await?;
         
         // Update forest cache if we have one
-        {
-            let mut cache = self.forest_cache.write().await;
-            if let Some(forest) = cache.get_mut(bucket) {
-                let now = chrono::Utc::now().timestamp();
-                forest.upsert_file(ForestFileEntry {
-                    path: key.to_string(),
-                    storage_key: storage_key.clone(),
-                    size: data.len() as u64,
-                    content_type: metadata.content_type.clone(),
-                    created_at: now,
-                    modified_at: now,
-                    user_metadata: HashMap::new(),
-                    content_hash: None,
-                });
-            }
+        if let Some(mut entry) = self.forest_cache.get_mut(bucket) {
+            let now = chrono::Utc::now().timestamp();
+            entry.forest.upsert_file(ForestFileEntry {
+                path: key.to_string(),
+                storage_key: storage_key.clone(),
+                size: data.len() as u64,
+                content_type: metadata.content_type.clone(),
+                created_at: now,
+                modified_at: now,
+                user_metadata: HashMap::new(),
+                content_hash: None,
+            });
+            entry.dirty = true;
         }
         
         Ok(result)
@@ -1800,16 +1947,21 @@ impl EncryptedClient {
                 fula_crypto::CryptoError::Decryption(e.to_string())
             ))?;
         
-        // Create decoder
-        let mut decoder = ChunkedDecoder::new(dek, chunked_meta.clone());
-        
+        // Create decoder (format-aware for AAD)
+        let mut decoder = if chunked_meta.format == "streaming-v2" {
+            let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
+            ChunkedDecoder::with_aad(dek, chunked_meta.clone(), aad_prefix)
+        } else {
+            ChunkedDecoder::new(dek, chunked_meta.clone())
+        };
+
         // Download and decrypt each chunk
         for chunk_idx in 0..chunked_meta.num_chunks {
             let chunk_key = ChunkedFileMetadata::chunk_key(&storage_key, chunk_idx);
             let chunk_data = self.inner.get_object(bucket, &chunk_key).await?;
             decoder.decrypt_chunk(chunk_idx, &chunk_data)?;
         }
-        
+
         // Finalize and return
         decoder.finalize()
             .map_err(ClientError::Encryption)
@@ -1885,18 +2037,23 @@ impl EncryptedClient {
         // Download and decrypt only needed chunks
         let mut decrypted_chunks = Vec::new();
         
+        let is_v2 = chunked_meta.format == "streaming-v2";
         for chunk_idx in needed_chunks {
             let chunk_key = ChunkedFileMetadata::chunk_key(&storage_key, chunk_idx);
             let chunk_data = self.inner.get_object(bucket, &chunk_key).await?;
-            
+
             let nonce = chunked_meta.get_chunk_nonce(chunk_idx)
                 .map_err(ClientError::Encryption)?;
-            
-            // Decrypt this chunk with the DEK
+
+            // Decrypt this chunk with the DEK (format-aware for AAD)
             let aead = Aead::new_default(&dek);
-            let plaintext = aead.decrypt(&nonce, &chunk_data)
-                .map_err(ClientError::Encryption)?;
-            
+            let plaintext = if is_v2 {
+                let aad = format!("fula:v4:chunk:{}:{}", storage_key, chunk_idx).into_bytes();
+                aead.decrypt_with_aad(&nonce, &chunk_data, &aad)
+            } else {
+                aead.decrypt(&nonce, &chunk_data)
+            }.map_err(ClientError::Encryption)?;
+
             decrypted_chunks.push((chunk_idx, plaintext));
         }
         
