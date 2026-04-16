@@ -13,7 +13,13 @@ use fula_crypto::{
     hpke::{Encryptor, Decryptor, EncryptedData},
     symmetric::{Aead, Nonce},
     private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, KeyObfuscation, obfuscate_key},
-    private_forest::{PrivateForest, EncryptedForest, ForestFileEntry, derive_index_key},
+    private_forest::{
+        PrivateForest, EncryptedForest, ForestFileEntry, derive_index_key,
+        ShardedPrivateForest, ForestShard,
+        EncryptedShardManifest, EncryptedForestShard, ForestEvent,
+        detect_forest_format, ForestOrManifest, derive_shard_key,
+        compute_initial_shard_count, SHARDED_MIGRATION_THRESHOLD,
+    },
     sharing::{ShareToken, AcceptedShare, ShareRecipient},
     rotation::{KeyRotationManager, WrappedKeyInfo},
     ChunkedEncoder, ChunkedFileMetadata, should_use_chunked,
@@ -26,12 +32,39 @@ use dashmap::DashMap;
 const DEFAULT_FOREST_CACHE_TTL_SECS: i64 = 60;
 
 /// A cached forest entry with timestamp for TTL-based invalidation
-struct ForestCacheEntry {
-    forest: PrivateForest,
-    /// When this entry was last loaded from (or saved to) storage
-    loaded_at: i64,
-    /// Whether the entry has local modifications not yet persisted to storage
-    dirty: bool,
+///
+/// Supports both monolithic (version 1/2) and sharded (version 3) formats.
+/// The in-memory cache is ephemeral — everything is reconstructable from S3.
+enum ForestCacheEntry {
+    /// Monolithic forest (FlatMapV1 or HamtV2)
+    Monolithic {
+        forest: PrivateForest,
+        loaded_at: i64,
+        dirty: bool,
+    },
+    /// Sharded forest (ShardedV3)
+    Sharded {
+        forest: ShardedPrivateForest,
+        loaded_at: i64,
+    },
+}
+
+impl ForestCacheEntry {
+    fn loaded_at(&self) -> i64 {
+        match self {
+            ForestCacheEntry::Monolithic { loaded_at, .. } => *loaded_at,
+            ForestCacheEntry::Sharded { loaded_at, .. } => *loaded_at,
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        match self {
+            ForestCacheEntry::Monolithic { dirty, .. } => *dirty,
+            ForestCacheEntry::Sharded { forest, .. } => {
+                forest.manifest_dirty || !forest.dirty_shards.is_empty()
+            }
+        }
+    }
 }
 
 /// Configuration for client-side encryption
@@ -870,9 +903,20 @@ impl EncryptedClient {
         // Check cache first (respect TTL for clean entries, always use dirty entries)
         if let Some(entry) = self.forest_cache.get(bucket) {
             let now = chrono::Utc::now().timestamp();
-            let is_fresh = (now - entry.loaded_at) < self.encryption.forest_cache_ttl_secs;
-            if is_fresh || entry.dirty {
-                return Ok(entry.forest.clone());
+            let is_fresh = (now - entry.loaded_at()) < self.encryption.forest_cache_ttl_secs;
+            if is_fresh || entry.is_dirty() {
+                match entry.value() {
+                    ForestCacheEntry::Monolithic { forest, .. } => return Ok(forest.clone()),
+                    ForestCacheEntry::Sharded { .. } => {
+                        // Sharded forest — caller should use sharded API instead.
+                        // For backward compat, return an error indicating upgrade.
+                        return Err(ClientError::Encryption(
+                            fula_crypto::CryptoError::Encryption(
+                                "forest is sharded (v3); use sharded API methods".to_string()
+                            )
+                        ));
+                    }
+                }
             }
             // Stale and clean — drop reference before removing
             drop(entry);
@@ -880,63 +924,188 @@ impl EncryptedClient {
         }
 
         // Security audit fix #8: Use DETERMINISTIC key derivation for forest index
-        // This ensures we can find the same forest across sessions
-        // The key is derived from: master_key + "forest:" + bucket_name
         let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
         let index_key = derive_index_key(&forest_dek, bucket);
 
         // Try to load from storage
         match self.inner.get_object_with_metadata(bucket, &index_key).await {
             Ok(result) => {
-                // Decrypt the forest
-                let encrypted = EncryptedForest::from_bytes(&result.data)
-                    .map_err(ClientError::Encryption)?;
-                let forest = encrypted.decrypt(&forest_dek)
-                    .map_err(ClientError::Encryption)?;
-                
-                // Cache it (freshly loaded from storage, not dirty)
-                let now = chrono::Utc::now().timestamp();
-                self.forest_cache.insert(bucket.to_string(), ForestCacheEntry {
-                    forest: forest.clone(),
-                    loaded_at: now,
-                    dirty: false,
-                });
+                match detect_forest_format(&result.data).map_err(ClientError::Encryption)? {
+                    ForestOrManifest::Monolithic(encrypted) => {
+                        let forest = encrypted.decrypt(&forest_dek)
+                            .map_err(ClientError::Encryption)?;
 
-                Ok(forest)
+                        let now = chrono::Utc::now().timestamp();
+                        self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::Monolithic {
+                            forest: forest.clone(),
+                            loaded_at: now,
+                            dirty: false,
+                        });
+
+                        Ok(forest)
+                    }
+                    ForestOrManifest::Manifest(encrypted_manifest) => {
+                        let manifest = encrypted_manifest.decrypt(&forest_dek)
+                            .map_err(ClientError::Encryption)?;
+
+                        let sharded = ShardedPrivateForest::from_manifest(manifest);
+                        let now = chrono::Utc::now().timestamp();
+                        self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::Sharded {
+                            forest: sharded,
+                            loaded_at: now,
+                        });
+
+                        Err(ClientError::Encryption(
+                            fula_crypto::CryptoError::Encryption(
+                                "forest is sharded (v3); use sharded API methods".to_string()
+                            )
+                        ))
+                    }
+                }
             }
             Err(_) => {
-                // No forest exists yet - create empty one
+                // No forest exists yet - create empty one (monolithic for new users)
                 let forest = PrivateForest::new();
-
-                // Cache it (new empty forest, not dirty)
                 let now = chrono::Utc::now().timestamp();
-                self.forest_cache.insert(bucket.to_string(), ForestCacheEntry {
+                self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::Monolithic {
                     forest: forest.clone(),
                     loaded_at: now,
                     dirty: false,
                 });
-                
                 Ok(forest)
             }
         }
     }
 
-    /// Save the private forest index for a bucket
+    /// Check if the forest for a bucket is in sharded format
+    pub fn is_forest_sharded(&self, bucket: &str) -> bool {
+        self.forest_cache.get(bucket)
+            .map(|entry| matches!(entry.value(), ForestCacheEntry::Sharded { .. }))
+            .unwrap_or(false)
+    }
+
+    /// Load a single shard from S3 and cache it
+    async fn load_shard(&self, bucket: &str, shard_index: usize) -> Result<()> {
+        let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+
+        let (shard_salt, num_shards) = {
+            let entry = self.forest_cache.get(bucket)
+                .ok_or_else(|| ClientError::Encryption(
+                    fula_crypto::CryptoError::Encryption("forest not loaded".to_string())
+                ))?;
+            match entry.value() {
+                ForestCacheEntry::Sharded { forest, .. } => {
+                    (forest.manifest.shard_salt.clone(), forest.manifest.num_shards)
+                }
+                _ => return Err(ClientError::Encryption(
+                    fula_crypto::CryptoError::Encryption("forest is not sharded".to_string())
+                )),
+            }
+        };
+
+        if shard_index >= num_shards {
+            return Err(ClientError::Encryption(
+                fula_crypto::CryptoError::Encryption(format!("shard index {} out of range ({})", shard_index, num_shards))
+            ));
+        }
+
+        let shard_key = derive_shard_key(&forest_dek, bucket, &shard_salt, shard_index);
+
+        match self.inner.get_object_with_metadata(bucket, &shard_key).await {
+            Ok(result) => {
+                let encrypted = EncryptedForestShard::from_bytes(&result.data)
+                    .map_err(ClientError::Encryption)?;
+                let shard = encrypted.decrypt(&forest_dek)
+                    .map_err(ClientError::Encryption)?;
+
+                if let Some(mut entry) = self.forest_cache.get_mut(bucket) {
+                    if let ForestCacheEntry::Sharded { forest, .. } = entry.value_mut() {
+                        forest.set_shard(shard);
+                    }
+                }
+                Ok(())
+            }
+            Err(_) => {
+                // Shard doesn't exist yet — create empty
+                let shard = ForestShard::new(shard_index);
+                if let Some(mut entry) = self.forest_cache.get_mut(bucket) {
+                    if let ForestCacheEntry::Sharded { forest, .. } = entry.value_mut() {
+                        forest.set_shard(shard);
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Load all shards in parallel (for listing operations)
+    async fn load_all_shards(&self, bucket: &str) -> Result<()> {
+        let num_shards = {
+            let entry = self.forest_cache.get(bucket)
+                .ok_or_else(|| ClientError::Encryption(
+                    fula_crypto::CryptoError::Encryption("forest not loaded".to_string())
+                ))?;
+            match entry.value() {
+                ForestCacheEntry::Sharded { forest, .. } => {
+                    if forest.all_shards_loaded() {
+                        return Ok(());
+                    }
+                    forest.manifest.num_shards
+                }
+                _ => return Ok(()), // Monolithic — nothing to load
+            }
+        };
+
+        // Load all unloaded shards in parallel
+        let mut futures = Vec::new();
+        for i in 0..num_shards {
+            let is_loaded = self.forest_cache.get(bucket)
+                .map(|entry| match entry.value() {
+                    ForestCacheEntry::Sharded { forest, .. } => forest.is_shard_loaded(i),
+                    _ => true,
+                })
+                .unwrap_or(true);
+
+            if !is_loaded {
+                futures.push(self.load_shard(bucket, i));
+            }
+        }
+
+        // Execute all shard loads concurrently
+        let results = futures::future::join_all(futures).await;
+        for result in results {
+            result?;
+        }
+
+        Ok(())
+    }
+
+    /// Ensure the forest is loaded for a bucket (handles both monolithic and sharded)
+    ///
+    /// For sharded forests, loads the manifest and the specific shard needed for `path`.
+    /// Returns the forest DEK for convenience.
+    async fn ensure_forest_loaded(&self, bucket: &str) -> Result<()> {
+        // Try loading — if it fails because it's sharded, that's fine (manifest is cached)
+        match self.load_forest(bucket).await {
+            Ok(_) => Ok(()),
+            Err(ref e) if e.to_string().contains("sharded (v3)") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Save the private forest index for a bucket (monolithic format)
     pub async fn save_forest(&self, bucket: &str, forest: &PrivateForest) -> Result<()> {
-        // Security audit fix #8: Use DETERMINISTIC key derivation (same as load_forest)
         let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
         let index_key = derive_index_key(&forest_dek, bucket);
 
-        // Encrypt the forest
         let encrypted = EncryptedForest::encrypt(forest, &forest_dek)
             .map_err(ClientError::Encryption)?;
         let data = encrypted.to_bytes()
             .map_err(ClientError::Encryption)?;
 
-        // Upload (the index looks like any other encrypted blob)
+        // No longer include x-fula-forest header (audit finding C-007)
         let metadata = ObjectMetadata::new()
-            .with_content_type("application/octet-stream")
-            .with_metadata("x-fula-forest", "true");
+            .with_content_type("application/octet-stream");
 
         self.inner.put_object_with_metadata(
             bucket,
@@ -945,9 +1114,8 @@ impl EncryptedClient {
             Some(metadata),
         ).await?;
 
-        // Update cache (just saved to storage, so clean and fresh)
         let now = chrono::Utc::now().timestamp();
-        self.forest_cache.insert(bucket.to_string(), ForestCacheEntry {
+        self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::Monolithic {
             forest: forest.clone(),
             loaded_at: now,
             dirty: false,
@@ -956,8 +1124,208 @@ impl EncryptedClient {
         Ok(())
     }
 
+    /// Save a sharded forest — uploads only dirty shards + manifest
+    async fn save_sharded_forest(&self, bucket: &str) -> Result<()> {
+        let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+        let index_key = derive_index_key(&forest_dek, bucket);
+
+        // Extract what we need to upload from the cache
+        let (manifest_clone, _dirty_indices, shards_to_upload) = {
+            let entry = self.forest_cache.get(bucket)
+                .ok_or_else(|| ClientError::Encryption(
+                    fula_crypto::CryptoError::Encryption("no sharded forest in cache".to_string())
+                ))?;
+            match entry.value() {
+                ForestCacheEntry::Sharded { forest, .. } => {
+                    let dirty: Vec<usize> = forest.dirty_shards.iter().copied().collect();
+                    let shards: Vec<ForestShard> = dirty.iter()
+                        .filter_map(|&i| forest.shards.get(i).and_then(|s| s.clone()))
+                        .collect();
+                    (forest.manifest.clone(), dirty, shards)
+                }
+                _ => return Err(ClientError::Encryption(
+                    fula_crypto::CryptoError::Encryption("forest is not sharded".to_string())
+                )),
+            }
+        };
+
+        // Upload dirty shards
+        for shard in &shards_to_upload {
+            let shard_key = derive_shard_key(&forest_dek, bucket, &manifest_clone.shard_salt, shard.shard_index);
+
+            let encrypted = EncryptedForestShard::encrypt(shard, &forest_dek)
+                .map_err(ClientError::Encryption)?;
+            let data = encrypted.to_bytes()
+                .map_err(ClientError::Encryption)?;
+
+            let metadata = ObjectMetadata::new()
+                .with_content_type("application/octet-stream");
+
+            self.inner.put_object_with_metadata(
+                bucket,
+                &shard_key,
+                Bytes::from(data),
+                Some(metadata),
+            ).await?;
+        }
+
+        // Upload manifest
+        let encrypted_manifest = EncryptedShardManifest::encrypt(&manifest_clone, &forest_dek)
+            .map_err(ClientError::Encryption)?;
+        let manifest_data = encrypted_manifest.to_bytes()
+            .map_err(ClientError::Encryption)?;
+
+        let metadata = ObjectMetadata::new()
+            .with_content_type("application/octet-stream");
+
+        self.inner.put_object_with_metadata(
+            bucket,
+            &index_key,
+            Bytes::from(manifest_data),
+            Some(metadata),
+        ).await?;
+
+        // Clear dirty flags
+        if let Some(mut entry) = self.forest_cache.get_mut(bucket) {
+            if let ForestCacheEntry::Sharded { forest, loaded_at } = entry.value_mut() {
+                forest.dirty_shards.clear();
+                forest.manifest_dirty = false;
+                *loaded_at = chrono::Utc::now().timestamp();
+            }
+        }
+
+        Ok(())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MIGRATION: Monolithic ↔ Sharded forest format conversion
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Migrate a bucket's forest from monolithic to sharded format.
+    ///
+    /// Call this explicitly to migrate early, or let `flush_forest()` auto-migrate
+    /// when the file count crosses `SHARDED_MIGRATION_THRESHOLD` (5,000).
+    ///
+    /// Crash-safe: new shards are written first, then the manifest overwrites the
+    /// old monolithic blob at `index_key`. Old format is gone once manifest is written.
+    pub async fn migrate_to_sharded(&self, bucket: &str) -> Result<ForestEvent> {
+        let start = std::time::Instant::now();
+
+        // Load the current monolithic forest
+        let forest = self.load_forest(bucket).await?;
+        let file_count = forest.file_count();
+        let num_shards = compute_initial_shard_count(file_count);
+
+        let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+        let index_key = derive_index_key(&forest_dek, bucket);
+
+        // Convert to sharded
+        let sharded = ShardedPrivateForest::from_migration(forest, &forest_dek, num_shards);
+
+        // Phase A: upload all shard blobs
+        for i in 0..sharded.manifest.num_shards {
+            if let Some(shard) = sharded.shards.get(i).and_then(|s| s.as_ref()) {
+                let shard_key = derive_shard_key(&forest_dek, bucket, &sharded.manifest.shard_salt, i);
+                let encrypted = EncryptedForestShard::encrypt(shard, &forest_dek)
+                    .map_err(ClientError::Encryption)?;
+                let data = encrypted.to_bytes().map_err(ClientError::Encryption)?;
+
+                self.inner.put_object_with_metadata(
+                    bucket,
+                    &shard_key,
+                    Bytes::from(data),
+                    Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
+                ).await?;
+            }
+        }
+
+        // Phase B: overwrite index_key with new manifest
+        let encrypted_manifest = EncryptedShardManifest::encrypt(&sharded.manifest, &forest_dek)
+            .map_err(ClientError::Encryption)?;
+        let manifest_data = encrypted_manifest.to_bytes().map_err(ClientError::Encryption)?;
+
+        self.inner.put_object_with_metadata(
+            bucket,
+            &index_key,
+            Bytes::from(manifest_data),
+            Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
+        ).await?;
+
+        // Update cache
+        let now = chrono::Utc::now().timestamp();
+        let mut clean_forest = sharded;
+        clean_forest.dirty_shards.clear();
+        clean_forest.manifest_dirty = false;
+        self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::Sharded {
+            forest: clean_forest,
+            loaded_at: now,
+        });
+
+        let duration = start.elapsed();
+        Ok(ForestEvent::MigrationCompleted {
+            bucket: bucket.to_string(),
+            duration_ms: duration.as_millis() as u64,
+        })
+    }
+
+    /// Migrate a bucket's forest from sharded back to monolithic format (rollback).
+    ///
+    /// Loads all shards, merges into a single PrivateForest, saves monolithic,
+    /// then cleans up old shard objects from S3.
+    pub async fn migrate_to_monolithic(&self, bucket: &str) -> Result<()> {
+        self.ensure_forest_loaded(bucket).await?;
+
+        if !self.is_forest_sharded(bucket) {
+            return Ok(()); // Already monolithic
+        }
+
+        let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+
+        // Load all shards
+        self.load_all_shards(bucket).await?;
+
+        // Collect old shard keys for cleanup
+        let (forest, old_shard_keys) = {
+            let entry = self.forest_cache.get(bucket).unwrap();
+            match entry.value() {
+                ForestCacheEntry::Sharded { forest, .. } => {
+                    let mono = forest.to_monolithic().map_err(ClientError::Encryption)?;
+                    let shard_keys: Vec<String> = (0..forest.manifest.num_shards)
+                        .map(|i| derive_shard_key(&forest_dek, bucket, &forest.manifest.shard_salt, i))
+                        .collect();
+                    (mono, shard_keys)
+                }
+                _ => return Ok(()),
+            }
+        };
+
+        // Save as monolithic (overwrites manifest at index_key)
+        self.save_forest(bucket, &forest).await?;
+
+        // Phase C: cleanup old shard objects
+        for shard_key in &old_shard_keys {
+            let _ = self.inner.delete_object(bucket, shard_key).await;
+        }
+
+        Ok(())
+    }
+
+    /// Get the current forest file count for a bucket (for migration threshold checks).
+    pub async fn forest_file_count(&self, bucket: &str) -> Result<usize> {
+        self.ensure_forest_loaded(bucket).await?;
+
+        let count = self.forest_cache.get(bucket).map(|entry| {
+            match entry.value() {
+                ForestCacheEntry::Monolithic { forest, .. } => forest.file_count(),
+                ForestCacheEntry::Sharded { forest, .. } => forest.file_count(),
+            }
+        }).unwrap_or(0);
+
+        Ok(count)
+    }
+
     /// Put an encrypted object using FlatNamespace mode
-    /// 
+    ///
     /// This automatically updates AND SAVES the forest index after each file.
     /// For bulk uploads, use `put_object_flat_deferred` + `flush_forest` instead.
     pub async fn put_object_flat(
@@ -995,15 +1363,25 @@ impl EncryptedClient {
     ) -> Result<PutObjectResult> {
         let data = data.into();
         let original_size = data.len() as u64;
-        
-        // Load or create forest (from cache if available)
-        let mut forest = self.load_forest(bucket).await?;
-        
+
+        // Load or create forest (handles both monolithic and sharded)
+        self.ensure_forest_loaded(bucket).await?;
+        let is_sharded = self.is_forest_sharded(bucket);
+
         // Generate a DEK for this object
         let dek = self.encryption.key_manager.generate_dek();
-        
-        // Generate flat storage key (no structure hints!)
-        let storage_key = forest.generate_key(key, &dek);
+
+        // Generate flat storage key from cached forest
+        let storage_key = {
+            let cache_entry = self.forest_cache.get(bucket)
+                .ok_or_else(|| ClientError::Encryption(
+                    fula_crypto::CryptoError::Encryption("forest not loaded".to_string())
+                ))?;
+            match cache_entry.value() {
+                ForestCacheEntry::Monolithic { forest, .. } => forest.generate_key(key, &dek),
+                ForestCacheEntry::Sharded { forest, .. } => forest.generate_key(key, &dek),
+            }
+        };
 
         // Encrypt the DEK with HPKE
         let encryptor = Encryptor::new(self.encryption.public_key());
@@ -1013,13 +1391,11 @@ impl EncryptedClient {
         // Create private metadata
         let private_meta = PrivateMetadata::new(key, original_size)
             .with_content_type(content_type.unwrap_or("application/octet-stream"));
-        
+
         let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
             .map_err(ClientError::Encryption)?;
 
-        // Add to forest index (in memory only)
-        let entry = ForestFileEntry::from_metadata(&private_meta, storage_key.clone());
-        forest.upsert_file(entry);
+        let forest_entry = ForestFileEntry::from_metadata(&private_meta, storage_key.clone());
 
         let kek_version = self.encryption.key_manager.version();
 
@@ -1081,11 +1457,40 @@ impl EncryptedClient {
 
         // Update cache (but don't save to storage yet — mark dirty)
         let now = chrono::Utc::now().timestamp();
-        self.forest_cache.insert(bucket.to_string(), ForestCacheEntry {
-            forest,
-            loaded_at: now,
-            dirty: true,
-        });
+
+        if is_sharded {
+            // Sharded: load target shard, upsert in-place via get_mut
+            let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+            let shard_index = {
+                let cache_entry = self.forest_cache.get(bucket).unwrap();
+                match cache_entry.value() {
+                    ForestCacheEntry::Sharded { forest, .. } => forest.shard_for(key, &forest_dek),
+                    _ => unreachable!(),
+                }
+            };
+            self.load_shard(bucket, shard_index).await?;
+            if let Some(mut cache_entry) = self.forest_cache.get_mut(bucket) {
+                if let ForestCacheEntry::Sharded { forest, loaded_at } = cache_entry.value_mut() {
+                    forest.upsert_file(forest_entry, &forest_dek);
+                    *loaded_at = now;
+                }
+            }
+        } else {
+            // Monolithic: clone, mutate, re-insert
+            let mut forest = {
+                let cache_entry = self.forest_cache.get(bucket).unwrap();
+                match cache_entry.value() {
+                    ForestCacheEntry::Monolithic { forest, .. } => forest.clone(),
+                    _ => unreachable!(),
+                }
+            };
+            forest.upsert_file(forest_entry);
+            self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::Monolithic {
+                forest,
+                loaded_at: now,
+                dirty: true,
+            });
+        }
 
         Ok(result)
     }
@@ -1193,20 +1598,93 @@ impl EncryptedClient {
     /// Call this after bulk uploads using `put_object_flat_deferred`.
     /// This persists the in-memory forest index to encrypted storage.
     pub async fn flush_forest(&self, bucket: &str) -> Result<()> {
-        let forest = self.forest_cache.get(bucket).map(|entry| entry.forest.clone());
+        let is_dirty = self.forest_cache.get(bucket)
+            .map(|entry| entry.is_dirty())
+            .unwrap_or(false);
 
-        if let Some(forest) = forest {
-            self.save_forest(bucket, &forest).await?;
+        if !is_dirty {
+            return Ok(());
         }
 
-        Ok(())
+        if self.is_forest_sharded(bucket) {
+            // Check if resharding is needed before saving
+            let needs_reshard = self.forest_cache.get(bucket).map(|entry| {
+                match entry.value() {
+                    ForestCacheEntry::Sharded { forest, .. } => forest.should_reshard(),
+                    _ => false,
+                }
+            }).unwrap_or(false);
+
+            if needs_reshard {
+                let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+                // Load all shards for resharding
+                self.load_all_shards(bucket).await?;
+
+                // Collect old shard keys before resharding (old salt → old keys)
+                let old_shard_keys: Vec<String> = {
+                    let entry = self.forest_cache.get(bucket).unwrap();
+                    match entry.value() {
+                        ForestCacheEntry::Sharded { forest, .. } => {
+                            (0..forest.manifest.num_shards)
+                                .map(|i| derive_shard_key(&forest_dek, bucket, &forest.manifest.shard_salt, i))
+                                .collect()
+                        }
+                        _ => Vec::new(),
+                    }
+                };
+
+                // Reshard in-place
+                if let Some(mut entry) = self.forest_cache.get_mut(bucket) {
+                    if let ForestCacheEntry::Sharded { forest, .. } = entry.value_mut() {
+                        forest.reshard(&forest_dek).map_err(ClientError::Encryption)?;
+                    }
+                }
+
+                // Save resharded forest (all shards marked dirty)
+                self.save_sharded_forest(bucket).await?;
+
+                // Cleanup old shard objects (Phase C — safe because new manifest is already written)
+                for key in &old_shard_keys {
+                    let _ = self.inner.delete_object(bucket, key).await;
+                }
+
+                Ok(())
+            } else {
+                self.save_sharded_forest(bucket).await
+            }
+        } else {
+            // Monolithic: check if auto-migration should happen
+            let file_count = self.forest_cache.get(bucket).map(|entry| {
+                match entry.value() {
+                    ForestCacheEntry::Monolithic { forest, .. } => forest.file_count(),
+                    _ => 0,
+                }
+            }).unwrap_or(0);
+
+            if file_count >= SHARDED_MIGRATION_THRESHOLD {
+                // Auto-migrate to sharded format
+                self.migrate_to_sharded(bucket).await?;
+                Ok(())
+            } else {
+                let forest = self.forest_cache.get(bucket).and_then(|entry| {
+                    match entry.value() {
+                        ForestCacheEntry::Monolithic { forest, .. } => Some(forest.clone()),
+                        _ => None,
+                    }
+                });
+                if let Some(forest) = forest {
+                    self.save_forest(bucket, &forest).await?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Check if there are unsaved forest changes
     pub async fn has_pending_forest_changes(&self, bucket: &str) -> bool {
         self.forest_cache
             .get(bucket)
-            .map(|entry| entry.dirty)
+            .map(|entry| entry.is_dirty())
             .unwrap_or(false)
     }
 
@@ -1234,13 +1712,46 @@ impl EncryptedClient {
         bucket: &str,
         key: &str,
     ) -> Result<Bytes> {
-        // Load forest to get the storage key
-        let forest = self.load_forest(bucket).await?;
-        
-        let storage_key = forest.get_storage_key(key)
-            .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?;
+        // Ensure forest is loaded (handles both monolithic and sharded)
+        self.ensure_forest_loaded(bucket).await?;
 
-        self.get_object_decrypted_by_storage_key(bucket, storage_key).await
+        let storage_key = if self.is_forest_sharded(bucket) {
+            // Sharded: load only the needed shard
+            let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+            let shard_index = {
+                let entry = self.forest_cache.get(bucket)
+                    .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?;
+                match entry.value() {
+                    ForestCacheEntry::Sharded { forest, .. } => forest.shard_for(key, &forest_dek),
+                    _ => unreachable!(),
+                }
+            };
+            self.load_shard(bucket, shard_index).await?;
+
+            let entry = self.forest_cache.get(bucket).unwrap();
+            match entry.value() {
+                ForestCacheEntry::Sharded { forest, .. } => {
+                    forest.get_storage_key(key, &forest_dek)
+                        .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?
+                        .to_string()
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            // Monolithic: already loaded by ensure_forest_loaded
+            let entry = self.forest_cache.get(bucket)
+                .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?;
+            match entry.value() {
+                ForestCacheEntry::Monolithic { forest, .. } => {
+                    forest.get_storage_key(key)
+                        .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?
+                        .to_string()
+                }
+                _ => unreachable!(),
+            }
+        };
+
+        self.get_object_decrypted_by_storage_key(bucket, &storage_key).await
     }
 
     /// List directory from forest index (FlatNamespace mode)
@@ -1252,14 +1763,28 @@ impl EncryptedClient {
         bucket: &str,
         prefix: Option<&str>,
     ) -> Result<DirectoryListing> {
-        let forest = self.load_forest(bucket).await?;
-        
+        self.ensure_forest_loaded(bucket).await?;
+
         let prefix_str = prefix.unwrap_or("/");
-        let files = forest.list_recursive(prefix_str);
-        
+
+        let files: Vec<ForestFileEntry> = if self.is_forest_sharded(bucket) {
+            self.load_all_shards(bucket).await?;
+            let entry = self.forest_cache.get(bucket).unwrap();
+            match entry.value() {
+                ForestCacheEntry::Sharded { forest, .. } => forest.list_recursive(prefix_str).into_iter().cloned().collect(),
+                _ => unreachable!(),
+            }
+        } else {
+            let entry = self.forest_cache.get(bucket).unwrap();
+            match entry.value() {
+                ForestCacheEntry::Monolithic { forest, .. } => forest.list_recursive(prefix_str).into_iter().cloned().collect(),
+                _ => unreachable!(),
+            }
+        };
+
         let mut directories: HashMap<String, Vec<FileMetadata>> = HashMap::new();
-        
-        for entry in files {
+
+        for entry in &files {
             let dir = if let Some(last_slash) = entry.path.rfind('/') {
                 entry.path[..last_slash].to_string()
             } else {
@@ -1294,10 +1819,25 @@ impl EncryptedClient {
         &self,
         bucket: &str,
     ) -> Result<Vec<FileMetadata>> {
-        let forest = self.load_forest(bucket).await?;
-        
-        let files: Vec<FileMetadata> = forest.list_all_files()
-            .into_iter()
+        self.ensure_forest_loaded(bucket).await?;
+
+        let all_files: Vec<ForestFileEntry> = if self.is_forest_sharded(bucket) {
+            self.load_all_shards(bucket).await?;
+            let entry = self.forest_cache.get(bucket).unwrap();
+            match entry.value() {
+                ForestCacheEntry::Sharded { forest, .. } => forest.list_all_files().into_iter().cloned().collect(),
+                _ => unreachable!(),
+            }
+        } else {
+            let entry = self.forest_cache.get(bucket).unwrap();
+            match entry.value() {
+                ForestCacheEntry::Monolithic { forest, .. } => forest.list_all_files().into_iter().cloned().collect(),
+                _ => unreachable!(),
+            }
+        };
+
+        let files: Vec<FileMetadata> = all_files
+            .iter()
             .map(|entry| FileMetadata {
                 storage_key: entry.storage_key.clone(),
                 original_key: entry.path.clone(),
@@ -1321,23 +1861,58 @@ impl EncryptedClient {
         bucket: &str,
         key: &str,
     ) -> Result<()> {
-        let mut forest = self.load_forest(bucket).await?;
-        
-        // Get storage key before removing from forest
-        let storage_key = forest.get_storage_key(key)
-            .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?
-            .to_string();
+        self.ensure_forest_loaded(bucket).await?;
 
-        // Remove from storage
-        self.inner.delete_object(bucket, &storage_key).await?;
+        if self.is_forest_sharded(bucket) {
+            // Sharded: load the needed shard, find storage key, delete
+            let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+            let shard_index = {
+                let entry = self.forest_cache.get(bucket)
+                    .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?;
+                match entry.value() {
+                    ForestCacheEntry::Sharded { forest, .. } => forest.shard_for(key, &forest_dek),
+                    _ => unreachable!(),
+                }
+            };
+            self.load_shard(bucket, shard_index).await?;
 
-        // Remove from forest
-        forest.remove_file(key);
+            let storage_key = {
+                let entry = self.forest_cache.get(bucket).unwrap();
+                match entry.value() {
+                    ForestCacheEntry::Sharded { forest, .. } => {
+                        forest.get_storage_key(key, &forest_dek)
+                            .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?
+                            .to_string()
+                    }
+                    _ => unreachable!(),
+                }
+            };
 
-        // Save updated forest
-        self.save_forest(bucket, &forest).await?;
+            // Remove from storage
+            self.inner.delete_object(bucket, &storage_key).await?;
 
-        Ok(())
+            // Remove from forest shard (marks shard dirty)
+            if let Some(mut entry) = self.forest_cache.get_mut(bucket) {
+                if let ForestCacheEntry::Sharded { forest, .. } = entry.value_mut() {
+                    forest.remove_file(key, &forest_dek);
+                }
+            }
+
+            // Save updated shards
+            self.save_sharded_forest(bucket).await
+        } else {
+            let mut forest = self.load_forest(bucket).await?;
+
+            let storage_key = forest.get_storage_key(key)
+                .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?
+                .to_string();
+
+            self.inner.delete_object(bucket, &storage_key).await?;
+            forest.remove_file(key);
+            self.save_forest(bucket, &forest).await?;
+
+            Ok(())
+        }
     }
 
     /// Get the private forest for sharing (extract subtree)
@@ -1348,8 +1923,24 @@ impl EncryptedClient {
         bucket: &str,
         prefix: &str,
     ) -> Result<PrivateForest> {
-        let forest = self.load_forest(bucket).await?;
-        Ok(forest.extract_subtree(prefix))
+        self.ensure_forest_loaded(bucket).await?;
+
+        if self.is_forest_sharded(bucket) {
+            let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+            self.load_all_shards(bucket).await?;
+            let entry = self.forest_cache.get(bucket).unwrap();
+            match entry.value() {
+                ForestCacheEntry::Sharded { forest, .. } => {
+                    forest.extract_subtree(prefix, &forest_dek)
+                        .to_monolithic()
+                        .map_err(ClientError::Encryption)
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            let forest = self.load_forest(bucket).await?;
+            Ok(forest.extract_subtree(prefix))
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1742,17 +2333,30 @@ impl EncryptedClient {
             failures: Vec::new(),
         };
 
-        for obj in objects.objects {
-            // Skip forest index
-            if obj.key.starts_with("Qm") && obj.key.len() > 40 {
-                // Check if it's the forest index
-                let head = self.inner.head_object(bucket, &obj.key).await;
-                if let Ok(h) = head {
-                    if h.metadata.get("x-fula-forest").is_some() {
-                        report.skipped += 1;
-                        continue;
-                    }
+        // Build set of forest keys to skip using deterministic key derivation
+        // (replaces x-fula-forest header check — audit finding C-007)
+        let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+        let index_key = derive_index_key(&forest_dek, bucket);
+
+        let mut forest_keys = std::collections::HashSet::new();
+        forest_keys.insert(index_key);
+
+        // If sharded, also skip shard keys
+        let _ = self.ensure_forest_loaded(bucket).await;
+        if let Some(entry) = self.forest_cache.get(bucket) {
+            if let ForestCacheEntry::Sharded { forest, .. } = entry.value() {
+                for i in 0..forest.manifest.num_shards {
+                    let shard_key = derive_shard_key(&forest_dek, bucket, &forest.manifest.shard_salt, i);
+                    forest_keys.insert(shard_key);
                 }
+            }
+        }
+
+        for obj in objects.objects {
+            // Skip forest index and shard objects (deterministic key check, no HEAD needed)
+            if forest_keys.contains(&obj.key) {
+                report.skipped += 1;
+                continue;
             }
 
             match self.rewrap_object_dek(bucket, &obj.key, rotation_manager).await {
@@ -1872,7 +2476,7 @@ impl EncryptedClient {
         // Update forest cache if we have one
         if let Some(mut entry) = self.forest_cache.get_mut(bucket) {
             let now = chrono::Utc::now().timestamp();
-            entry.forest.upsert_file(ForestFileEntry {
+            let file_entry = ForestFileEntry {
                 path: key.to_string(),
                 storage_key: storage_key.clone(),
                 size: data.len() as u64,
@@ -1881,8 +2485,18 @@ impl EncryptedClient {
                 modified_at: now,
                 user_metadata: HashMap::new(),
                 content_hash: None,
-            });
-            entry.dirty = true;
+            };
+            match entry.value_mut() {
+                ForestCacheEntry::Monolithic { forest, dirty, .. } => {
+                    forest.upsert_file(file_entry);
+                    *dirty = true;
+                }
+                ForestCacheEntry::Sharded { forest, loaded_at } => {
+                    let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+                    forest.upsert_file(file_entry, &forest_dek);
+                    *loaded_at = now;
+                }
+            }
         }
         
         Ok(result)

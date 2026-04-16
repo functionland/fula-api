@@ -101,7 +101,15 @@ pub use hybrid_kem::{
 };
 pub use inbox::{ShareEnvelope, ShareEnvelopeBuilder, InboxEntry, InboxEntryStatus, ShareInbox, INBOX_PREFIX, DEFAULT_INBOX_TTL_SECONDS};
 pub use keys::{DekKey, KekKeyPair, KeyManager, PublicKey, SecretKey};
-pub use private_forest::{PrivateForest, EncryptedForest, ForestFileEntry, ForestDirectoryEntry, ForestFormat, derive_index_key, generate_flat_key};
+pub use private_forest::{
+    PrivateForest, EncryptedForest, ForestFileEntry, ForestDirectoryEntry, ForestFormat,
+    derive_index_key, generate_flat_key,
+    // Sharded forest (S-001)
+    ShardManifest, ForestShard, EncryptedShardManifest, EncryptedForestShard,
+    ShardedPrivateForest, ForestEvent, ForestOrManifest,
+    detect_forest_format, derive_shard_key, shard_for_path, compute_initial_shard_count,
+    SHARDED_MIGRATION_THRESHOLD, RESHARD_THRESHOLD, MAX_SHARDS,
+};
 pub use private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, PublicMetadata, KeyObfuscation, obfuscate_key};
 pub use rotation::{KeyRotationManager, FileSystemRotation, WrappedKeyInfo, RotationResult};
 pub use secret_link::{SecretLink, SecretLinkBuilder, SecretLinkPayload, is_valid_secret_link_url, extract_opaque_id, SHARE_PATH_PREFIX};
