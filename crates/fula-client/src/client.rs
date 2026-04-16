@@ -171,6 +171,53 @@ impl FulaClient {
         })
     }
 
+    /// Put an object with metadata and optional If-Match / If-None-Match guards.
+    ///
+    /// Used by conditional-write paths (e.g. forest flush) to detect concurrent
+    /// modification. On ETag mismatch the server returns 412, which surfaces as
+    /// `ClientError::ConcurrentModification`.
+    #[instrument(skip(self, data))]
+    pub async fn put_object_with_metadata_conditional(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        metadata: Option<ObjectMetadata>,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<PutObjectResult> {
+        let path = format!("/{}/{}", bucket, key);
+        let data = data.into();
+
+        let mut headers = HashMap::new();
+        if let Some(meta) = metadata {
+            if let Some(ct) = meta.content_type {
+                headers.insert("Content-Type".to_string(), ct);
+            }
+            for (k, v) in meta.user_metadata {
+                headers.insert(format!("x-amz-meta-{}", k), v);
+            }
+        }
+        if let Some(etag) = if_match {
+            headers.insert("If-Match".to_string(), format!("\"{}\"", etag.trim_matches('"')));
+        }
+        if let Some(etag) = if_none_match {
+            let val = if etag == "*" { "*".to_string() } else { format!("\"{}\"", etag.trim_matches('"')) };
+            headers.insert("If-None-Match".to_string(), val);
+        }
+
+        let response = self.request("PUT", &path, None, Some(headers), Some(data)).await?;
+
+        let etag = response
+            .headers()
+            .get("ETag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_matches('"').to_string())
+            .unwrap_or_default();
+
+        Ok(PutObjectResult { etag, version_id: None })
+    }
+
     /// Put an object with pinning credentials
     /// 
     /// This uploads the object and also pins it to a remote pinning service.
@@ -444,6 +491,15 @@ impl FulaClient {
         // Check for errors
         let status = response.status();
         if !status.is_success() {
+            // 412 Precondition Failed surfaces as ConcurrentModification so
+            // callers using If-Match / If-None-Match can retry distinctly.
+            if status.as_u16() == 412 {
+                let _ = response.text().await;
+                return Err(ClientError::ConcurrentModification(
+                    "precondition failed (ETag mismatch)".to_string()
+                ));
+            }
+
             // For HEAD requests, S3 returns error code in x-amz-error-code header
             // since there's no response body
             let error_code = response
@@ -451,9 +507,9 @@ impl FulaClient {
                 .get("x-amz-error-code")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            
+
             let text = response.text().await.unwrap_or_default();
-            
+
             // If we have an error code header, use it; otherwise parse XML or use status
             if let Some(code) = error_code {
                 return Err(ClientError::S3Error {
@@ -462,7 +518,7 @@ impl FulaClient {
                     request_id: None,
                 });
             }
-            
+
             return Err(ClientError::from_s3_xml(&text, status.as_u16()));
         }
 

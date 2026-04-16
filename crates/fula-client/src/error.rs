@@ -59,6 +59,14 @@ pub enum ClientError {
     /// Download failed
     #[error("Download failed: {0}")]
     DownloadFailed(String),
+
+    /// Concurrent modification detected (412 Precondition Failed / ETag mismatch).
+    ///
+    /// Returned by conditional writes (e.g. forest flush with If-Match) when another
+    /// writer has updated the same object since it was loaded. Callers should reload
+    /// and retry.
+    #[error("Concurrent modification: {0}")]
+    ConcurrentModification(String),
 }
 
 impl ClientError {
@@ -87,6 +95,13 @@ impl ClientError {
     pub fn is_access_denied(&self) -> bool {
         matches!(self, Self::AccessDenied(_))
             || matches!(self, Self::S3Error { code, .. } if code == "AccessDenied")
+    }
+
+    /// Check if this is a concurrent-modification / precondition-failed error.
+    pub fn is_concurrent_modification(&self) -> bool {
+        matches!(self, Self::ConcurrentModification(_))
+            || matches!(self, Self::S3Error { code, .. }
+                if code == "PreconditionFailed" || code == "HTTP412" || code == "412")
     }
 }
 

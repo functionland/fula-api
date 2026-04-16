@@ -219,6 +219,7 @@ async fn object_delete_handler(
     session: axum::extract::Extension<crate::state::UserSession>,
     path: axum::extract::Path<(String, String)>,
     query: axum::extract::Query<ObjectQueryParams>,
+    headers: axum::http::HeaderMap,
 ) -> Result<axum::response::Response, crate::ApiError> {
     if query.upload_id.is_some() {
         let mp_params = handlers::MultipartParams {
@@ -230,7 +231,7 @@ async fn object_delete_handler(
     } else if query.tagging.is_some() {
         handlers::delete_object_tagging(state, session, path).await
     } else {
-        handlers::delete_object(state, session, path).await
+        handlers::delete_object(state, session, path, headers).await
     }
 }
 

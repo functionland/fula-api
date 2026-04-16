@@ -1,6 +1,6 @@
 //! Object operation handlers
 
-use crate::pinning::{check_can_upload, pin_for_user};
+use crate::pinning::{check_can_upload, pin_for_user, unpin_for_user};
 use crate::{AppState, ApiError, S3ErrorCode};
 use crate::state::UserSession;
 use crate::xml;
@@ -459,6 +459,7 @@ pub async fn delete_object(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<UserSession>,
     Path((bucket_name, key)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
@@ -467,7 +468,11 @@ pub async fn delete_object(
     // User-scoped bucket access
     let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
 
-    bucket.delete_object(&key).await?;
+    // Capture the removed metadata so we can unpin the CID after the index
+    // is successfully updated. Must unpin AFTER persist — if persist fails
+    // and we've already unpinned, the data is gone but the index still
+    // references it on next start (recoverable on re-upload, but bad UX).
+    let removed = bucket.delete_object(&key).await?;
     bucket.flush().await?;
 
     // Persist the bucket registry so the updated root CID survives restarts.
@@ -477,6 +482,57 @@ pub async fn delete_object(
             tracing::error!(error = %e, "Failed to persist bucket registry after delete_object — change may be lost on restart");
             ApiError::s3(S3ErrorCode::InternalError, "Failed to persist storage index. Please retry.")
         })?;
+
+    // Best-effort IPFS unpin (F-NEW). Must be refcount-safe: if any other key
+    // in this bucket still references the same CID (client-side dedup, or two
+    // keys coincidentally mapped to the same content), skip the unpin to avoid
+    // losing pins for still-referenced data.
+    //
+    // Cross-bucket refcount is not checked here: each bucket's pinning is
+    // scoped to its own index, and the pinning service tracks pins by
+    // request_id — unpinning one bucket's pin does not affect other buckets'
+    // pins of the same CID, since each was added as a separate pin.
+    if let Some(removed_meta) = removed {
+        let cid = removed_meta.cid;
+        let still_referenced = match bucket
+            .list_objects(None, None, None, None)
+            .await
+        {
+            Ok(result) => result.objects.iter().any(|o| o.metadata.cid == cid),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    cid = %cid,
+                    "Could not enumerate bucket to refcount-check CID; skipping unpin conservatively"
+                );
+                true
+            }
+        };
+
+        if !still_referenced {
+            if let Err(e) = state.block_store.unpin(&cid).await {
+                tracing::warn!(
+                    cid = %cid,
+                    error = %e,
+                    "Failed to unpin from local IPFS (best-effort)"
+                );
+            }
+
+            unpin_for_user(
+                &headers,
+                &cid,
+                state.config.pinning_service_endpoint.as_deref(),
+                Some(&session.jwt_token),
+            )
+            .await;
+        } else {
+            tracing::debug!(
+                cid = %cid,
+                bucket = %bucket_name,
+                "Skipping unpin — CID still referenced by another key in the bucket"
+            );
+        }
+    }
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }

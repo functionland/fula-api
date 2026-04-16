@@ -108,6 +108,9 @@ impl From<fula_client::ClientError> for FulaError {
             ClientError::AccessDenied(msg) => FulaError::AccessDenied(msg),
             ClientError::UploadFailed(msg) => FulaError::UploadFailed(msg),
             ClientError::DownloadFailed(msg) => FulaError::DownloadFailed(msg),
+            ClientError::ConcurrentModification(msg) => FulaError::InvalidResponse(
+                format!("concurrent modification: {}", msg),
+            ),
         }
     }
 }

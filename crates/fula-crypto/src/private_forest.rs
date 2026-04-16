@@ -567,6 +567,11 @@ impl Default for PrivateForest {
 }
 
 /// Encrypted private forest (what gets stored)
+///
+/// Version semantics:
+/// - v1/v2: legacy monolithic forest, no AAD, no replay protection.
+/// - v4: monolithic forest with AAD bound to `fula:forest:v4:<bucket>:<sequence>`
+///   and an outer `sequence` counter for replay detection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EncryptedForest {
     /// Version of the encryption format
@@ -577,6 +582,12 @@ pub struct EncryptedForest {
     /// Nonce used for encryption
     #[serde(with = "base64_serde")]
     pub nonce: Vec<u8>,
+    /// Monotonic sequence counter (v4+). Bound into AAD to prevent replay.
+    ///
+    /// Present only for version >= 4. Legacy v1/v2 blobs omit this field
+    /// to preserve on-disk format compatibility.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sequence: Option<u64>,
 }
 
 mod base64_serde {
@@ -595,31 +606,97 @@ mod base64_serde {
     }
 }
 
+/// Compute the AAD for a v4 monolithic forest.
+///
+/// Bound to bucket + sequence to prevent replay of an older forest snapshot
+/// by a malicious or compromised storage server.
+pub fn forest_v4_aad(bucket: &str, sequence: u64) -> Vec<u8> {
+    format!("fula:forest:v4:{}:{}", bucket, sequence).into_bytes()
+}
+
 impl EncryptedForest {
-    /// Encrypt a private forest with a DEK
+    /// Encrypt a private forest with a DEK (legacy v1, no AAD).
+    ///
+    /// Prefer [`EncryptedForest::encrypt_v4`] for new writes — it binds the
+    /// ciphertext to the bucket and a monotonic sequence counter for replay
+    /// protection. This legacy constructor is preserved so existing tests and
+    /// pre-v4 call sites compile, but new code paths go through v4.
     pub fn encrypt(forest: &PrivateForest, dek: &DekKey) -> Result<Self> {
         let json = serde_json::to_vec(forest)
             .map_err(|e| CryptoError::Serialization(e.to_string()))?;
-        
+
         let nonce = Nonce::generate();
         let aead = Aead::new_default(dek);
         let ciphertext = aead.encrypt(&nonce, &json)?;
-        
+
         Ok(Self {
             version: 1,
             ciphertext,
             nonce: nonce.as_bytes().to_vec(),
+            sequence: None,
         })
     }
 
-    /// Decrypt a private forest with a DEK
+    /// Encrypt a private forest with a DEK and AAD binding (v4).
+    ///
+    /// Produces an [`EncryptedForest`] with `version = 4` and a monotonic
+    /// `sequence` counter. The sequence and bucket are bound into the AEAD
+    /// via AAD, so any rollback attempt by a malicious storage server fails
+    /// the AEAD tag check.
+    pub fn encrypt_v4(
+        forest: &PrivateForest,
+        dek: &DekKey,
+        bucket: &str,
+        sequence: u64,
+    ) -> Result<Self> {
+        let json = serde_json::to_vec(forest)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(dek);
+        let aad = forest_v4_aad(bucket, sequence);
+        let ciphertext = aead.encrypt_with_aad(&nonce, &json, &aad)?;
+
+        Ok(Self {
+            version: 4,
+            ciphertext,
+            nonce: nonce.as_bytes().to_vec(),
+            sequence: Some(sequence),
+        })
+    }
+
+    /// Decrypt a private forest with a DEK (legacy v1/v2, no AAD).
     pub fn decrypt(&self, dek: &DekKey) -> Result<PrivateForest> {
         let nonce = Nonce::from_bytes(&self.nonce)?;
         let aead = Aead::new_default(dek);
         let plaintext = aead.decrypt(&nonce, &self.ciphertext)?;
-        
+
         serde_json::from_slice(&plaintext)
             .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+
+    /// Decrypt a v4 forest with a DEK, verifying bucket binding via AAD.
+    ///
+    /// Returns the decrypted forest plus the bound sequence. Callers should
+    /// compare the returned sequence against their cached last-seen sequence
+    /// to detect replay.
+    pub fn decrypt_v4(&self, dek: &DekKey, bucket: &str) -> Result<(PrivateForest, u64)> {
+        if self.version != 4 {
+            return Err(CryptoError::Decryption(format!(
+                "expected EncryptedForest version 4, got {}",
+                self.version
+            )));
+        }
+        let sequence = self.sequence.ok_or_else(|| {
+            CryptoError::Decryption("v4 EncryptedForest missing sequence field".to_string())
+        })?;
+        let nonce = Nonce::from_bytes(&self.nonce)?;
+        let aead = Aead::new_default(dek);
+        let aad = forest_v4_aad(bucket, sequence);
+        let plaintext = aead.decrypt_with_aad(&nonce, &self.ciphertext, &aad)?;
+        let forest: PrivateForest = serde_json::from_slice(&plaintext)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+        Ok((forest, sequence))
     }
 
     /// Serialize to bytes for storage
@@ -668,10 +745,11 @@ pub fn derive_shard_key(forest_dek: &DekKey, bucket: &str, shard_salt: &[u8], sh
     format!("Qm{}", hex::encode(&hash.as_bytes()[..22]))
 }
 
-/// Determine which shard a file path belongs to
+/// Determine which shard a file path belongs to (legacy v3/v5 routing)
 ///
 /// Uses DEK + shard_salt in the hash so an observer who knows a filename
-/// cannot guess which shard it's in without the secret key.
+/// cannot guess which shard it's in without the secret key. Hashes the full
+/// path, so every file may land in a different shard regardless of directory.
 pub fn shard_for_path(path: &str, dek: &DekKey, shard_salt: &[u8], num_shards: usize) -> usize {
     let mut hasher = blake3::Hasher::new_derive_key(SHARD_ASSIGN_DOMAIN);
     hasher.update(dek.as_bytes());
@@ -679,6 +757,72 @@ pub fn shard_for_path(path: &str, dek: &DekKey, shard_salt: &[u8], num_shards: u
     hasher.update(shard_salt);
     let hash = hasher.finalize();
     (hash.as_bytes()[0] as usize) % num_shards
+}
+
+/// Canonicalize a path to the directory used for v6 shard routing.
+///
+/// Always returns a non-empty string ending in `/`. Examples:
+/// - `/a/b/c.txt` → `/a/b/`
+/// - `/file.txt`  → `/`
+/// - `/a/b/`      → `/a/b/`
+/// - ``           → `/`
+/// - `/`          → `/`
+///
+/// Directories route to themselves so `list_directory` can find files by
+/// loading only the shard that owns the directory.
+pub fn parent_dir_for_routing(path: &str) -> String {
+    if path.is_empty() || path == "/" {
+        return "/".to_string();
+    }
+    if path.ends_with('/') {
+        return path.to_string();
+    }
+    match path.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(idx) => format!("{}/", &path[..idx]),
+        None => "/".to_string(),
+    }
+}
+
+/// Determine which shard a file path belongs to under v6 routing.
+///
+/// Hashes the parent directory (canonicalized via [`parent_dir_for_routing`])
+/// rather than the full path. All files sharing a parent directory land in
+/// the same shard, which gives directory-locality for `list_directory` and
+/// common co-edit patterns without leaking the directory structure to the
+/// server (the DEK is mixed into the hash, so shard IDs remain indistinct).
+///
+/// Uses two bytes of hash output so that scaling beyond 256 shards is clean
+/// once callers are ready to lift that cap.
+pub fn shard_for_path_v6(path: &str, dek: &DekKey, shard_salt: &[u8], num_shards: usize) -> usize {
+    let parent = parent_dir_for_routing(path);
+    let mut hasher = blake3::Hasher::new_derive_key(SHARD_ASSIGN_DOMAIN);
+    hasher.update(dek.as_bytes());
+    hasher.update(parent.as_bytes());
+    hasher.update(shard_salt);
+    let hash = hasher.finalize();
+    let bytes = hash.as_bytes();
+    let idx = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+    idx % num_shards
+}
+
+/// Version-aware shard routing.
+///
+/// Dispatches to [`shard_for_path`] (legacy v3/v5 full-path hash) or
+/// [`shard_for_path_v6`] (v6 parent-directory hash) based on the manifest
+/// version. Callers that already have a `ShardedPrivateForest` should use
+/// `ShardedPrivateForest::shard_for`, which wraps this helper.
+pub fn shard_for_path_versioned(
+    manifest_version: u8,
+    path: &str,
+    dek: &DekKey,
+    shard_salt: &[u8],
+    num_shards: usize,
+) -> usize {
+    match manifest_version {
+        6 => shard_for_path_v6(path, dek, shard_salt, num_shards),
+        _ => shard_for_path(path, dek, shard_salt, num_shards),
+    }
 }
 
 /// Compute the initial shard count for migration based on file count
@@ -717,13 +861,25 @@ pub enum ForestEvent {
     },
 }
 
-/// Shard manifest — stored encrypted at the index_key (version 3)
+/// Shard manifest — stored encrypted at the index_key (version 3, 5, or 6)
 ///
-/// Constant-size regardless of file or directory count.
-/// All variable-size data lives in individual shards.
+/// Constant-size-ish regardless of file count (grows only with num_shards).
+/// All variable-size per-file data lives in individual shards.
+///
+/// For v5+ (AAD-bound) manifests, `shard_sequences` carries the expected
+/// sequence for each shard, vouched for by the manifest's own AEAD tag.
+/// This closes the cold-start shard-replay hole: on first load, the client
+/// learns each shard's expected sequence from the manifest and rejects any
+/// shard whose embedded sequence does not match.
+///
+/// Version semantics:
+/// - v3: legacy, no AAD. Routing hashes full path.
+/// - v5: AAD-bound manifest + shards. Routing hashes full path (legacy).
+/// - v6: AAD-bound manifest + shards. Routing hashes parent directory,
+///   giving directory-locality for upsert/list_directory.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShardManifest {
-    /// Version of the manifest format (= 3)
+    /// Version of the manifest format (3 = legacy, 5 = AAD-bound, 6 = directory-aware)
     pub version: u8,
     /// Format identifier
     pub format: String,
@@ -738,10 +894,20 @@ pub struct ShardManifest {
     pub created_at: i64,
     /// Last modified timestamp (Unix seconds)
     pub modified_at: i64,
+    /// Expected sequence per shard (v5+).
+    ///
+    /// Length equals `num_shards` after a v5 write. Absent (empty) on v3
+    /// manifests for backward compatibility; len-mismatch is tolerated as
+    /// "no per-shard replay check available" for legacy data.
+    #[serde(default)]
+    pub shard_sequences: Vec<u64>,
 }
 
 impl ShardManifest {
-    /// Create a new shard manifest
+    /// Create a new shard manifest (legacy v3 shape, zeroed shard_sequences).
+    ///
+    /// Callers flushing new data should bump to v5 via [`ShardManifest::into_v5`]
+    /// once they know the expected sequences for each shard.
     pub fn new(num_shards: usize) -> Self {
         use rand::RngCore;
         let num_shards = num_shards.next_power_of_two().max(16).min(MAX_SHARDS);
@@ -761,6 +927,7 @@ impl ShardManifest {
             root: "/".to_string(),
             created_at: now,
             modified_at: now,
+            shard_sequences: Vec::new(),
         }
     }
 
@@ -770,6 +937,32 @@ impl ShardManifest {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+    }
+
+    /// Promote a manifest to v5 shape (AAD-bound, legacy routing) with the given per-shard sequences.
+    ///
+    /// `sequences.len()` must equal `self.num_shards`. Caller is responsible for
+    /// incrementing each sequence on every shard write.
+    pub fn into_v5(mut self, sequences: Vec<u64>) -> Self {
+        self.version = 5;
+        self.format = "sharded-v5".to_string();
+        self.shard_sequences = sequences;
+        self
+    }
+
+    /// Promote a manifest to v6 shape (AAD-bound, directory-aware routing)
+    /// with the given per-shard sequences.
+    ///
+    /// `sequences.len()` must equal `self.num_shards`. Callers MUST ensure the
+    /// shard contents are already distributed using v6 routing (either freshly
+    /// built, or redistributed via `ShardedPrivateForest::reshard_to_v6`)
+    /// before flipping the manifest version — otherwise reads after this
+    /// commit will route to the wrong shard.
+    pub fn into_v6(mut self, sequences: Vec<u64>) -> Self {
+        self.version = 6;
+        self.format = "sharded-v6".to_string();
+        self.shard_sequences = sequences;
+        self
     }
 }
 
@@ -804,10 +997,33 @@ impl ForestShard {
     }
 }
 
+/// Compute the AAD for a v5 shard manifest.
+pub fn manifest_v5_aad(bucket: &str, sequence: u64) -> Vec<u8> {
+    format!("fula:manifest:v5:{}:{}", bucket, sequence).into_bytes()
+}
+
+/// Compute the AAD for a v6 shard manifest (directory-aware routing).
+///
+/// Distinct prefix from v5 so a v5 ciphertext cannot be served in place of
+/// a v6 one (routing-version downgrade is detected at AEAD verification
+/// time rather than relying on the plaintext version field).
+pub fn manifest_v6_aad(bucket: &str, sequence: u64) -> Vec<u8> {
+    format!("fula:manifest:v6:{}:{}", bucket, sequence).into_bytes()
+}
+
 /// Encrypted shard manifest (what gets stored at the index_key)
+///
+/// Version semantics:
+/// - v3: legacy sharded manifest, no AAD, no replay protection.
+/// - v5: sharded manifest with AAD bound to `fula:manifest:v5:<bucket>:<sequence>`
+///   and an outer `sequence` counter. Legacy full-path shard routing.
+///   Plaintext carries `shard_sequences` to vouch for per-shard replay protection.
+/// - v6: same wrapper shape as v5 but with distinct AAD prefix and directory-
+///   aware shard routing (see [`shard_for_path_v6`]). AAD prefix differs from v5
+///   so a v5 ciphertext cannot be accepted in a v6 slot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EncryptedShardManifest {
-    /// Version of the encryption format (= 3 to distinguish from EncryptedForest v1)
+    /// Version of the encryption format (3 = legacy, 5 = AAD-bound, 6 = AAD + v6 routing)
     pub version: u8,
     /// Encrypted manifest data
     #[serde(with = "base64_serde")]
@@ -815,10 +1031,13 @@ pub struct EncryptedShardManifest {
     /// Nonce used for encryption
     #[serde(with = "base64_serde")]
     pub nonce: Vec<u8>,
+    /// Monotonic sequence counter (v5+). Bound into AAD to prevent replay.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sequence: Option<u64>,
 }
 
 impl EncryptedShardManifest {
-    /// Encrypt a shard manifest with a DEK
+    /// Encrypt a shard manifest with a DEK (legacy v3, no AAD).
     pub fn encrypt(manifest: &ShardManifest, dek: &DekKey) -> Result<Self> {
         let json = serde_json::to_vec(manifest)
             .map_err(|e| CryptoError::Serialization(e.to_string()))?;
@@ -831,10 +1050,34 @@ impl EncryptedShardManifest {
             version: 3,
             ciphertext,
             nonce: nonce.as_bytes().to_vec(),
+            sequence: None,
         })
     }
 
-    /// Decrypt a shard manifest with a DEK
+    /// Encrypt a shard manifest with a DEK and AAD binding (v5).
+    pub fn encrypt_v5(
+        manifest: &ShardManifest,
+        dek: &DekKey,
+        bucket: &str,
+        sequence: u64,
+    ) -> Result<Self> {
+        let json = serde_json::to_vec(manifest)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(dek);
+        let aad = manifest_v5_aad(bucket, sequence);
+        let ciphertext = aead.encrypt_with_aad(&nonce, &json, &aad)?;
+
+        Ok(Self {
+            version: 5,
+            ciphertext,
+            nonce: nonce.as_bytes().to_vec(),
+            sequence: Some(sequence),
+        })
+    }
+
+    /// Decrypt a shard manifest with a DEK (legacy v3, no AAD).
     pub fn decrypt(&self, dek: &DekKey) -> Result<ShardManifest> {
         let nonce = Nonce::from_bytes(&self.nonce)?;
         let aead = Aead::new_default(dek);
@@ -842,6 +1085,79 @@ impl EncryptedShardManifest {
 
         serde_json::from_slice(&plaintext)
             .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+
+    /// Decrypt a v5 shard manifest with a DEK, verifying bucket binding via AAD.
+    ///
+    /// Returns the manifest plus the bound sequence. Callers should compare
+    /// against their cached last-seen sequence to detect replay.
+    pub fn decrypt_v5(&self, dek: &DekKey, bucket: &str) -> Result<(ShardManifest, u64)> {
+        if self.version != 5 {
+            return Err(CryptoError::Decryption(format!(
+                "expected EncryptedShardManifest version 5, got {}",
+                self.version
+            )));
+        }
+        let sequence = self.sequence.ok_or_else(|| {
+            CryptoError::Decryption("v5 EncryptedShardManifest missing sequence field".to_string())
+        })?;
+        let nonce = Nonce::from_bytes(&self.nonce)?;
+        let aead = Aead::new_default(dek);
+        let aad = manifest_v5_aad(bucket, sequence);
+        let plaintext = aead.decrypt_with_aad(&nonce, &self.ciphertext, &aad)?;
+        let manifest: ShardManifest = serde_json::from_slice(&plaintext)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+        Ok((manifest, sequence))
+    }
+
+    /// Encrypt a shard manifest with a DEK and AAD binding (v6, directory-aware).
+    ///
+    /// Same wrapper shape as v5 but with a distinct AAD prefix
+    /// (`fula:manifest:v6:<bucket>:<sequence>`) so that a v5 ciphertext cannot
+    /// be accepted in place of a v6 one.
+    pub fn encrypt_v6(
+        manifest: &ShardManifest,
+        dek: &DekKey,
+        bucket: &str,
+        sequence: u64,
+    ) -> Result<Self> {
+        let json = serde_json::to_vec(manifest)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(dek);
+        let aad = manifest_v6_aad(bucket, sequence);
+        let ciphertext = aead.encrypt_with_aad(&nonce, &json, &aad)?;
+
+        Ok(Self {
+            version: 6,
+            ciphertext,
+            nonce: nonce.as_bytes().to_vec(),
+            sequence: Some(sequence),
+        })
+    }
+
+    /// Decrypt a v6 shard manifest, verifying bucket + sequence via AAD.
+    ///
+    /// Rejects any non-v6 wrapper so that a downgraded v3/v5 ciphertext cannot
+    /// pass the version check silently.
+    pub fn decrypt_v6(&self, dek: &DekKey, bucket: &str) -> Result<(ShardManifest, u64)> {
+        if self.version != 6 {
+            return Err(CryptoError::Decryption(format!(
+                "expected EncryptedShardManifest version 6, got {}",
+                self.version
+            )));
+        }
+        let sequence = self.sequence.ok_or_else(|| {
+            CryptoError::Decryption("v6 EncryptedShardManifest missing sequence field".to_string())
+        })?;
+        let nonce = Nonce::from_bytes(&self.nonce)?;
+        let aead = Aead::new_default(dek);
+        let aad = manifest_v6_aad(bucket, sequence);
+        let plaintext = aead.decrypt_with_aad(&nonce, &self.ciphertext, &aad)?;
+        let manifest: ShardManifest = serde_json::from_slice(&plaintext)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+        Ok((manifest, sequence))
     }
 
     /// Serialize to bytes for storage
@@ -857,7 +1173,16 @@ impl EncryptedShardManifest {
     }
 }
 
+/// Compute the AAD for a v2 forest shard.
+pub fn shard_v2_aad(bucket: &str, shard_index: usize, sequence: u64) -> Vec<u8> {
+    format!("fula:shard:v2:{}:{}:{}", bucket, shard_index, sequence).into_bytes()
+}
+
 /// Encrypted forest shard (what gets stored per-shard in S3)
+///
+/// Version semantics:
+/// - v1: legacy shard, no AAD, no replay protection.
+/// - v2: AAD bound to `fula:shard:v2:<bucket>:<shard_index>:<sequence>`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EncryptedForestShard {
     /// Version of the encryption format
@@ -868,10 +1193,13 @@ pub struct EncryptedForestShard {
     /// Nonce used for encryption
     #[serde(with = "base64_serde")]
     pub nonce: Vec<u8>,
+    /// Monotonic sequence counter (v2+). Bound into AAD to prevent replay.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sequence: Option<u64>,
 }
 
 impl EncryptedForestShard {
-    /// Encrypt a forest shard with a DEK
+    /// Encrypt a forest shard with a DEK (legacy v1, no AAD).
     pub fn encrypt(shard: &ForestShard, dek: &DekKey) -> Result<Self> {
         let json = serde_json::to_vec(shard)
             .map_err(|e| CryptoError::Serialization(e.to_string()))?;
@@ -884,10 +1212,38 @@ impl EncryptedForestShard {
             version: 1,
             ciphertext,
             nonce: nonce.as_bytes().to_vec(),
+            sequence: None,
         })
     }
 
-    /// Decrypt a forest shard with a DEK
+    /// Encrypt a forest shard with a DEK and AAD binding (v2).
+    ///
+    /// Binds to bucket + shard_index + sequence. The shard index is included
+    /// so that a malicious server cannot serve shard `j`'s ciphertext in
+    /// response to a request for shard `i`.
+    pub fn encrypt_v2(
+        shard: &ForestShard,
+        dek: &DekKey,
+        bucket: &str,
+        sequence: u64,
+    ) -> Result<Self> {
+        let json = serde_json::to_vec(shard)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(dek);
+        let aad = shard_v2_aad(bucket, shard.shard_index, sequence);
+        let ciphertext = aead.encrypt_with_aad(&nonce, &json, &aad)?;
+
+        Ok(Self {
+            version: 2,
+            ciphertext,
+            nonce: nonce.as_bytes().to_vec(),
+            sequence: Some(sequence),
+        })
+    }
+
+    /// Decrypt a forest shard with a DEK (legacy v1, no AAD).
     pub fn decrypt(&self, dek: &DekKey) -> Result<ForestShard> {
         let nonce = Nonce::from_bytes(&self.nonce)?;
         let aead = Aead::new_default(dek);
@@ -895,6 +1251,36 @@ impl EncryptedForestShard {
 
         serde_json::from_slice(&plaintext)
             .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+
+    /// Decrypt a v2 forest shard, verifying bucket + shard_index + sequence via AAD.
+    ///
+    /// Caller must pass the `shard_index` it requested. Returns the shard and
+    /// the bound sequence. Callers should compare the sequence against the
+    /// manifest's `shard_sequences[shard_index]` entry (populated by the AAD-
+    /// protected v5 manifest) to detect shard-level replay.
+    pub fn decrypt_v2(
+        &self,
+        dek: &DekKey,
+        bucket: &str,
+        shard_index: usize,
+    ) -> Result<(ForestShard, u64)> {
+        if self.version != 2 {
+            return Err(CryptoError::Decryption(format!(
+                "expected EncryptedForestShard version 2, got {}",
+                self.version
+            )));
+        }
+        let sequence = self.sequence.ok_or_else(|| {
+            CryptoError::Decryption("v2 EncryptedForestShard missing sequence field".to_string())
+        })?;
+        let nonce = Nonce::from_bytes(&self.nonce)?;
+        let aead = Aead::new_default(dek);
+        let aad = shard_v2_aad(bucket, shard_index, sequence);
+        let plaintext = aead.decrypt_with_aad(&nonce, &self.ciphertext, &aad)?;
+        let shard: ForestShard = serde_json::from_slice(&plaintext)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+        Ok((shard, sequence))
     }
 
     /// Serialize to bytes for storage
@@ -921,13 +1307,23 @@ pub enum ForestOrManifest {
 /// Detect whether bytes at the index_key are a monolithic forest or shard manifest
 ///
 /// Reads the outer `version` field to determine the format without decrypting.
+///
+/// Version mapping:
+/// - 1, 2, 4    → monolithic `EncryptedForest` (v4 carries AAD+sequence).
+/// - 3, 5, 6    → sharded `EncryptedShardManifest`. v5 carries AAD+sequence
+///                with legacy full-path routing; v6 adds directory-aware
+///                routing with a distinct AAD prefix.
 pub fn detect_forest_format(bytes: &[u8]) -> Result<ForestOrManifest> {
     let parsed: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|e| CryptoError::Serialization(e.to_string()))?;
 
     match parsed.get("version").and_then(|v| v.as_u64()) {
-        Some(1) | Some(2) => Ok(ForestOrManifest::Monolithic(EncryptedForest::from_bytes(bytes)?)),
-        Some(3) => Ok(ForestOrManifest::Manifest(EncryptedShardManifest::from_bytes(bytes)?)),
+        Some(1) | Some(2) | Some(4) => {
+            Ok(ForestOrManifest::Monolithic(EncryptedForest::from_bytes(bytes)?))
+        }
+        Some(3) | Some(5) | Some(6) => {
+            Ok(ForestOrManifest::Manifest(EncryptedShardManifest::from_bytes(bytes)?))
+        }
         Some(v) => Err(CryptoError::Encryption(format!("unsupported forest version: {}", v))),
         None => Err(CryptoError::Serialization("missing version field in forest data".to_string())),
     }
@@ -972,14 +1368,24 @@ impl ShardedPrivateForest {
         }
     }
 
-    /// Migrate a monolithic forest into a sharded forest
+    /// Migrate a monolithic forest into a sharded forest (v6, directory-aware)
+    ///
+    /// New migrations always target v6 routing. The manifest is created in its
+    /// base v3 shape (with `version = 3`, routing via full path) but is then
+    /// flipped to v6 so that `shard_for` uses parent-directory routing for the
+    /// distribution loop below. The client is still responsible for calling
+    /// `into_v6(shard_sequences)` when it writes the manifest to disk.
     pub fn from_migration(forest: PrivateForest, dek: &DekKey, num_shards: usize) -> Self {
         let mut sharded = Self::new(num_shards);
         // Preserve timestamps
         sharded.manifest.created_at = forest.created_at;
+        // Flip to v6 routing so the distribution loop and all subsequent
+        // upserts land files by parent directory.
+        sharded.manifest.version = 6;
+        sharded.manifest.format = "sharded-v6".to_string();
 
         for entry in forest.list_all_files() {
-            let shard_idx = shard_for_path(
+            let shard_idx = shard_for_path_v6(
                 &entry.path,
                 dek,
                 &sharded.manifest.shard_salt,
@@ -999,6 +1405,56 @@ impl ShardedPrivateForest {
         sharded
     }
 
+    /// Reshard in place from v3/v5 (legacy full-path routing) to v6 (parent-
+    /// directory routing).
+    ///
+    /// Requires all shards to be loaded. Keeps `num_shards` unchanged,
+    /// generates a fresh salt, and redistributes every file using v6 routing.
+    /// Marks every shard dirty so the next flush rewrites the full index.
+    pub fn reshard_to_v6(&mut self, dek: &DekKey) -> Result<()> {
+        if !self.all_shards_loaded() {
+            return Err(CryptoError::Encryption(
+                "all shards must be loaded before resharding to v6".to_string(),
+            ));
+        }
+        if self.manifest.version == 6 {
+            return Ok(());
+        }
+
+        let all_files: Vec<ForestFileEntry> = self
+            .shards
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .flat_map(|shard| shard.files.values().cloned())
+            .collect();
+
+        use rand::RngCore;
+        let mut new_salt = vec![0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut new_salt);
+
+        let num_shards = self.manifest.num_shards;
+        let mut new_shards: Vec<Option<ForestShard>> =
+            (0..num_shards).map(|i| Some(ForestShard::new(i))).collect();
+
+        for entry in all_files {
+            let shard_idx = shard_for_path_v6(&entry.path, dek, &new_salt, num_shards);
+            if let Some(Some(shard)) = new_shards.get_mut(shard_idx) {
+                shard.files.insert(entry.path.clone(), entry);
+            }
+        }
+
+        self.manifest.version = 6;
+        self.manifest.format = "sharded-v6".to_string();
+        self.manifest.shard_salt = new_salt;
+        self.manifest.touch();
+
+        self.shards = new_shards;
+        self.dirty_shards = (0..num_shards).collect();
+        self.manifest_dirty = true;
+
+        Ok(())
+    }
+
     /// Get the number of shards
     pub fn num_shards(&self) -> usize {
         self.manifest.num_shards
@@ -1011,8 +1467,51 @@ impl ShardedPrivateForest {
     }
 
     /// Determine which shard a path belongs to
+    ///
+    /// Dispatches on manifest version:
+    /// - v6 uses [`shard_for_path_v6`] (parent-directory routing).
+    /// - v3/v5 use [`shard_for_path`] (legacy full-path routing).
     pub fn shard_for(&self, path: &str, dek: &DekKey) -> usize {
-        shard_for_path(path, dek, &self.manifest.shard_salt, self.manifest.num_shards)
+        shard_for_path_versioned(
+            self.manifest.version,
+            path,
+            dek,
+            &self.manifest.shard_salt,
+            self.manifest.num_shards,
+        )
+    }
+
+    /// Returns true if this forest uses v6 directory-aware routing.
+    ///
+    /// v6 is the only routing where `list_directory(dir)` can be answered by
+    /// loading a single shard — callers should check this before skipping
+    /// `load_all_shards`.
+    pub fn uses_v6_routing(&self) -> bool {
+        self.manifest.version == 6
+    }
+
+    /// Shard containing all files directly under `dir` (v6 routing only).
+    ///
+    /// Returns `None` for non-v6 forests — legacy routing hashes each file's
+    /// full path, so files in a single directory may land in any shard.
+    /// Accepts `dir` with or without a trailing slash; normalizes internally.
+    pub fn shard_for_dir(&self, dir: &str, dek: &DekKey) -> Option<usize> {
+        if !self.uses_v6_routing() {
+            return None;
+        }
+        let normalized = if dir.is_empty() || dir == "/" {
+            "/".to_string()
+        } else if dir.ends_with('/') {
+            dir.to_string()
+        } else {
+            format!("{}/", dir)
+        };
+        Some(shard_for_path_v6(
+            &normalized,
+            dek,
+            &self.manifest.shard_salt,
+            self.manifest.num_shards,
+        ))
     }
 
     /// Add or update a file entry
@@ -1267,9 +1766,19 @@ impl ShardedPrivateForest {
             .map(|i| Some(ForestShard::new(i)))
             .collect();
 
-        // Redistribute files
+        // Redistribute files using the manifest's current routing version.
+        // v6 forests keep v6 routing on reshard; v3/v5 forests keep legacy
+        // routing. Callers that want to upgrade routing should use
+        // `reshard_to_v6` instead.
+        let routing_version = self.manifest.version;
         for entry in all_files {
-            let shard_idx = shard_for_path(&entry.path, dek, &new_salt, new_num_shards);
+            let shard_idx = shard_for_path_versioned(
+                routing_version,
+                &entry.path,
+                dek,
+                &new_salt,
+                new_num_shards,
+            );
             if let Some(Some(shard)) = new_shards.get_mut(shard_idx) {
                 shard.files.insert(entry.path.clone(), entry);
             }
@@ -1317,6 +1826,11 @@ impl ShardedPrivateForest {
 
         let mut subtree = ShardedPrivateForest::new(self.manifest.num_shards);
         subtree.manifest.shard_salt = self.manifest.shard_salt.clone();
+        // Preserve the routing version so `upsert_file` uses the same routing
+        // as the source forest — otherwise a v6 source would route its files
+        // differently into a v3-default subtree.
+        subtree.manifest.version = self.manifest.version;
+        subtree.manifest.format = self.manifest.format.clone();
 
         for entry in files {
             subtree.upsert_file(entry, dek);
@@ -2101,5 +2615,286 @@ mod tests {
         // Private files not included
         let all = subtree.list_all_files();
         assert!(all.iter().all(|f| f.path.starts_with("/shared")));
+    }
+
+    // ============================================================================
+    // Fix 1 (F-2.1 + F-7.4): AAD-bound forest/manifest/shard v4/v5/v2 tests
+    // ============================================================================
+
+    #[test]
+    fn test_forest_v4_roundtrip() {
+        let dek = DekKey::generate();
+        let mut forest = PrivateForest::new();
+        forest.upsert_file(ForestFileEntry {
+            path: "/a.txt".to_string(),
+            storage_key: "QmABC".to_string(),
+            size: 10,
+            content_type: None,
+            created_at: 0,
+            modified_at: 0,
+            user_metadata: HashMap::new(),
+            content_hash: None,
+        });
+
+        let enc = EncryptedForest::encrypt_v4(&forest, &dek, "bucket-1", 7).unwrap();
+        assert_eq!(enc.version, 4);
+        assert_eq!(enc.sequence, Some(7));
+
+        let (dec, seq) = enc.decrypt_v4(&dek, "bucket-1").unwrap();
+        assert_eq!(seq, 7);
+        assert_eq!(dec.file_count(), 1);
+    }
+
+    #[test]
+    fn test_forest_v4_wrong_bucket_fails() {
+        let dek = DekKey::generate();
+        let forest = PrivateForest::new();
+        let enc = EncryptedForest::encrypt_v4(&forest, &dek, "bucket-1", 1).unwrap();
+        let err = enc.decrypt_v4(&dek, "bucket-2");
+        assert!(err.is_err(), "decrypt with wrong bucket must fail");
+    }
+
+    #[test]
+    fn test_forest_v4_replay_tampered_sequence_fails() {
+        let dek = DekKey::generate();
+        let forest = PrivateForest::new();
+        let mut enc = EncryptedForest::encrypt_v4(&forest, &dek, "b", 5).unwrap();
+        // Server flips outer sequence to try to replay — AAD tag check must fail.
+        enc.sequence = Some(6);
+        let err = enc.decrypt_v4(&dek, "b");
+        assert!(err.is_err(), "tampered sequence must fail AAD verification");
+    }
+
+    #[test]
+    fn test_forest_v1_legacy_still_decrypts() {
+        let dek = DekKey::generate();
+        let forest = PrivateForest::new();
+        let enc = EncryptedForest::encrypt(&forest, &dek).unwrap();
+        assert_eq!(enc.version, 1);
+        assert!(enc.sequence.is_none());
+        // Legacy decrypt must still work (backward compat).
+        let _ = enc.decrypt(&dek).unwrap();
+    }
+
+    #[test]
+    fn test_manifest_v5_roundtrip_and_shard_sequences() {
+        let dek = DekKey::generate();
+        let manifest = ShardManifest::new(16).into_v5(vec![0u64; 16]);
+        let enc = EncryptedShardManifest::encrypt_v5(&manifest, &dek, "b", 3).unwrap();
+        assert_eq!(enc.version, 5);
+        assert_eq!(enc.sequence, Some(3));
+
+        let (dec, seq) = enc.decrypt_v5(&dek, "b").unwrap();
+        assert_eq!(seq, 3);
+        assert_eq!(dec.version, 5);
+        assert_eq!(dec.shard_sequences.len(), 16);
+    }
+
+    #[test]
+    fn test_manifest_v3_legacy_still_decrypts() {
+        let dek = DekKey::generate();
+        let manifest = ShardManifest::new(16);
+        let enc = EncryptedShardManifest::encrypt(&manifest, &dek).unwrap();
+        assert_eq!(enc.version, 3);
+        let _ = enc.decrypt(&dek).unwrap();
+    }
+
+    #[test]
+    fn test_shard_v2_roundtrip() {
+        let dek = DekKey::generate();
+        let mut shard = ForestShard::new(4);
+        shard.files.insert(
+            "/x".to_string(),
+            ForestFileEntry {
+                path: "/x".to_string(),
+                storage_key: "QmX".to_string(),
+                size: 1,
+                content_type: None,
+                created_at: 0,
+                modified_at: 0,
+                user_metadata: HashMap::new(),
+                content_hash: None,
+            },
+        );
+        let enc = EncryptedForestShard::encrypt_v2(&shard, &dek, "b", 11).unwrap();
+        assert_eq!(enc.version, 2);
+        assert_eq!(enc.sequence, Some(11));
+
+        let (dec, seq) = enc.decrypt_v2(&dek, "b", 4).unwrap();
+        assert_eq!(seq, 11);
+        assert_eq!(dec.shard_index, 4);
+        assert_eq!(dec.files.len(), 1);
+    }
+
+    #[test]
+    fn test_shard_v2_wrong_shard_index_fails() {
+        // If the server swaps shard j's ciphertext into a request for shard i,
+        // the AAD check (which binds the index) must detect it.
+        let dek = DekKey::generate();
+        let shard = ForestShard::new(4);
+        let enc = EncryptedForestShard::encrypt_v2(&shard, &dek, "b", 1).unwrap();
+        let err = enc.decrypt_v2(&dek, "b", 5);
+        assert!(err.is_err(), "decrypt with wrong shard_index must fail");
+    }
+
+    #[test]
+    fn test_detect_forest_format_v4_and_v5() {
+        let dek = DekKey::generate();
+
+        // v4 monolithic
+        let forest = PrivateForest::new();
+        let ef4 = EncryptedForest::encrypt_v4(&forest, &dek, "b", 1).unwrap();
+        let bytes4 = ef4.to_bytes().unwrap();
+        match detect_forest_format(&bytes4).unwrap() {
+            ForestOrManifest::Monolithic(_) => {}
+            _ => panic!("expected Monolithic for v4"),
+        }
+
+        // v5 manifest
+        let manifest = ShardManifest::new(16).into_v5(vec![0u64; 16]);
+        let em5 = EncryptedShardManifest::encrypt_v5(&manifest, &dek, "b", 1).unwrap();
+        let bytes5 = em5.to_bytes().unwrap();
+        match detect_forest_format(&bytes5).unwrap() {
+            ForestOrManifest::Manifest(_) => {}
+            _ => panic!("expected Manifest for v5"),
+        }
+    }
+
+    #[test]
+    fn test_parent_dir_for_routing() {
+        assert_eq!(parent_dir_for_routing("/a/b/c.txt"), "/a/b/");
+        assert_eq!(parent_dir_for_routing("/file.txt"), "/");
+        assert_eq!(parent_dir_for_routing("/a/b/"), "/a/b/");
+        assert_eq!(parent_dir_for_routing("/"), "/");
+        assert_eq!(parent_dir_for_routing(""), "/");
+        assert_eq!(parent_dir_for_routing("/a"), "/");
+    }
+
+    #[test]
+    fn test_shard_for_path_v6_directory_locality() {
+        let dek = DekKey::generate();
+        let salt = vec![0u8; 32];
+        let num_shards = 16;
+
+        // All files sharing the same parent directory land in the same shard.
+        let dir_a = [
+            "/dir_a/1.txt",
+            "/dir_a/2.txt",
+            "/dir_a/very_long_filename.data",
+        ];
+        let idx_a = shard_for_path_v6(dir_a[0], &dek, &salt, num_shards);
+        for path in &dir_a {
+            assert_eq!(shard_for_path_v6(path, &dek, &salt, num_shards), idx_a);
+        }
+
+        // Files in a different parent directory hash independently (may or may not
+        // differ, but over enough directories at least some differ).
+        let mut seen = std::collections::HashSet::new();
+        for d in 0..32 {
+            let p = format!("/d{}/file.txt", d);
+            seen.insert(shard_for_path_v6(&p, &dek, &salt, num_shards));
+        }
+        assert!(seen.len() > 1, "v6 routing should spread directories across shards");
+    }
+
+    #[test]
+    fn test_manifest_v6_roundtrip_and_bucket_binding() {
+        let dek = DekKey::generate();
+        let manifest = ShardManifest::new(16).into_v6(vec![1u64; 16]);
+        assert_eq!(manifest.version, 6);
+        assert_eq!(manifest.format, "sharded-v6");
+
+        let em = EncryptedShardManifest::encrypt_v6(&manifest, &dek, "bucket", 1).unwrap();
+        assert_eq!(em.version, 6);
+        assert_eq!(em.sequence, Some(1));
+
+        let (decoded, seq) = em.decrypt_v6(&dek, "bucket").unwrap();
+        assert_eq!(decoded.version, 6);
+        assert_eq!(decoded.format, "sharded-v6");
+        assert_eq!(decoded.shard_sequences, vec![1u64; 16]);
+        assert_eq!(seq, 1);
+
+        // Wrong bucket binding fails.
+        assert!(em.decrypt_v6(&dek, "other-bucket").is_err());
+        // v5 decrypt refuses a v6 ciphertext (distinct AAD prefix).
+        assert!(em.decrypt_v5(&dek, "bucket").is_err());
+    }
+
+    #[test]
+    fn test_detect_forest_format_v6() {
+        let dek = DekKey::generate();
+        let manifest = ShardManifest::new(16).into_v6(vec![0u64; 16]);
+        let em = EncryptedShardManifest::encrypt_v6(&manifest, &dek, "b", 1).unwrap();
+        let bytes = em.to_bytes().unwrap();
+        match detect_forest_format(&bytes).unwrap() {
+            ForestOrManifest::Manifest(_) => {}
+            _ => panic!("expected Manifest for v6"),
+        }
+    }
+
+    #[test]
+    fn test_from_migration_targets_v6() {
+        let dek = DekKey::generate();
+        let mut mono = PrivateForest::new();
+        for path in &["/a/x.txt", "/a/y.txt", "/b/x.txt"] {
+            let meta = PrivateMetadata::new(*path, 10);
+            let sk = mono.generate_key(path, &dek);
+            mono.upsert_file(ForestFileEntry::from_metadata(&meta, sk));
+        }
+
+        let sharded = ShardedPrivateForest::from_migration(mono, &dek, 16);
+        assert_eq!(sharded.manifest.version, 6);
+        assert_eq!(sharded.manifest.format, "sharded-v6");
+        assert!(sharded.uses_v6_routing());
+
+        // /a/x.txt and /a/y.txt must share a shard.
+        let sx = sharded.shard_for("/a/x.txt", &dek);
+        let sy = sharded.shard_for("/a/y.txt", &dek);
+        assert_eq!(sx, sy);
+    }
+
+    #[test]
+    fn test_reshard_to_v6_from_v3_preserves_files() {
+        let dek = DekKey::generate();
+        let mut sharded = ShardedPrivateForest::new(16);
+        assert_eq!(sharded.manifest.version, 3);
+        // Ensure all shards loaded for reshard.
+        for i in 0..16 {
+            sharded.set_shard(ForestShard::new(i));
+        }
+
+        for i in 0..20 {
+            let path = format!("/dir{}/file{}.txt", i % 4, i);
+            let meta = PrivateMetadata::new(&path, 10);
+            let sk = sharded.generate_key(&path, &dek);
+            sharded.upsert_file(ForestFileEntry::from_metadata(&meta, sk), &dek);
+        }
+
+        sharded.reshard_to_v6(&dek).unwrap();
+        assert_eq!(sharded.manifest.version, 6);
+        assert_eq!(sharded.file_count(), 20);
+
+        // After reshard, same-directory files share a shard.
+        let s1 = sharded.shard_for("/dir1/file1.txt", &dek);
+        let s2 = sharded.shard_for("/dir1/file5.txt", &dek);
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn test_shard_for_dir_only_for_v6() {
+        let dek = DekKey::generate();
+        let sharded_v3 = ShardedPrivateForest::new(16);
+        assert!(sharded_v3.shard_for_dir("/a/b/", &dek).is_none());
+
+        let mut sharded_v6 = ShardedPrivateForest::new(16);
+        sharded_v6.manifest.version = 6;
+        let s = sharded_v6.shard_for_dir("/a/b/", &dek).unwrap();
+        // shard_for on any file under /a/b/ must match shard_for_dir.
+        assert_eq!(s, sharded_v6.shard_for("/a/b/file.txt", &dek));
+        // Trailing-slash normalization: both forms agree.
+        assert_eq!(
+            sharded_v6.shard_for_dir("/a/b", &dek),
+            sharded_v6.shard_for_dir("/a/b/", &dek),
+        );
     }
 }

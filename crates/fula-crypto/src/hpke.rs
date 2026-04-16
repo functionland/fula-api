@@ -76,23 +76,35 @@ pub fn check_entropy() -> crate::Result<()> {
 pub const ENCAPSULATED_KEY_SIZE: usize = 32;
 
 /// HPKE configuration
+///
+/// # Fixed cipher suite
+///
+/// The HPKE implementation is hardcoded to the RFC 9180 suite
+/// `X25519HkdfSha256 + HkdfSha256 + ChaCha20Poly1305`. The [`HpkeConfig::aead`]
+/// field is **ignored** by `HpkeEncryption` and is retained only for
+/// forward-compatibility and diagnostics. Setting it to anything other than
+/// [`AeadCipher::ChaCha20Poly1305`] does not change behavior.
 #[derive(Clone, Debug, Serialize, SerdeDeserialize)]
 pub struct HpkeConfig {
-    /// The AEAD cipher preference.
+    /// Nominal AEAD cipher — **ignored by the current implementation**.
     ///
-    /// **Note:** This field is currently ignored by the HPKE encryption logic.
-    /// The actual AEAD algorithm is hardcoded to ChaCha20Poly1305 as part of the
-    /// RFC 9180 cipher suite (X25519HkdfSha256 + HkdfSha256 + ChaCha20Poly1305).
-    /// This field is retained for forward compatibility and configuration display.
+    /// The RFC 9180 suite is fixed to ChaCha20Poly1305. This field exists so
+    /// that future cipher-suite negotiation can be wired in without a schema
+    /// break. Use [`AeadCipher::ChaCha20Poly1305`] for any config that is
+    /// serialized and later inspected, to avoid misleading readers.
+    #[deprecated(
+        note = "ignored; the RFC 9180 suite is fixed to ChaCha20Poly1305 — kept for forward-compat only"
+    )]
     pub aead: AeadCipher,
     /// Key derivation context
     pub context: String,
 }
 
 impl Default for HpkeConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
-            aead: AeadCipher::Aes256Gcm,
+            aead: AeadCipher::ChaCha20Poly1305,
             context: "fula-hpke-v1".to_string(),
         }
     }
