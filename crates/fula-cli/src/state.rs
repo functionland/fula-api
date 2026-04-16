@@ -3,7 +3,6 @@
 use crate::config::GatewayConfig;
 use crate::multipart::MultipartManager;
 use blake3::Hasher;
-use dashmap::DashMap;
 use fula_blockstore::{
     FlexibleBlockStore, IpfsPinningBlockStore, IpfsPinningConfig, MemoryBlockStore,
 };
@@ -32,8 +31,6 @@ pub struct AppState {
     pub bucket_manager: Arc<BucketManager<FlexibleBlockStore>>,
     /// Multipart upload manager
     pub multipart_manager: Arc<MultipartManager>,
-    /// User session cache
-    pub sessions: Arc<DashMap<String, UserSession>>,
 }
 
 impl AppState {
@@ -111,7 +108,6 @@ impl AppState {
             block_store,
             bucket_manager,
             multipart_manager,
-            sessions: Arc::new(DashMap::new()),
         })
     }
 

@@ -115,11 +115,14 @@ pub async fn put_object(
             e
         })?;
 
-    // Persist the bucket registry so the new root CID survives restarts
-    // Use the user's JWT for pinning service authentication
-    if let Err(e) = state.bucket_manager.persist_registry_with_token(&session.jwt_token).await {
-        tracing::warn!(error = %e, "Failed to persist bucket registry after put_object");
-    }
+    // Persist the bucket registry so the new root CID survives restarts.
+    // This MUST succeed — otherwise the new tree root is lost on restart.
+    // Use the user's JWT for pinning service authentication.
+    state.bucket_manager.persist_registry_with_token(&session.jwt_token).await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to persist bucket registry after put_object — data may be lost on restart");
+            ApiError::s3(S3ErrorCode::InternalError, "Failed to persist storage index. Please retry.")
+        })?;
 
     // Pin the BUCKET ROOT CID to ensure tree structure survives GC.
     // This recursively pins all tree nodes AND all referenced object data.
@@ -467,11 +470,13 @@ pub async fn delete_object(
     bucket.delete_object(&key).await?;
     bucket.flush().await?;
 
-    // Persist the bucket registry so the updated root CID survives restarts
-    // Use the user's JWT for pinning service authentication
-    if let Err(e) = state.bucket_manager.persist_registry_with_token(&session.jwt_token).await {
-        tracing::warn!(error = %e, "Failed to persist bucket registry after delete_object");
-    }
+    // Persist the bucket registry so the updated root CID survives restarts.
+    // This MUST succeed — otherwise the delete is lost on restart.
+    state.bucket_manager.persist_registry_with_token(&session.jwt_token).await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to persist bucket registry after delete_object — change may be lost on restart");
+            ApiError::s3(S3ErrorCode::InternalError, "Failed to persist storage index. Please retry.")
+        })?;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -525,11 +530,13 @@ pub async fn copy_object(
     dest_bucket_handle.put_object(dest_key, dest_metadata.clone()).await?;
     dest_bucket_handle.flush().await?;
 
-    // Persist the bucket registry so the updated root CID survives restarts
-    // Use the user's JWT for pinning service authentication
-    if let Err(e) = state.bucket_manager.persist_registry_with_token(&session.jwt_token).await {
-        tracing::warn!(error = %e, "Failed to persist bucket registry after copy_object");
-    }
+    // Persist the bucket registry so the updated root CID survives restarts.
+    // This MUST succeed — otherwise the copy is lost on restart.
+    state.bucket_manager.persist_registry_with_token(&session.jwt_token).await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to persist bucket registry after copy_object — change may be lost on restart");
+            ApiError::s3(S3ErrorCode::InternalError, "Failed to persist storage index. Please retry.")
+        })?;
 
     let xml_response = xml::copy_object_result(
         dest_metadata.last_modified,

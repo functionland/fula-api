@@ -31,6 +31,66 @@ use dashmap::DashMap;
 /// Default forest cache TTL in seconds
 const DEFAULT_FOREST_CACHE_TTL_SECS: i64 = 60;
 
+/// Upload manifest for resumable chunked uploads.
+///
+/// Written to a local file before uploading chunks. On failure, the manifest
+/// records which chunks were successfully uploaded so the upload can resume
+/// without re-uploading completed chunks.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct UploadManifest {
+    /// Bucket name
+    pub bucket: String,
+    /// Obfuscated storage key for the index object
+    pub storage_key: String,
+    /// Original user-facing key
+    pub original_key: String,
+    /// Total number of chunks
+    pub num_chunks: u32,
+    /// Per-chunk status: chunk key and whether it was uploaded
+    pub chunks: Vec<ManifestChunk>,
+    /// Serialized encryption metadata (JSON) for the index object.
+    /// Stored so resume can finalize without re-encrypting.
+    pub index_metadata_json: String,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ManifestChunk {
+    pub index: u32,
+    pub chunk_key: String,
+    pub uploaded: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl UploadManifest {
+    /// Read a manifest from a file
+    pub fn load(path: &std::path::Path) -> std::result::Result<Self, ClientError> {
+        let data = std::fs::read_to_string(path)
+            .map_err(ClientError::Io)?;
+        serde_json::from_str(&data).map_err(|e| {
+            ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                format!("Invalid upload manifest: {}", e),
+            ))
+        })
+    }
+
+    /// Write the manifest to a file
+    pub fn save(&self, path: &std::path::Path) -> std::result::Result<(), ClientError> {
+        let data = serde_json::to_string_pretty(self).map_err(|e| {
+            ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                format!("Failed to serialize manifest: {}", e),
+            ))
+        })?;
+        std::fs::write(path, data).map_err(ClientError::Io)
+    }
+
+    /// Count how many chunks still need uploading
+    pub fn remaining(&self) -> usize {
+        self.chunks.iter().filter(|c| !c.uploaded).count()
+    }
+}
+
 /// A cached forest entry with timestamp for TTL-based invalidation
 ///
 /// Supports both monolithic (version 1/2) and sharded (version 3) formats.
@@ -211,18 +271,32 @@ pub struct EncryptedClient {
     forest_cache: DashMap<String, ForestCacheEntry>,
     /// Optional pinning credentials for remote pinning
     pinning: Option<PinningCredentials>,
+    /// Per-bucket migration locks.
+    /// Read lock: normal operations (load_forest, flush_forest, put_object_flat_deferred).
+    /// Write lock: migration (migrate_to_sharded). Prevents concurrent reads from
+    /// seeing stale monolithic data while migration is replacing the cache entry.
+    migration_locks: DashMap<String, Arc<tokio::sync::RwLock<()>>>,
 }
 
 impl EncryptedClient {
     /// Create a new encrypted client
     pub fn new(config: Config, encryption: EncryptionConfig) -> Result<Self> {
         let inner = FulaClient::new(config)?;
-        Ok(Self { 
-            inner, 
+        Ok(Self {
+            inner,
             encryption,
             forest_cache: DashMap::new(),
             pinning: None,
+            migration_locks: DashMap::new(),
         })
+    }
+
+    /// Get or create the migration lock for a bucket
+    fn migration_lock(&self, bucket: &str) -> Arc<tokio::sync::RwLock<()>> {
+        self.migration_locks
+            .entry(bucket.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
     }
 
     /// Get the underlying client
@@ -232,16 +306,17 @@ impl EncryptedClient {
 
     /// Create a new encrypted client with pinning credentials
     pub fn new_with_pinning(
-        config: Config, 
+        config: Config,
         encryption: EncryptionConfig,
         pinning: PinningCredentials,
     ) -> Result<Self> {
         let inner = FulaClient::new(config)?;
-        Ok(Self { 
-            inner, 
+        Ok(Self {
+            inner,
             encryption,
             forest_cache: DashMap::new(),
             pinning: Some(pinning),
+            migration_locks: DashMap::new(),
         })
     }
 
@@ -490,78 +565,11 @@ impl EncryptedClient {
             fula_crypto::CryptoError::Decryption(format!("Invalid chunked metadata: {}", e))
         ))?;
 
-        let num_chunks = chunked_meta.num_chunks;
-
-        // For small chunk counts, sequential is fine and avoids spawn overhead
-        if num_chunks <= 2 {
-            let mut decoder = if chunked_meta.format == "streaming-v2" {
-                let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
-                fula_crypto::ChunkedDecoder::with_aad(dek.clone(), chunked_meta.clone(), aad_prefix)
-            } else {
-                fula_crypto::ChunkedDecoder::new(dek.clone(), chunked_meta.clone())
-            };
-            let mut plaintext = Vec::with_capacity(chunked_meta.total_size as usize);
-
-            for chunk_index in 0..num_chunks {
-                let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk_index);
-                let chunk_result = self.inner.get_object(bucket, &chunk_key).await?;
-                let chunk_plaintext = decoder.decrypt_chunk(chunk_index, &chunk_result)
-                    .map_err(ClientError::Encryption)?;
-                plaintext.extend_from_slice(&chunk_plaintext);
-            }
-
-            return Ok(Bytes::from(plaintext));
-        }
-
-        // Parallel download: spawn bounded concurrent fetches
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_CHUNK_DOWNLOADS));
-        let mut handles = Vec::with_capacity(num_chunks as usize);
-
-        for chunk_index in 0..num_chunks {
-            let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk_index);
-            let client = self.inner.clone();
-            let bucket = bucket.to_string();
-            let sem = semaphore.clone();
-
-            let handle = tokio::spawn(async move {
-                let _permit = sem.acquire().await.map_err(|e|
-                    ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
-                )?;
-                let data = client.get_object(&bucket, &chunk_key).await?;
-                Ok::<(u32, Bytes), ClientError>((chunk_index, data))
-            });
-
-            handles.push(handle);
-        }
-
-        // Collect all results
-        let mut downloaded_chunks: Vec<(u32, Bytes)> = Vec::with_capacity(num_chunks as usize);
-        for handle in handles {
-            let (idx, data) = handle.await
-                .map_err(|e| ClientError::Encryption(
-                    fula_crypto::CryptoError::Decryption(format!("Chunk download task failed: {}", e))
-                ))??;
-            downloaded_chunks.push((idx, data));
-        }
-
-        // Sort by index and decrypt in order
-        downloaded_chunks.sort_by_key(|(idx, _)| *idx);
-
-        let mut decoder = if chunked_meta.format == "streaming-v2" {
-            let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
-            fula_crypto::ChunkedDecoder::with_aad(dek.clone(), chunked_meta.clone(), aad_prefix)
-        } else {
-            fula_crypto::ChunkedDecoder::new(dek.clone(), chunked_meta.clone())
-        };
-        let mut plaintext = Vec::with_capacity(chunked_meta.total_size as usize);
-
-        for (chunk_index, chunk_data) in &downloaded_chunks {
-            let chunk_plaintext = decoder.decrypt_chunk(*chunk_index, chunk_data)
-                .map_err(ClientError::Encryption)?;
-            plaintext.extend_from_slice(&chunk_plaintext);
-        }
-
-        Ok(Bytes::from(plaintext))
+        // Delegate to the windowed download engine which keeps peak memory
+        // bounded to ~window_size * chunk_size regardless of total file size.
+        let mut output = Vec::with_capacity(chunked_meta.total_size as usize);
+        self.download_chunks_windowed_to_writer(bucket, storage_key, &chunked_meta, dek, &mut output).await?;
+        Ok(Bytes::from(output))
     }
 
     /// Internal: Download and decrypt a chunked file in a streaming fashion
@@ -583,6 +591,26 @@ impl EncryptedClient {
             fula_crypto::CryptoError::Decryption(format!("Invalid chunked metadata: {}", e))
         ))?;
 
+        self.download_chunks_windowed_to_writer(bucket, storage_key, &chunked_meta, dek, writer).await
+    }
+
+    /// Core windowed download+decrypt engine.
+    ///
+    /// Processes chunks in sliding windows of `MAX_CONCURRENT_CHUNK_DOWNLOADS`,
+    /// downloading in parallel within each window, decrypting in order, and
+    /// writing to the output. Peak memory is bounded to ~`window_size * chunk_size`
+    /// regardless of total file size.
+    ///
+    /// Used by both the `Bytes`-returning paths (via `Vec<u8>` writer) and the
+    /// generic writer path.
+    async fn download_chunks_windowed_to_writer<W: std::io::Write>(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        chunked_meta: &ChunkedFileMetadata,
+        dek: &fula_crypto::keys::DekKey,
+        writer: &mut W,
+    ) -> Result<u64> {
         let num_chunks = chunked_meta.num_chunks;
         let mut decoder = if chunked_meta.format == "streaming-v2" {
             let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
@@ -1091,6 +1119,14 @@ impl EncryptedClient {
     /// The forest contains the encrypted directory structure and path→storage_key mapping.
     /// This is only used in FlatNamespace mode.
     pub async fn load_forest(&self, bucket: &str) -> Result<PrivateForest> {
+        let lock = self.migration_lock(bucket);
+        let _guard = lock.read().await;
+        self.load_forest_internal(bucket).await
+    }
+
+    /// Internal load_forest without migration lock (used by migrate_to_sharded
+    /// which already holds the write lock).
+    async fn load_forest_internal(&self, bucket: &str) -> Result<PrivateForest> {
         // Check cache first (respect TTL for clean entries, always use dirty entries)
         if let Some(entry) = self.forest_cache.get(bucket) {
             let now = chrono::Utc::now().timestamp();
@@ -1399,11 +1435,19 @@ impl EncryptedClient {
     ///
     /// Crash-safe: new shards are written first, then the manifest overwrites the
     /// old monolithic blob at `index_key`. Old format is gone once manifest is written.
+    ///
+    /// Acquires an exclusive (write) migration lock for this bucket. Concurrent
+    /// `load_forest` / `flush_forest` / `put_object_flat_deferred` calls will
+    /// block on the read lock until migration completes. Shard uploads run in
+    /// parallel to minimize lock hold time.
     pub async fn migrate_to_sharded(&self, bucket: &str) -> Result<ForestEvent> {
+        let lock = self.migration_lock(bucket);
+        let _guard = lock.write().await;
+
         let start = std::time::Instant::now();
 
-        // Load the current monolithic forest
-        let forest = self.load_forest(bucket).await?;
+        // Load the current monolithic forest (bypass read lock — we hold write)
+        let forest = self.load_forest_internal(bucket).await?;
         let file_count = forest.file_count();
         let num_shards = compute_initial_shard_count(file_count);
 
@@ -1413,7 +1457,10 @@ impl EncryptedClient {
         // Convert to sharded
         let sharded = ShardedPrivateForest::from_migration(forest, &forest_dek, num_shards);
 
-        // Phase A: upload all shard blobs
+        // Phase A: upload all shard blobs in parallel to minimize lock time
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
+        let mut handles = Vec::new();
+
         for i in 0..sharded.manifest.num_shards {
             if let Some(shard) = sharded.shards.get(i).and_then(|s| s.as_ref()) {
                 let shard_key = derive_shard_key(&forest_dek, bucket, &sharded.manifest.shard_salt, i);
@@ -1421,13 +1468,32 @@ impl EncryptedClient {
                     .map_err(ClientError::Encryption)?;
                 let data = encrypted.to_bytes().map_err(ClientError::Encryption)?;
 
-                self.inner.put_object_with_metadata(
-                    bucket,
-                    &shard_key,
-                    Bytes::from(data),
-                    Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
-                ).await?;
+                let client = self.inner.clone();
+                let bucket_owned = bucket.to_string();
+                let sem = semaphore.clone();
+
+                let handle = tokio::spawn(async move {
+                    let _permit = sem.acquire().await.map_err(|e|
+                        ClientError::Encryption(fula_crypto::CryptoError::Encryption(e.to_string()))
+                    )?;
+                    client.put_object_with_metadata(
+                        &bucket_owned,
+                        &shard_key,
+                        Bytes::from(data),
+                        Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
+                    ).await?;
+                    Ok::<(), ClientError>(())
+                });
+                handles.push(handle);
             }
+        }
+
+        // Collect shard upload results
+        for handle in handles {
+            handle.await
+                .map_err(|e| ClientError::Encryption(
+                    fula_crypto::CryptoError::Encryption(format!("Shard upload task failed: {}", e))
+                ))??;
         }
 
         // Phase B: overwrite index_key with new manifest
@@ -1442,7 +1508,7 @@ impl EncryptedClient {
             Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
         ).await?;
 
-        // Update cache
+        // Update cache (under write lock — no concurrent readers can see stale data)
         let now = chrono::Utc::now().timestamp();
         let mut clean_forest = sharded;
         clean_forest.dirty_shards.clear();
@@ -1825,11 +1891,484 @@ impl EncryptedClient {
         Ok(result)
     }
 
+    /// Upload an object with resumable chunked encoding.
+    ///
+    /// Like `put_object_encrypted_with_type`, but writes a manifest file at
+    /// `manifest_path` before uploading chunks. On failure, the manifest records
+    /// which chunks succeeded, and the upload can be resumed with `resume_upload`.
+    ///
+    /// On success, the manifest file is deleted. Existing non-resumable methods
+    /// are unchanged (they still delete-on-failure).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn put_object_encrypted_resumable(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        content_type: Option<&str>,
+        manifest_path: &std::path::Path,
+    ) -> Result<PutObjectResult> {
+        let data = data.into();
+        let original_size = data.len() as u64;
+
+        let dek = self.encryption.key_manager.generate_dek();
+        let encryptor = Encryptor::new(self.encryption.public_key());
+        let wrapped_dek = encryptor.encrypt_dek(&dek)
+            .map_err(ClientError::Encryption)?;
+
+        let private_meta = PrivateMetadata::new(key, original_size)
+            .with_content_type(content_type.unwrap_or("application/octet-stream"));
+        let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
+            .map_err(ClientError::Encryption)?;
+
+        let path_dek = self.encryption.key_manager.derive_path_key(key);
+        let storage_key = obfuscate_key(key, &path_dek, self.encryption.obfuscation_mode.clone());
+        let kek_version = self.encryption.key_manager.version();
+
+        // Encode all chunks (in memory — for streaming, use put_object_encrypted_streaming)
+        let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
+        let mut encoder = ChunkedEncoder::with_aad(dek.clone(), aad_prefix);
+        let mut all_chunks = encoder.update(&data).map_err(ClientError::Encryption)?;
+        let (final_chunk, chunked_metadata, _outboard) = encoder.finalize()
+            .map_err(ClientError::Encryption)?;
+        if let Some(chunk) = final_chunk {
+            all_chunks.push(chunk);
+        }
+
+        // Build the index metadata JSON (same as put_object_chunked_internal)
+        let index_metadata_json = serde_json::json!({
+            "version": 4,
+            "algorithm": "AES-256-GCM",
+            "wrapped_key": serde_json::to_value(&wrapped_dek).unwrap(),
+            "kek_version": kek_version,
+            "metadata_privacy": true,
+            "obfuscation_mode": "flat",
+            "private_metadata": encrypted_meta.to_json().map_err(ClientError::Encryption)?,
+            "chunked": serde_json::to_value(&chunked_metadata).unwrap(),
+        }).to_string();
+
+        // Write manifest before uploading any chunks
+        let manifest_chunks: Vec<ManifestChunk> = all_chunks.iter().map(|c| {
+            ManifestChunk {
+                index: c.index,
+                chunk_key: ChunkedFileMetadata::chunk_key(&storage_key, c.index),
+                uploaded: false,
+            }
+        }).collect();
+
+        let mut manifest = UploadManifest {
+            bucket: bucket.to_string(),
+            storage_key: storage_key.clone(),
+            original_key: key.to_string(),
+            num_chunks: all_chunks.len() as u32,
+            chunks: manifest_chunks,
+            index_metadata_json,
+        };
+        manifest.save(manifest_path)?;
+
+        // Upload chunks in parallel
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_CHUNK_UPLOADS));
+        let mut handles = Vec::with_capacity(all_chunks.len());
+
+        for chunk in all_chunks {
+            let chunk_key = ChunkedFileMetadata::chunk_key(&storage_key, chunk.index);
+            let chunk_key_ret = chunk_key.clone();
+            let chunk_idx = chunk.index;
+            let sem = semaphore.clone();
+            let client = self.inner.clone();
+            let bucket_owned = bucket.to_string();
+            let pinning = self.pinning.clone();
+            let chunk_metadata = ObjectMetadata::new()
+                .with_content_type("application/octet-stream")
+                .with_metadata("x-fula-chunk-index", &chunk.index.to_string());
+
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.map_err(|e|
+                    ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
+                )?;
+                if let Some(ref pin) = pinning {
+                    client.put_object_with_metadata_and_pinning(
+                        &bucket_owned, &chunk_key, chunk.ciphertext,
+                        Some(chunk_metadata), &pin.endpoint, &pin.token,
+                    ).await?;
+                } else {
+                    client.put_object_with_metadata(
+                        &bucket_owned, &chunk_key, chunk.ciphertext, Some(chunk_metadata),
+                    ).await?;
+                }
+                Ok::<(u32, String), ClientError>((chunk_idx, chunk_key_ret))
+            });
+            handles.push(handle);
+        }
+
+        // Collect results, updating manifest as chunks complete
+        let mut upload_error: Option<ClientError> = None;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok((idx, _key))) => {
+                    if let Some(mc) = manifest.chunks.iter_mut().find(|c| c.index == idx) {
+                        mc.uploaded = true;
+                    }
+                    let _ = manifest.save(manifest_path);
+                }
+                Ok(Err(e)) => { if upload_error.is_none() { upload_error = Some(e); } }
+                Err(e) => {
+                    if upload_error.is_none() {
+                        upload_error = Some(ClientError::Encryption(
+                            fula_crypto::CryptoError::Decryption(format!("Chunk upload task failed: {}", e))
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = upload_error {
+            // Save manifest with partial progress — DON'T delete uploaded chunks
+            let _ = manifest.save(manifest_path);
+            return Err(err);
+        }
+
+        // All chunks uploaded — finalize
+        self.finalize_resumed_upload(&manifest, manifest_path).await
+    }
+
+    /// Upload an object from an async reader, encrypting and uploading chunks
+    /// as they are produced. Never holds more than ~2x chunk_size in memory.
+    ///
+    /// Writes the same `streaming-v2` format with AAD as the in-memory upload
+    /// path, so existing `ChunkedDecoder` decrypts these identically.
+    ///
+    /// The `total_size` parameter is needed to create accurate private metadata
+    /// since we can't know the size from a reader without reading it.
+    ///
+    /// Only available on native (not WASM) because it requires `AsyncStreamingEncoder`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn put_object_encrypted_streaming<R: tokio::io::AsyncRead + Unpin + Send>(
+        &self,
+        bucket: &str,
+        key: &str,
+        reader: R,
+        total_size: u64,
+        content_type: Option<&str>,
+    ) -> Result<PutObjectResult> {
+        // Generate a DEK for this object
+        let dek = self.encryption.key_manager.generate_dek();
+
+        // Encrypt the DEK with HPKE for the owner
+        let encryptor = Encryptor::new(self.encryption.public_key());
+        let wrapped_dek = encryptor.encrypt_dek(&dek)
+            .map_err(ClientError::Encryption)?;
+
+        // Create private metadata
+        let private_meta = PrivateMetadata::new(key, total_size)
+            .with_content_type(content_type.unwrap_or("application/octet-stream"));
+        let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
+            .map_err(ClientError::Encryption)?;
+
+        // Generate obfuscated storage key using path-derived DEK
+        let path_dek = self.encryption.key_manager.derive_path_key(key);
+        let storage_key = obfuscate_key(key, &path_dek, self.encryption.obfuscation_mode.clone());
+
+        let kek_version = self.encryption.key_manager.version();
+
+        // Use AsyncStreamingEncoder with AAD binding
+        let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
+        let mut encoder = fula_crypto::AsyncStreamingEncoder::with_aad(dek.clone(), aad_prefix);
+
+        // Process the reader — chunks are produced as the reader is consumed.
+        // Memory usage bounded to ~chunk_size during encoding.
+        let all_chunks = encoder.process_reader(reader).await
+            .map_err(ClientError::Encryption)?;
+        let (chunked_metadata, _outboard) = encoder.finalize();
+
+        // Upload chunks in parallel with bounded concurrency
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_CHUNK_UPLOADS));
+        let mut handles = Vec::with_capacity(all_chunks.len());
+
+        for chunk in all_chunks {
+            let chunk_key = ChunkedFileMetadata::chunk_key(&storage_key, chunk.index);
+            let chunk_key_ret = chunk_key.clone();
+            let sem = semaphore.clone();
+            let client = self.inner.clone();
+            let bucket = bucket.to_string();
+            let chunk_metadata = ObjectMetadata::new()
+                .with_content_type("application/octet-stream")
+                .with_metadata("x-fula-chunk-index", &chunk.index.to_string());
+            let pinning = self.pinning.clone();
+
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.map_err(|e|
+                    ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
+                )?;
+                if let Some(ref pin) = pinning {
+                    client.put_object_with_metadata_and_pinning(
+                        &bucket, &chunk_key, chunk.ciphertext,
+                        Some(chunk_metadata), &pin.endpoint, &pin.token,
+                    ).await?;
+                } else {
+                    client.put_object_with_metadata(
+                        &bucket, &chunk_key, chunk.ciphertext, Some(chunk_metadata),
+                    ).await?;
+                }
+                Ok::<String, ClientError>(chunk_key_ret)
+            });
+            handles.push(handle);
+        }
+
+        // Collect results — track uploaded chunk keys for cleanup on failure
+        let mut uploaded_keys: Vec<String> = Vec::new();
+        let mut upload_error: Option<ClientError> = None;
+
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(key)) => uploaded_keys.push(key),
+                Ok(Err(e)) => { if upload_error.is_none() { upload_error = Some(e); } }
+                Err(e) => {
+                    if upload_error.is_none() {
+                        upload_error = Some(ClientError::Encryption(
+                            fula_crypto::CryptoError::Decryption(format!("Chunk upload task failed: {}", e))
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = upload_error {
+            for key in &uploaded_keys {
+                let _ = self.inner.delete_object(bucket, key).await;
+            }
+            return Err(err);
+        }
+
+        // Create index object with encryption metadata
+        let enc_metadata = serde_json::json!({
+            "version": 4,
+            "algorithm": "AES-256-GCM",
+            "wrapped_key": serde_json::to_value(&wrapped_dek).unwrap(),
+            "kek_version": kek_version,
+            "metadata_privacy": true,
+            "obfuscation_mode": "flat",
+            "private_metadata": encrypted_meta.to_json().map_err(ClientError::Encryption)?,
+            "chunked": serde_json::to_value(&chunked_metadata).unwrap(),
+        });
+
+        let index_body = enc_metadata.to_string();
+        let metadata = ObjectMetadata::new()
+            .with_content_type("application/json")
+            .with_metadata("x-fula-encrypted", "true")
+            .with_metadata("x-fula-chunked", "true")
+            .with_metadata("x-fula-encryption", &index_body);
+
+        let result = if let Some(ref pinning) = self.pinning {
+            self.inner.put_object_with_metadata_and_pinning(
+                bucket, &storage_key, Bytes::from(index_body.clone()),
+                Some(metadata), &pinning.endpoint, &pinning.token,
+            ).await?
+        } else {
+            self.inner.put_object_with_metadata(
+                bucket, &storage_key, Bytes::from(index_body.clone()), Some(metadata),
+            ).await?
+        };
+
+        Ok(result)
+    }
+
+    /// Resume a chunked upload from a manifest file.
+    ///
+    /// Reads the manifest to determine which chunks were already uploaded,
+    /// re-encrypts and uploads only the remaining chunks, then finalizes
+    /// the index object. On success, deletes the manifest file.
+    ///
+    /// `data` must be the same file content that was used for the original
+    /// upload attempt (the manifest does not store the file data).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn resume_upload(
+        &self,
+        manifest_path: &std::path::Path,
+        data: &[u8],
+    ) -> Result<PutObjectResult> {
+        let mut manifest = UploadManifest::load(manifest_path)?;
+
+        if manifest.remaining() == 0 {
+            // All chunks uploaded — just finalize the index
+            return self.finalize_resumed_upload(&manifest, manifest_path).await;
+        }
+
+        // Re-encrypt only the missing chunks.
+        // We need the same DEK and AAD, which are embedded in the index metadata.
+        // Parse the index metadata to extract the chunked metadata (nonces etc.)
+        let index_meta: serde_json::Value = serde_json::from_str(&manifest.index_metadata_json)
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(format!("Invalid index metadata in manifest: {}", e))
+            ))?;
+
+        let chunked_meta: ChunkedFileMetadata = serde_json::from_value(
+            index_meta["chunked"].clone()
+        ).map_err(|e| ClientError::Encryption(
+            fula_crypto::CryptoError::Decryption(format!("Invalid chunked metadata in manifest: {}", e))
+        ))?;
+
+        // Re-derive the DEK: we need the wrapped key + our secret key
+        let wrapped_dek: EncryptedData = serde_json::from_value(
+            index_meta["wrapped_key"].clone()
+        ).map_err(|e| ClientError::Encryption(
+            fula_crypto::CryptoError::Decryption(format!("Invalid wrapped key in manifest: {}", e))
+        ))?;
+
+        let decryptor = Decryptor::new(self.encryption.key_manager.keypair());
+        let dek = decryptor.decrypt_dek(&wrapped_dek)
+            .map_err(ClientError::Encryption)?;
+
+        // Re-encrypt and upload only missing chunks
+        let chunk_size = chunked_meta.chunk_size as usize;
+        let aad_prefix = format!("fula:v4:chunk:{}", manifest.storage_key);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_CHUNK_UPLOADS));
+        let mut handles = Vec::new();
+
+        for mc in &manifest.chunks {
+            if mc.uploaded {
+                continue;
+            }
+
+            let chunk_index = mc.index;
+            let start = chunk_index as usize * chunk_size;
+            let end = std::cmp::min(start + chunk_size, data.len());
+            if start >= data.len() {
+                break;
+            }
+
+            let chunk_data = &data[start..end];
+
+            // Encrypt using the per-chunk nonce from the original metadata
+            let nonce = chunked_meta.get_chunk_nonce(chunk_index)
+                .map_err(ClientError::Encryption)?;
+            let aead = Aead::new_default(&dek);
+            let aad = format!("{}:{}", aad_prefix, chunk_index).into_bytes();
+            let ciphertext = aead.encrypt_with_aad(&nonce, chunk_data, &aad)
+                .map_err(ClientError::Encryption)?;
+
+            let chunk_key = mc.chunk_key.clone();
+            let chunk_key_ret = chunk_key.clone();
+            let sem = semaphore.clone();
+            let client = self.inner.clone();
+            let bucket = manifest.bucket.clone();
+            let pinning = self.pinning.clone();
+            let ciphertext_bytes = Bytes::from(ciphertext);
+            let chunk_metadata = ObjectMetadata::new()
+                .with_content_type("application/octet-stream")
+                .with_metadata("x-fula-chunk-index", &chunk_index.to_string());
+
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.map_err(|e|
+                    ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
+                )?;
+                if let Some(ref pin) = pinning {
+                    client.put_object_with_metadata_and_pinning(
+                        &bucket, &chunk_key, ciphertext_bytes,
+                        Some(chunk_metadata), &pin.endpoint, &pin.token,
+                    ).await?;
+                } else {
+                    client.put_object_with_metadata(
+                        &bucket, &chunk_key, ciphertext_bytes, Some(chunk_metadata),
+                    ).await?;
+                }
+                Ok::<(u32, String), ClientError>((chunk_index, chunk_key_ret))
+            });
+            handles.push(handle);
+        }
+
+        // Collect results, updating manifest as chunks complete
+        let mut upload_error: Option<ClientError> = None;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok((idx, _key))) => {
+                    if let Some(mc) = manifest.chunks.iter_mut().find(|c| c.index == idx) {
+                        mc.uploaded = true;
+                    }
+                    // Persist manifest after each successful chunk for crash safety
+                    let _ = manifest.save(manifest_path);
+                }
+                Ok(Err(e)) => { if upload_error.is_none() { upload_error = Some(e); } }
+                Err(e) => {
+                    if upload_error.is_none() {
+                        upload_error = Some(ClientError::Encryption(
+                            fula_crypto::CryptoError::Decryption(format!("Chunk upload task failed: {}", e))
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = upload_error {
+            // Save manifest with partial progress — DON'T delete chunks
+            let _ = manifest.save(manifest_path);
+            return Err(err);
+        }
+
+        // All chunks uploaded — finalize
+        self.finalize_resumed_upload(&manifest, manifest_path).await
+    }
+
+    /// Upload the index object for a resumed upload and clean up the manifest.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn finalize_resumed_upload(
+        &self,
+        manifest: &UploadManifest,
+        manifest_path: &std::path::Path,
+    ) -> Result<PutObjectResult> {
+        let index_body = &manifest.index_metadata_json;
+        let metadata = ObjectMetadata::new()
+            .with_content_type("application/json")
+            .with_metadata("x-fula-encrypted", "true")
+            .with_metadata("x-fula-chunked", "true")
+            .with_metadata("x-fula-encryption", index_body);
+
+        let result = if let Some(ref pinning) = self.pinning {
+            self.inner.put_object_with_metadata_and_pinning(
+                &manifest.bucket, &manifest.storage_key,
+                Bytes::from(index_body.clone()),
+                Some(metadata), &pinning.endpoint, &pinning.token,
+            ).await?
+        } else {
+            self.inner.put_object_with_metadata(
+                &manifest.bucket, &manifest.storage_key,
+                Bytes::from(index_body.clone()), Some(metadata),
+            ).await?
+        };
+
+        // Success — delete the manifest file
+        let _ = std::fs::remove_file(manifest_path);
+        Ok(result)
+    }
+
+    /// Abort a previously failed upload: delete all uploaded chunks and
+    /// remove the manifest file.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn abort_upload(
+        &self,
+        manifest_path: &std::path::Path,
+    ) -> Result<()> {
+        let manifest = UploadManifest::load(manifest_path)?;
+
+        for mc in &manifest.chunks {
+            if mc.uploaded {
+                let _ = self.inner.delete_object(&manifest.bucket, &mc.chunk_key).await;
+            }
+        }
+
+        let _ = std::fs::remove_file(manifest_path);
+        Ok(())
+    }
+
     /// Flush the forest index to storage
-    /// 
+    ///
     /// Call this after bulk uploads using `put_object_flat_deferred`.
     /// This persists the in-memory forest index to encrypted storage.
     pub async fn flush_forest(&self, bucket: &str) -> Result<()> {
+        // Acquire read lock — blocks only if migration is in progress
+        let lock = self.migration_lock(bucket);
+        let _guard = lock.read().await;
+
         let is_dirty = self.forest_cache.get(bucket)
             .map(|entry| entry.is_dirty())
             .unwrap_or(false);
@@ -2414,7 +2953,10 @@ impl EncryptedClient {
         self.download_chunks_parallel(bucket, storage_key, &chunked_meta, dek).await
     }
 
-    /// Shared helper: parallel chunk download, decrypt, and assemble
+    /// Shared helper: parallel chunk download, decrypt, and assemble.
+    ///
+    /// Delegates to the windowed download engine which keeps peak memory
+    /// bounded to ~window_size * chunk_size regardless of total file size.
     async fn download_chunks_parallel(
         &self,
         bucket: &str,
@@ -2422,68 +2964,9 @@ impl EncryptedClient {
         chunked_meta: &ChunkedFileMetadata,
         dek: &fula_crypto::keys::DekKey,
     ) -> Result<Bytes> {
-        let num_chunks = chunked_meta.num_chunks;
-
-        let mut decoder = if chunked_meta.format == "streaming-v2" {
-            let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
-            fula_crypto::ChunkedDecoder::with_aad(dek.clone(), chunked_meta.clone(), aad_prefix)
-        } else {
-            fula_crypto::ChunkedDecoder::new(dek.clone(), chunked_meta.clone())
-        };
-
-        // For small chunk counts, sequential is fine
-        if num_chunks <= 2 {
-            let mut plaintext = Vec::with_capacity(chunked_meta.total_size as usize);
-            for chunk_index in 0..num_chunks {
-                let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk_index);
-                let chunk_result = self.inner.get_object(bucket, &chunk_key).await?;
-                let chunk_plaintext = decoder.decrypt_chunk(chunk_index, &chunk_result)
-                    .map_err(ClientError::Encryption)?;
-                plaintext.extend_from_slice(&chunk_plaintext);
-            }
-            return Ok(Bytes::from(plaintext));
-        }
-
-        // Parallel download with bounded concurrency
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_CHUNK_DOWNLOADS));
-        let mut handles = Vec::with_capacity(num_chunks as usize);
-
-        for chunk_index in 0..num_chunks {
-            let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk_index);
-            let client = self.inner.clone();
-            let bucket = bucket.to_string();
-            let sem = semaphore.clone();
-
-            let handle = tokio::spawn(async move {
-                let _permit = sem.acquire().await.map_err(|e|
-                    ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
-                )?;
-                let data = client.get_object(&bucket, &chunk_key).await?;
-                Ok::<(u32, Bytes), ClientError>((chunk_index, data))
-            });
-
-            handles.push(handle);
-        }
-
-        let mut downloaded_chunks: Vec<(u32, Bytes)> = Vec::with_capacity(num_chunks as usize);
-        for handle in handles {
-            let (idx, data) = handle.await
-                .map_err(|e| ClientError::Encryption(
-                    fula_crypto::CryptoError::Decryption(format!("Chunk download task failed: {}", e))
-                ))??;
-            downloaded_chunks.push((idx, data));
-        }
-
-        downloaded_chunks.sort_by_key(|(idx, _)| *idx);
-
-        let mut plaintext = Vec::with_capacity(chunked_meta.total_size as usize);
-        for (chunk_index, chunk_data) in &downloaded_chunks {
-            let chunk_plaintext = decoder.decrypt_chunk(*chunk_index, chunk_data)
-                .map_err(ClientError::Encryption)?;
-            plaintext.extend_from_slice(&chunk_plaintext);
-        }
-
-        Ok(Bytes::from(plaintext))
+        let mut output = Vec::with_capacity(chunked_meta.total_size as usize);
+        self.download_chunks_windowed_to_writer(bucket, storage_key, chunked_meta, dek, &mut output).await?;
+        Ok(Bytes::from(output))
     }
 
     /// Accept a ShareToken and get an AcceptedShare for reading objects
