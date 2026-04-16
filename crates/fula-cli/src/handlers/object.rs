@@ -51,6 +51,44 @@ pub async fn put_object(
         None => body,
     };
 
+    // Open bucket first so conditional-write guards can consult the current
+    // stored ETag without doing extra I/O later. (Moved ahead of put_block.)
+    tracing::debug!(bucket = %bucket_name, "Opening user-scoped bucket");
+    let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await
+        .map_err(|e| {
+            tracing::error!(error = %e, bucket = %bucket_name, "Failed to open bucket");
+            e
+        })?;
+
+    // RFC 7232 conditional-write preconditions. Used by fula-client forest
+    // flush to catch concurrent writers (surfaces as ClientError::Concurrent
+    // Modification on 412). Checked before put_block to avoid an orphan
+    // block when the precondition fails.
+    //
+    // NOTE: This is a best-effort check — get_object + put_object are not
+    // atomic under concurrent PUTs on the same key (each request opens its
+    // own bucket snapshot). The client's retry-on-412 loop handles the
+    // residual commit-window race.
+    let existing = bucket.get_object(&key).await?;
+    let current_etag: Option<&str> = existing.as_ref().map(|m| m.etag.as_str());
+
+    if let Some(h) = headers.get("If-Match").and_then(|v| v.to_str().ok()) {
+        if !match_if_match(h, current_etag) {
+            return Err(ApiError::s3(
+                S3ErrorCode::PreconditionFailed,
+                "If-Match precondition failed",
+            ));
+        }
+    }
+    if let Some(h) = headers.get("If-None-Match").and_then(|v| v.to_str().ok()) {
+        if !match_if_none_match(h, current_etag) {
+            return Err(ApiError::s3(
+                S3ErrorCode::PreconditionFailed,
+                "If-None-Match precondition failed",
+            ));
+        }
+    }
+
     // Store the data
     let cid = state.block_store.put_block(&body).await?;
 
@@ -92,14 +130,6 @@ pub async fn put_object(
             }
         }
     }
-
-    // Store in bucket (user-scoped)
-    tracing::debug!(bucket = %bucket_name, "Opening user-scoped bucket");
-    let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await
-        .map_err(|e| {
-            tracing::error!(error = %e, bucket = %bucket_name, "Failed to open bucket");
-            e
-        })?;
 
     tracing::debug!(key = %key, "Storing object metadata");
     bucket.put_object(key.clone(), metadata).await
@@ -604,4 +634,105 @@ pub async fn copy_object(
         [("Content-Type", "application/xml")],
         xml_response,
     ).into_response())
+}
+
+// ============================================================================
+// RFC 7232 conditional-write helpers (If-Match / If-None-Match)
+// ============================================================================
+//
+// S3 subset: strong ETags only. Weak validators (`W/"..."`) are rejected.
+// Stored ETags are un-quoted CID strings (see ObjectMetadata::new); client
+// sends quoted values, so parse_etag_list strips quotes before comparison.
+
+/// RFC 7232 §3.1. True iff the If-Match precondition is satisfied.
+pub(crate) fn match_if_match(header: &str, current: Option<&str>) -> bool {
+    let h = header.trim();
+    if h == "*" {
+        return current.is_some();
+    }
+    let Some(cur) = current else { return false; };
+    parse_etag_list(h).any(|t| t == cur)
+}
+
+/// RFC 7232 §3.2. True iff the If-None-Match precondition is satisfied.
+pub(crate) fn match_if_none_match(header: &str, current: Option<&str>) -> bool {
+    let h = header.trim();
+    if h == "*" {
+        return current.is_none();
+    }
+    let Some(cur) = current else { return true; };
+    !parse_etag_list(h).any(|t| t == cur)
+}
+
+/// Parse a comma-separated list of strong quoted ETags. Weak validators
+/// (`W/"..."`) and unquoted tokens are silently skipped.
+fn parse_etag_list(s: &str) -> impl Iterator<Item = String> + '_ {
+    s.split(',').filter_map(|tok| {
+        let t = tok.trim();
+        if t.starts_with("W/") || t.starts_with("w/") {
+            return None;
+        }
+        let t = t.strip_prefix('"')?.strip_suffix('"')?;
+        Some(t.to_string())
+    })
+}
+
+#[cfg(test)]
+mod conditional_tests {
+    use super::{match_if_match, match_if_none_match};
+
+    #[test]
+    fn if_match_star_requires_existing() {
+        assert!(match_if_match("*", Some("abc")));
+        assert!(!match_if_match("*", None));
+    }
+
+    #[test]
+    fn if_none_match_star_requires_absent() {
+        assert!(!match_if_none_match("*", Some("abc")));
+        assert!(match_if_none_match("*", None));
+    }
+
+    #[test]
+    fn if_match_single_tag() {
+        assert!(match_if_match("\"abc\"", Some("abc")));
+        assert!(!match_if_match("\"abc\"", Some("xyz")));
+        assert!(!match_if_match("\"abc\"", None));
+    }
+
+    #[test]
+    fn if_none_match_single_tag() {
+        assert!(!match_if_none_match("\"abc\"", Some("abc")));
+        assert!(match_if_none_match("\"abc\"", Some("xyz")));
+        assert!(match_if_none_match("\"abc\"", None));
+    }
+
+    #[test]
+    fn etag_list_any_matches() {
+        assert!(match_if_match("\"a\", \"b\"", Some("b")));
+        assert!(!match_if_match("\"a\", \"b\"", Some("c")));
+        assert!(!match_if_none_match("\"a\", \"b\"", Some("a")));
+    }
+
+    #[test]
+    fn weak_etag_rejected() {
+        // Weak validators are filtered out — neither If-Match nor If-None-Match
+        // can satisfy against them.
+        assert!(!match_if_match("W/\"abc\"", Some("abc")));
+        // If-None-Match with no valid tags in list vs an existing etag:
+        // parse_etag_list returns empty, so .any() is false, so !false = true.
+        assert!(match_if_none_match("W/\"abc\"", Some("abc")));
+    }
+
+    #[test]
+    fn empty_or_whitespace_header() {
+        assert!(!match_if_match("", Some("abc")));
+        assert!(match_if_none_match("", Some("abc")));
+        assert!(!match_if_match("   ", Some("abc")));
+    }
+
+    #[test]
+    fn handles_surrounding_whitespace_in_list() {
+        assert!(match_if_match("  \"x\"  ,  \"y\"  ", Some("y")));
+    }
 }

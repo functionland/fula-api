@@ -108,7 +108,11 @@ impl S3ErrorCode {
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::NoSuchBucket | Self::NoSuchKey | Self::NoSuchUpload => StatusCode::NOT_FOUND,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
-            Self::OperationAborted | Self::PreconditionFailed => StatusCode::CONFLICT,
+            Self::OperationAborted => StatusCode::CONFLICT,
+            // RFC 7232 §4.2 — If-Match / If-None-Match precondition failures
+            // map to 412. The client (fula-client) explicitly checks for 412
+            // to surface ConcurrentModification.
+            Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::RequestTimeTooSkewed => StatusCode::FORBIDDEN,
             Self::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -178,6 +182,11 @@ impl ApiError {
                 fula_core::CoreError::ObjectNotFound { .. } => S3ErrorCode::NoSuchKey,
                 fula_core::CoreError::InvalidBucketName(_) => S3ErrorCode::InvalidBucketName,
                 fula_core::CoreError::AccessDenied(_) => S3ErrorCode::AccessDenied,
+                // INVARIANT: CoreError::PreconditionFailed comes only from
+                // delete_bucket's non-empty check today, so it remaps to the
+                // BucketNotEmpty S3 code (409). If a new caller emits
+                // CoreError::PreconditionFailed for a different reason, route
+                // it through a distinct S3ErrorCode instead.
                 fula_core::CoreError::PreconditionFailed(_) => S3ErrorCode::BucketNotEmpty,
                 _ => S3ErrorCode::InternalError,
             },
