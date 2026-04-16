@@ -1980,6 +1980,7 @@ fn wire__crate__api__sharing__get_with_share_impl(
     >,
     bucket: impl CstDecode<String>,
     storage_key: impl CstDecode<String>,
+    original_key: impl CstDecode<String>,
     share: impl CstDecode<
         RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<AcceptedShareHandle>>,
     >,
@@ -1994,6 +1995,7 @@ fn wire__crate__api__sharing__get_with_share_impl(
             let api_client = client.cst_decode();
             let api_bucket = bucket.cst_decode();
             let api_storage_key = storage_key.cst_decode();
+            let api_original_key = original_key.cst_decode();
             let api_share = share.cst_decode();
             move |context| async move {
                 transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
@@ -2032,6 +2034,7 @@ fn wire__crate__api__sharing__get_with_share_impl(
                             &*api_client_guard,
                             api_bucket,
                             api_storage_key,
+                            api_original_key,
                             &*api_share_guard,
                         )
                         .await?;
@@ -2052,6 +2055,7 @@ fn wire__crate__api__sharing__get_with_token_impl(
     >,
     bucket: impl CstDecode<String>,
     storage_key: impl CstDecode<String>,
+    original_key: impl CstDecode<String>,
     token_json: impl CstDecode<String>,
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
@@ -2064,6 +2068,7 @@ fn wire__crate__api__sharing__get_with_token_impl(
             let api_client = client.cst_decode();
             let api_bucket = bucket.cst_decode();
             let api_storage_key = storage_key.cst_decode();
+            let api_original_key = original_key.cst_decode();
             let api_token_json = token_json.cst_decode();
             move |context| async move {
                 transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
@@ -2091,6 +2096,7 @@ fn wire__crate__api__sharing__get_with_token_impl(
                             &*api_client_guard,
                             api_bucket,
                             api_storage_key,
+                            api_original_key,
                             api_token_json,
                         )
                         .await?;
@@ -7198,9 +7204,10 @@ mod io {
         client: usize,
         bucket: *mut wire_cst_list_prim_u_8_strict,
         storage_key: *mut wire_cst_list_prim_u_8_strict,
+        original_key: *mut wire_cst_list_prim_u_8_strict,
         share: usize,
     ) {
-        wire__crate__api__sharing__get_with_share_impl(port_, client, bucket, storage_key, share)
+        wire__crate__api__sharing__get_with_share_impl(port_, client, bucket, storage_key, original_key, share)
     }
 
     #[unsafe(no_mangle)]
@@ -7209,6 +7216,7 @@ mod io {
         client: usize,
         bucket: *mut wire_cst_list_prim_u_8_strict,
         storage_key: *mut wire_cst_list_prim_u_8_strict,
+        original_key: *mut wire_cst_list_prim_u_8_strict,
         token_json: *mut wire_cst_list_prim_u_8_strict,
     ) {
         wire__crate__api__sharing__get_with_token_impl(
@@ -7216,6 +7224,7 @@ mod io {
             client,
             bucket,
             storage_key,
+            original_key,
             token_json,
         )
     }
@@ -9464,9 +9473,10 @@ mod web {
         client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
         bucket: String,
         storage_key: String,
+        original_key: String,
         share: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
     ) {
-        wire__crate__api__sharing__get_with_share_impl(port_, client, bucket, storage_key, share)
+        wire__crate__api__sharing__get_with_share_impl(port_, client, bucket, storage_key, original_key, share)
     }
 
     #[wasm_bindgen]
@@ -9475,6 +9485,7 @@ mod web {
         client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
         bucket: String,
         storage_key: String,
+        original_key: String,
         token_json: String,
     ) {
         wire__crate__api__sharing__get_with_token_impl(
@@ -9482,6 +9493,7 @@ mod web {
             client,
             bucket,
             storage_key,
+            original_key,
             token_json,
         )
     }

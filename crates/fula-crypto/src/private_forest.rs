@@ -223,6 +223,20 @@ mod hex_serde {
 const HAMT_MIGRATION_THRESHOLD: usize = 1000;
 
 impl PrivateForest {
+    /// Normalize a directory path for consistent HashMap lookups.
+    /// Strips trailing slash (except for root "/") and ensures leading slash.
+    fn normalize_dir_path(dir_path: &str) -> String {
+        if dir_path.is_empty() || dir_path == "/" {
+            return "/".to_string();
+        }
+        let trimmed = dir_path.trim_end_matches('/');
+        if trimmed.starts_with('/') {
+            trimmed.to_string()
+        } else {
+            format!("/{}", trimmed)
+        }
+    }
+
     /// Create a new empty private forest (FlatMapV1 format)
     pub fn new() -> Self {
         Self::with_format(ForestFormat::FlatMapV1)
@@ -459,13 +473,7 @@ impl PrivateForest {
 
     /// List files in a directory (non-recursive)
     pub fn list_directory(&self, dir_path: &str) -> Vec<&ForestFileEntry> {
-        let normalized = if dir_path.is_empty() || dir_path == "/" {
-            "/".to_string()
-        } else if dir_path.starts_with('/') {
-            dir_path.to_string()
-        } else {
-            format!("/{}", dir_path)
-        };
+        let normalized = Self::normalize_dir_path(dir_path);
 
         if let Some(dir) = self.directories.get(&normalized) {
             dir.files.iter()
@@ -478,13 +486,7 @@ impl PrivateForest {
 
     /// List subdirectories of a directory
     pub fn list_subdirs(&self, dir_path: &str) -> Vec<&str> {
-        let normalized = if dir_path.is_empty() || dir_path == "/" {
-            "/".to_string()
-        } else if dir_path.starts_with('/') {
-            dir_path.to_string()
-        } else {
-            format!("/{}", dir_path)
-        };
+        let normalized = Self::normalize_dir_path(dir_path);
 
         if let Some(dir) = self.directories.get(&normalized) {
             dir.subdirs.iter().map(|s| s.as_str()).collect()
