@@ -413,6 +413,7 @@ mod forest_cache_dirty_protection {
             modified_at: now,
             content_hash: None,
             user_metadata: HashMap::new(),
+            encrypted: false,
         };
 
         forest.upsert_file(entry);
@@ -444,6 +445,7 @@ mod forest_cache_dirty_protection {
                 modified_at: now,
                 content_hash: None,
                 user_metadata: HashMap::new(),
+                encrypted: false,
             };
             forest.upsert_file(entry);
         }
@@ -484,6 +486,7 @@ mod forest_cache_dirty_protection {
             modified_at: now,
             content_hash: None,
             user_metadata: HashMap::new(),
+            encrypted: false,
         };
         forest.upsert_file(entry);
         assert_eq!(forest.file_count(), 1);
@@ -796,6 +799,7 @@ mod forest_format_compat {
             modified_at: now,
             content_hash: None,
             user_metadata: HashMap::new(),
+            encrypted: false,
         });
 
         let encrypted = EncryptedForest::encrypt(&forest, &dek).unwrap();
@@ -826,6 +830,7 @@ mod forest_format_compat {
                 modified_at: now,
                 content_hash: None,
                 user_metadata: HashMap::new(),
+                encrypted: false,
             });
         }
 
@@ -1158,6 +1163,7 @@ mod realistic_environment {
             modified_at: now,
             content_hash: None,
             user_metadata: HashMap::new(),
+            encrypted: false,
         });
 
         // 3. Save (encrypt + serialize) — this is what "flush" does
@@ -1180,6 +1186,7 @@ mod realistic_environment {
             modified_at: now,
             content_hash: None,
             user_metadata: HashMap::new(),
+            encrypted: false,
         });
         assert_eq!(loaded.file_count(), 2);
 

@@ -126,10 +126,22 @@ pub struct ForestFileEntry {
     /// User metadata
     #[serde(default)]
     pub user_metadata: HashMap<String, String>,
+    /// Whether the underlying object MUST be fetched via the encrypted
+    /// download path. `true` for new encrypted uploads; legacy entries
+    /// deserialize as `false` via `#[serde(default)]`. The client uses this
+    /// to reject a malicious storage backend that returns
+    /// `x-fula-encrypted: false` for a path that was uploaded encrypted
+    /// (audit finding C-AUDIT-004).
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 impl ForestFileEntry {
-    /// Create from private metadata and storage key
+    /// Create from private metadata and storage key.
+    ///
+    /// Callers that created this entry in response to a successful encrypted
+    /// upload should call `mark_encrypted()` afterwards so later reads can
+    /// enforce that the object is not served in plaintext.
     pub fn from_metadata(metadata: &PrivateMetadata, storage_key: String) -> Self {
         Self {
             path: metadata.original_key.clone(),
@@ -140,7 +152,15 @@ impl ForestFileEntry {
             modified_at: metadata.modified_at,
             content_hash: metadata.content_hash.clone(),
             user_metadata: metadata.user_metadata.clone(),
+            encrypted: false,
         }
+    }
+
+    /// Mark this entry as "must be fetched encrypted". Used by the client
+    /// immediately after a successful encrypted PUT so future reads can
+    /// refuse to accept a plaintext response from the storage backend.
+    pub fn mark_encrypted(&mut self) {
+        self.encrypted = true;
     }
 
     /// Get filename from path
@@ -2224,6 +2244,7 @@ mod tests {
             modified_at: 2000,
             user_metadata: HashMap::new(),
             content_hash: None,
+            encrypted: false,
         });
 
         let encrypted = EncryptedForestShard::encrypt(&shard, &dek).unwrap();
@@ -2299,6 +2320,7 @@ mod tests {
             modified_at: 1000,
             user_metadata: HashMap::new(),
             content_hash: None,
+            encrypted: false,
         };
 
         forest.upsert_file(entry.clone(), &dek);
@@ -2322,6 +2344,7 @@ mod tests {
             modified_at: 1000,
             user_metadata: HashMap::new(),
             content_hash: None,
+            encrypted: false,
         };
 
         forest.upsert_file(entry, &dek);
@@ -2349,6 +2372,7 @@ mod tests {
                 modified_at: 2000,
                 user_metadata: HashMap::new(),
                 content_hash: None,
+                encrypted: false,
             });
         }
 
@@ -2383,6 +2407,7 @@ mod tests {
                 modified_at: 1000,
                 user_metadata: HashMap::new(),
                 content_hash: None,
+                encrypted: false,
             }, &dek);
         }
 
@@ -2410,6 +2435,7 @@ mod tests {
                 modified_at: 1000,
                 user_metadata: HashMap::new(),
                 content_hash: None,
+                encrypted: false,
             }, &dek);
         }
 
@@ -2467,6 +2493,7 @@ mod tests {
                     modified_at: 1000,
                     user_metadata: HashMap::new(),
                     content_hash: None,
+                    encrypted: false,
                 }, &dek);
                 if forest.max_shard_size() > RESHARD_THRESHOLD {
                     break;
@@ -2506,6 +2533,7 @@ mod tests {
                 modified_at: 1000,
                 user_metadata: HashMap::new(),
                 content_hash: None,
+                encrypted: false,
             }, &dek);
         }
 
@@ -2530,6 +2558,7 @@ mod tests {
                 modified_at: 1000,
                 user_metadata: HashMap::new(),
                 content_hash: None,
+                encrypted: false,
             }, &dek);
         }
         for i in 0..5 {
@@ -2542,6 +2571,7 @@ mod tests {
                 modified_at: 1000,
                 user_metadata: HashMap::new(),
                 content_hash: None,
+                encrypted: false,
             }, &dek);
         }
 
@@ -2595,6 +2625,7 @@ mod tests {
                 modified_at: 1000,
                 user_metadata: HashMap::new(),
                 content_hash: None,
+                encrypted: false,
             }, &dek);
         }
         for i in 0..5 {
@@ -2607,6 +2638,7 @@ mod tests {
                 modified_at: 1000,
                 user_metadata: HashMap::new(),
                 content_hash: None,
+                encrypted: false,
             }, &dek);
         }
 
@@ -2634,6 +2666,7 @@ mod tests {
             modified_at: 0,
             user_metadata: HashMap::new(),
             content_hash: None,
+            encrypted: false,
         });
 
         let enc = EncryptedForest::encrypt_v4(&forest, &dek, "bucket-1", 7).unwrap();
@@ -2714,6 +2747,7 @@ mod tests {
                 modified_at: 0,
                 user_metadata: HashMap::new(),
                 content_hash: None,
+                encrypted: false,
             },
         );
         let enc = EncryptedForestShard::encrypt_v2(&shard, &dek, "b", 11).unwrap();

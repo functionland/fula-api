@@ -338,18 +338,26 @@ impl Decryptor {
 
     /// Decrypt data with custom AAD (must match the AAD used during encryption)
     /// Security audit fix #5: AAD binding verification
+    ///
+    /// Attacker-controllable failure modes (malformed encapsulated key, tag
+    /// mismatch, AAD mismatch) collapse to a single generic error so an
+    /// attacker with a decryption oracle can't distinguish reasons.
     pub fn decrypt_with_aad(&self, encrypted: &EncryptedData, aad: &[u8]) -> Result<Vec<u8>> {
-        // Parse secret key into HPKE format
+        // Parse secret key into HPKE format.
+        // This failure is NOT attacker-controllable — it reflects a corrupted
+        // local keystore, so keep the specific error to aid operators.
         let sk_recip = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(
             self.secret.as_bytes()
         ).map_err(|e| CryptoError::Decryption(format!("Invalid secret key: {:?}", e)))?;
 
-        // Parse encapsulated key
+        // Parse encapsulated key. This IS attacker-controllable (comes from the
+        // ciphertext envelope), so map to the generic failure below.
         let enc_key = <X25519HkdfSha256 as Kem>::EncappedKey::from_bytes(
             encrypted.encapsulated_key.as_bytes()
-        ).map_err(|e| CryptoError::Decryption(format!("Invalid encapsulated key: {:?}", e)))?;
+        ).map_err(|_| CryptoError::Decryption("authentication failed".to_string()))?;
 
-        // Use RFC 9180 single-shot open (Base mode)
+        // Use RFC 9180 single-shot open (Base mode). Tag/AAD failure is also
+        // attacker-controllable and must share the same error string.
         let plaintext = hpke::single_shot_open::<
             ChaCha20Poly1305,
             HkdfSha256,
@@ -361,7 +369,7 @@ impl Decryptor {
             HPKE_INFO,
             &encrypted.ciphertext,
             aad,  // Security audit fix #5: AAD binding verification
-        ).map_err(|e| CryptoError::Decryption(format!("HPKE decryption failed: {:?}", e)))?;
+        ).map_err(|_| CryptoError::Decryption("authentication failed".to_string()))?;
 
         Ok(plaintext)
     }

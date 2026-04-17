@@ -163,6 +163,12 @@ enum ForestCacheEntry {
         manifest_etag: Option<String>,
         /// Highest manifest sequence observed (v5+). `None` for legacy v3.
         last_manifest_sequence: Option<u64>,
+        /// Per-shard ETags captured from the last successful load or save of
+        /// each shard blob. Used for conditional writes (`If-Match`) so two
+        /// concurrent writers can't both overwrite the same shard with their
+        /// own view (C-AUDIT-003). `None` at index `i` means the shard has
+        /// never been observed (first write path or shard not yet loaded).
+        shard_etags: Vec<Option<String>>,
     },
 }
 
@@ -333,6 +339,12 @@ pub struct EncryptedClient {
     /// Write lock: migration (migrate_to_sharded). Prevents concurrent reads from
     /// seeing stale monolithic data while migration is replacing the cache entry.
     migration_locks: DashMap<String, Arc<tokio::sync::RwLock<()>>>,
+    /// Optional per-bucket minimum-acceptable forest sequence (C-AUDIT-008).
+    /// Populated via `set_forest_sequence_floor`. When set, a forest load whose
+    /// decrypted sequence is below the floor is rejected as a replay. Opt-in —
+    /// applications that want cross-session protection persist the counter
+    /// themselves (e.g., in an encrypted keystore) and restore it on startup.
+    seq_floors: DashMap<String, u64>,
 }
 
 impl EncryptedClient {
@@ -345,6 +357,7 @@ impl EncryptedClient {
             forest_cache: DashMap::new(),
             pinning: None,
             migration_locks: DashMap::new(),
+            seq_floors: DashMap::new(),
         })
     }
 
@@ -374,6 +387,7 @@ impl EncryptedClient {
             forest_cache: DashMap::new(),
             pinning: Some(pinning),
             migration_locks: DashMap::new(),
+            seq_floors: DashMap::new(),
         })
     }
 
@@ -386,6 +400,48 @@ impl EncryptedClient {
     /// Get the encryption config
     pub fn encryption_config(&self) -> &EncryptionConfig {
         &self.encryption
+    }
+
+    /// Return the forest sequence most recently observed for `bucket`, if any.
+    ///
+    /// Monolithic forests expose `last_sequence`; sharded forests expose
+    /// `last_manifest_sequence`. Applications that want cross-session replay
+    /// protection (C-AUDIT-008) persist this value after each successful
+    /// save/load and restore it on startup via `set_forest_sequence_floor`.
+    pub fn get_forest_sequence(&self, bucket: &str) -> Option<u64> {
+        self.forest_cache.get(bucket).and_then(|entry| match entry.value() {
+            ForestCacheEntry::Monolithic { last_sequence, .. } => *last_sequence,
+            ForestCacheEntry::Sharded { last_manifest_sequence, .. } => *last_manifest_sequence,
+        })
+    }
+
+    /// Install a per-bucket minimum-acceptable forest sequence (C-AUDIT-008).
+    ///
+    /// After calling this, any forest load whose decrypted sequence is below
+    /// `min_seq` is rejected as a replay. Intended for applications that
+    /// persist the counter externally (e.g., encrypted keystore) so a
+    /// restart cannot be tricked into accepting a stale manifest that was
+    /// captured off the wire before the process went down.
+    ///
+    /// Opt-in: if never called, behavior is identical to previous versions.
+    pub fn set_forest_sequence_floor(&self, bucket: &str, min_seq: u64) {
+        self.seq_floors.insert(bucket.to_string(), min_seq);
+    }
+
+    /// Reject a load whose decrypted sequence is below the configured floor.
+    /// No-op when no floor has been set for the bucket.
+    fn check_sequence_floor(&self, bucket: &str, observed_seq: u64) -> Result<()> {
+        if let Some(floor) = self.seq_floors.get(bucket).map(|r| *r) {
+            if observed_seq < floor {
+                return Err(ClientError::Encryption(
+                    fula_crypto::CryptoError::Decryption(format!(
+                        "forest replay detected: sequence {} below configured floor {}",
+                        observed_seq, floor
+                    ))
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Start a background task that periodically flushes dirty forest caches
@@ -577,6 +633,14 @@ impl EncryptedClient {
             .unwrap_or(false);
 
         if !is_encrypted {
+            // C-AUDIT-004: refuse plaintext response when forest records this
+            // storage_key as a previously-encrypted upload. Prevents a
+            // malicious backend from returning attacker-chosen plaintext.
+            if self.forest_entry_requires_encryption(bucket, storage_key) {
+                return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                    "storage backend served plaintext for an encrypted path".to_string()
+                )));
+            }
             return Ok(result.data);
         }
 
@@ -719,14 +783,28 @@ impl EncryptedClient {
         writer: &mut W,
     ) -> Result<u64> {
         let num_chunks = chunked_meta.num_chunks;
+        // Use VerifiedStreamingDecoder so the Bao root hash is verified at
+        // finalize — this closes the truncation / tampering attack where a
+        // malicious storage backend serves fewer chunks than were uploaded
+        // (fixed by C-AUDIT-001). The finalize check also implicitly binds
+        // num_chunks and root_hash against the DEK's keyed hash state
+        // (mitigates C-AUDIT-002 for those fields without a format change).
+        //
+        // NOTE: Bytes reach the writer BEFORE verification completes; on
+        // integrity failure callers must discard whatever was written. This
+        // matches blake3/bao's streaming model.
         let mut decoder = if chunked_meta.format == "streaming-v2" {
             let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
-            fula_crypto::ChunkedDecoder::with_aad(dek.clone(), chunked_meta.clone(), aad_prefix)
+            fula_crypto::VerifiedStreamingDecoder::with_aad(
+                dek.clone(), chunked_meta.clone(), aad_prefix,
+            ).map_err(ClientError::Encryption)?
         } else {
-            fula_crypto::ChunkedDecoder::new(dek.clone(), chunked_meta.clone())
+            fula_crypto::VerifiedStreamingDecoder::new(dek.clone(), chunked_meta.clone())
+                .map_err(ClientError::Encryption)?
         };
 
         let mut total_written: u64 = 0;
+        let mut chunks_decrypted: u64 = 0;
         let window_size = Self::MAX_CONCURRENT_CHUNK_DOWNLOADS;
 
         // Process chunks in sliding windows to bound memory usage.
@@ -766,18 +844,46 @@ impl EncryptedClient {
                 window_chunks.push((idx, data));
             }
 
-            // Sort by index and decrypt in order, writing directly to output
+            // Sort by index and decrypt in order, writing directly to output.
+            // decrypt_and_verify both decrypts AEAD AND updates the Bao hasher,
+            // so each chunk contributes to the final integrity check.
             window_chunks.sort_by_key(|(idx, _)| *idx);
 
             for (chunk_index, chunk_data) in &window_chunks {
-                let chunk_plaintext = decoder.decrypt_chunk(*chunk_index, chunk_data)
+                let chunk_plaintext = decoder.decrypt_and_verify(*chunk_index, chunk_data)
                     .map_err(ClientError::Encryption)?;
                 writer.write_all(&chunk_plaintext)
                     .map_err(ClientError::Io)?;
                 total_written += chunk_plaintext.len() as u64;
+                chunks_decrypted += 1;
             }
             // window_chunks dropped here — frees ciphertext memory before next window
         }
+
+        // C-AUDIT-002 defense-in-depth: both counters and the declared total
+        // size must match what the metadata claimed. These are redundant with
+        // the Bao hash check on the happy path, but catch certain edge cases
+        // like zero-length chunks or backends returning empty bodies.
+        if chunks_decrypted != num_chunks as u64 {
+            return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                format!(
+                    "chunk count mismatch: metadata claimed {}, decoded {}",
+                    num_chunks, chunks_decrypted
+                ),
+            )));
+        }
+        if total_written != chunked_meta.total_size {
+            return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                format!(
+                    "total size mismatch: metadata claimed {}, decoded {} bytes",
+                    chunked_meta.total_size, total_written
+                ),
+            )));
+        }
+
+        // Final Bao root-hash verification — the critical check that catches
+        // silent truncation and tampering of chunk contents or ordering.
+        decoder.finalize_and_verify().map_err(ClientError::Encryption)?;
 
         Ok(total_written)
     }
@@ -827,6 +933,12 @@ impl EncryptedClient {
             .unwrap_or(false);
 
         if !is_encrypted {
+            // C-AUDIT-004: block plaintext response for forest-known encrypted entries
+            if self.forest_entry_requires_encryption(bucket, storage_key) {
+                return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                    "storage backend served plaintext for an encrypted path".to_string()
+                )));
+            }
             writer.write_all(&result.data).map_err(ClientError::Io)?;
             return Ok(result.data.len() as u64);
         }
@@ -901,6 +1013,12 @@ impl EncryptedClient {
             .unwrap_or(false);
 
         if !is_encrypted {
+            // C-AUDIT-004: block plaintext response for forest-known encrypted entries
+            if self.forest_entry_requires_encryption(bucket, storage_key) {
+                return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                    "storage backend served plaintext for an encrypted path".to_string()
+                )));
+            }
             let size = result.data.len() as u64;
             return Ok(DecryptedObjectInfo {
                 data: result.data,
@@ -1057,6 +1175,12 @@ impl EncryptedClient {
             .unwrap_or(false);
 
         if !is_encrypted {
+            // C-AUDIT-004: block plaintext response for forest-known encrypted entries
+            if self.forest_entry_requires_encryption(bucket, storage_key) {
+                return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                    "storage backend served plaintext metadata for an encrypted path".to_string()
+                )));
+            }
             return Ok(FileMetadata {
                 storage_key: storage_key.to_string(),
                 original_key: storage_key.to_string(),
@@ -1300,6 +1424,9 @@ impl EncryptedClient {
                         let (forest, observed_seq) = if encrypted.version == 4 {
                             let (f, seq) = encrypted.decrypt_v4(&forest_dek, bucket)
                                 .map_err(ClientError::Encryption)?;
+                            // Cross-session replay check (C-AUDIT-008): any caller-installed
+                            // floor overrides the in-memory cache comparison.
+                            self.check_sequence_floor(bucket, seq)?;
                             // Replay check: compare against cached last_sequence.
                             let cached = self.forest_cache.get(bucket).and_then(|e| match e.value() {
                                 ForestCacheEntry::Monolithic { last_sequence, .. } => *last_sequence,
@@ -1361,6 +1488,7 @@ impl EncryptedClient {
                             6 => {
                                 let (m, seq) = encrypted_manifest.decrypt_v6(&forest_dek, bucket)
                                     .map_err(ClientError::Encryption)?;
+                                self.check_sequence_floor(bucket, seq)?;
                                 if let Some(last) = cached_prior_manifest_seq {
                                     if seq < last {
                                         return Err(ClientError::Encryption(
@@ -1384,6 +1512,7 @@ impl EncryptedClient {
                                 }
                                 let (m, seq) = encrypted_manifest.decrypt_v5(&forest_dek, bucket)
                                     .map_err(ClientError::Encryption)?;
+                                self.check_sequence_floor(bucket, seq)?;
                                 if let Some(last) = cached_prior_manifest_seq {
                                     if seq < last {
                                         return Err(ClientError::Encryption(
@@ -1411,11 +1540,15 @@ impl EncryptedClient {
 
                         let sharded = ShardedPrivateForest::from_manifest(manifest);
                         let now = chrono::Utc::now().timestamp();
+                        let num_shards = sharded.manifest.num_shards;
                         self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::Sharded {
                             forest: sharded,
                             loaded_at: now,
                             manifest_etag: observed_etag,
                             last_manifest_sequence: observed_manifest_seq,
+                            // Per-shard ETags are populated lazily on first load of
+                            // each shard (see `load_shard`). Start with None markers.
+                            shard_etags: vec![None; num_shards],
                         });
 
                         Err(ClientError::Encryption(
@@ -1483,6 +1616,7 @@ impl EncryptedClient {
 
         match self.inner.get_object_with_metadata(bucket, &shard_key).await {
             Ok(result) => {
+                let observed_etag = if result.etag.is_empty() { None } else { Some(result.etag.clone()) };
                 let encrypted = EncryptedForestShard::from_bytes(&result.data)
                     .map_err(ClientError::Encryption)?;
                 // Dispatch on shard version: v2 = AAD-bound, v1 = legacy.
@@ -1510,8 +1644,11 @@ impl EncryptedClient {
                 };
 
                 if let Some(mut entry) = self.forest_cache.get_mut(bucket) {
-                    if let ForestCacheEntry::Sharded { forest, .. } = entry.value_mut() {
+                    if let ForestCacheEntry::Sharded { forest, shard_etags, .. } = entry.value_mut() {
                         forest.set_shard(shard);
+                        if shard_index < shard_etags.len() {
+                            shard_etags[shard_index] = observed_etag;
+                        }
                     }
                 }
                 Ok(())
@@ -1520,8 +1657,11 @@ impl EncryptedClient {
                 // Shard doesn't exist yet — create empty
                 let shard = ForestShard::new(shard_index);
                 if let Some(mut entry) = self.forest_cache.get_mut(bucket) {
-                    if let ForestCacheEntry::Sharded { forest, .. } = entry.value_mut() {
+                    if let ForestCacheEntry::Sharded { forest, shard_etags, .. } = entry.value_mut() {
                         forest.set_shard(shard);
+                        if shard_index < shard_etags.len() {
+                            shard_etags[shard_index] = None;
+                        }
                     }
                 }
                 Ok(())
@@ -1582,6 +1722,34 @@ impl EncryptedClient {
             Ok(_) => Ok(()),
             Err(ref e) if e.to_string().contains("forest is sharded") => Ok(()),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Check whether the forest has an entry for `storage_key` that was
+    /// uploaded encrypted.
+    ///
+    /// Returns `true` only when an entry is present in the currently loaded
+    /// forest AND carries `encrypted: true`. For sharded forests whose shards
+    /// haven't been loaded yet, this returns `false` (best-effort check),
+    /// which is acceptable: the enforcement is defense-in-depth that kicks in
+    /// whenever the forest is loaded (the common case for authenticated
+    /// sessions). Used to block malicious backends from returning plaintext
+    /// for paths that the client uploaded encrypted (C-AUDIT-004).
+    fn forest_entry_requires_encryption(&self, bucket: &str, storage_key: &str) -> bool {
+        match self.forest_cache.get(bucket) {
+            Some(entry) => match entry.value() {
+                ForestCacheEntry::Monolithic { forest, .. } => {
+                    forest.find_by_storage_key(storage_key)
+                        .map(|e| e.encrypted)
+                        .unwrap_or(false)
+                }
+                ForestCacheEntry::Sharded { forest, .. } => {
+                    forest.find_by_storage_key(storage_key)
+                        .map(|e| e.encrypted)
+                        .unwrap_or(false)
+                }
+            },
+            None => false,
         }
     }
 
@@ -1650,17 +1818,24 @@ impl EncryptedClient {
         let index_key = derive_index_key(&forest_dek, bucket);
 
         // Extract what we need to upload + bump per-shard sequences in the cache.
-        let (mut manifest_clone, dirty_indices, shards_to_upload, prior_manifest_seq, prior_etag) = {
+        // Capture per-shard prior ETags so each shard PUT can be conditional
+        // (C-AUDIT-003) — two concurrent writers can't both overwrite the
+        // same shard with their own view.
+        let (mut manifest_clone, dirty_indices, shards_to_upload, prior_manifest_seq, prior_etag, prior_shard_etags) = {
             let mut entry = self.forest_cache.get_mut(bucket)
                 .ok_or_else(|| ClientError::Encryption(
                     fula_crypto::CryptoError::Encryption("no sharded forest in cache".to_string())
                 ))?;
             match entry.value_mut() {
-                ForestCacheEntry::Sharded { forest, manifest_etag, last_manifest_sequence, .. } => {
+                ForestCacheEntry::Sharded { forest, manifest_etag, last_manifest_sequence, shard_etags, .. } => {
                     let num_shards = forest.manifest.num_shards;
                     // Ensure shard_sequences is sized to num_shards (legacy v3 may be empty).
                     if forest.manifest.shard_sequences.len() != num_shards {
                         forest.manifest.shard_sequences = vec![0u64; num_shards];
+                    }
+                    // Keep shard_etags aligned with num_shards (reshards may grow).
+                    if shard_etags.len() != num_shards {
+                        shard_etags.resize(num_shards, None);
                     }
                     let dirty: Vec<usize> = forest.dirty_shards.iter().copied().collect();
                     // Bump per-shard sequences for dirty shards.
@@ -1671,12 +1846,18 @@ impl EncryptedClient {
                     let shards: Vec<ForestShard> = dirty.iter()
                         .filter_map(|&i| forest.shards.get(i).and_then(|s| s.clone()))
                         .collect();
+                    // Clone the subset of prior ETags we'll need for the
+                    // conditional shard PUTs below.
+                    let prior_shard_etags: Vec<Option<String>> = dirty.iter()
+                        .map(|&i| shard_etags.get(i).cloned().flatten())
+                        .collect();
                     (
                         forest.manifest.clone(),
                         dirty,
                         shards,
                         *last_manifest_sequence,
                         manifest_etag.clone(),
+                        prior_shard_etags,
                     )
                 }
                 _ => return Err(ClientError::Encryption(
@@ -1685,8 +1866,12 @@ impl EncryptedClient {
             }
         };
 
-        // Upload dirty shards as v2 (AAD-bound).
-        for shard in &shards_to_upload {
+        // Upload dirty shards as v2 (AAD-bound). Each PUT is conditional on
+        // the prior shard ETag — if another writer raced us, the server
+        // returns a concurrent-modification error and we drop the cache so
+        // the caller re-reads the latest state before retrying.
+        let mut new_shard_etags: Vec<(usize, Option<String>)> = Vec::with_capacity(shards_to_upload.len());
+        for (pos, shard) in shards_to_upload.iter().enumerate() {
             let shard_idx = shard.shard_index;
             let shard_seq = manifest_clone.shard_sequences.get(shard_idx).copied().unwrap_or(1);
             let shard_key = derive_shard_key(&forest_dek, bucket, &manifest_clone.shard_salt, shard_idx);
@@ -1699,12 +1884,29 @@ impl EncryptedClient {
             let metadata = ObjectMetadata::new()
                 .with_content_type("application/octet-stream");
 
-            self.inner.put_object_with_metadata(
+            let prior_etag_for_shard = prior_shard_etags.get(pos).cloned().flatten();
+            let put_result = self.inner.put_object_with_metadata_conditional(
                 bucket,
                 &shard_key,
                 Bytes::from(data),
                 Some(metadata),
-            ).await?;
+                prior_etag_for_shard.as_deref(),
+                None,
+            ).await;
+
+            match put_result {
+                Ok(r) => {
+                    let new_etag = if r.etag.is_empty() { None } else { Some(r.etag) };
+                    new_shard_etags.push((shard_idx, new_etag));
+                }
+                Err(e) if e.is_concurrent_modification() => {
+                    // Another writer raced us on this shard. Drop the cache so
+                    // the caller re-reads the latest shard state before retry.
+                    self.forest_cache.remove(bucket);
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         // Upload manifest as v6 (AAD-bound, directory-aware routing). Bump manifest sequence.
@@ -1761,10 +1963,12 @@ impl EncryptedClient {
         let new_etag = if put_result.etag.is_empty() { None } else { Some(put_result.etag) };
         let _ = dirty_indices;
 
-        // Clear dirty flags + record new ETag + bump manifest sequence
+        // Clear dirty flags + record new ETag + bump manifest sequence +
+        // persist per-shard ETags observed from the conditional PUTs above
+        // (C-AUDIT-003) so subsequent saves can keep using conditional writes.
         if let Some(mut entry) = self.forest_cache.get_mut(bucket) {
             if let ForestCacheEntry::Sharded {
-                forest, loaded_at, manifest_etag, last_manifest_sequence
+                forest, loaded_at, manifest_etag, last_manifest_sequence, shard_etags
             } = entry.value_mut() {
                 forest.dirty_shards.clear();
                 forest.manifest_dirty = false;
@@ -1773,6 +1977,14 @@ impl EncryptedClient {
                 *loaded_at = chrono::Utc::now().timestamp();
                 *manifest_etag = new_etag;
                 *last_manifest_sequence = Some(next_manifest_seq);
+                if shard_etags.len() != forest.manifest.num_shards {
+                    shard_etags.resize(forest.manifest.num_shards, None);
+                }
+                for (shard_idx, new_shard_etag) in new_shard_etags {
+                    if shard_idx < shard_etags.len() {
+                        shard_etags[shard_idx] = new_shard_etag;
+                    }
+                }
             }
         }
 
@@ -1816,7 +2028,9 @@ impl EncryptedClient {
         // Initialize per-shard sequences at 1 — every shard is being written for the first time.
         sharded.manifest.shard_sequences = vec![1u64; sharded.manifest.num_shards];
 
-        // Phase A: upload all shard blobs in parallel as v2 (AAD-bound)
+        // Phase A: upload all shard blobs in parallel as v2 (AAD-bound).
+        // Collect uploaded shard keys so we can compensate (delete them) if
+        // Phase B fails — otherwise a failed migration leaks orphan shards.
         let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
         let mut handles = Vec::new();
 
@@ -1832,6 +2046,7 @@ impl EncryptedClient {
                 let client = self.inner.clone();
                 let bucket_owned = bucket.to_string();
                 let sem = semaphore.clone();
+                let shard_key_for_task = shard_key.clone();
 
                 let handle = tokio::spawn(async move {
                     let _permit = sem.acquire().await.map_err(|e|
@@ -1839,22 +2054,42 @@ impl EncryptedClient {
                     )?;
                     client.put_object_with_metadata(
                         &bucket_owned,
-                        &shard_key,
+                        &shard_key_for_task,
                         Bytes::from(data),
                         Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
                     ).await?;
-                    Ok::<(), ClientError>(())
+                    Ok::<String, ClientError>(shard_key_for_task)
                 });
                 handles.push(handle);
             }
         }
 
-        // Collect shard upload results
+        // Collect shard upload results, tracking successfully uploaded keys
+        // so we can compensate on Phase B failure.
+        let mut uploaded_shard_keys: Vec<String> = Vec::with_capacity(handles.len());
+        let mut phase_a_error: Option<ClientError> = None;
         for handle in handles {
-            handle.await
-                .map_err(|e| ClientError::Encryption(
-                    fula_crypto::CryptoError::Encryption(format!("Shard upload task failed: {}", e))
-                ))??;
+            match handle.await {
+                Ok(Ok(key)) => uploaded_shard_keys.push(key),
+                Ok(Err(e)) => {
+                    if phase_a_error.is_none() { phase_a_error = Some(e); }
+                }
+                Err(e) => {
+                    if phase_a_error.is_none() {
+                        phase_a_error = Some(ClientError::Encryption(
+                            fula_crypto::CryptoError::Encryption(format!("Shard upload task failed: {}", e))
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = phase_a_error {
+            // Best-effort cleanup: delete any shards that DID succeed.
+            for key in &uploaded_shard_keys {
+                let _ = self.inner.delete_object(bucket, key).await;
+            }
+            return Err(err);
         }
 
         // Phase B: overwrite index_key with new manifest (v6 AAD-bound, sequence=1,
@@ -1867,12 +2102,25 @@ impl EncryptedClient {
         ).map_err(ClientError::Encryption)?;
         let manifest_data = encrypted_manifest.to_bytes().map_err(ClientError::Encryption)?;
 
-        let put_result = self.inner.put_object_with_metadata(
+        let manifest_put = self.inner.put_object_with_metadata(
             bucket,
             &index_key,
             Bytes::from(manifest_data),
             Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
-        ).await?;
+        ).await;
+
+        let put_result = match manifest_put {
+            Ok(r) => r,
+            Err(e) => {
+                // Manifest failed — roll back Phase A by deleting uploaded shards.
+                // Without this, the shards remain orphaned because the monolithic
+                // forest is still authoritative.
+                for key in &uploaded_shard_keys {
+                    let _ = self.inner.delete_object(bucket, key).await;
+                }
+                return Err(e);
+            }
+        };
 
         // Update cache (under write lock — no concurrent readers can see stale data)
         let new_etag = if put_result.etag.is_empty() { None } else { Some(put_result.etag) };
@@ -1880,11 +2128,16 @@ impl EncryptedClient {
         let mut clean_forest = sharded;
         clean_forest.dirty_shards.clear();
         clean_forest.manifest_dirty = false;
+        let num_shards = clean_forest.manifest.num_shards;
         self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::Sharded {
             forest: clean_forest,
             loaded_at: now,
             manifest_etag: new_etag,
             last_manifest_sequence: Some(manifest_seq),
+            // Phase A uploads were unconditional (first write for migrated bucket).
+            // We don't have per-shard ETags to record here yet; they'll be
+            // populated on the first read/write of each shard after migration.
+            shard_etags: vec![None; num_shards],
         });
 
         let duration = start.elapsed();
@@ -2021,7 +2274,10 @@ impl EncryptedClient {
         let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
             .map_err(ClientError::Encryption)?;
 
-        let forest_entry = ForestFileEntry::from_metadata(&private_meta, storage_key.clone());
+        // Mark the forest entry as encrypted so subsequent reads refuse a
+        // plaintext response from the storage backend (C-AUDIT-004).
+        let mut forest_entry = ForestFileEntry::from_metadata(&private_meta, storage_key.clone());
+        forest_entry.mark_encrypted();
 
         let kek_version = self.encryption.key_manager.version();
 
@@ -2267,8 +2523,10 @@ impl EncryptedClient {
             .with_metadata("x-fula-chunked", "true")
             .with_metadata("x-fula-encryption", &index_body);
         
-        // Upload index object
-        let result = if let Some(ref pinning) = self.pinning {
+        // Upload index object. If this fails after all chunks were successfully
+        // uploaded, we must compensate by deleting the chunks — otherwise the
+        // upload is non-atomic and leaks storage.
+        let index_result = if let Some(ref pinning) = self.pinning {
             self.inner.put_object_with_metadata_and_pinning(
                 bucket,
                 storage_key,
@@ -2276,16 +2534,27 @@ impl EncryptedClient {
                 Some(metadata),
                 &pinning.endpoint,
                 &pinning.token,
-            ).await?
+            ).await
         } else {
             self.inner.put_object_with_metadata(
                 bucket,
                 storage_key,
                 Bytes::from(index_body.clone()),
                 Some(metadata),
-            ).await?
+            ).await
         };
-        
+
+        let result = match index_result {
+            Ok(r) => r,
+            Err(e) => {
+                // Compensating delete: best-effort cleanup of orphaned chunks.
+                for key in &uploaded_keys {
+                    let _ = self.inner.delete_object(bucket, key).await;
+                }
+                return Err(e);
+            }
+        };
+
         Ok(result)
     }
 
@@ -2988,30 +3257,17 @@ impl EncryptedClient {
 
         let prefix_str = prefix.unwrap_or("/");
 
-        let files: Vec<ForestFileEntry> = if self.is_forest_sharded(bucket) {
-            self.load_all_shards(bucket).await?;
-            let entry = self.forest_cache.get(bucket).unwrap();
-            match entry.value() {
-                ForestCacheEntry::Sharded { forest, .. } => forest.list_recursive(prefix_str).into_iter().cloned().collect(),
-                _ => unreachable!(),
-            }
-        } else {
-            let entry = self.forest_cache.get(bucket).unwrap();
-            match entry.value() {
-                ForestCacheEntry::Monolithic { forest, .. } => forest.list_recursive(prefix_str).into_iter().cloned().collect(),
-                _ => unreachable!(),
-            }
-        };
-
+        // Build `directories` directly from forest entries without
+        // materializing an intermediate Vec<ForestFileEntry>. Halves peak
+        // memory for listings (was: clone all → clone again into FileMetadata).
         let mut directories: HashMap<String, Vec<FileMetadata>> = HashMap::new();
 
-        for entry in &files {
+        let build_entry = |entry: &ForestFileEntry| -> (String, FileMetadata) {
             let dir = if let Some(last_slash) = entry.path.rfind('/') {
                 entry.path[..last_slash].to_string()
             } else {
                 "/".to_string()
             };
-            
             let metadata = FileMetadata {
                 storage_key: entry.storage_key.clone(),
                 original_key: entry.path.clone(),
@@ -3022,10 +3278,34 @@ impl EncryptedClient {
                 user_metadata: entry.user_metadata.clone(),
                 is_encrypted: true,
             };
-            
-            directories.entry(dir).or_default().push(metadata);
+            (dir, metadata)
+        };
+
+        if self.is_forest_sharded(bucket) {
+            self.load_all_shards(bucket).await?;
+            let entry = self.forest_cache.get(bucket).unwrap();
+            match entry.value() {
+                ForestCacheEntry::Sharded { forest, .. } => {
+                    for fentry in forest.list_recursive(prefix_str) {
+                        let (dir, metadata) = build_entry(fentry);
+                        directories.entry(dir).or_default().push(metadata);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            let entry = self.forest_cache.get(bucket).unwrap();
+            match entry.value() {
+                ForestCacheEntry::Monolithic { forest, .. } => {
+                    for fentry in forest.list_recursive(prefix_str) {
+                        let (dir, metadata) = build_entry(fentry);
+                        directories.entry(dir).or_default().push(metadata);
+                    }
+                }
+                _ => unreachable!(),
+            }
         }
-        
+
         Ok(DirectoryListing {
             bucket: bucket.to_string(),
             prefix: prefix.map(|s| s.to_string()),
@@ -3042,35 +3322,39 @@ impl EncryptedClient {
     ) -> Result<Vec<FileMetadata>> {
         self.ensure_forest_loaded(bucket).await?;
 
-        let all_files: Vec<ForestFileEntry> = if self.is_forest_sharded(bucket) {
+        // Build FileMetadata directly from forest references — avoids the
+        // intermediate Vec<ForestFileEntry> clone that previously doubled
+        // peak memory for listings.
+        let make_meta = |entry: &ForestFileEntry| FileMetadata {
+            storage_key: entry.storage_key.clone(),
+            original_key: entry.path.clone(),
+            original_size: entry.size,
+            content_type: entry.content_type.clone(),
+            created_at: Some(entry.created_at),
+            modified_at: Some(entry.modified_at),
+            user_metadata: entry.user_metadata.clone(),
+            is_encrypted: true,
+        };
+
+        let files: Vec<FileMetadata> = if self.is_forest_sharded(bucket) {
             self.load_all_shards(bucket).await?;
             let entry = self.forest_cache.get(bucket).unwrap();
             match entry.value() {
-                ForestCacheEntry::Sharded { forest, .. } => forest.list_all_files().into_iter().cloned().collect(),
+                ForestCacheEntry::Sharded { forest, .. } => {
+                    forest.list_all_files().into_iter().map(&make_meta).collect()
+                }
                 _ => unreachable!(),
             }
         } else {
             let entry = self.forest_cache.get(bucket).unwrap();
             match entry.value() {
-                ForestCacheEntry::Monolithic { forest, .. } => forest.list_all_files().into_iter().cloned().collect(),
+                ForestCacheEntry::Monolithic { forest, .. } => {
+                    forest.list_all_files().into_iter().map(&make_meta).collect()
+                }
                 _ => unreachable!(),
             }
         };
 
-        let files: Vec<FileMetadata> = all_files
-            .iter()
-            .map(|entry| FileMetadata {
-                storage_key: entry.storage_key.clone(),
-                original_key: entry.path.clone(),
-                original_size: entry.size,
-                content_type: entry.content_type.clone(),
-                created_at: Some(entry.created_at),
-                modified_at: Some(entry.modified_at),
-                user_metadata: entry.user_metadata.clone(),
-                is_encrypted: true,
-            })
-            .collect();
-        
         Ok(files)
     }
 
@@ -3366,6 +3650,12 @@ impl EncryptedClient {
             .unwrap_or(false);
 
         if !is_encrypted {
+            // C-AUDIT-004: block plaintext response for forest-known encrypted entries
+            if self.forest_entry_requires_encryption(bucket, storage_key) {
+                return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                    "storage backend served plaintext for an encrypted path".to_string()
+                )));
+            }
             return Ok(result.data);
         }
 
@@ -3939,6 +4229,9 @@ impl EncryptedClient {
                 modified_at: now,
                 user_metadata: HashMap::new(),
                 content_hash: None,
+                // C-AUDIT-004: forest entries from encrypted uploads MUST
+                // be marked so later reads refuse a plaintext backend response.
+                encrypted: true,
             };
             match entry.value_mut() {
                 ForestCacheEntry::Monolithic { forest, dirty, .. } => {
