@@ -292,6 +292,11 @@ fn create_cors_layer(origins: &[String]) -> CorsLayer {
         header::HeaderName::from_static("x-amz-content-sha256"),
         header::HeaderName::from_static("x-amz-date"),
         header::HeaderName::from_static("x-amz-copy-source"),
+        // RFC 7232 conditional-write headers. fula-client uses these on every
+        // forest manifest save AND on every per-shard save (C-AUDIT-003). Must
+        // be in allow_headers so browser / WASM clients pass CORS preflight.
+        header::IF_MATCH,
+        header::IF_NONE_MATCH,
         // Direct pinning headers
         header::HeaderName::from_static("x-pinning-service"),
         header::HeaderName::from_static("x-pinning-token"),
@@ -300,6 +305,12 @@ fn create_cors_layer(origins: &[String]) -> CorsLayer {
         header::HeaderName::from_static("x-amz-meta-x-pinning-service"),
         header::HeaderName::from_static("x-amz-meta-x-pinning-token"),
         header::HeaderName::from_static("x-amz-meta-x-pinning-name"),
+        // Fula encryption user-metadata headers sent on encrypted PUT. Browser
+        // clients need these in allow_headers so preflight passes; native
+        // reqwest-based clients were unaffected because they don't run CORS.
+        header::HeaderName::from_static("x-amz-meta-x-fula-encrypted"),
+        header::HeaderName::from_static("x-amz-meta-x-fula-encryption"),
+        header::HeaderName::from_static("x-amz-meta-x-fula-chunked"),
     ];
     
     let cors = CorsLayer::new()
