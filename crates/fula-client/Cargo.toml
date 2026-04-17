@@ -28,6 +28,7 @@ tracing = { workspace = true }
 url = "2.5"
 base64 = { workspace = true }
 hex = { workspace = true }
+blake3 = { workspace = true }
 mime_guess = "2.0"
 tokio = { version = "1.42", default-features = false, features = ["sync"] }
 dashmap = { workspace = true }
@@ -38,6 +39,8 @@ dashmap = { workspace = true }
 fula-crypto = { path = "../fula-crypto" }
 reqwest = { workspace = true }
 uuid = { workspace = true }
+fs2 = "0.4"
+dirs = "5"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # WASM: disable default features (no tokio), enable wasm feature

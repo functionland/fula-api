@@ -67,6 +67,28 @@ pub enum ClientError {
     /// and retry.
     #[error("Concurrent modification: {0}")]
     ConcurrentModification(String),
+
+    /// Concurrent forest flush could not be reconciled within the retry budget.
+    ///
+    /// Raised by `save_forest` / `save_sharded_forest` when repeated optimistic-merge
+    /// retries continue to lose 412 races. The WAL at `wal_path` still holds the
+    /// unreconciled operations — either delete it to drop the work or invoke flush
+    /// again later. (NEW-7.2.)
+    #[error("Concurrent modification unresolved after {retries} retries: bucket={bucket}, pending ops={unresolved_ops}, wal={wal_path}")]
+    ConcurrentModificationExhausted {
+        bucket: String,
+        retries: usize,
+        unresolved_ops: usize,
+        wal_path: String,
+    },
+
+    /// Another rotation is already running against the same journal path.
+    ///
+    /// `rotate_bucket_with_journal` acquires an exclusive OS file lock on the
+    /// journal so two processes (or threads) cannot garble the append log.
+    /// (NEW-L.4.)
+    #[error("Rotation already in progress for bucket: {bucket}")]
+    RotationInProgress { bucket: String },
 }
 
 impl ClientError {
@@ -100,6 +122,7 @@ impl ClientError {
     /// Check if this is a concurrent-modification / precondition-failed error.
     pub fn is_concurrent_modification(&self) -> bool {
         matches!(self, Self::ConcurrentModification(_))
+            || matches!(self, Self::ConcurrentModificationExhausted { .. })
             || matches!(self, Self::S3Error { code, .. }
                 if code == "PreconditionFailed" || code == "HTTP412" || code == "412")
     }

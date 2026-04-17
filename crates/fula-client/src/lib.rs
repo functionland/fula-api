@@ -43,6 +43,8 @@ mod encryption;
 mod error;
 mod multipart;
 mod types;
+#[cfg(not(target_arch = "wasm32"))]
+mod wal;
 
 pub use client::FulaClient;
 pub use config::Config;

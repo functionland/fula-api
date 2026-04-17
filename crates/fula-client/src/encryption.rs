@@ -28,8 +28,16 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use dashmap::DashMap;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::wal::{self, WalEntry};
+
 /// Default forest cache TTL in seconds
 const DEFAULT_FOREST_CACHE_TTL_SECS: i64 = 60;
+
+/// Max 412-retry attempts before `flush_forest` surfaces
+/// `ConcurrentModificationExhausted` (NEW-7.2).
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_FLUSH_RETRIES: usize = 3;
 
 /// Default interval at which the background auto-flush task persists dirty
 /// forests to storage when enabled via `start_auto_flush()`.
@@ -345,6 +353,11 @@ pub struct EncryptedClient {
     /// applications that want cross-session protection persist the counter
     /// themselves (e.g., in an encrypted keystore) and restore it on startup.
     seq_floors: DashMap<String, u64>,
+    /// Set of buckets for which WAL recovery has already been attempted this
+    /// session (NEW-7.2). Keeps `ensure_forest_loaded` from re-replaying the
+    /// WAL on every call — recovery fires once per bucket per process lifetime.
+    #[cfg(not(target_arch = "wasm32"))]
+    wal_recovered_buckets: DashMap<String, ()>,
 }
 
 impl EncryptedClient {
@@ -358,6 +371,8 @@ impl EncryptedClient {
             pinning: None,
             migration_locks: DashMap::new(),
             seq_floors: DashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            wal_recovered_buckets: DashMap::new(),
         })
     }
 
@@ -388,6 +403,8 @@ impl EncryptedClient {
             pinning: Some(pinning),
             migration_locks: DashMap::new(),
             seq_floors: DashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            wal_recovered_buckets: DashMap::new(),
         })
     }
 
@@ -633,10 +650,10 @@ impl EncryptedClient {
             .unwrap_or(false);
 
         if !is_encrypted {
-            // C-AUDIT-004: refuse plaintext response when forest records this
-            // storage_key as a previously-encrypted upload. Prevents a
-            // malicious backend from returning attacker-chosen plaintext.
-            if self.forest_entry_requires_encryption(bucket, storage_key) {
+            // C-AUDIT-004 / NEW-2.1: refuse plaintext response when forest records
+            // this storage_key as a previously-encrypted upload. Forces a forest
+            // load first so an empty cache cannot be used as a bypass.
+            if self.forest_entry_requires_encryption(bucket, storage_key).await? {
                 return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
                     "storage backend served plaintext for an encrypted path".to_string()
                 )));
@@ -933,8 +950,8 @@ impl EncryptedClient {
             .unwrap_or(false);
 
         if !is_encrypted {
-            // C-AUDIT-004: block plaintext response for forest-known encrypted entries
-            if self.forest_entry_requires_encryption(bucket, storage_key) {
+            // C-AUDIT-004 / NEW-2.1: block plaintext response for forest-known encrypted entries
+            if self.forest_entry_requires_encryption(bucket, storage_key).await? {
                 return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
                     "storage backend served plaintext for an encrypted path".to_string()
                 )));
@@ -1013,8 +1030,8 @@ impl EncryptedClient {
             .unwrap_or(false);
 
         if !is_encrypted {
-            // C-AUDIT-004: block plaintext response for forest-known encrypted entries
-            if self.forest_entry_requires_encryption(bucket, storage_key) {
+            // C-AUDIT-004 / NEW-2.1: block plaintext response for forest-known encrypted entries
+            if self.forest_entry_requires_encryption(bucket, storage_key).await? {
                 return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
                     "storage backend served plaintext for an encrypted path".to_string()
                 )));
@@ -1175,8 +1192,8 @@ impl EncryptedClient {
             .unwrap_or(false);
 
         if !is_encrypted {
-            // C-AUDIT-004: block plaintext response for forest-known encrypted entries
-            if self.forest_entry_requires_encryption(bucket, storage_key) {
+            // C-AUDIT-004 / NEW-2.1: block plaintext response for forest-known encrypted entries
+            if self.forest_entry_requires_encryption(bucket, storage_key).await? {
                 return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
                     "storage backend served plaintext metadata for an encrypted path".to_string()
                 )));
@@ -1483,6 +1500,15 @@ impl EncryptedClient {
                             ForestCacheEntry::Sharded { forest, .. } => Some(forest.manifest.version),
                             _ => None,
                         });
+                        // NEW-L.7: augment the in-memory guard with a persisted version
+                        // pin so a gateway cannot downgrade us via a cold start.
+                        let persisted_prior_version = self.load_persisted_manifest_version(bucket);
+                        let effective_prior_version = match (cached_prior_manifest_version, persisted_prior_version) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        };
 
                         let (manifest, observed_manifest_seq) = match encrypted_manifest.version {
                             6 => {
@@ -1502,8 +1528,8 @@ impl EncryptedClient {
                                 (m, Some(seq))
                             }
                             5 => {
-                                // Reject routing-version downgrade if cache already saw v6.
-                                if cached_prior_manifest_version == Some(6) {
+                                // Reject routing-version downgrade if cache or disk already saw v6.
+                                if effective_prior_version.map_or(false, |v| v >= 6) {
                                     return Err(ClientError::Encryption(
                                         fula_crypto::CryptoError::Decryption(
                                             "manifest routing downgrade detected: server served v5 after v6 was observed".to_string()
@@ -1526,8 +1552,11 @@ impl EncryptedClient {
                                 (m, Some(seq))
                             }
                             _ => {
-                                // Legacy v3: reject downgrade if we previously saw v5 or v6.
-                                if cached_prior_manifest_seq.is_some() {
+                                // Legacy v3: reject downgrade if we previously saw v5 or v6
+                                // in-memory OR on disk.
+                                if cached_prior_manifest_seq.is_some()
+                                    || effective_prior_version.map_or(false, |v| v >= 5)
+                                {
                                     return Err(ClientError::Encryption(
                                         fula_crypto::CryptoError::Decryption(
                                             "manifest version downgrade detected: server served legacy v3 after an AAD-bound manifest was observed".to_string()
@@ -1537,6 +1566,10 @@ impl EncryptedClient {
                                 (encrypted_manifest.decrypt(&forest_dek).map_err(ClientError::Encryption)?, None)
                             }
                         };
+
+                        // NEW-L.7: persist the highest version observed so the guard
+                        // survives a process restart.
+                        self.persist_manifest_version(bucket, encrypted_manifest.version);
 
                         let sharded = ShardedPrivateForest::from_manifest(manifest);
                         let now = chrono::Utc::now().timestamp();
@@ -1589,6 +1622,20 @@ impl EncryptedClient {
     /// replay. A mismatch fails the load.
     async fn load_shard(&self, bucket: &str, shard_index: usize) -> Result<()> {
         let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+
+        // Short-circuit: if the shard is already loaded into our cache, do not
+        // re-fetch from S3. Re-fetching unconditionally would overwrite any
+        // pending in-memory upserts (e.g. from a previous `put_object_flat_deferred`
+        // into the same shard) with stale bytes, silently dropping the earlier
+        // writes. When the manifest changes under us (412 retry), the whole
+        // cache entry is evicted, which clears the shards too — so "shard is
+        // in-memory" is a sufficient consistency signal here.
+        let already_loaded = self.forest_cache.get(bucket)
+            .map(|entry| matches!(entry.value(), ForestCacheEntry::Sharded { forest, .. } if forest.is_shard_loaded(shard_index)))
+            .unwrap_or(false);
+        if already_loaded {
+            return Ok(());
+        }
 
         let (shard_salt, num_shards, expected_seq) = {
             let entry = self.forest_cache.get(bucket)
@@ -1711,6 +1758,67 @@ impl EncryptedClient {
         Ok(())
     }
 
+    /// Path to the per-bucket manifest-version pin file.
+    ///
+    /// NEW-L.7: the file stores the highest manifest version we have previously
+    /// observed for this bucket. It survives process restart so a gateway cannot
+    /// silently downgrade us from v6 to v5 on cold start. Location honours
+    /// `FULA_STATE_DIR` if set, otherwise `dirs::state_dir()` (XDG on Linux,
+    /// Library/Application Support on macOS, AppData on Windows). Returns None
+    /// when neither is available (WASM, locked-down sandboxes).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn manifest_version_path(&self, bucket: &str) -> Option<std::path::PathBuf> {
+        let base = match std::env::var("FULA_STATE_DIR") {
+            Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+            _ => dirs::state_dir().or_else(dirs::data_local_dir)?,
+        };
+        let bucket_hash = blake3::hash(bucket.as_bytes());
+        let bucket_id: String = hex::encode(&bucket_hash.as_bytes()[..16]);
+        Some(base.join("fula").join("manifest-version").join(bucket_id))
+    }
+
+    /// Read the persisted prior-observed manifest version for `bucket`, if any.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_persisted_manifest_version(&self, bucket: &str) -> Option<u8> {
+        let path = self.manifest_version_path(bucket)?;
+        let bytes = std::fs::read(&path).ok()?;
+        let s = std::str::from_utf8(&bytes).ok()?.trim();
+        s.parse::<u8>().ok()
+    }
+
+    /// Atomically write the manifest version for `bucket`. Monotonic: writes
+    /// nothing if the new version is not strictly greater than what's on disk.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_manifest_version(&self, bucket: &str, version: u8) {
+        let Some(path) = self.manifest_version_path(bucket) else { return; };
+        let prior = self.load_persisted_manifest_version(bucket).unwrap_or(0);
+        if version <= prior {
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // tmp + rename for atomicity. Best-effort: if the write fails we log and
+        // continue; the in-memory guard still catches intra-session downgrades.
+        let tmp = path.with_extension("tmp");
+        let write_ok = std::fs::write(&tmp, version.to_string().as_bytes()).is_ok();
+        if !write_ok {
+            tracing::warn!(?path, "failed to write manifest-version tmp file");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            tracing::warn!(?path, error = %e, "failed to atomically rename manifest-version file");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// WASM stub: persistence is a no-op so behaviour matches the
+    /// in-memory-only cache.
+    #[cfg(target_arch = "wasm32")]
+    fn load_persisted_manifest_version(&self, _bucket: &str) -> Option<u8> { None }
+    #[cfg(target_arch = "wasm32")]
+    fn persist_manifest_version(&self, _bucket: &str, _version: u8) {}
+
     /// Ensure the forest is loaded for a bucket (handles both monolithic and sharded)
     ///
     /// For sharded forests, loads the manifest and the specific shard needed for `path`.
@@ -1718,25 +1826,69 @@ impl EncryptedClient {
     async fn ensure_forest_loaded(&self, bucket: &str) -> Result<()> {
         // Try loading — if it fails because it's sharded, that's fine (manifest is cached).
         // Matches any of v3 / v5 / v6 manifest formats ("forest is sharded" prefix).
-        match self.load_forest(bucket).await {
+        let load_result = match self.load_forest(bucket).await {
             Ok(_) => Ok(()),
             Err(ref e) if e.to_string().contains("forest is sharded") => Ok(()),
             Err(e) => Err(e),
+        };
+
+        // NEW-7.2: on the first successful load of this bucket in this process,
+        // check for a WAL left behind by a prior crash. If present, replay it
+        // and re-drive the flush so the dirty entries become durable. Fires at
+        // most once per (bucket, client) even if this function is called many
+        // times. Failure to recover is logged but not propagated — the read
+        // that triggered the load should still succeed; the next write will
+        // re-trigger the retry path.
+        #[cfg(not(target_arch = "wasm32"))]
+        if load_result.is_ok() && !self.wal_recovered_buckets.contains_key(bucket) {
+            self.wal_recovered_buckets.insert(bucket.to_string(), ());
+            if let Err(e) = self.recover_wal_after_load(bucket).await {
+                tracing::warn!(%bucket, error = %e, "startup WAL recovery failed; dirty entries remain in WAL for next flush");
+            }
         }
+
+        load_result
+    }
+
+    /// Replay any WAL entries for `bucket` that were left on disk by a prior
+    /// process and re-flush so they become durable. No-op when no WAL file
+    /// exists. Called from `ensure_forest_loaded` exactly once per bucket
+    /// per session.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn recover_wal_after_load(&self, bucket: &str) -> Result<()> {
+        let mac_key = wal::derive_mac_key(&self.encryption.key_manager, bucket);
+        let entries = match wal::load(bucket, &mac_key) {
+            Ok(v) if v.is_empty() => return Ok(()),
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%bucket, error = %e, "WAL load failed during startup recovery");
+                return Ok(());
+            }
+        };
+        let count = entries.len();
+        tracing::info!(%bucket, entries = count, "replaying WAL entries from prior session");
+        self.replay_wal_entries(bucket, entries).await?;
+        // Re-drive the flush so the replayed entries become durable. On success
+        // `flush_forest` clears the WAL; on failure the WAL stays on disk for
+        // the next retry trigger. Boxed to break the mutual recursion
+        // `ensure_forest_loaded → recover_wal_after_load → flush_forest →
+        // ensure_forest_loaded` at the type level — the `wal_recovered_buckets`
+        // flag prevents actual runtime recursion.
+        Box::pin(self.flush_forest(bucket)).await
     }
 
     /// Check whether the forest has an entry for `storage_key` that was
     /// uploaded encrypted.
     ///
-    /// Returns `true` only when an entry is present in the currently loaded
-    /// forest AND carries `encrypted: true`. For sharded forests whose shards
-    /// haven't been loaded yet, this returns `false` (best-effort check),
-    /// which is acceptable: the enforcement is defense-in-depth that kicks in
-    /// whenever the forest is loaded (the common case for authenticated
-    /// sessions). Used to block malicious backends from returning plaintext
-    /// for paths that the client uploaded encrypted (C-AUDIT-004).
-    fn forest_entry_requires_encryption(&self, bucket: &str, storage_key: &str) -> bool {
-        match self.forest_cache.get(bucket) {
+    /// Forces a forest load first so that an empty cache (cold start, prior
+    /// failed load, eviction after 412) cannot be used to bypass the check by
+    /// returning `false`. If the forest cannot be loaded, propagates the error
+    /// — callers refuse plaintext rather than returning attacker-chosen bytes.
+    /// Returns `Ok(true)` when an entry is present in the loaded forest AND
+    /// carries `encrypted: true`. (NEW-2.1 / C-AUDIT-004.)
+    async fn forest_entry_requires_encryption(&self, bucket: &str, storage_key: &str) -> Result<bool> {
+        self.ensure_forest_loaded(bucket).await?;
+        let decision = match self.forest_cache.get(bucket) {
             Some(entry) => match entry.value() {
                 ForestCacheEntry::Monolithic { forest, .. } => {
                     forest.find_by_storage_key(storage_key)
@@ -1750,7 +1902,8 @@ impl EncryptedClient {
                 }
             },
             None => false,
-        }
+        };
+        Ok(decision)
     }
 
     /// Save the private forest index for a bucket (monolithic v4 format with AAD+sequence)
@@ -1870,6 +2023,16 @@ impl EncryptedClient {
         // the prior shard ETag — if another writer raced us, the server
         // returns a concurrent-modification error and we drop the cache so
         // the caller re-reads the latest state before retrying.
+        //
+        // NEW-7.2: on a successful phase-1 shard PUT, we also append a
+        // `WalEntry::ShardWrote` to the WAL. If the phase-2 manifest PUT then
+        // 412s, the winning manifest won't reflect our advancement, and
+        // `load_shard`'s AEAD seq check would refuse to read our own shard.
+        // The `ShardWrote` record lets `replay_wal_entries` reconcile the
+        // cached manifest's `shard_sequences[idx]` with what we actually
+        // persisted to S3 so the retry can proceed.
+        #[cfg(not(target_arch = "wasm32"))]
+        let wal_mac = wal::derive_mac_key(&self.encryption.key_manager, bucket);
         let mut new_shard_etags: Vec<(usize, Option<String>)> = Vec::with_capacity(shards_to_upload.len());
         for (pos, shard) in shards_to_upload.iter().enumerate() {
             let shard_idx = shard.shard_index;
@@ -1897,6 +2060,20 @@ impl EncryptedClient {
             match put_result {
                 Ok(r) => {
                     let new_etag = if r.etag.is_empty() { None } else { Some(r.etag) };
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        if let Err(e) = wal::append(
+                            bucket,
+                            &wal_mac,
+                            WalEntry::ShardWrote {
+                                idx: shard_idx,
+                                seq: shard_seq,
+                                etag: new_etag.clone(),
+                            },
+                        ) {
+                            tracing::warn!(%bucket, shard_idx, error = %e, "WAL append failed (ShardWrote); continuing");
+                        }
+                    }
                     new_shard_etags.push((shard_idx, new_etag));
                 }
                 Err(e) if e.is_concurrent_modification() => {
@@ -2344,6 +2521,13 @@ impl EncryptedClient {
         // overwrites always orphan the previous main/chunk objects on S3.
         let now = chrono::Utc::now().timestamp();
 
+        // NEW-7.2: mirror dirty upsert to WAL so a 412 loser can replay its
+        // work on top of the winner's forest (optimistic-merge retry) and so a
+        // crash between upsert and flush doesn't lose the entry. Cloned now
+        // before `forest_entry` is consumed by `upsert_file` below.
+        #[cfg(not(target_arch = "wasm32"))]
+        let wal_entry_clone = forest_entry.clone();
+
         let old_storage_key: Option<String> = if is_sharded {
             // Sharded: load target shard, upsert in-place via get_mut
             let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
@@ -2391,6 +2575,18 @@ impl EncryptedClient {
             });
             old
         };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let wal_mac = wal::derive_mac_key(&self.encryption.key_manager, bucket);
+            if let Err(e) = wal::append(
+                bucket,
+                &wal_mac,
+                WalEntry::Insert { key: key.to_string(), entry: wal_entry_clone },
+            ) {
+                tracing::warn!(%bucket, error = %e, "WAL append failed (upsert); continuing");
+            }
+        }
 
         // Best-effort cleanup of the orphaned previous upload. Guarded by an
         // in-forest refcount check so we never delete a storage key that some
@@ -3027,11 +3223,79 @@ impl EncryptedClient {
         Ok(())
     }
 
-    /// Flush the forest index to storage
+    /// Flush the forest index to storage.
     ///
     /// Call this after bulk uploads using `put_object_flat_deferred`.
     /// This persists the in-memory forest index to encrypted storage.
+    ///
+    /// NEW-7.2: on a 412 (concurrent modification), this wrapper reloads the
+    /// winner's forest, replays any pending WAL entries on top, and retries
+    /// the flush up to `MAX_FLUSH_RETRIES` times. If all retries lose the
+    /// race, surfaces `ClientError::ConcurrentModificationExhausted` with the
+    /// WAL path so the caller can inspect / recover pending work.
     pub async fn flush_forest(&self, bucket: &str) -> Result<()> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            // On WASM we have no WAL / no file state, so fall back to the old
+            // behaviour (single attempt, propagate 412 immediately).
+            return self.flush_forest_inner(bucket).await;
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let wal_mac = wal::derive_mac_key(&self.encryption.key_manager, bucket);
+            let mut last_err: Option<ClientError> = None;
+            for attempt in 0..MAX_FLUSH_RETRIES {
+                match self.flush_forest_inner(bucket).await {
+                    Ok(()) => {
+                        // Clean flush: drop the WAL so we don't replay old
+                        // entries on future flushes / restarts.
+                        if let Err(e) = wal::clear(bucket) {
+                            tracing::warn!(%bucket, error = %e, "WAL clear after flush failed");
+                        }
+                        return Ok(());
+                    }
+                    Err(e) if e.is_concurrent_modification() && attempt + 1 < MAX_FLUSH_RETRIES => {
+                        tracing::warn!(%bucket, attempt, "flush_forest: 412 race, replaying WAL and retrying");
+                        // Cache was already evicted by save_forest / save_sharded_forest.
+                        // Reload the winner's forest, replay any WAL entries on top,
+                        // then fall through to the next retry.
+                        self.ensure_forest_loaded(bucket).await?;
+                        let wal_entries = wal::load(bucket, &wal_mac)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(%bucket, error = %e, "WAL load failed during replay");
+                                Vec::new()
+                            });
+                        self.replay_wal_entries(bucket, wal_entries).await?;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    Err(e) if e.is_concurrent_modification() => {
+                        last_err = Some(e);
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            // Exhausted. Build a structured error with the WAL path for diagnosis.
+            let unresolved_ops = wal::load(bucket, &wal_mac).map(|v| v.len()).unwrap_or(0);
+            let wal_path_str = wal::path_for(bucket)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<no-state-dir>".to_string());
+            tracing::warn!(%bucket, retries = MAX_FLUSH_RETRIES, unresolved_ops, "flush_forest: giving up after retries");
+            let _ = last_err; // retained for future structured reporting
+            Err(ClientError::ConcurrentModificationExhausted {
+                bucket: bucket.to_string(),
+                retries: MAX_FLUSH_RETRIES,
+                unresolved_ops,
+                wal_path: wal_path_str,
+            })
+        }
+    }
+
+    /// Single-attempt flush of the forest index to storage. Called by
+    /// `flush_forest` inside its retry loop.
+    async fn flush_forest_inner(&self, bucket: &str) -> Result<()> {
         // Acquire read lock — blocks only if migration is in progress
         let lock = self.migration_lock(bucket);
         let _guard = lock.read().await;
@@ -3161,6 +3425,140 @@ impl EncryptedClient {
                 Ok(())
             }
         }
+    }
+
+    /// Replay a WAL entry list on top of the currently-cached forest for
+    /// `bucket`. Used by `flush_forest` after a 412-race to re-apply a losing
+    /// writer's dirty ops on top of the winner's forest before retrying the
+    /// flush (NEW-7.2). Loads the target shard(s) as needed.
+    ///
+    /// `ShardWrote` entries are processed first so that any subsequent
+    /// `load_shard` inside an `Insert`/`Remove` replay uses the reconciled
+    /// `shard_sequences[idx]` — otherwise the winner's manifest (which didn't
+    /// know about our phase-1 advancement) would trip the AEAD seq verifier.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn replay_wal_entries(&self, bucket: &str, entries: Vec<WalEntry>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let is_sharded = self.is_forest_sharded(bucket);
+        let forest_dek = if is_sharded {
+            Some(self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket)))
+        } else {
+            None
+        };
+
+        // Phase 1: reconcile ShardWrote entries onto the cache's manifest view.
+        // For each shard we already successfully wrote to S3, set
+        // `shard_sequences[idx]` and `shard_etags[idx]` to what we persisted so
+        // the retry path can re-read and re-flush consistently. We keep only the
+        // MAX observed seq per shard in case of multiple races.
+        if is_sharded {
+            let mut shard_writes: std::collections::HashMap<usize, (u64, Option<String>)> =
+                std::collections::HashMap::new();
+            for entry in &entries {
+                if let WalEntry::ShardWrote { idx, seq, etag } = entry {
+                    let slot = shard_writes.entry(*idx).or_insert((0u64, None));
+                    if *seq >= slot.0 {
+                        *slot = (*seq, etag.clone());
+                    }
+                }
+            }
+            if !shard_writes.is_empty() {
+                if let Some(mut cache_entry) = self.forest_cache.get_mut(bucket) {
+                    if let ForestCacheEntry::Sharded { forest, shard_etags, .. } = cache_entry.value_mut() {
+                        let num_shards = forest.manifest.num_shards;
+                        if forest.manifest.shard_sequences.len() != num_shards {
+                            forest.manifest.shard_sequences.resize(num_shards, 0);
+                        }
+                        if shard_etags.len() != num_shards {
+                            shard_etags.resize(num_shards, None);
+                        }
+                        for (idx, (seq, etag)) in shard_writes {
+                            if idx < num_shards {
+                                let cur = forest.manifest.shard_sequences[idx];
+                                if seq > cur {
+                                    forest.manifest.shard_sequences[idx] = seq;
+                                }
+                                shard_etags[idx] = etag;
+                                // Mark dirty so the retry flush re-PUTs this shard
+                                // (bumping its seq to wal_seq + 1 and carrying our
+                                // replayed Insert/Remove entries).
+                                forest.dirty_shards.insert(idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 2: replay Insert/Remove in order. Any load_shard inside this
+        // loop now sees the reconciled shard_sequences and will AEAD-verify
+        // correctly against the bytes we actually left on S3.
+        for entry in entries {
+            match entry {
+                WalEntry::Insert { key, entry: forest_entry } => {
+                    if is_sharded {
+                        let dek = forest_dek.as_ref().unwrap();
+                        let shard_index = {
+                            let cache = match self.forest_cache.get(bucket) {
+                                Some(c) => c,
+                                None => continue,
+                            };
+                            match cache.value() {
+                                ForestCacheEntry::Sharded { forest, .. } => forest.shard_for(&key, dek),
+                                _ => continue,
+                            }
+                        };
+                        self.load_shard(bucket, shard_index).await?;
+                        if let Some(mut cache_entry) = self.forest_cache.get_mut(bucket) {
+                            if let ForestCacheEntry::Sharded { forest, .. } = cache_entry.value_mut() {
+                                forest.upsert_file(forest_entry, dek);
+                            }
+                        }
+                    } else {
+                        if let Some(mut cache_entry) = self.forest_cache.get_mut(bucket) {
+                            if let ForestCacheEntry::Monolithic { forest, dirty, .. } = cache_entry.value_mut() {
+                                forest.upsert_file(forest_entry);
+                                *dirty = true;
+                            }
+                        }
+                    }
+                }
+                WalEntry::Remove { key } => {
+                    if is_sharded {
+                        let dek = forest_dek.as_ref().unwrap();
+                        let shard_index = {
+                            let cache = match self.forest_cache.get(bucket) {
+                                Some(c) => c,
+                                None => continue,
+                            };
+                            match cache.value() {
+                                ForestCacheEntry::Sharded { forest, .. } => forest.shard_for(&key, dek),
+                                _ => continue,
+                            }
+                        };
+                        self.load_shard(bucket, shard_index).await?;
+                        if let Some(mut cache_entry) = self.forest_cache.get_mut(bucket) {
+                            if let ForestCacheEntry::Sharded { forest, .. } = cache_entry.value_mut() {
+                                forest.remove_file(&key, dek);
+                            }
+                        }
+                    } else {
+                        if let Some(mut cache_entry) = self.forest_cache.get_mut(bucket) {
+                            if let ForestCacheEntry::Monolithic { forest, dirty, .. } = cache_entry.value_mut() {
+                                forest.remove_file(&key);
+                                *dirty = true;
+                            }
+                        }
+                    }
+                }
+                WalEntry::ShardWrote { .. } => {
+                    // Already handled in Phase 1.
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Check if there are unsaved forest changes
@@ -3485,6 +3883,18 @@ impl EncryptedClient {
                 }
             }
 
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let wal_mac = wal::derive_mac_key(&self.encryption.key_manager, bucket);
+                if let Err(e) = wal::append(
+                    bucket,
+                    &wal_mac,
+                    WalEntry::Remove { key: key.to_string() },
+                ) {
+                    tracing::warn!(%bucket, error = %e, "WAL append failed (remove); continuing");
+                }
+            }
+
             // Use flush_forest instead of save_sharded_forest so that v3/v5→v6
             // auto-migration fires on delete-only flows (not just put flows).
             self.flush_forest(bucket).await?;
@@ -3510,7 +3920,36 @@ impl EncryptedClient {
 
             // Update and save forest first, then delete storage
             forest.remove_file(key);
-            self.save_forest(bucket, &forest).await?;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let wal_mac = wal::derive_mac_key(&self.encryption.key_manager, bucket);
+                if let Err(e) = wal::append(
+                    bucket,
+                    &wal_mac,
+                    WalEntry::Remove { key: key.to_string() },
+                ) {
+                    tracing::warn!(%bucket, error = %e, "WAL append failed (remove monolithic); continuing");
+                }
+            }
+            // Persist the updated forest back into the cache so flush_forest's
+            // retry loop (NEW-7.2) sees the in-memory change; then flush via
+            // flush_forest so 412 races trigger the WAL replay path.
+            let now = chrono::Utc::now().timestamp();
+            let (prior_etag, prior_seq) = self.forest_cache.get(bucket)
+                .map(|e| match e.value() {
+                    ForestCacheEntry::Monolithic { index_etag, last_sequence, .. } =>
+                        (index_etag.clone(), *last_sequence),
+                    _ => (None, None),
+                })
+                .unwrap_or((None, None));
+            self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::Monolithic {
+                forest: forest.clone(),
+                loaded_at: now,
+                dirty: true,
+                index_etag: prior_etag,
+                last_sequence: prior_seq,
+            });
+            self.flush_forest(bucket).await?;
 
             // Delete chunk objects if this was a chunked file (best-effort)
             if let Some(n) = num_chunks {
@@ -3650,8 +4089,8 @@ impl EncryptedClient {
             .unwrap_or(false);
 
         if !is_encrypted {
-            // C-AUDIT-004: block plaintext response for forest-known encrypted entries
-            if self.forest_entry_requires_encryption(bucket, storage_key) {
+            // C-AUDIT-004 / NEW-2.1: block plaintext response for forest-known encrypted entries
+            if self.forest_entry_requires_encryption(bucket, storage_key).await? {
                 return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
                     "storage backend served plaintext for an encrypted path".to_string()
                 )));
@@ -3972,17 +4411,55 @@ impl EncryptedClient {
             }
         }
 
+        // NEW-7.1: derive a per-bucket MAC key for the rotation journal, domain-separated
+        // from any encryption key. Each journal line carries a BLAKE3 keyed MAC so a
+        // local tamperer cannot cause legitimate keys to be skipped on the next run.
+        #[cfg(not(target_arch = "wasm32"))]
+        let journal_mac_key = self.encryption.key_manager
+            .derive_path_key(&format!("rotation-journal-mac:{}", bucket));
+
         // Load prior rotation state from the journal, if one was provided and exists.
         #[cfg(not(target_arch = "wasm32"))]
         let already_rotated: std::collections::HashSet<String> = match journal_path {
             Some(path) if path.exists() => {
                 match std::fs::read_to_string(path) {
-                    Ok(contents) => contents
-                        .lines()
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .collect(),
+                    Ok(contents) => {
+                        let mut set = std::collections::HashSet::new();
+                        for line in contents.lines() {
+                            let line = line.trim();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            let Some((key_str, mac_hex)) = line.split_once('\t') else {
+                                tracing::warn!(%line, "rotation journal: malformed line, skipping");
+                                continue;
+                            };
+                            let Ok(actual) = hex::decode(mac_hex) else {
+                                tracing::warn!(%key_str, "rotation journal: bad hex MAC, skipping");
+                                continue;
+                            };
+                            if actual.len() != 32 {
+                                tracing::warn!(%key_str, "rotation journal: wrong MAC length, skipping");
+                                continue;
+                            }
+                            let expected = blake3::keyed_hash(
+                                journal_mac_key.as_bytes(),
+                                key_str.as_bytes(),
+                            );
+                            // Constant-time compare to avoid length/byte-wise timing leaks.
+                            let matches = expected.as_bytes()
+                                .iter()
+                                .zip(actual.iter())
+                                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                                == 0;
+                            if matches {
+                                set.insert(key_str.to_string());
+                            } else {
+                                tracing::warn!(%key_str, "rotation journal: MAC mismatch, skipping forged line");
+                            }
+                        }
+                        set
+                    }
                     Err(e) => {
                         tracing::warn!(?path, error = %e, "rotate_bucket_with_journal: failed to read journal, starting fresh");
                         std::collections::HashSet::new()
@@ -4019,13 +4496,19 @@ impl EncryptedClient {
             .await;
 
         // Journal is append-only; flush after every successful rewrap so an
-        // interruption only loses the in-flight items.
+        // interruption only loses the in-flight items. NEW-L.4: an exclusive OS file
+        // lock prevents two rotations from garbling each other's appends.
         #[cfg(not(target_arch = "wasm32"))]
         let mut journal_writer: Option<std::io::BufWriter<std::fs::File>> = match journal_path {
             Some(path) => {
+                use fs2::FileExt;
                 use std::io::Write;
                 match std::fs::OpenOptions::new().create(true).append(true).open(path) {
                     Ok(f) => {
+                        if let Err(e) = f.try_lock_exclusive() {
+                            tracing::warn!(?path, error = %e, "rotate_bucket_with_journal: journal is locked by another process");
+                            return Err(ClientError::RotationInProgress { bucket: bucket.to_string() });
+                        }
                         let mut w = std::io::BufWriter::new(f);
                         // If resuming, write an empty line-flush so callers see a valid file.
                         let _ = w.flush();
@@ -4047,7 +4530,10 @@ impl EncryptedClient {
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(w) = journal_writer.as_mut() {
                         use std::io::Write;
-                        if writeln!(w, "{}", key).is_err() || w.flush().is_err() {
+                        let mac = blake3::keyed_hash(journal_mac_key.as_bytes(), key.as_bytes());
+                        if writeln!(w, "{}\t{}", key, hex::encode(mac.as_bytes())).is_err()
+                            || w.flush().is_err()
+                        {
                             tracing::warn!(%key, "rotate_bucket_with_journal: failed to append to journal");
                         }
                     }
@@ -4059,6 +4545,7 @@ impl EncryptedClient {
             }
         }
 
+        // Dropping the writer closes the file, which releases the exclusive lock.
         #[cfg(not(target_arch = "wasm32"))]
         drop(journal_writer);
 

@@ -111,6 +111,15 @@ impl From<fula_client::ClientError> for FulaError {
             ClientError::ConcurrentModification(msg) => FulaError::InvalidResponse(
                 format!("concurrent modification: {}", msg),
             ),
+            ClientError::ConcurrentModificationExhausted { bucket, retries, unresolved_ops, wal_path } => {
+                FulaError::InvalidResponse(format!(
+                    "concurrent modification unresolved after {} retries: bucket={}, pending ops={}, wal={}",
+                    retries, bucket, unresolved_ops, wal_path
+                ))
+            }
+            ClientError::RotationInProgress { bucket } => FulaError::InvalidResponse(
+                format!("rotation already in progress for bucket: {}", bucket),
+            ),
         }
     }
 }
