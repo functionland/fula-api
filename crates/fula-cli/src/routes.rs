@@ -64,6 +64,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/{bucket}/{*key}", head(handlers::head_object))
         .route("/{bucket}/{*key}", delete(object_delete_handler))
         .route("/{bucket}/{*key}", post(object_post_handler))
+        // Forest migration advisory locks (v1 -> v7).
+        // Serialized per `{hashed_user_id}:{bucket}`; see handlers::locks.
+        .route("/locks/{bucket}", post(handlers::acquire_lock))
+        .route("/locks/{bucket}", delete(handlers::release_lock))
+        .route("/locks/{bucket}/heartbeat", post(handlers::heartbeat_lock))
         // Private middleware only
         .layer(axum_middleware::from_fn(middleware::request_id_middleware))
         .layer(axum_middleware::from_fn(middleware::logging_middleware))
@@ -311,6 +316,9 @@ fn create_cors_layer(origins: &[String]) -> CorsLayer {
         header::HeaderName::from_static("x-amz-meta-x-fula-encrypted"),
         header::HeaderName::from_static("x-amz-meta-x-fula-encryption"),
         header::HeaderName::from_static("x-amz-meta-x-fula-chunked"),
+        // Migration lock token passed on DELETE /locks/{bucket} and
+        // POST /locks/{bucket}/heartbeat — browsers run CORS preflight.
+        header::HeaderName::from_static("x-fula-lock-token"),
     ];
     
     let cors = CorsLayer::new()

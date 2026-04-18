@@ -500,6 +500,26 @@ impl FulaClient {
                 ));
             }
 
+            // 409 on a /locks/ endpoint means the migration lock is held.
+            // We narrowly gate on the path so non-lock 409s (e.g. S3
+            // BucketAlreadyExists) continue to surface as S3 errors.
+            if status.as_u16() == 409 && path.starts_with("/locks/") {
+                let body = response.text().await.unwrap_or_default();
+                let expires_at = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("expires_at").and_then(|e| e.as_i64()))
+                    .unwrap_or(0);
+                // Strip the "/locks/" prefix to recover the bucket name, and
+                // drop any trailing "/heartbeat" segment.
+                let bucket = path
+                    .trim_start_matches("/locks/")
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                return Err(ClientError::MigrationLockHeld { bucket, expires_at });
+            }
+
             // For HEAD requests, S3 returns error code in x-amz-error-code header
             // since there's no response body
             let error_code = response
@@ -523,6 +543,68 @@ impl FulaClient {
         }
 
         Ok(response)
+    }
+}
+
+/// Handle returned from `acquire_migration_lock`. Carries the token needed
+/// to release the lock or refresh its TTL.
+#[derive(Debug, Clone)]
+pub struct MigrationLockHandle {
+    pub token: String,
+    pub expires_at_ms: i64,
+}
+
+impl FulaClient {
+    /// Acquire the server-side migration advisory lock for `bucket`.
+    ///
+    /// Returns the holder's token on success. On 409, returns
+    /// `ClientError::MigrationLockHeld { bucket, expires_at }` — the caller
+    /// should interpret this as "another device is migrating" and fall back
+    /// to a read-only path.
+    #[instrument(skip(self))]
+    pub async fn acquire_migration_lock(&self, bucket: &str) -> Result<MigrationLockHandle> {
+        let path = format!("/locks/{}", bucket);
+        let response = self.request("POST", &path, None, None, None).await?;
+        let text = response.text().await?;
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| ClientError::InvalidResponse(format!("lock acquire: {}", e)))?;
+        let token = v.get("token").and_then(|t| t.as_str())
+            .ok_or_else(|| ClientError::InvalidResponse("lock acquire: missing token".into()))?
+            .to_string();
+        let expires_at_ms = v.get("expires_at").and_then(|e| e.as_i64())
+            .ok_or_else(|| ClientError::InvalidResponse("lock acquire: missing expires_at".into()))?;
+        Ok(MigrationLockHandle { token, expires_at_ms })
+    }
+
+    /// Release the migration lock for `bucket`. Requires the token returned
+    /// from `acquire_migration_lock`. Idempotent: a 404 (already released)
+    /// is treated as success.
+    #[instrument(skip(self, token))]
+    pub async fn release_migration_lock(&self, bucket: &str, token: &str) -> Result<()> {
+        let path = format!("/locks/{}", bucket);
+        let mut headers = HashMap::new();
+        headers.insert("x-fula-lock-token".to_string(), token.to_string());
+        match self.request("DELETE", &path, None, Some(headers), None).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.is_not_found() => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Refresh the TTL on the migration lock for `bucket`. Returns the new
+    /// `expires_at_ms`. Callers should run this on a ~30s cadence so the
+    /// 60s server TTL never lapses mid-migration.
+    #[instrument(skip(self, token))]
+    pub async fn heartbeat_migration_lock(&self, bucket: &str, token: &str) -> Result<i64> {
+        let path = format!("/locks/{}/heartbeat", bucket);
+        let mut headers = HashMap::new();
+        headers.insert("x-fula-lock-token".to_string(), token.to_string());
+        let response = self.request("POST", &path, None, Some(headers), None).await?;
+        let text = response.text().await?;
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| ClientError::InvalidResponse(format!("lock heartbeat: {}", e)))?;
+        v.get("expires_at").and_then(|e| e.as_i64())
+            .ok_or_else(|| ClientError::InvalidResponse("lock heartbeat: missing expires_at".into()))
     }
 }
 

@@ -120,6 +120,9 @@ impl From<fula_client::ClientError> for FulaError {
             ClientError::RotationInProgress { bucket } => FulaError::InvalidResponse(
                 format!("rotation already in progress for bucket: {}", bucket),
             ),
+            ClientError::MigrationLockHeld { bucket, expires_at } => FulaError::InvalidResponse(
+                format!("migration lock held for bucket {} (expires at {} ms)", bucket, expires_at),
+            ),
         }
     }
 }

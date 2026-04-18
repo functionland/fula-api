@@ -25,6 +25,24 @@ use crate::error::{ClientError, Result};
 const WAL_FILE_VERSION: u8 = 1;
 
 /// A single WAL record.
+///
+/// **Format-agnostic.** The on-disk layout is deliberately the same across
+/// every supported forest version (v1 monolithic through v7 sharded-HAMT).
+/// Entries are keyed by user-facing path (plus storage_key for inserts) so
+/// replay can target the correct shard on whatever manifest is live at
+/// recovery time — the WAL carries no version field and does not care whether
+/// the currently-active forest is monolithic or sharded.
+///
+/// **Interaction with v1 → v7 migration.** The load-time migration trigger
+/// (`EncryptedClient::migrate_v1_to_v7_internal`) checks for WAL presence
+/// before acquiring the server lock; a non-empty WAL short-circuits to
+/// `DeferredTransientError`. Rationale: draining the WAL rewrites the v1
+/// index blob, which invalidates the If-Match ETag the migration would bind
+/// to the v7 manifest PUT. Waiting for the next access means the next
+/// `ensure_forest_loaded` call drains the WAL via `recover_wal_after_load`
+/// (which calls `flush_forest` — itself responsible for `wal::clear` on
+/// success) and the following load-time trigger re-enters with a matching
+/// ETag.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op")]
 pub(crate) enum WalEntry {

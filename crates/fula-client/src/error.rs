@@ -89,6 +89,15 @@ pub enum ClientError {
     /// (NEW-L.4.)
     #[error("Rotation already in progress for bucket: {bucket}")]
     RotationInProgress { bucket: String },
+
+    /// Server-side advisory migration lock is already held by another device
+    /// or by a prior session whose TTL has not yet expired.
+    ///
+    /// Returned by `POST /locks/{bucket}` with a 409 response. The caller should
+    /// fall back to read-only v1 access for this session; the next session will
+    /// re-enter the load-time migration path.
+    #[error("Migration lock held for bucket {bucket} (expires at {expires_at} ms)")]
+    MigrationLockHeld { bucket: String, expires_at: i64 },
 }
 
 impl ClientError {

@@ -31,6 +31,9 @@ pub struct AppState {
     pub bucket_manager: Arc<BucketManager<FlexibleBlockStore>>,
     /// Multipart upload manager
     pub multipart_manager: Arc<MultipartManager>,
+    /// In-memory advisory lock store used to serialize v1 -> v7 forest
+    /// migrations across devices. TTL-bounded; process-local only.
+    pub lock_store: crate::handlers::locks::LockStore,
 }
 
 impl AppState {
@@ -103,11 +106,16 @@ impl AppState {
         // Initialize multipart manager
         let multipart_manager = Arc::new(MultipartManager::new(config.multipart_expiry_secs));
 
+        // Initialize empty lock store. The sweeper is spawned by `server::run_server`
+        // after AppState is wrapped in an Arc.
+        let lock_store = crate::handlers::locks::LockStore::new();
+
         Ok(Self {
             config,
             block_store,
             bucket_manager,
             multipart_manager,
+            lock_store,
         })
     }
 
