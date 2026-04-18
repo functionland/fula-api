@@ -15,14 +15,19 @@ use fula_crypto::{
     private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, KeyObfuscation, obfuscate_key},
     private_forest::{
         PrivateForest, EncryptedForest, ForestFileEntry, derive_index_key,
+        generate_flat_key,
         ShardedPrivateForest, ForestShard,
         EncryptedShardManifest, EncryptedForestShard, ForestEvent,
         detect_forest_format, ForestOrManifest, derive_shard_key,
         compute_initial_shard_count, SHARDED_MIGRATION_THRESHOLD,
+        EncryptedShardManifestV7, ShardManifestV7,
     },
     sharing::{ShareToken, AcceptedShare, ShareRecipient},
     rotation::{KeyRotationManager, WrappedKeyInfo},
+    wnfs_hamt::BlobBackend,
+    sharded_hamt_forest::ShardedHamtPrivateForest,
     ChunkedEncoder, ChunkedFileMetadata, should_use_chunked,
+    CryptoError,
 };
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -71,6 +76,79 @@ impl Drop for AutoFlushHandle {
         if let Some(tx) = self.cancel.take() {
             let _ = tx.send(());
         }
+    }
+}
+
+/// S3-backed implementation of `fula_crypto::wnfs_hamt::BlobBackend`.
+///
+/// Thin wrapper that maps `BlobBackend::{get, put}(path, bytes)` to plain
+/// `FulaClient::{get_object, put_object}(bucket, path, bytes)`. All crypto
+/// (AEAD, content addressing) lives in `V7NodeStore` inside fula-crypto —
+/// this type deliberately does no encryption of its own, so `V7NodeStore`
+/// can be reused with an in-memory backend in tests.
+///
+/// One backend instance is cheap (just a cloned `FulaClient` + bucket
+/// name) — construct per-flush and drop.
+#[derive(Clone)]
+pub struct S3BlobBackend {
+    inner: FulaClient,
+    bucket: String,
+}
+
+impl S3BlobBackend {
+    /// Construct a backend rooted at `bucket` on top of an existing
+    /// `FulaClient`.
+    pub fn new(inner: FulaClient, bucket: impl Into<String>) -> Self {
+        Self {
+            inner,
+            bucket: bucket.into(),
+        }
+    }
+}
+
+fn client_err_to_crypto(err: ClientError) -> CryptoError {
+    CryptoError::Storage(err.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait::async_trait]
+impl BlobBackend for S3BlobBackend {
+    async fn get(&self, path: &str) -> fula_crypto::Result<Vec<u8>> {
+        let bytes = self
+            .inner
+            .get_object(&self.bucket, path)
+            .await
+            .map_err(client_err_to_crypto)?;
+        Ok(bytes.to_vec())
+    }
+
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> fula_crypto::Result<()> {
+        self.inner
+            .put_object(&self.bucket, path, bytes)
+            .await
+            .map(|_| ())
+            .map_err(client_err_to_crypto)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[async_trait::async_trait(?Send)]
+impl BlobBackend for S3BlobBackend {
+    async fn get(&self, path: &str) -> fula_crypto::Result<Vec<u8>> {
+        let bytes = self
+            .inner
+            .get_object(&self.bucket, path)
+            .await
+            .map_err(client_err_to_crypto)?;
+        Ok(bytes.to_vec())
+    }
+
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> fula_crypto::Result<()> {
+        self.inner
+            .put_object(&self.bucket, path, bytes)
+            .await
+            .map(|_| ())
+            .map_err(client_err_to_crypto)
     }
 }
 
@@ -178,6 +256,23 @@ enum ForestCacheEntry {
         /// never been observed (first write path or shard not yet loaded).
         shard_etags: Vec<Option<String>>,
     },
+    /// Sharded-HAMT forest (v7). Per-shard HAMT tree with nodes
+    /// stored independently at `__fula_forest_v7_nodes/<storage_key>`.
+    /// The forest holds per-shard root storage keys, sequences,
+    /// and interior nodes load lazily through `V7NodeStore`.
+    ///
+    /// Wrapped in `Arc<tokio::sync::Mutex<_>>` because mutation methods
+    /// (`upsert_file`, `flush_dirty`) are async and would require holding
+    /// a `DashMap::RefMut` across an `await`, which deadlocks DashMap's
+    /// shard locks.
+    ShardedHamt {
+        forest: Arc<tokio::sync::Mutex<ShardedHamtPrivateForest>>,
+        loaded_at: i64,
+        /// ETag of the manifest object itself.
+        manifest_etag: Option<String>,
+        /// Highest manifest sequence observed.
+        last_manifest_sequence: Option<u64>,
+    },
 }
 
 impl ForestCacheEntry {
@@ -185,6 +280,7 @@ impl ForestCacheEntry {
         match self {
             ForestCacheEntry::Monolithic { loaded_at, .. } => *loaded_at,
             ForestCacheEntry::Sharded { loaded_at, .. } => *loaded_at,
+            ForestCacheEntry::ShardedHamt { loaded_at, .. } => *loaded_at,
         }
     }
 
@@ -194,6 +290,15 @@ impl ForestCacheEntry {
             ForestCacheEntry::Sharded { forest, .. } => {
                 forest.manifest_dirty || !forest.dirty_shards.is_empty()
             }
+            // `tokio::sync::Mutex::try_lock` is a synchronous probe. When
+            // uncontended we read the forest's authoritative dirty state.
+            // When contended (a flush or mutation is in flight), fall back
+            // to `true` — the cache entry is in active use, so callers
+            // should not treat it as stale and evict while we're mid-flush.
+            ForestCacheEntry::ShardedHamt { forest, .. } => match forest.try_lock() {
+                Ok(guard) => guard.is_dirty(),
+                Err(_) => true,
+            },
         }
     }
 }
@@ -429,6 +534,7 @@ impl EncryptedClient {
         self.forest_cache.get(bucket).and_then(|entry| match entry.value() {
             ForestCacheEntry::Monolithic { last_sequence, .. } => *last_sequence,
             ForestCacheEntry::Sharded { last_manifest_sequence, .. } => *last_manifest_sequence,
+            ForestCacheEntry::ShardedHamt { last_manifest_sequence, .. } => *last_manifest_sequence,
         })
     }
 
@@ -831,34 +937,23 @@ impl EncryptedClient {
         for window_start in (0..num_chunks as usize).step_by(window_size) {
             let window_end = std::cmp::min(window_start + window_size, num_chunks as usize);
 
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(window_size));
-            let mut handles = Vec::with_capacity(window_end - window_start);
-
-            for chunk_index in window_start..window_end {
+            // Use futures::stream::buffer_unordered for cross-platform bounded
+            // concurrency — tokio::spawn + Semaphore pulls in tokio's `rt`
+            // feature which isn't available on wasm32.
+            use futures::StreamExt;
+            let futs = (window_start..window_end).map(|chunk_index| {
                 let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk_index as u32);
                 let client = self.inner.clone();
                 let bucket = bucket.to_string();
-                let sem = semaphore.clone();
-
-                let handle = tokio::spawn(async move {
-                    let _permit = sem.acquire().await.map_err(|e|
-                        ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
-                    )?;
+                async move {
                     let data = client.get_object(&bucket, &chunk_key).await?;
                     Ok::<(u32, Bytes), ClientError>((chunk_index as u32, data))
-                });
-
-                handles.push(handle);
-            }
-
-            // Collect window results
+                }
+            });
+            let mut stream = futures::stream::iter(futs).buffer_unordered(window_size);
             let mut window_chunks: Vec<(u32, Bytes)> = Vec::with_capacity(window_end - window_start);
-            for handle in handles {
-                let (idx, data) = handle.await
-                    .map_err(|e| ClientError::Encryption(
-                        fula_crypto::CryptoError::Decryption(format!("Chunk download task failed: {}", e))
-                    ))??;
-                window_chunks.push((idx, data));
+            while let Some(result) = stream.next().await {
+                window_chunks.push(result?);
             }
 
             // Sort by index and decrypt in order, writing directly to output.
@@ -1387,7 +1482,8 @@ impl EncryptedClient {
             if is_fresh || entry.is_dirty() {
                 match entry.value() {
                     ForestCacheEntry::Monolithic { forest, .. } => return Ok(forest.clone()),
-                    ForestCacheEntry::Sharded { .. } => {
+                    ForestCacheEntry::Sharded { .. } |
+                    ForestCacheEntry::ShardedHamt { .. } => {
                         // Sharded forest — caller should use sharded API instead.
                         // For backward compat, return an error indicating upgrade.
                         return Err(ClientError::Encryption(
@@ -1417,9 +1513,13 @@ impl EncryptedClient {
                 let cached_any_seen_sequence = self.forest_cache.get(bucket).and_then(|e| match e.value() {
                     ForestCacheEntry::Monolithic { last_sequence, .. } => *last_sequence,
                     ForestCacheEntry::Sharded { last_manifest_sequence, .. } => *last_manifest_sequence,
+                    ForestCacheEntry::ShardedHamt { last_manifest_sequence, .. } => *last_manifest_sequence,
                 });
                 let cached_is_sharded = self.forest_cache.get(bucket)
-                    .map(|e| matches!(e.value(), ForestCacheEntry::Sharded { .. }))
+                    .map(|e| matches!(
+                        e.value(),
+                        ForestCacheEntry::Sharded { .. } | ForestCacheEntry::ShardedHamt { .. }
+                    ))
                     .unwrap_or(false);
 
                 match detect_forest_format(&result.data).map_err(ClientError::Encryption)? {
@@ -1494,10 +1594,13 @@ impl EncryptedClient {
                         // manifest.version so that a server cannot quietly roll back routing.
                         let cached_prior_manifest_seq = self.forest_cache.get(bucket).and_then(|e| match e.value() {
                             ForestCacheEntry::Sharded { last_manifest_sequence, .. } => *last_manifest_sequence,
+                            ForestCacheEntry::ShardedHamt { last_manifest_sequence, .. } => *last_manifest_sequence,
                             _ => None,
                         });
                         let cached_prior_manifest_version = self.forest_cache.get(bucket).and_then(|e| match e.value() {
                             ForestCacheEntry::Sharded { forest, .. } => Some(forest.manifest.version),
+                            // v7 variant is structurally pinned to version 7 — no lock needed.
+                            ForestCacheEntry::ShardedHamt { .. } => Some(7u8),
                             _ => None,
                         });
                         // NEW-L.7: augment the in-memory guard with a persisted version
@@ -1590,6 +1693,83 @@ impl EncryptedClient {
                             )
                         ))
                     }
+                    ForestOrManifest::ManifestV7(encrypted_manifest_v7) => {
+                        // v7 HAMT-per-shard forest. Populate-then-error
+                        // mirrors the v5/v6 arms above: decrypt, run replay
+                        // and downgrade guards, persist the version pin,
+                        // insert into the forest cache, and only then
+                        // surface the "use sharded API" error so callers
+                        // that resolve through the sharded pipeline see a
+                        // ready entry on their next lookup.
+                        let cached_prior_manifest_seq = self.forest_cache.get(bucket).and_then(|e| match e.value() {
+                            ForestCacheEntry::Sharded { last_manifest_sequence, .. } => *last_manifest_sequence,
+                            ForestCacheEntry::ShardedHamt { last_manifest_sequence, .. } => *last_manifest_sequence,
+                            _ => None,
+                        });
+                        let cached_prior_manifest_version = self.forest_cache.get(bucket).and_then(|e| match e.value() {
+                            ForestCacheEntry::Sharded { forest, .. } => Some(forest.manifest.version),
+                            // v7 variant is structurally pinned to version 7 — no lock needed.
+                            ForestCacheEntry::ShardedHamt { .. } => Some(7u8),
+                            _ => None,
+                        });
+                        let persisted_prior_version = self.load_persisted_manifest_version(bucket);
+                        let effective_prior_version = match (cached_prior_manifest_version, persisted_prior_version) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        };
+                        // v7 is the newest format — any cache or persisted
+                        // hint pointing at >=8 would be a future format we
+                        // cannot read. A peer at 7 or lower is fine.
+                        if effective_prior_version.map_or(false, |v| v > 7) {
+                            return Err(ClientError::Encryption(
+                                fula_crypto::CryptoError::Decryption(
+                                    "manifest routing downgrade detected: server served v7 after a newer manifest was observed".to_string()
+                                )
+                            ));
+                        }
+
+                        let (manifest, observed_manifest_seq) = {
+                            let (m, seq) = encrypted_manifest_v7
+                                .decrypt_v7(&forest_dek, bucket)
+                                .map_err(ClientError::Encryption)?;
+                            self.check_sequence_floor(bucket, seq)?;
+                            if let Some(last) = cached_prior_manifest_seq {
+                                if seq < last {
+                                    return Err(ClientError::Encryption(
+                                        fula_crypto::CryptoError::Decryption(format!(
+                                            "manifest replay detected: sequence {} < cached {}",
+                                            seq, last
+                                        ))
+                                    ));
+                                }
+                            }
+                            (m, Some(seq))
+                        };
+
+                        self.persist_manifest_version(bucket, 7);
+
+                        let now = chrono::Utc::now().timestamp();
+                        let forest = ShardedHamtPrivateForest::from_manifest(
+                            manifest,
+                            bucket.to_string(),
+                            forest_dek.clone(),
+                        );
+                        let forest_arc = Arc::new(tokio::sync::Mutex::new(forest));
+                        self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::ShardedHamt {
+                            forest: forest_arc,
+                            loaded_at: now,
+                            manifest_etag: observed_etag,
+                            last_manifest_sequence: observed_manifest_seq,
+                        });
+
+                        Err(ClientError::Encryption(
+                            fula_crypto::CryptoError::Encryption(
+                                "forest is sharded; use sharded API methods".to_string()
+                            )
+                        ))
+                    }
                 }
             }
             Err(_) => {
@@ -1608,10 +1788,22 @@ impl EncryptedClient {
         }
     }
 
-    /// Check if the forest for a bucket is in sharded format
+    /// Check if the forest for a bucket is in sharded format (v3/v5/v6).
+    ///
+    /// **Strict predicate.** Returns `true` only for flat-HashMap shards
+    /// (`ShardedPrivateForest`). v7 HAMT-per-shard forests do **not** match —
+    /// callers that want "any sharded shape" must combine this with
+    /// `is_forest_sharded_hamt`.
     pub fn is_forest_sharded(&self, bucket: &str) -> bool {
         self.forest_cache.get(bucket)
             .map(|entry| matches!(entry.value(), ForestCacheEntry::Sharded { .. }))
+            .unwrap_or(false)
+    }
+
+    /// Check if the forest for a bucket is in sharded-HAMT format (v7).
+    pub fn is_forest_sharded_hamt(&self, bucket: &str) -> bool {
+        self.forest_cache.get(bucket)
+            .map(|entry| matches!(entry.value(), ForestCacheEntry::ShardedHamt { .. }))
             .unwrap_or(false)
     }
 
@@ -1900,6 +2092,11 @@ impl EncryptedClient {
                         .map(|e| e.encrypted)
                         .unwrap_or(false)
                 }
+                // v7 read path isn't wired yet — fail closed: treat the
+                // entry as requiring encryption so callers refuse to serve
+                // plaintext bytes. Once the v7 traversal lands, this arm
+                // will do a real HAMT lookup.
+                ForestCacheEntry::ShardedHamt { .. } => true,
             },
             None => false,
         };
@@ -1917,6 +2114,10 @@ impl EncryptedClient {
                 (index_etag.clone(), *last_sequence)
             }
             ForestCacheEntry::Sharded { manifest_etag, .. } => (manifest_etag.clone(), None),
+            // Monolithic save over a v7-sharded bucket would regress the
+            // routing format — surface the cache's manifest ETag so the
+            // conditional PUT fails loudly instead of silently clobbering.
+            ForestCacheEntry::ShardedHamt { manifest_etag, .. } => (manifest_etag.clone(), None),
         }).unwrap_or((None, None));
         let next_sequence = prior_sequence.unwrap_or(0).saturating_add(1);
 
@@ -2168,22 +2369,153 @@ impl EncryptedClient {
         Ok(())
     }
 
+    /// Save a v7 sharded-HAMT forest.
+    ///
+    /// Two phases, mirroring `save_sharded_forest` for v5/v6:
+    ///
+    /// 1. **Node flush.** Acquire the per-bucket forest mutex and call
+    ///    `ShardedHamtPrivateForest::flush_dirty`. This encrypts every dirty
+    ///    shard's HAMT (root + any rewritten interior/value nodes) under the
+    ///    shard DEK + per-node AEAD AAD and PUTs them through the
+    ///    `S3BlobBackend` wrapper. Node paths are content-addressed
+    ///    (`BLAKE3(salt ‖ plaintext)[..22]`), so node-level conditional PUTs
+    ///    are unnecessary — collisions are impossible and late-arriving
+    ///    duplicate PUTs of the same plaintext are idempotent.
+    /// 2. **Manifest commit.** Encrypt the updated manifest with a bumped
+    ///    manifest-level sequence and conditionally PUT it against the
+    ///    previously observed manifest ETag. On 412 we drop the cached
+    ///    forest so the caller re-reads the winning state before retrying.
+    ///
+    /// Invariants preserved:
+    /// - `manifest_etag` + `last_manifest_sequence` gate rollback of the
+    ///   root-swap (same as v6).
+    /// - Per-shard `seq` is bumped inside `flush_dirty` before any node
+    ///   blob is PUT, so AAD on the uploaded nodes matches the manifest we
+    ///   then write.
+    /// - Nodes that become unreachable after a rewrite are left in place;
+    ///   an out-of-band GC sweep (future work) cleans them once two
+    ///   manifest generations have rotated past.
+    async fn save_sharded_hamt_forest(&self, bucket: &str) -> Result<()> {
+        let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+        let index_key = derive_index_key(&forest_dek, bucket);
+
+        // Snapshot prior etag + seq and clone out the forest Arc.  The
+        // DashMap guard is dropped at the end of this block so we can
+        // `.lock().await` the forest mutex below without holding a shard
+        // lock across the await.
+        let (forest_arc, prior_etag, prior_seq) = {
+            let entry = self.forest_cache.get(bucket)
+                .ok_or_else(|| ClientError::Encryption(
+                    fula_crypto::CryptoError::Encryption("no v7 forest in cache".to_string())
+                ))?;
+            match entry.value() {
+                ForestCacheEntry::ShardedHamt { forest, manifest_etag, last_manifest_sequence, .. } => {
+                    (forest.clone(), manifest_etag.clone(), *last_manifest_sequence)
+                }
+                _ => return Err(ClientError::Encryption(
+                    fula_crypto::CryptoError::Encryption(
+                        "forest is not v7 sharded-HAMT".to_string()
+                    )
+                )),
+            }
+        };
+
+        // Phase 1: flush dirty HAMT nodes. `flush_dirty` bumps each dirty
+        // shard's `seq` *before* writing, so AAD on the uploaded node blobs
+        // is bound to the post-flush sequence we'll commit in phase 2.
+        let backend = Arc::new(S3BlobBackend::new(self.inner.clone(), bucket.to_string()));
+        let manifest_snapshot = {
+            let mut guard = forest_arc.lock().await;
+            guard.flush_dirty(&backend).await
+                .map_err(ClientError::Encryption)?;
+            guard.manifest().clone()
+        };
+
+        // Phase 2: encrypt + conditionally PUT the manifest.
+        let next_seq = prior_seq.unwrap_or(0).saturating_add(1);
+        let encrypted_manifest = EncryptedShardManifestV7::encrypt_v7(
+            &manifest_snapshot,
+            &forest_dek,
+            bucket,
+            next_seq,
+        ).map_err(ClientError::Encryption)?;
+        let data = encrypted_manifest.to_bytes()
+            .map_err(ClientError::Encryption)?;
+
+        let metadata = ObjectMetadata::new()
+            .with_content_type("application/octet-stream");
+
+        let put_result = self.inner.put_object_with_metadata_conditional(
+            bucket,
+            &index_key,
+            Bytes::from(data),
+            Some(metadata),
+            prior_etag.as_deref(),
+            None,
+        ).await;
+
+        let put_result = match put_result {
+            Ok(r) => r,
+            Err(e) if e.is_concurrent_modification() => {
+                // Another writer installed a newer manifest. Our node blobs
+                // are already on S3 and referenced by our local manifest,
+                // which is now stale. Drop the cache so the caller re-reads
+                // the winning manifest before retrying; orphaned nodes get
+                // collected by the async GC sweep.
+                self.forest_cache.remove(bucket);
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let new_etag = if put_result.etag.is_empty() { None } else { Some(put_result.etag) };
+
+        // Update cache metadata in place — the forest itself already reflects
+        // the post-flush state (dirty flags cleared by `flush_dirty`).
+        // (manifest-version pin is written on the load path, matching v6's
+        // save_sharded_forest which also skips re-persisting it on save.)
+        if let Some(mut entry) = self.forest_cache.get_mut(bucket) {
+            if let ForestCacheEntry::ShardedHamt {
+                loaded_at, manifest_etag, last_manifest_sequence, ..
+            } = entry.value_mut() {
+                *loaded_at = chrono::Utc::now().timestamp();
+                *manifest_etag = new_etag;
+                *last_manifest_sequence = Some(next_seq);
+            }
+        }
+
+        Ok(())
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // MIGRATION: Monolithic ↔ Sharded forest format conversion
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Migrate a bucket's forest from monolithic to sharded format.
+    /// Migrate a bucket's forest from monolithic (v1/v2) directly to sharded-HAMT (v7).
     ///
     /// Call this explicitly to migrate early, or let `flush_forest()` auto-migrate
     /// when the file count crosses `SHARDED_MIGRATION_THRESHOLD` (5,000).
     ///
-    /// Crash-safe: new shards are written first, then the manifest overwrites the
-    /// old monolithic blob at `index_key`. Old format is gone once manifest is written.
+    /// **Why v7 (and not v6 first).** All pre-v3 data sits on v1 monolithic and the
+    /// install base is below the sharding threshold — there is no production v6
+    /// data. Routing new migrations through v6 would introduce a migration nobody
+    /// will benefit from and leave a second upgrade (v6→v7) pending. Direct v1→v7
+    /// has no speed disadvantage at 5k entries spread across 256 shards (≈20
+    /// entries per shard → one root node per shard) and avoids the mixed-manifest
+    /// / two-step-upgrade code paths.
     ///
-    /// Acquires an exclusive (write) migration lock for this bucket. Concurrent
-    /// `load_forest` / `flush_forest` / `put_object_flat_deferred` calls will
-    /// block on the read lock until migration completes. Shard uploads run in
-    /// parallel to minimize lock hold time.
+    /// **Shape.** (1) take the migration write lock, (2) load v1 monolithic index
+    /// (index data only — no user file bytes are touched), (3) construct a v7
+    /// manifest preserving the original `created_at`, (4) replay every file and
+    /// directory entry into the HAMT (empty directories are preserved via
+    /// `upsert_directory`), (5) `flush_dirty` writes all HAMT node blobs under
+    /// per-shard AEAD, (6) PUT the v7 manifest over the existing `index_key`,
+    /// (7) install the new forest into cache.
+    ///
+    /// **On failure.** v7 node blobs are content-addressed and remain at
+    /// `__fula_forest_v7_nodes/<hex>` until swept by the orphan-GC pass. The v1
+    /// monolithic blob remains authoritative until the manifest PUT succeeds, so
+    /// partial migrations never corrupt readable state.
     pub async fn migrate_to_sharded(&self, bucket: &str) -> Result<ForestEvent> {
         let lock = self.migration_lock(bucket);
         let _guard = lock.write().await;
@@ -2198,123 +2530,87 @@ impl EncryptedClient {
         let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
         let index_key = derive_index_key(&forest_dek, bucket);
 
-        // Convert to sharded. `from_migration` now produces a v6 manifest
-        // (directory-aware routing) so that all files land in the shard of
-        // their parent directory from the first write.
-        let mut sharded = ShardedPrivateForest::from_migration(forest, &forest_dek, num_shards);
-        // Initialize per-shard sequences at 1 — every shard is being written for the first time.
-        sharded.manifest.shard_sequences = vec![1u64; sharded.manifest.num_shards];
+        // Build a fresh v7 manifest. `ShardManifestV7::new` generates a new
+        // bucket salt + fresh timestamps; we overwrite `created_at` so the
+        // bucket's creation time carries forward from v1. `modified_at` stays
+        // at "now" because the act of migrating is itself a modification.
+        let mut manifest = ShardManifestV7::new(num_shards);
+        manifest.created_at = forest.created_at;
 
-        // Phase A: upload all shard blobs in parallel as v2 (AAD-bound).
-        // Collect uploaded shard keys so we can compensate (delete them) if
-        // Phase B fails — otherwise a failed migration leaks orphan shards.
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
-        let mut handles = Vec::new();
+        // Construct the mutation engine. Every shard starts `LoadedEmpty` (root
+        // = None) so the upsert loops don't issue any reads — they build the
+        // HAMT purely in memory and stage node blobs for `flush_dirty`.
+        let mut v7 = ShardedHamtPrivateForest::from_manifest(
+            manifest,
+            bucket.to_string(),
+            forest_dek.clone(),
+        );
 
-        for i in 0..sharded.manifest.num_shards {
-            if let Some(shard) = sharded.shards.get(i).and_then(|s| s.as_ref()) {
-                let shard_key = derive_shard_key(&forest_dek, bucket, &sharded.manifest.shard_salt, i);
-                let shard_seq = sharded.manifest.shard_sequences[i];
-                let encrypted = EncryptedForestShard::encrypt_v2(
-                    shard, &forest_dek, bucket, shard_seq,
-                ).map_err(ClientError::Encryption)?;
-                let data = encrypted.to_bytes().map_err(ClientError::Encryption)?;
+        let backend = Arc::new(S3BlobBackend::new(self.inner.clone(), bucket.to_string()));
 
-                let client = self.inner.clone();
-                let bucket_owned = bucket.to_string();
-                let sem = semaphore.clone();
-                let shard_key_for_task = shard_key.clone();
-
-                let handle = tokio::spawn(async move {
-                    let _permit = sem.acquire().await.map_err(|e|
-                        ClientError::Encryption(fula_crypto::CryptoError::Encryption(e.to_string()))
-                    )?;
-                    client.put_object_with_metadata(
-                        &bucket_owned,
-                        &shard_key_for_task,
-                        Bytes::from(data),
-                        Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
-                    ).await?;
-                    Ok::<String, ClientError>(shard_key_for_task)
-                });
-                handles.push(handle);
-            }
+        // Replay files. Ordering doesn't matter — HAMT set is commutative per key
+        // and each call also wires the parent-chain directory entries.
+        for entry in forest.files.values() {
+            v7.upsert_file(entry.clone(), &backend).await
+                .map_err(ClientError::Encryption)?;
         }
 
-        // Collect shard upload results, tracking successfully uploaded keys
-        // so we can compensate on Phase B failure.
-        let mut uploaded_shard_keys: Vec<String> = Vec::with_capacity(handles.len());
-        let mut phase_a_error: Option<ClientError> = None;
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(key)) => uploaded_shard_keys.push(key),
-                Ok(Err(e)) => {
-                    if phase_a_error.is_none() { phase_a_error = Some(e); }
-                }
-                Err(e) => {
-                    if phase_a_error.is_none() {
-                        phase_a_error = Some(ClientError::Encryption(
-                            fula_crypto::CryptoError::Encryption(format!("Shard upload task failed: {}", e))
-                        ));
-                    }
-                }
-            }
+        // Preserve empty directories AND replay v1's canonical directory
+        // metadata. Ordering matters: this must run *after* the file loop.
+        // The file loop creates `D:` entries as a side-effect of
+        // `ensure_ancestor_chain` — those entries have `metadata: None`,
+        // `subtree_dek: None`, and a partial `files`/`subdirs` list that grows
+        // as each file is added. This loop then overwrites each dir entry
+        // with v1's authoritative version, which preserves metadata +
+        // subtree_dek and locks in the canonical `files`/`subdirs` lists.
+        // Reversing the order would let the file loop clobber these fields
+        // back to the synthesized defaults.
+        for dir_entry in forest.directories.values() {
+            v7.upsert_directory(dir_entry.clone(), &backend).await
+                .map_err(ClientError::Encryption)?;
         }
 
-        if let Some(err) = phase_a_error {
-            // Best-effort cleanup: delete any shards that DID succeed.
-            for key in &uploaded_shard_keys {
-                let _ = self.inner.delete_object(bucket, key).await;
-            }
-            return Err(err);
-        }
+        // Phase A: flush HAMT node blobs. `flush_dirty` bumps each dirty
+        // shard's `seq` before writing so node-AAD is bound to the sequence
+        // we'll commit in Phase B.
+        v7.flush_dirty(&backend).await
+            .map_err(ClientError::Encryption)?;
 
-        // Phase B: overwrite index_key with new manifest (v6 AAD-bound, sequence=1,
-        // directory-aware routing). `from_migration` already set version=6; we
-        // call into_v6 to lock in the current shard_sequences snapshot.
+        let manifest_snapshot = v7.manifest().clone();
+
+        // Phase B: encrypt + PUT the manifest at `index_key` (seq = 1 — this is
+        // the first v7 write for this bucket). Unconditional PUT, matching the
+        // prior v6 migration: the migration write lock holds off other writers,
+        // and we don't have a v1-level precondition etag we could usefully
+        // bind here (the v1 monolithic blob is being replaced, not updated).
         let manifest_seq: u64 = 1;
-        sharded.manifest = sharded.manifest.clone().into_v6(sharded.manifest.shard_sequences.clone());
-        let encrypted_manifest = EncryptedShardManifest::encrypt_v6(
-            &sharded.manifest, &forest_dek, bucket, manifest_seq,
+        let encrypted_manifest = EncryptedShardManifestV7::encrypt_v7(
+            &manifest_snapshot,
+            &forest_dek,
+            bucket,
+            manifest_seq,
         ).map_err(ClientError::Encryption)?;
-        let manifest_data = encrypted_manifest.to_bytes().map_err(ClientError::Encryption)?;
+        let manifest_data = encrypted_manifest.to_bytes()
+            .map_err(ClientError::Encryption)?;
 
-        let manifest_put = self.inner.put_object_with_metadata(
+        let put_result = self.inner.put_object_with_metadata(
             bucket,
             &index_key,
             Bytes::from(manifest_data),
             Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
-        ).await;
+        ).await?;
 
-        let put_result = match manifest_put {
-            Ok(r) => r,
-            Err(e) => {
-                // Manifest failed — roll back Phase A by deleting uploaded shards.
-                // Without this, the shards remain orphaned because the monolithic
-                // forest is still authoritative.
-                for key in &uploaded_shard_keys {
-                    let _ = self.inner.delete_object(bucket, key).await;
-                }
-                return Err(e);
-            }
-        };
-
-        // Update cache (under write lock — no concurrent readers can see stale data)
+        // Install the migrated forest into the cache. The forest mutex wraps
+        // the engine so concurrent readers/writers go through the same v7 API
+        // that load_forest builds on the read path.
         let new_etag = if put_result.etag.is_empty() { None } else { Some(put_result.etag) };
         let now = chrono::Utc::now().timestamp();
-        let mut clean_forest = sharded;
-        clean_forest.dirty_shards.clear();
-        clean_forest.manifest_dirty = false;
-        let num_shards = clean_forest.manifest.num_shards;
-        self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::Sharded {
-            forest: clean_forest,
+        let forest_arc = Arc::new(tokio::sync::Mutex::new(v7));
+        self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::ShardedHamt {
+            forest: forest_arc,
             loaded_at: now,
             manifest_etag: new_etag,
             last_manifest_sequence: Some(manifest_seq),
-            // Phase A uploads were unconditional (first write for migrated bucket).
-            // We don't have per-shard ETags to record here yet; they'll be
-            // populated on the first read/write of each shard after migration.
-            shard_etags: vec![None; num_shards],
         });
 
         let duration = start.elapsed();
@@ -2370,12 +2666,32 @@ impl EncryptedClient {
     pub async fn forest_file_count(&self, bucket: &str) -> Result<usize> {
         self.ensure_forest_loaded(bucket).await?;
 
-        let count = self.forest_cache.get(bucket).map(|entry| {
-            match entry.value() {
-                ForestCacheEntry::Monolithic { forest, .. } => forest.file_count(),
-                ForestCacheEntry::Sharded { forest, .. } => forest.file_count(),
+        // Extract either a synchronous count (monolithic / v5–v6) or an Arc
+        // handle to the v7 forest whose mutex must be awaited below. The
+        // DashMap guard is dropped at the end of this block so we don't
+        // hold a shard lock across the `lock().await` that follows.
+        let (sync_count, v7_forest) = {
+            let entry_opt = self.forest_cache.get(bucket);
+            match entry_opt.as_ref().map(|e| e.value()) {
+                Some(ForestCacheEntry::Monolithic { forest, .. }) => (Some(forest.file_count()), None),
+                Some(ForestCacheEntry::Sharded { forest, .. }) => (Some(forest.file_count()), None),
+                Some(ForestCacheEntry::ShardedHamt { forest, .. }) => (None, Some(forest.clone())),
+                None => (Some(0), None),
             }
-        }).unwrap_or(0);
+        };
+
+        let count = if let Some(c) = sync_count {
+            c
+        } else if let Some(arc) = v7_forest {
+            // v7 keeps a per-shard `entry_count` in the manifest so total
+            // counts are O(1) without walking the HAMT.
+            let guard = arc.lock().await;
+            guard.manifest().shards.iter()
+                .map(|s| s.entry_count as usize)
+                .sum()
+        } else {
+            0
+        };
 
         Ok(count)
     }
@@ -2427,15 +2743,40 @@ impl EncryptedClient {
         // Generate a DEK for this object
         let dek = self.encryption.key_manager.generate_dek();
 
-        // Generate flat storage key from cached forest
-        let storage_key = {
+        // Generate flat storage key from cached forest.
+        //
+        // For v7 we can't derive the key while holding the DashMap guard —
+        // ShardedHamtPrivateForest is behind a `tokio::sync::Mutex` and taking
+        // its `.lock().await` across the DashMap guard would deadlock the
+        // DashMap shard. The sync formats finalize inline; for v7 we extract
+        // the Arc, drop the guard, lock the mutex to copy `shard_salt`, drop
+        // the lock, then compute the key.
+        enum KeyPath {
+            Ready(String),
+            V7(Arc<tokio::sync::Mutex<ShardedHamtPrivateForest>>),
+        }
+        let path = {
             let cache_entry = self.forest_cache.get(bucket)
                 .ok_or_else(|| ClientError::Encryption(
                     fula_crypto::CryptoError::Encryption("forest not loaded".to_string())
                 ))?;
             match cache_entry.value() {
-                ForestCacheEntry::Monolithic { forest, .. } => forest.generate_key(key, &dek),
-                ForestCacheEntry::Sharded { forest, .. } => forest.generate_key(key, &dek),
+                ForestCacheEntry::Monolithic { forest, .. } =>
+                    KeyPath::Ready(forest.generate_key(key, &dek)),
+                ForestCacheEntry::Sharded { forest, .. } =>
+                    KeyPath::Ready(forest.generate_key(key, &dek)),
+                ForestCacheEntry::ShardedHamt { forest, .. } =>
+                    KeyPath::V7(forest.clone()),
+            }
+        };
+        let storage_key = match path {
+            KeyPath::Ready(sk) => sk,
+            KeyPath::V7(forest_arc) => {
+                let salt = {
+                    let guard = forest_arc.lock().await;
+                    guard.manifest().shard_salt.clone()
+                };
+                generate_flat_key(key, &dek, &salt)
             }
         };
 
@@ -2528,14 +2869,47 @@ impl EncryptedClient {
         #[cfg(not(target_arch = "wasm32"))]
         let wal_entry_clone = forest_entry.clone();
 
-        let old_storage_key: Option<String> = if is_sharded {
+        let is_v7 = self.is_forest_sharded_hamt(bucket);
+
+        let old_storage_key: Option<String> = if is_v7 {
+            // v7 sharded-HAMT: forest is behind a tokio Mutex. Extract the
+            // Arc under the DashMap guard, drop the guard, then lock and
+            // mutate. `get_file` + `upsert_file` both take `&mut self`, so
+            // they must run under the same lock-held region; the mutex is
+            // non-reentrant but the two calls are sequential, not nested.
+            let forest_arc = {
+                let cache_entry = self.forest_cache.get(bucket).unwrap();
+                match cache_entry.value() {
+                    ForestCacheEntry::ShardedHamt { forest, .. } => forest.clone(),
+                    _ => unreachable!("is_forest_sharded_hamt guard above"),
+                }
+            };
+            let backend: Arc<S3BlobBackend> = Arc::new(
+                S3BlobBackend::new(self.inner.clone(), bucket.to_string())
+            );
+            let old = {
+                let mut guard = forest_arc.lock().await;
+                let prior = guard.get_file(key, &backend).await
+                    .map_err(ClientError::Encryption)?;
+                guard.upsert_file(forest_entry, &backend).await
+                    .map_err(ClientError::Encryption)?;
+                prior.map(|e| e.storage_key)
+            };
+            if let Some(mut cache_entry) = self.forest_cache.get_mut(bucket) {
+                if let ForestCacheEntry::ShardedHamt { loaded_at, .. } = cache_entry.value_mut() {
+                    *loaded_at = now;
+                }
+            }
+            old
+        } else if is_sharded {
             // Sharded: load target shard, upsert in-place via get_mut
             let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
             let shard_index = {
                 let cache_entry = self.forest_cache.get(bucket).unwrap();
                 match cache_entry.value() {
                     ForestCacheEntry::Sharded { forest, .. } => forest.shard_for(key, &forest_dek),
-                    _ => unreachable!(),
+                    ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_v7 handled above"),
+                    ForestCacheEntry::Monolithic { .. } => unreachable!("is_sharded true rules out Monolithic"),
                 }
             };
             self.load_shard(bucket, shard_index).await?;
@@ -2555,13 +2929,16 @@ impl EncryptedClient {
             }
             old
         } else {
-            // Monolithic: clone, mutate, re-insert
+            // Monolithic: clone, mutate, re-insert. v7 (ShardedHamt) is
+            // ruled out by the `is_v7` arm above; v6 (Sharded) is ruled out
+            // by the `is_sharded` arm above.
             let (mut forest, prior_etag, prior_seq) = {
                 let cache_entry = self.forest_cache.get(bucket).unwrap();
                 match cache_entry.value() {
                     ForestCacheEntry::Monolithic { forest, index_etag, last_sequence, .. } =>
                         (forest.clone(), index_etag.clone(), *last_sequence),
-                    _ => unreachable!(),
+                    ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_v7 handled above"),
+                    ForestCacheEntry::Sharded { .. } => unreachable!("is_sharded false rules out Sharded"),
                 }
             };
             let old = forest.get_storage_key(key).map(|s| s.to_string());
@@ -2629,11 +3006,12 @@ impl EncryptedClient {
             all_chunks.push(chunk);
         }
         
-        // Upload chunks in parallel with bounded concurrency
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_CHUNK_UPLOADS));
-        let mut handles = Vec::with_capacity(all_chunks.len());
-
-        for chunk in all_chunks {
+        // Upload chunks in parallel with bounded concurrency. Using
+        // futures::stream::buffer_unordered rather than tokio::spawn so the
+        // same code runs on wasm32 (where tokio has no multi-thread runtime).
+        use futures::StreamExt;
+        let pinning = self.pinning.clone();
+        let futs = all_chunks.into_iter().map(|chunk| {
             let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk.index);
             let chunk_metadata = ObjectMetadata::new()
                 .with_content_type("application/octet-stream")
@@ -2642,14 +3020,10 @@ impl EncryptedClient {
 
             let client = self.inner.clone();
             let bucket = bucket.to_string();
-            let sem = semaphore.clone();
-            let pinning = self.pinning.clone();
+            let pinning = pinning.clone();
             let chunk_key_ret = chunk_key.clone();
 
-            let handle = tokio::spawn(async move {
-                let _permit = sem.acquire().await.map_err(|e|
-                    ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
-                )?;
+            async move {
                 if let Some(ref pin) = pinning {
                     client.put_object_with_metadata_and_pinning(
                         &bucket,
@@ -2668,26 +3042,22 @@ impl EncryptedClient {
                     ).await?;
                 }
                 Ok::<String, ClientError>(chunk_key_ret)
-            });
+            }
+        });
 
-            handles.push(handle);
-        }
+        let results: Vec<std::result::Result<String, ClientError>> = futures::stream::iter(futs)
+            .buffer_unordered(Self::MAX_CONCURRENT_CHUNK_UPLOADS)
+            .collect()
+            .await;
 
-        // Collect results — track uploaded chunk keys for cleanup on failure
+        // Track successfully uploaded chunk keys so we can clean them up if
+        // any upload in the batch failed.
         let mut uploaded_keys: Vec<String> = Vec::new();
         let mut upload_error: Option<ClientError> = None;
-
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(key)) => uploaded_keys.push(key),
-                Ok(Err(e)) => { if upload_error.is_none() { upload_error = Some(e); } }
-                Err(e) => {
-                    if upload_error.is_none() {
-                        upload_error = Some(ClientError::Encryption(
-                            fula_crypto::CryptoError::Decryption(format!("Chunk upload task failed: {}", e))
-                        ));
-                    }
-                }
+        for result in results {
+            match result {
+                Ok(key) => uploaded_keys.push(key),
+                Err(e) => { if upload_error.is_none() { upload_error = Some(e); } }
             }
         }
 
@@ -3308,6 +3678,12 @@ impl EncryptedClient {
             return Ok(());
         }
 
+        // v7 sharded-HAMT: no auto-migration or reshard inside a flush yet —
+        // those are separate follow-ups. Just route to the v7 save path.
+        if self.is_forest_sharded_hamt(bucket) {
+            return self.save_sharded_hamt_forest(bucket).await;
+        }
+
         if self.is_forest_sharded(bucket) {
             // Auto-migrate legacy v3/v5 sharded forests to v6 (directory-aware routing)
             // on the next flush. Requires loading every shard to redistribute files,
@@ -3441,12 +3817,84 @@ impl EncryptedClient {
         if entries.is_empty() {
             return Ok(());
         }
+        let is_v7 = self.is_forest_sharded_hamt(bucket);
         let is_sharded = self.is_forest_sharded(bucket);
         let forest_dek = if is_sharded {
             Some(self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket)))
         } else {
             None
         };
+
+        // v7 replay runs on a distinct cache shape (ShardedHamt holds an
+        // `Arc<tokio::sync::Mutex<ShardedHamtPrivateForest>>`). Detect once
+        // here; the body below dispatches to this branch before touching
+        // the v6-style manifest fields that don't exist on v7.
+        if is_v7 {
+            let (forest_arc, backend) = {
+                let entry = match self.forest_cache.get(bucket) {
+                    Some(e) => e,
+                    None => return Ok(()),
+                };
+                match entry.value() {
+                    ForestCacheEntry::ShardedHamt { forest, .. } => {
+                        let fa = forest.clone();
+                        let be = Arc::new(S3BlobBackend::new(self.inner.clone(), bucket.to_string()));
+                        (fa, be)
+                    }
+                    _ => unreachable!("is_v7 guard above"),
+                }
+            };
+
+            // Phase 1 (v7): fold every ShardWrote into a `max(seq, etag)`
+            // view per shard, then reconcile the manifest + mark the shard
+            // dirty so the next flush re-PUTs the node subtree bumped to
+            // wal_seq + 1 (matching the v6 contract — a shard we already
+            // wrote to S3 owns its slot, and the replay has to rewrite from
+            // that slot forward so node AAD stays consistent).
+            let mut shard_writes: std::collections::HashMap<usize, (u64, Option<String>)> =
+                std::collections::HashMap::new();
+            for wentry in &entries {
+                if let WalEntry::ShardWrote { idx, seq, etag } = wentry {
+                    let slot = shard_writes.entry(*idx).or_insert((0u64, None));
+                    if *seq >= slot.0 {
+                        *slot = (*seq, etag.clone());
+                    }
+                }
+            }
+
+            {
+                let mut guard = forest_arc.lock().await;
+                if !shard_writes.is_empty() {
+                    let num_shards = guard.manifest().shards.len();
+                    for (idx, (seq, etag)) in shard_writes {
+                        if idx < num_shards {
+                            guard.reconcile_shard_write(idx, seq, etag);
+                        }
+                    }
+                }
+
+                // Phase 2 (v7): replay Insert/Remove in the same order they
+                // were logged. `upsert_file` / `remove_file` are
+                // per-shard-dirty-marking so a subsequent `flush_dirty`
+                // picks them up under the post-reconciled sequence.
+                for wentry in entries {
+                    match wentry {
+                        WalEntry::Insert { key: _, entry: forest_entry } => {
+                            guard.upsert_file(forest_entry, &backend).await
+                                .map_err(ClientError::Encryption)?;
+                        }
+                        WalEntry::Remove { key } => {
+                            let _ = guard.remove_file(&key, &backend).await
+                                .map_err(ClientError::Encryption)?;
+                        }
+                        WalEntry::ShardWrote { .. } => {
+                            // Handled above in Phase 1.
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
 
         // Phase 1: reconcile ShardWrote entries onto the cache's manifest view.
         // For each shard we already successfully wrote to S3, set
@@ -3603,6 +4051,34 @@ impl EncryptedClient {
         // Ensure forest is loaded (handles both monolithic and sharded)
         self.ensure_forest_loaded(bucket).await?;
 
+        if self.is_forest_sharded_hamt(bucket) {
+            // v7 read path: walk the HAMT to resolve `key` → `ForestFileEntry`.
+            // Scope the DashMap guard so it is dropped before we `.lock().await`
+            // on the v7 forest mutex (DashMap → forest-lock is the deadlock
+            // direction; the reverse is safe).
+            let forest_arc = {
+                let entry = self.forest_cache.get(bucket)
+                    .ok_or_else(|| ClientError::NotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    })?;
+                match entry.value() {
+                    ForestCacheEntry::ShardedHamt { forest, .. } => forest.clone(),
+                    _ => unreachable!("is_forest_sharded_hamt guard above"),
+                }
+            };
+            let backend = Arc::new(S3BlobBackend::new(self.inner.clone(), bucket.to_string()));
+            let entry_opt = {
+                let mut guard = forest_arc.lock().await;
+                guard.get_file(key, &backend).await.map_err(ClientError::Encryption)?
+            };
+            let entry = entry_opt.ok_or_else(|| ClientError::NotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            })?;
+            return self.get_object_decrypted_by_storage_key(bucket, &entry.storage_key).await;
+        }
+
         let storage_key = if self.is_forest_sharded(bucket) {
             // Sharded: load only the needed shard
             let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
@@ -3611,7 +4087,8 @@ impl EncryptedClient {
                     .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?;
                 match entry.value() {
                     ForestCacheEntry::Sharded { forest, .. } => forest.shard_for(key, &forest_dek),
-                    _ => unreachable!(),
+                    ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_forest_sharded_hamt guard above"),
+                    ForestCacheEntry::Monolithic { .. } => unreachable!("is_forest_sharded true rules out Monolithic"),
                 }
             };
             self.load_shard(bucket, shard_index).await?;
@@ -3623,7 +4100,8 @@ impl EncryptedClient {
                         .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?
                         .to_string()
                 }
-                _ => unreachable!(),
+                ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_forest_sharded_hamt guard above"),
+                ForestCacheEntry::Monolithic { .. } => unreachable!("is_forest_sharded true rules out Monolithic"),
             }
         } else {
             // Monolithic: already loaded by ensure_forest_loaded
@@ -3635,7 +4113,8 @@ impl EncryptedClient {
                         .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?
                         .to_string()
                 }
-                _ => unreachable!(),
+                ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_forest_sharded_hamt guard above"),
+                ForestCacheEntry::Sharded { .. } => unreachable!("is_forest_sharded false rules out Sharded"),
             }
         };
 
@@ -3679,6 +4158,39 @@ impl EncryptedClient {
             (dir, metadata)
         };
 
+        if self.is_forest_sharded_hamt(bucket) {
+            // v7: walk every shard's HAMT to collect files under the
+            // prefix. Extract the Arc before awaiting so the DashMap guard
+            // is dropped before we take the v7 mutex.
+            let forest_arc = {
+                let entry = self.forest_cache.get(bucket)
+                    .ok_or_else(|| ClientError::Encryption(
+                        fula_crypto::CryptoError::Encryption("forest not loaded".to_string())
+                    ))?;
+                match entry.value() {
+                    ForestCacheEntry::ShardedHamt { forest, .. } => forest.clone(),
+                    _ => unreachable!("is_forest_sharded_hamt guard above"),
+                }
+            };
+            let backend: Arc<S3BlobBackend> = Arc::new(
+                S3BlobBackend::new(self.inner.clone(), bucket.to_string())
+            );
+            let files = {
+                let mut guard = forest_arc.lock().await;
+                guard.list_recursive(prefix_str, &backend).await
+                    .map_err(ClientError::Encryption)?
+            };
+            for fentry in &files {
+                let (dir, metadata) = build_entry(fentry);
+                directories.entry(dir).or_default().push(metadata);
+            }
+            return Ok(DirectoryListing {
+                bucket: bucket.to_string(),
+                prefix: prefix.map(|s| s.to_string()),
+                directories,
+            });
+        }
+
         if self.is_forest_sharded(bucket) {
             self.load_all_shards(bucket).await?;
             let entry = self.forest_cache.get(bucket).unwrap();
@@ -3689,7 +4201,8 @@ impl EncryptedClient {
                         directories.entry(dir).or_default().push(metadata);
                     }
                 }
-                _ => unreachable!(),
+                ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_forest_sharded_hamt guard above"),
+                ForestCacheEntry::Monolithic { .. } => unreachable!("is_forest_sharded true rules out Monolithic"),
             }
         } else {
             let entry = self.forest_cache.get(bucket).unwrap();
@@ -3700,7 +4213,8 @@ impl EncryptedClient {
                         directories.entry(dir).or_default().push(metadata);
                     }
                 }
-                _ => unreachable!(),
+                ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_forest_sharded_hamt guard above"),
+                ForestCacheEntry::Sharded { .. } => unreachable!("is_forest_sharded false rules out Sharded"),
             }
         }
 
@@ -3734,6 +4248,29 @@ impl EncryptedClient {
             is_encrypted: true,
         };
 
+        if self.is_forest_sharded_hamt(bucket) {
+            let forest_arc = {
+                let entry = self.forest_cache.get(bucket)
+                    .ok_or_else(|| ClientError::Encryption(
+                        fula_crypto::CryptoError::Encryption("forest not loaded".to_string())
+                    ))?;
+                match entry.value() {
+                    ForestCacheEntry::ShardedHamt { forest, .. } => forest.clone(),
+                    _ => unreachable!("is_forest_sharded_hamt guard above"),
+                }
+            };
+            let backend: Arc<S3BlobBackend> = Arc::new(
+                S3BlobBackend::new(self.inner.clone(), bucket.to_string())
+            );
+            let entries = {
+                let mut guard = forest_arc.lock().await;
+                guard.list_all_files(&backend).await
+                    .map_err(ClientError::Encryption)?
+            };
+            let files: Vec<FileMetadata> = entries.iter().map(&make_meta).collect();
+            return Ok(files);
+        }
+
         let files: Vec<FileMetadata> = if self.is_forest_sharded(bucket) {
             self.load_all_shards(bucket).await?;
             let entry = self.forest_cache.get(bucket).unwrap();
@@ -3741,7 +4278,8 @@ impl EncryptedClient {
                 ForestCacheEntry::Sharded { forest, .. } => {
                     forest.list_all_files().into_iter().map(&make_meta).collect()
                 }
-                _ => unreachable!(),
+                ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_forest_sharded_hamt guard above"),
+                ForestCacheEntry::Monolithic { .. } => unreachable!("is_forest_sharded true rules out Monolithic"),
             }
         } else {
             let entry = self.forest_cache.get(bucket).unwrap();
@@ -3749,7 +4287,8 @@ impl EncryptedClient {
                 ForestCacheEntry::Monolithic { forest, .. } => {
                     forest.list_all_files().into_iter().map(&make_meta).collect()
                 }
-                _ => unreachable!(),
+                ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_forest_sharded_hamt guard above"),
+                ForestCacheEntry::Sharded { .. } => unreachable!("is_forest_sharded false rules out Sharded"),
             }
         };
 
@@ -3790,6 +4329,10 @@ impl EncryptedClient {
             ForestCacheEntry::Sharded { forest, .. } => {
                 forest.find_by_storage_key(storage_key).is_some()
             }
+            // v7 traversal isn't wired yet; be conservative and keep the
+            // object to match the function's "never delete what we can't
+            // verify is orphaned" invariant.
+            ForestCacheEntry::ShardedHamt { .. } => true,
         }
     }
 
@@ -3845,6 +4388,59 @@ impl EncryptedClient {
     ) -> Result<()> {
         self.ensure_forest_loaded(bucket).await?;
 
+        if self.is_forest_sharded_hamt(bucket) {
+            // v7: remove from HAMT, then flush (persists manifest + WAL
+            // clear). Same order-of-operations invariant as the other
+            // branches: mutate forest → flush → delete storage objects so
+            // we never leave a dangling reference; an orphaned blob is
+            // recoverable, a dangling ref is not.
+            let forest_arc = {
+                let entry = self.forest_cache.get(bucket)
+                    .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?;
+                match entry.value() {
+                    ForestCacheEntry::ShardedHamt { forest, .. } => forest.clone(),
+                    _ => unreachable!("is_forest_sharded_hamt guard above"),
+                }
+            };
+            let backend: Arc<S3BlobBackend> = Arc::new(
+                S3BlobBackend::new(self.inner.clone(), bucket.to_string())
+            );
+            let removed = {
+                let mut guard = forest_arc.lock().await;
+                guard.remove_file(key, &backend).await
+                    .map_err(ClientError::Encryption)?
+            };
+            let removed = removed.ok_or_else(|| ClientError::NotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            })?;
+            let storage_key = removed.storage_key;
+
+            // Check chunk count before flushing so we know what to clean up.
+            let num_chunks = self.get_chunked_num_chunks(bucket, &storage_key).await;
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let wal_mac = wal::derive_mac_key(&self.encryption.key_manager, bucket);
+                if let Err(e) = wal::append(
+                    bucket,
+                    &wal_mac,
+                    WalEntry::Remove { key: key.to_string() },
+                ) {
+                    tracing::warn!(%bucket, error = %e, "WAL append failed (remove v7); continuing");
+                }
+            }
+
+            self.flush_forest(bucket).await?;
+
+            if let Some(n) = num_chunks {
+                self.delete_chunk_objects(bucket, &storage_key, n).await;
+            }
+            let _ = self.inner.delete_object(bucket, &storage_key).await;
+
+            return Ok(());
+        }
+
         if self.is_forest_sharded(bucket) {
             // Sharded: load the needed shard, find storage key, delete
             let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
@@ -3853,7 +4449,8 @@ impl EncryptedClient {
                     .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?;
                 match entry.value() {
                     ForestCacheEntry::Sharded { forest, .. } => forest.shard_for(key, &forest_dek),
-                    _ => unreachable!(),
+                    ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_forest_sharded_hamt guard above"),
+                    ForestCacheEntry::Monolithic { .. } => unreachable!("is_forest_sharded true rules out Monolithic"),
                 }
             };
             self.load_shard(bucket, shard_index).await?;
@@ -3866,7 +4463,8 @@ impl EncryptedClient {
                             .ok_or_else(|| ClientError::NotFound { bucket: bucket.to_string(), key: key.to_string() })?
                             .to_string()
                     }
-                    _ => unreachable!(),
+                    ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_forest_sharded_hamt guard above"),
+                    ForestCacheEntry::Monolithic { .. } => unreachable!("is_forest_sharded true rules out Monolithic"),
                 }
             };
 
@@ -3973,6 +4571,28 @@ impl EncryptedClient {
     ) -> Result<PrivateForest> {
         self.ensure_forest_loaded(bucket).await?;
 
+        if self.is_forest_sharded_hamt(bucket) {
+            let forest_arc = {
+                let entry = self.forest_cache.get(bucket)
+                    .ok_or_else(|| ClientError::Encryption(
+                        fula_crypto::CryptoError::Encryption("forest not loaded".to_string())
+                    ))?;
+                match entry.value() {
+                    ForestCacheEntry::ShardedHamt { forest, .. } => forest.clone(),
+                    _ => unreachable!("is_forest_sharded_hamt guard above"),
+                }
+            };
+            let backend: Arc<S3BlobBackend> = Arc::new(
+                S3BlobBackend::new(self.inner.clone(), bucket.to_string())
+            );
+            let subtree = {
+                let mut guard = forest_arc.lock().await;
+                guard.extract_subtree(prefix, &backend).await
+                    .map_err(ClientError::Encryption)?
+            };
+            return Ok(subtree);
+        }
+
         if self.is_forest_sharded(bucket) {
             let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
             self.load_all_shards(bucket).await?;
@@ -3983,7 +4603,8 @@ impl EncryptedClient {
                         .to_monolithic()
                         .map_err(ClientError::Encryption)
                 }
-                _ => unreachable!(),
+                ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_forest_sharded_hamt guard above"),
+                ForestCacheEntry::Monolithic { .. } => unreachable!("is_forest_sharded true rules out Monolithic"),
             }
         } else {
             let forest = self.load_forest(bucket).await?;
@@ -4611,12 +5232,12 @@ impl EncryptedClient {
             chunks.push(chunk);
         }
         
-        // Upload chunks in parallel with bounded concurrency
+        // Upload chunks in parallel with bounded concurrency. Using
+        // futures::stream::buffer_unordered rather than tokio::spawn so the
+        // same code runs on wasm32 (where tokio has no multi-thread runtime).
         let _uploaded_keys = {
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_CHUNK_UPLOADS));
-            let mut handles = Vec::with_capacity(chunks.len());
-
-            for chunk in chunks {
+            use futures::StreamExt;
+            let futs = chunks.into_iter().map(|chunk| {
                 let chunk_key = ChunkedFileMetadata::chunk_key(&storage_key, chunk.index);
                 let chunk_metadata = ObjectMetadata::new()
                     .with_content_type("application/octet-stream")
@@ -4625,13 +5246,9 @@ impl EncryptedClient {
 
                 let client = self.inner.clone();
                 let bucket = bucket.to_string();
-                let sem = semaphore.clone();
                 let chunk_key_ret = chunk_key.clone();
 
-                let handle = tokio::spawn(async move {
-                    let _permit = sem.acquire().await.map_err(|e|
-                        ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
-                    )?;
+                async move {
                     client.put_object_with_metadata(
                         &bucket,
                         &chunk_key,
@@ -4639,25 +5256,20 @@ impl EncryptedClient {
                         Some(chunk_metadata),
                     ).await?;
                     Ok::<String, ClientError>(chunk_key_ret)
-                });
+                }
+            });
 
-                handles.push(handle);
-            }
+            let results: Vec<std::result::Result<String, ClientError>> = futures::stream::iter(futs)
+                .buffer_unordered(Self::MAX_CONCURRENT_CHUNK_UPLOADS)
+                .collect()
+                .await;
 
             let mut uploaded_keys: Vec<String> = Vec::new();
             let mut upload_error: Option<ClientError> = None;
-
-            for handle in handles {
-                match handle.await {
-                    Ok(Ok(key)) => uploaded_keys.push(key),
-                    Ok(Err(e)) => { if upload_error.is_none() { upload_error = Some(e); } }
-                    Err(e) => {
-                        if upload_error.is_none() {
-                            upload_error = Some(ClientError::Encryption(
-                                fula_crypto::CryptoError::Decryption(format!("Chunk upload task failed: {}", e))
-                            ));
-                        }
-                    }
+            for result in results {
+                match result {
+                    Ok(key) => uploaded_keys.push(key),
+                    Err(e) => { if upload_error.is_none() { upload_error = Some(e); } }
                 }
             }
 
@@ -4704,35 +5316,66 @@ impl EncryptedClient {
             Some(index_metadata),
         ).await?;
         
-        // Update forest cache if we have one
-        if let Some(mut entry) = self.forest_cache.get_mut(bucket) {
-            let now = chrono::Utc::now().timestamp();
-            let file_entry = ForestFileEntry {
-                path: key.to_string(),
-                storage_key: storage_key.clone(),
-                size: data.len() as u64,
-                content_type: metadata.content_type.clone(),
-                created_at: now,
-                modified_at: now,
-                user_metadata: HashMap::new(),
-                content_hash: None,
-                // C-AUDIT-004: forest entries from encrypted uploads MUST
-                // be marked so later reads refuse a plaintext backend response.
-                encrypted: true,
-            };
-            match entry.value_mut() {
-                ForestCacheEntry::Monolithic { forest, dirty, .. } => {
-                    forest.upsert_file(file_entry);
-                    *dirty = true;
+        // Update forest cache if we have one.
+        //
+        // v7 mutates an `Arc<tokio::sync::Mutex<ShardedHamtPrivateForest>>`
+        // whose `upsert_file` is async and cannot be called while holding
+        // the DashMap guard. Split the match: sync formats mutate in place
+        // under the guard, v7 extracts the Arc and performs the async
+        // upsert after dropping it.
+        let now = chrono::Utc::now().timestamp();
+        let file_entry = ForestFileEntry {
+            path: key.to_string(),
+            storage_key: storage_key.clone(),
+            size: data.len() as u64,
+            content_type: metadata.content_type.clone(),
+            created_at: now,
+            modified_at: now,
+            user_metadata: HashMap::new(),
+            content_hash: None,
+            // C-AUDIT-004: forest entries from encrypted uploads MUST
+            // be marked so later reads refuse a plaintext backend response.
+            encrypted: true,
+        };
+
+        let v7_forest_arc = {
+            let entry_opt = self.forest_cache.get_mut(bucket);
+            if let Some(mut entry) = entry_opt {
+                match entry.value_mut() {
+                    ForestCacheEntry::Monolithic { forest, dirty, .. } => {
+                        forest.upsert_file(file_entry.clone());
+                        *dirty = true;
+                        None
+                    }
+                    ForestCacheEntry::Sharded { forest, loaded_at, .. } => {
+                        let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
+                        forest.upsert_file(file_entry.clone(), &forest_dek);
+                        *loaded_at = now;
+                        None
+                    }
+                    ForestCacheEntry::ShardedHamt { forest, .. } => Some(forest.clone()),
                 }
-                ForestCacheEntry::Sharded { forest, loaded_at, .. } => {
-                    let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
-                    forest.upsert_file(file_entry, &forest_dek);
+            } else {
+                None
+            }
+        };
+
+        if let Some(forest_arc) = v7_forest_arc {
+            let backend: Arc<S3BlobBackend> = Arc::new(
+                S3BlobBackend::new(self.inner.clone(), bucket.to_string())
+            );
+            {
+                let mut guard = forest_arc.lock().await;
+                guard.upsert_file(file_entry, &backend).await
+                    .map_err(ClientError::Encryption)?;
+            }
+            if let Some(mut entry) = self.forest_cache.get_mut(bucket) {
+                if let ForestCacheEntry::ShardedHamt { loaded_at, .. } = entry.value_mut() {
                     *loaded_at = now;
                 }
             }
         }
-        
+
         Ok(result)
     }
 
@@ -5060,11 +5703,76 @@ mod tests {
     fn test_encryption_config() {
         let config1 = EncryptionConfig::new();
         let config2 = EncryptionConfig::new();
-        
+
         // Different configs should have different keys
         assert_ne!(
             config1.public_key().as_bytes(),
             config2.public_key().as_bytes()
         );
+    }
+
+    /// Compile-time proof that `S3BlobBackend` satisfies the `BlobBackend`
+    /// bound used by `V7NodeStore`. Runs no real traffic — the actual
+    /// S3 round-trip is exercised by integration tests against a live
+    /// gateway. This guards against a future refactor accidentally losing
+    /// the trait's `Send + Sync` requirement on the native target.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn s3_blob_backend_satisfies_blob_backend_trait() {
+        fn assert_impl<T: BlobBackend + Send + Sync + 'static>() {}
+        assert_impl::<S3BlobBackend>();
+    }
+
+    /// `S3BlobBackend::new` takes a `FulaClient` + bucket and is cheaply
+    /// cloneable, so per-flush construction in the v7 pipeline is free.
+    #[test]
+    fn s3_blob_backend_constructs_and_clones() {
+        let cfg = Config::new("https://example.invalid");
+        let client = FulaClient::new(cfg).expect("client builds");
+        let backend = S3BlobBackend::new(client, "test-bucket");
+        // Clone must preserve bucket routing.
+        let cloned = backend.clone();
+        assert_eq!(cloned.bucket, "test-bucket");
+    }
+
+    /// A `ShardedHamt` cache entry reports its own `loaded_at` and delegates
+    /// `is_dirty()` to the wrapped `ShardedHamtPrivateForest`. A freshly
+    /// constructed forest has no mutations → `is_dirty()` is false. The
+    /// dirty-flag transitions after mutation are covered by tests in
+    /// `fula_crypto::sharded_hamt_forest` (e.g.
+    /// `flush_dirty_persists_and_reloads_cleanly`) where the required
+    /// `InMemoryBackend` helper lives.
+    #[test]
+    fn sharded_hamt_cache_entry_exposes_load_bearing_signals() {
+        use fula_crypto::private_forest::{ShardManifestV7, ShardV7};
+        use fula_crypto::keys::DekKey;
+
+        let manifest = ShardManifestV7 {
+            version: 7,
+            format: "sharded-hamt-v7".to_string(),
+            num_shards: 1,
+            shard_salt: vec![0u8; 32],
+            root: "/".to_string(),
+            created_at: 0,
+            modified_at: 0,
+            shards: vec![ShardV7 {
+                root: None,
+                seq: 0,
+                etag: None,
+                entry_count: 0,
+            }],
+        };
+
+        let dek = DekKey::from_bytes(&[0x42u8; 32]).unwrap();
+        let forest = ShardedHamtPrivateForest::from_manifest(manifest, "bucket", dek);
+        let forest_arc = Arc::new(tokio::sync::Mutex::new(forest));
+        let clean = ForestCacheEntry::ShardedHamt {
+            forest: forest_arc,
+            loaded_at: 42,
+            manifest_etag: Some("etag-abc".to_string()),
+            last_manifest_sequence: Some(17),
+        };
+        assert_eq!(clean.loaded_at(), 42);
+        assert!(!clean.is_dirty());
     }
 }

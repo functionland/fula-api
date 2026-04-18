@@ -807,7 +807,8 @@ mod forest_format_compat {
 
         match detect_forest_format(&bytes).unwrap() {
             ForestOrManifest::Monolithic(_) => { /* expected */ }
-            ForestOrManifest::Manifest(_) => panic!("Expected Monolithic format"),
+            ForestOrManifest::Manifest(_) => panic!("Expected Monolithic format, got v6 manifest"),
+            ForestOrManifest::ManifestV7(_) => panic!("Expected Monolithic format, got v7 manifest"),
         }
     }
 

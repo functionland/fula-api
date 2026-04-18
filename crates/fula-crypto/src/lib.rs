@@ -79,11 +79,13 @@ pub mod private_forest;
 pub mod private_metadata;
 pub mod rotation;
 pub mod secret_link;
+pub mod sharded_hamt_forest;
 pub mod sharing;
 pub mod streaming;
 pub mod subtree_keys;
 pub mod symmetric;
 pub mod time;
+pub mod wnfs_hamt;
 
 pub use chunked::{ChunkedEncoder, ChunkedDecoder, ChunkedFileMetadata, EncryptedChunk, should_use_chunked, CHUNKED_THRESHOLD, VerifiedStreamingDecoder};
 #[cfg(feature = "tokio-runtime")]
@@ -109,9 +111,15 @@ pub use private_forest::{
     ShardedPrivateForest, ForestEvent, ForestOrManifest,
     detect_forest_format, derive_shard_key, shard_for_path, compute_initial_shard_count,
     SHARDED_MIGRATION_THRESHOLD, RESHARD_THRESHOLD, MAX_SHARDS,
+    // Sharded-HAMT forest (v7)
+    ShardV7, ShardManifestV7, EncryptedShardManifestV7,
+    V7StorageKey, V7_STORAGE_KEY_LEN,
+    manifest_v7_aad, hamt_node_v7_aad, compute_v7_node_key,
 };
+pub use wnfs_hamt::{BlobBackend, V7NodeStore, V7_NODE_PREFIX};
 pub use private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, PublicMetadata, KeyObfuscation, obfuscate_key};
 pub use rotation::{KeyRotationManager, FileSystemRotation, WrappedKeyInfo, RotationResult};
+pub use sharded_hamt_forest::{HamtEntry, ShardedHamtPrivateForest};
 pub use secret_link::{SecretLink, SecretLinkBuilder, SecretLinkPayload, is_valid_secret_link_url, extract_opaque_id, SHARE_PATH_PREFIX};
 pub use sharing::{ShareToken, ShareBuilder, ShareRecipient, AcceptedShare, FolderShareManager, AccessValidation, ShareMode, SnapshotBinding, SnapshotVerification};
 pub use streaming::{BaoEncoder, BaoDecoder, BaoOutboard, VerifiedStream};

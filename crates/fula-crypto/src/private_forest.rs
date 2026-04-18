@@ -62,6 +62,10 @@ pub enum ForestFormat {
     HamtV2,
     /// Sharded index (version 3) — manifest + per-shard encrypted S3 objects
     ShardedV3,
+    /// HAMT-per-shard (version 7) — each shard is a content-addressed HAMT
+    /// rather than a flat HashMap, so a single shard can scale to millions of
+    /// entries without any client materializing the whole shard.
+    ShardedHamtV7,
 }
 
 impl Default for ForestFormat {
@@ -291,6 +295,7 @@ impl PrivateForest {
             ForestFormat::FlatMapV1 => (HashMap::new(), None),
             ForestFormat::HamtV2 => (HashMap::new(), Some(HamtIndex::new())),
             ForestFormat::ShardedV3 => unreachable!("ShardedV3 uses ShardedPrivateForest, not PrivateForest"),
+            ForestFormat::ShardedHamtV7 => unreachable!("ShardedHamtV7 uses ShardedHamtPrivateForest, not PrivateForest"),
         };
 
         Self {
@@ -398,6 +403,7 @@ impl PrivateForest {
                 }
             }
             ForestFormat::ShardedV3 => unreachable!("ShardedV3 uses ShardedPrivateForest, not PrivateForest"),
+            ForestFormat::ShardedHamtV7 => unreachable!("ShardedHamtV7 uses ShardedHamtPrivateForest, not PrivateForest"),
         }
     }
 
@@ -452,6 +458,7 @@ impl PrivateForest {
             ForestFormat::FlatMapV1 => self.files.remove(path),
             ForestFormat::HamtV2 => self.files_hamt.as_mut().and_then(|h| h.remove(path)),
             ForestFormat::ShardedV3 => unreachable!("ShardedV3 uses ShardedPrivateForest, not PrivateForest"),
+            ForestFormat::ShardedHamtV7 => unreachable!("ShardedHamtV7 uses ShardedHamtPrivateForest, not PrivateForest"),
         };
 
         if let Some(ref e) = entry {
@@ -472,6 +479,7 @@ impl PrivateForest {
             ForestFormat::FlatMapV1 => self.files.get(path),
             ForestFormat::HamtV2 => self.files_hamt.as_ref().and_then(|h| h.get(path)),
             ForestFormat::ShardedV3 => unreachable!("ShardedV3 uses ShardedPrivateForest, not PrivateForest"),
+            ForestFormat::ShardedHamtV7 => unreachable!("ShardedHamtV7 uses ShardedHamtPrivateForest, not PrivateForest"),
         }
     }
 
@@ -488,6 +496,7 @@ impl PrivateForest {
                 .map(|h| h.iter().map(|(_, v)| v).collect())
                 .unwrap_or_default(),
             ForestFormat::ShardedV3 => unreachable!("ShardedV3 uses ShardedPrivateForest, not PrivateForest"),
+            ForestFormat::ShardedHamtV7 => unreachable!("ShardedHamtV7 uses ShardedHamtPrivateForest, not PrivateForest"),
         }
     }
 
@@ -541,6 +550,7 @@ impl PrivateForest {
             ForestFormat::FlatMapV1 => self.files.len(),
             ForestFormat::HamtV2 => self.files_hamt.as_ref().map(|h| h.len()).unwrap_or(0),
             ForestFormat::ShardedV3 => unreachable!("ShardedV3 uses ShardedPrivateForest, not PrivateForest"),
+            ForestFormat::ShardedHamtV7 => unreachable!("ShardedHamtV7 uses ShardedHamtPrivateForest, not PrivateForest"),
         }
     }
 
@@ -1031,6 +1041,239 @@ pub fn manifest_v6_aad(bucket: &str, sequence: u64) -> Vec<u8> {
     format!("fula:manifest:v6:{}:{}", bucket, sequence).into_bytes()
 }
 
+//--------------------------------------------------------------------------------------------------
+// v7 sharded-HAMT forest
+//
+// Per-shard flat HashMap (v5/v6) is replaced with a content-addressed HAMT
+// rooted at `ShardV7::root`. A single shard can now scale to millions of
+// entries without any client materializing the whole shard. See the v7 plan
+// at /root/.claude/plans/do-a-thorough-line-cheeky-taco.md.
+//--------------------------------------------------------------------------------------------------
+
+/// Width of a v7 HAMT node storage key. Mirrors
+/// `wnfs_hamt::store::STORAGE_KEY_LEN` so the public v7 schema doesn't need
+/// to expose the internal `wnfs_hamt` module.
+pub const V7_STORAGE_KEY_LEN: usize = 22;
+
+/// Content-addressed storage key for a v7 HAMT node blob.
+///
+/// Derived as `BLAKE3(bucket_salt ‖ plaintext_node_bytes)[..V7_STORAGE_KEY_LEN]`.
+/// The per-bucket salt (from [`ShardManifestV7::shard_salt`]) prevents an
+/// external observer from correlating structurally-identical nodes across
+/// buckets; plaintext hashing (not ciphertext) preserves cross-revision
+/// dedup of unchanged subtrees.
+pub type V7StorageKey = [u8; V7_STORAGE_KEY_LEN];
+
+mod v7_storage_key_serde {
+    use super::V7_STORAGE_KEY_LEN;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        key: &Option<[u8; V7_STORAGE_KEY_LEN]>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match key {
+            Some(bytes) => s.serialize_some(&hex::encode(bytes)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<[u8; V7_STORAGE_KEY_LEN]>, D::Error> {
+        let s: Option<String> = Option::deserialize(d)?;
+        match s {
+            Some(hex_str) => {
+                let bytes = hex::decode(&hex_str).map_err(serde::de::Error::custom)?;
+                if bytes.len() != V7_STORAGE_KEY_LEN {
+                    return Err(serde::de::Error::custom(format!(
+                        "v7 storage key must be {} bytes, got {}",
+                        V7_STORAGE_KEY_LEN,
+                        bytes.len()
+                    )));
+                }
+                let mut arr = [0u8; V7_STORAGE_KEY_LEN];
+                arr.copy_from_slice(&bytes);
+                Ok(Some(arr))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// Per-shard metadata in a v7 sharded-HAMT manifest.
+///
+/// `root` points to this shard's HAMT root node. `None` means the shard is
+/// empty — no node has been written yet. On every committed mutation the
+/// root advances to the newly-written root node; intermediate nodes become
+/// unreachable and are GC'd lazily.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardV7 {
+    /// HAMT root node key; `None` when the shard has no entries.
+    #[serde(with = "v7_storage_key_serde", default)]
+    pub root: Option<V7StorageKey>,
+
+    /// Monotonic per-shard sequence counter. Paired with the manifest's
+    /// conditional-PUT ETag, this protects shard root swaps against replay:
+    /// a stale manifest re-upload is rejected by S3 on ETag mismatch, and
+    /// within a winning generation `seq` gives an ordering invariant for
+    /// WAL-driven retry. It is *not* part of per-node AAD — see
+    /// [`hamt_node_v7_aad`] for why.
+    pub seq: u64,
+
+    /// Conditional-PUT ETag of the last written manifest generation for this
+    /// shard. `None` before the first successful flush.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub etag: Option<String>,
+
+    /// Entry count held in this shard (files + directories). Maintained on
+    /// each flush so top-level `file_count()` and shard-growth heuristics
+    /// stay O(num_shards) without walking any HAMT.
+    pub entry_count: u32,
+}
+
+impl ShardV7 {
+    /// Fresh, empty shard — no HAMT nodes written, sequence 0.
+    pub fn new() -> Self {
+        Self {
+            root: None,
+            seq: 0,
+            etag: None,
+            entry_count: 0,
+        }
+    }
+
+    /// True when the shard holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.root.is_none() && self.entry_count == 0
+    }
+}
+
+impl Default for ShardV7 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// v7 sharded-HAMT manifest.
+///
+/// Shape mirrors [`ShardManifest`] but replaces the per-shard flat HashMap
+/// with a HAMT root reference. The manifest stays small (O(num_shards))
+/// regardless of total entry count.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardManifestV7 {
+    /// Manifest format version (= 7).
+    pub version: u8,
+    /// Format identifier for human-readable introspection.
+    pub format: String,
+    /// Number of shards (power of 2, capped at [`MAX_SHARDS`]).
+    pub num_shards: usize,
+    /// Random 32-byte salt used for shard routing and for content-hashing
+    /// HAMT node plaintext. Prevents cross-bucket correlation of
+    /// structurally identical nodes.
+    #[serde(with = "hex_serde")]
+    pub shard_salt: Vec<u8>,
+    /// Root directory path (usually "/").
+    pub root: String,
+    /// Creation timestamp (Unix seconds).
+    pub created_at: i64,
+    /// Last-modified timestamp (Unix seconds).
+    pub modified_at: i64,
+    /// Per-shard metadata. `shards.len() == num_shards` after construction.
+    pub shards: Vec<ShardV7>,
+}
+
+impl ShardManifestV7 {
+    /// Fresh v7 manifest with `num_shards` empty shards.
+    ///
+    /// `num_shards` is rounded up to the next power of two and clamped to
+    /// `[16, MAX_SHARDS]`, matching [`ShardManifest::new`].
+    pub fn new(num_shards: usize) -> Self {
+        use rand::RngCore;
+        let num_shards = num_shards.next_power_of_two().max(16).min(MAX_SHARDS);
+        let mut shard_salt = vec![0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut shard_salt);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        Self {
+            version: 7,
+            format: "sharded-hamt-v7".to_string(),
+            num_shards,
+            shard_salt,
+            root: "/".to_string(),
+            created_at: now,
+            modified_at: now,
+            shards: (0..num_shards).map(|_| ShardV7::new()).collect(),
+        }
+    }
+
+    /// Refresh the modified timestamp.
+    pub fn touch(&mut self) {
+        self.modified_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+    }
+
+    /// Total entries across all shards (O(num_shards), not O(N)).
+    pub fn entry_count(&self) -> u64 {
+        self.shards.iter().map(|s| s.entry_count as u64).sum()
+    }
+}
+
+/// Compute the AAD for a v7 shard manifest wrapper.
+///
+/// Distinct prefix from v5/v6 so a ciphertext of another format cannot be
+/// accepted in a v7 slot — format-downgrade is detected at AEAD verification
+/// rather than relying on the plaintext version field.
+pub fn manifest_v7_aad(bucket: &str, sequence: u64) -> Vec<u8> {
+    format!("fula:manifest:v7:{}:{}", bucket, sequence).into_bytes()
+}
+
+/// Compute the AAD for a v7 HAMT node blob.
+///
+/// Binds `bucket_id` and `shard_idx` (u16 big-endian) so a node from a
+/// different bucket or shard fails AEAD verification. Tree position (depth,
+/// bitmap slot) is deliberately NOT in the AAD — position is bound
+/// *structurally* by the parent node's recorded child [`V7StorageKey`], which
+/// is what preserves cross-revision dedup of unchanged subtrees under
+/// plaintext content-addressing.
+///
+/// `shard_seq` is intentionally absent: HAMT flushes only rewrite the path of
+/// mutated nodes, so a seq bump would invalidate untouched subtree
+/// ciphertexts whose AAD was sealed under an older seq. Replay protection
+/// lives at the manifest layer (`manifest.shards[i].seq` + ETag), and
+/// forgery-resistance comes from content-addressing the plaintext bytes.
+pub fn hamt_node_v7_aad(bucket: &str, shard_idx: u16) -> Vec<u8> {
+    let prefix = b"fula:hamt-node:v7:";
+    let mut aad = Vec::with_capacity(prefix.len() + bucket.len() + 2);
+    aad.extend_from_slice(prefix);
+    aad.extend_from_slice(bucket.as_bytes());
+    aad.extend_from_slice(&shard_idx.to_be_bytes());
+    aad
+}
+
+/// Compute a content-addressed v7 node key from the plaintext node bytes.
+///
+/// `BLAKE3(bucket_salt ‖ plaintext)[..V7_STORAGE_KEY_LEN]`. Hashing the
+/// plaintext (not ciphertext) preserves cross-revision dedup for unchanged
+/// subtrees; the per-bucket salt prevents cross-bucket correlation of
+/// structurally identical plaintext (e.g. empty nodes) by an external
+/// observer of the backing object store.
+pub fn compute_v7_node_key(bucket_salt: &[u8], plaintext: &[u8]) -> V7StorageKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(bucket_salt);
+    hasher.update(plaintext);
+    let digest = hasher.finalize();
+    let mut key = [0u8; V7_STORAGE_KEY_LEN];
+    key.copy_from_slice(&digest.as_bytes()[..V7_STORAGE_KEY_LEN]);
+    key
+}
+
 /// Encrypted shard manifest (what gets stored at the index_key)
 ///
 /// Version semantics:
@@ -1193,6 +1436,81 @@ impl EncryptedShardManifest {
     }
 }
 
+/// Encrypted v7 sharded-HAMT manifest (what gets stored at the index_key).
+///
+/// Parallel to [`EncryptedShardManifest`] but carries a [`ShardManifestV7`]
+/// plaintext. Version 7 is always AAD-bound; there is no legacy variant.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EncryptedShardManifestV7 {
+    /// Version of the encryption format (= 7).
+    pub version: u8,
+    /// AEAD ciphertext covering the serialized [`ShardManifestV7`].
+    #[serde(with = "base64_serde")]
+    pub ciphertext: Vec<u8>,
+    /// Nonce used for encryption.
+    #[serde(with = "base64_serde")]
+    pub nonce: Vec<u8>,
+    /// Monotonic manifest sequence counter bound into the AAD.
+    pub sequence: u64,
+}
+
+impl EncryptedShardManifestV7 {
+    /// Encrypt a v7 manifest with a DEK and AAD binding.
+    pub fn encrypt_v7(
+        manifest: &ShardManifestV7,
+        dek: &DekKey,
+        bucket: &str,
+        sequence: u64,
+    ) -> Result<Self> {
+        let json = serde_json::to_vec(manifest)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(dek);
+        let aad = manifest_v7_aad(bucket, sequence);
+        let ciphertext = aead.encrypt_with_aad(&nonce, &json, &aad)?;
+
+        Ok(Self {
+            version: 7,
+            ciphertext,
+            nonce: nonce.as_bytes().to_vec(),
+            sequence,
+        })
+    }
+
+    /// Decrypt a v7 manifest, verifying bucket + sequence via AAD.
+    ///
+    /// Rejects any non-v7 wrapper so that a downgraded v3/v5/v6 ciphertext
+    /// cannot pass the version check silently.
+    pub fn decrypt_v7(&self, dek: &DekKey, bucket: &str) -> Result<(ShardManifestV7, u64)> {
+        if self.version != 7 {
+            return Err(CryptoError::Decryption(format!(
+                "expected EncryptedShardManifestV7 version 7, got {}",
+                self.version
+            )));
+        }
+        let nonce = Nonce::from_bytes(&self.nonce)?;
+        let aead = Aead::new_default(dek);
+        let aad = manifest_v7_aad(bucket, self.sequence);
+        let plaintext = aead.decrypt_with_aad(&nonce, &self.ciphertext, &aad)?;
+        let manifest: ShardManifestV7 = serde_json::from_slice(&plaintext)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+        Ok((manifest, self.sequence))
+    }
+
+    /// Serialize to bytes for storage.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+}
+
 /// Compute the AAD for a v2 forest shard.
 pub fn shard_v2_aad(bucket: &str, shard_index: usize, sequence: u64) -> Vec<u8> {
     format!("fula:shard:v2:{}:{}:{}", bucket, shard_index, sequence).into_bytes()
@@ -1318,10 +1636,12 @@ impl EncryptedForestShard {
 
 /// Result of detecting the format at the index_key
 pub enum ForestOrManifest {
-    /// Monolithic forest (version 1 or 2)
+    /// Monolithic forest (version 1, 2, or 4).
     Monolithic(EncryptedForest),
-    /// Sharded manifest (version 3)
+    /// Sharded flat-HashMap manifest (version 3, 5, or 6).
     Manifest(EncryptedShardManifest),
+    /// Sharded-HAMT manifest (version 7).
+    ManifestV7(EncryptedShardManifestV7),
 }
 
 /// Detect whether bytes at the index_key are a monolithic forest or shard manifest
@@ -1333,6 +1653,8 @@ pub enum ForestOrManifest {
 /// - 3, 5, 6    → sharded `EncryptedShardManifest`. v5 carries AAD+sequence
 ///                with legacy full-path routing; v6 adds directory-aware
 ///                routing with a distinct AAD prefix.
+/// - 7          → sharded-HAMT `EncryptedShardManifestV7`; each shard stores
+///                a content-addressed HAMT root rather than a flat HashMap.
 pub fn detect_forest_format(bytes: &[u8]) -> Result<ForestOrManifest> {
     let parsed: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|e| CryptoError::Serialization(e.to_string()))?;
@@ -1343,6 +1665,9 @@ pub fn detect_forest_format(bytes: &[u8]) -> Result<ForestOrManifest> {
         }
         Some(3) | Some(5) | Some(6) => {
             Ok(ForestOrManifest::Manifest(EncryptedShardManifest::from_bytes(bytes)?))
+        }
+        Some(7) => {
+            Ok(ForestOrManifest::ManifestV7(EncryptedShardManifestV7::from_bytes(bytes)?))
         }
         Some(v) => Err(CryptoError::Encryption(format!("unsupported forest version: {}", v))),
         None => Err(CryptoError::Serialization("missing version field in forest data".to_string())),
@@ -2285,6 +2610,7 @@ mod tests {
         match detect_forest_format(&bytes).unwrap() {
             ForestOrManifest::Monolithic(_) => {} // expected
             ForestOrManifest::Manifest(_) => panic!("expected monolithic"),
+            ForestOrManifest::ManifestV7(_) => panic!("expected monolithic"),
         }
     }
 
@@ -2298,6 +2624,7 @@ mod tests {
         match detect_forest_format(&bytes).unwrap() {
             ForestOrManifest::Manifest(_) => {} // expected
             ForestOrManifest::Monolithic(_) => panic!("expected manifest"),
+            ForestOrManifest::ManifestV7(_) => panic!("expected manifest"),
         }
     }
 
@@ -2864,6 +3191,90 @@ mod tests {
             ForestOrManifest::Manifest(_) => {}
             _ => panic!("expected Manifest for v6"),
         }
+    }
+
+    #[test]
+    fn test_shard_manifest_v7_shape() {
+        let m = ShardManifestV7::new(16);
+        assert_eq!(m.version, 7);
+        assert_eq!(m.format, "sharded-hamt-v7");
+        assert_eq!(m.num_shards, 16);
+        assert_eq!(m.shard_salt.len(), 32);
+        assert_eq!(m.shards.len(), 16);
+        assert!(m.shards.iter().all(|s| s.is_empty()));
+        assert_eq!(m.entry_count(), 0);
+
+        // num_shards is rounded up to the next power of two and floored at 16.
+        let big = ShardManifestV7::new(100);
+        assert_eq!(big.num_shards, 128);
+        assert_eq!(big.shards.len(), 128);
+        let tiny = ShardManifestV7::new(1);
+        assert_eq!(tiny.num_shards, 16);
+    }
+
+    #[test]
+    fn test_shard_manifest_v7_encrypt_decrypt_roundtrip() {
+        let dek = DekKey::generate();
+        let mut manifest = ShardManifestV7::new(16);
+        manifest.shards[3].root = Some([0xAB; V7_STORAGE_KEY_LEN]);
+        manifest.shards[3].seq = 42;
+        manifest.shards[3].entry_count = 17;
+        manifest.shards[3].etag = Some("\"abc123\"".to_string());
+
+        let em = EncryptedShardManifestV7::encrypt_v7(&manifest, &dek, "bucket-x", 1).unwrap();
+        assert_eq!(em.version, 7);
+        assert_eq!(em.sequence, 1);
+
+        let (decoded, seq) = em.decrypt_v7(&dek, "bucket-x").unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(decoded.version, 7);
+        assert_eq!(decoded.shards[3].root, Some([0xAB; V7_STORAGE_KEY_LEN]));
+        assert_eq!(decoded.shards[3].seq, 42);
+        assert_eq!(decoded.shards[3].entry_count, 17);
+        assert_eq!(decoded.shards[3].etag.as_deref(), Some("\"abc123\""));
+
+        // Wrong bucket binding fails (AAD mismatch).
+        assert!(em.decrypt_v7(&dek, "different-bucket").is_err());
+
+        // v6 ciphertext cannot be decrypted as v7 (and vice versa).
+        let v6_manifest = ShardManifest::new(16).into_v6(vec![0u64; 16]);
+        let em6 = EncryptedShardManifest::encrypt_v6(&v6_manifest, &dek, "bucket-x", 1).unwrap();
+        let em6_bytes = em6.to_bytes().unwrap();
+        let coerced_v7 = EncryptedShardManifestV7::from_bytes(&em6_bytes);
+        if let Ok(parsed) = coerced_v7 {
+            // If JSON parses, version must fail the version==7 check at decrypt time.
+            assert!(parsed.decrypt_v7(&dek, "bucket-x").is_err());
+        }
+    }
+
+    #[test]
+    fn test_detect_forest_format_v7() {
+        let dek = DekKey::generate();
+        let manifest = ShardManifestV7::new(16);
+        let em = EncryptedShardManifestV7::encrypt_v7(&manifest, &dek, "b", 1).unwrap();
+        let bytes = em.to_bytes().unwrap();
+        match detect_forest_format(&bytes).unwrap() {
+            ForestOrManifest::ManifestV7(_) => {}
+            _ => panic!("expected ManifestV7 for v7"),
+        }
+    }
+
+    #[test]
+    fn test_hamt_node_v7_aad_shape() {
+        // Confirm the structural binding: prefix + bucket + u16_be(shard).
+        let aad = hamt_node_v7_aad("bucket-a", 0x0102);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"fula:hamt-node:v7:");
+        expected.extend_from_slice(b"bucket-a");
+        expected.extend_from_slice(&0x0102u16.to_be_bytes());
+        assert_eq!(aad, expected);
+
+        // Distinct buckets / shards produce distinct AADs. Sequence is NOT in
+        // AAD — HAMT flush only rewrites path-of-change nodes, so a seq-bound
+        // AAD would invalidate untouched subtree ciphertexts. Replay
+        // resistance lives at the manifest layer (ETag + manifest shard seq).
+        assert_ne!(hamt_node_v7_aad("b", 0), hamt_node_v7_aad("c", 0));
+        assert_ne!(hamt_node_v7_aad("b", 0), hamt_node_v7_aad("b", 1));
     }
 
     #[test]
