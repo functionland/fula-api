@@ -13,6 +13,7 @@ pub mod sharing;
 pub mod rotation;
 pub mod chunked;
 pub mod multipart;
+pub mod metrics;
 
 // Re-export all public types
 pub use types::*;
@@ -44,6 +45,8 @@ pub use encrypted::{
     put_encrypted_with_type,
     get_decrypted,
     get_decrypted_by_storage_key,
+    get_decrypted_buffered,
+    get_decrypted_buffered_by_storage_key,
     get_with_private_metadata,
     delete_encrypted,
     delete_by_storage_key,
@@ -59,6 +62,9 @@ pub use encrypted::{
     enc_create_bucket,
     enc_delete_bucket,
 };
+
+// Re-export metrics
+pub use metrics::wal_append_failure_count;
 
 // Re-export forest functions
 pub use forest::{

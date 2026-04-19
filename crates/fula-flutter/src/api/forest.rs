@@ -143,6 +143,7 @@ pub async fn list_from_forest(
 /// This is critical for large files (1GB+) where passing `Vec<u8>` through
 /// FFI would cause out-of-memory errors.
 #[cfg(not(target_arch = "wasm32"))]
+#[flutter_rust_bridge::frb(ignore)]
 pub async fn put_flat_from_path(
     client: &EncryptedClientHandle,
     bucket: String,
@@ -166,6 +167,7 @@ pub async fn put_flat_from_path(
 ///
 /// Same as `put_flat_from_path` but defers the forest save for batch efficiency.
 #[cfg(not(target_arch = "wasm32"))]
+#[flutter_rust_bridge::frb(ignore)]
 pub async fn put_flat_from_path_deferred(
     client: &EncryptedClientHandle,
     bucket: String,
@@ -187,6 +189,7 @@ pub async fn put_flat_from_path_deferred(
 
 /// Get the size of a file without reading it into memory
 #[cfg(not(target_arch = "wasm32"))]
+#[flutter_rust_bridge::frb(ignore)]
 pub async fn get_file_size(file_path: String) -> anyhow::Result<u64> {
     let metadata = tokio::fs::metadata(&file_path).await
         .with_context(|| format!("Failed to get file metadata: {}", file_path))?;

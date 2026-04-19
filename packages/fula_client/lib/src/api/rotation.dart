@@ -11,41 +11,49 @@ import 'types.dart';
 ///
 /// The rotation manager handles the key rotation process,
 /// including tracking which keys have been rotated.
-Future<RotationManagerHandle> createRotationManager(
-        {required EncryptedClientHandle client}) =>
+Future<RotationManagerHandle> createRotationManager({
+  required EncryptedClientHandle client,
+}) =>
     RustLib.instance.api.crateApiRotationCreateRotationManager(client: client);
 
 /// Get the KEK (Key Encryption Key) version used for an object
 ///
 /// Returns None if the object doesn't have version metadata.
-Future<int?> getKekVersion(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String storageKey}) =>
-    RustLib.instance.api.crateApiRotationGetKekVersion(
-        client: client, bucket: bucket, storageKey: storageKey);
+Future<int?> getKekVersion({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String storageKey,
+}) => RustLib.instance.api.crateApiRotationGetKekVersion(
+  client: client,
+  bucket: bucket,
+  storageKey: storageKey,
+);
 
 /// Re-wrap a single object's DEK with the current KEK
 ///
 /// Returns the new KEK version.
-Future<int> rewrapObject(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String storageKey,
-        required RotationManagerHandle manager}) =>
-    RustLib.instance.api.crateApiRotationRewrapObject(
-        client: client,
-        bucket: bucket,
-        storageKey: storageKey,
-        manager: manager);
+Future<int> rewrapObject({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String storageKey,
+  required RotationManagerHandle manager,
+}) => RustLib.instance.api.crateApiRotationRewrapObject(
+  client: client,
+  bucket: bucket,
+  storageKey: storageKey,
+  manager: manager,
+);
 
 /// Rotate all objects in a bucket
 ///
 /// This re-wraps the DEK for every object in the bucket.
 /// Returns a report with success/failure counts.
-Future<RotationReport> rotateBucket(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required RotationManagerHandle manager}) =>
-    RustLib.instance.api.crateApiRotationRotateBucket(
-        client: client, bucket: bucket, manager: manager);
+Future<RotationReport> rotateBucket({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required RotationManagerHandle manager,
+}) => RustLib.instance.api.crateApiRotationRotateBucket(
+  client: client,
+  bucket: bucket,
+  manager: manager,
+);

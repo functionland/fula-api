@@ -31,6 +31,20 @@ pub struct FulaConfig {
     pub timeout_seconds: u64,
     /// Maximum retry attempts (default: 3)
     pub max_retries: u32,
+    /// F10: per-chunk download timeout in seconds.
+    ///
+    /// Applied to every individual chunk fetched by the windowed chunked-download
+    /// engine. Guards against a slow server trickling bytes below the global
+    /// dead-connection threshold. Only active on native targets; wasm inherits
+    /// the browser fetch default. Default: 300 (5 minutes).
+    pub per_chunk_download_timeout_seconds: u64,
+    /// F8: maximum plaintext size a buffered download will accept.
+    ///
+    /// Applied *before* any network I/O by the buffered download path. If the
+    /// chunked metadata declares a `total_size` larger than this ceiling, the
+    /// buffered path returns an error instead of allocating the buffer.
+    /// Default: 256 MiB.
+    pub buffered_download_max_bytes: u64,
 }
 
 impl Default for FulaConfig {
@@ -40,6 +54,8 @@ impl Default for FulaConfig {
             access_token: None,
             timeout_seconds: 30,
             max_retries: 3,
+            per_chunk_download_timeout_seconds: 300,
+            buffered_download_max_bytes: 256 * 1024 * 1024,
         }
     }
 }

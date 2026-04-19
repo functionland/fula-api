@@ -11,6 +11,7 @@ import 'api/client.dart';
 import 'api/encrypted.dart';
 import 'api/error.dart';
 import 'api/forest.dart';
+import 'api/metrics.dart';
 import 'api/multipart.dart';
 import 'api/rotation.dart';
 import 'api/sharing.dart';
@@ -29,102 +30,117 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   });
 
   CrossPlatformFinalizerArg
-      get rust_arc_decrement_strong_count_AcceptedShareHandlePtr => wire
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle;
+  get rust_arc_decrement_strong_count_AcceptedShareHandlePtr => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle;
 
   CrossPlatformFinalizerArg
-      get rust_arc_decrement_strong_count_EncryptedClientHandlePtr => wire
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle;
+  get rust_arc_decrement_strong_count_EncryptedClientHandlePtr => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle;
 
   CrossPlatformFinalizerArg
-      get rust_arc_decrement_strong_count_FulaClientHandlePtr => wire
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle;
+  get rust_arc_decrement_strong_count_FulaClientHandlePtr => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle;
 
   CrossPlatformFinalizerArg
-      get rust_arc_decrement_strong_count_MultipartHandlePtr => wire
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle;
+  get rust_arc_decrement_strong_count_MultipartHandlePtr => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle;
 
   CrossPlatformFinalizerArg
-      get rust_arc_decrement_strong_count_RotationManagerHandlePtr => wire
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle;
+  get rust_arc_decrement_strong_count_RotationManagerHandlePtr => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle;
 
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw);
 
   @protected
   AcceptedShareHandle
-      dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          dynamic raw);
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    dynamic raw,
+  );
 
   @protected
   EncryptedClientHandle
-      dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          dynamic raw);
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    dynamic raw,
+  );
 
   @protected
   FulaClientHandle
-      dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          dynamic raw);
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    dynamic raw,
+  );
 
   @protected
   MultipartHandle
-      dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          dynamic raw);
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    dynamic raw,
+  );
 
   @protected
   RotationManagerHandle
-      dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          dynamic raw);
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    dynamic raw,
+  );
 
   @protected
   AcceptedShareHandle
-      dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          dynamic raw);
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    dynamic raw,
+  );
 
   @protected
   EncryptedClientHandle
-      dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          dynamic raw);
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    dynamic raw,
+  );
 
   @protected
   FulaClientHandle
-      dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          dynamic raw);
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    dynamic raw,
+  );
 
   @protected
   MultipartHandle
-      dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          dynamic raw);
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    dynamic raw,
+  );
 
   @protected
   RotationManagerHandle
-      dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          dynamic raw);
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    dynamic raw,
+  );
 
   @protected
   AcceptedShareHandle
-      dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          dynamic raw);
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    dynamic raw,
+  );
 
   @protected
   EncryptedClientHandle
-      dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          dynamic raw);
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    dynamic raw,
+  );
 
   @protected
   FulaClientHandle
-      dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          dynamic raw);
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    dynamic raw,
+  );
 
   @protected
   MultipartHandle
-      dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          dynamic raw);
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    dynamic raw,
+  );
 
   @protected
   RotationManagerHandle
-      dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          dynamic raw);
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    dynamic raw,
+  );
 
   @protected
   String dco_decode_String(dynamic raw);
@@ -302,78 +318,93 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   AcceptedShareHandle
-      sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          SseDeserializer deserializer);
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   EncryptedClientHandle
-      sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          SseDeserializer deserializer);
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   FulaClientHandle
-      sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          SseDeserializer deserializer);
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   MultipartHandle
-      sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          SseDeserializer deserializer);
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   RotationManagerHandle
-      sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          SseDeserializer deserializer);
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   AcceptedShareHandle
-      sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          SseDeserializer deserializer);
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   EncryptedClientHandle
-      sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          SseDeserializer deserializer);
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   FulaClientHandle
-      sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          SseDeserializer deserializer);
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   MultipartHandle
-      sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          SseDeserializer deserializer);
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   RotationManagerHandle
-      sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          SseDeserializer deserializer);
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   AcceptedShareHandle
-      sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          SseDeserializer deserializer);
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   EncryptedClientHandle
-      sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          SseDeserializer deserializer);
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   FulaClientHandle
-      sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          SseDeserializer deserializer);
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   MultipartHandle
-      sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          SseDeserializer deserializer);
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   RotationManagerHandle
-      sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          SseDeserializer deserializer);
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    SseDeserializer deserializer,
+  );
 
   @protected
   String sse_decode_String(SseDeserializer deserializer);
@@ -383,7 +414,8 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   EncryptionConfig sse_decode_box_autoadd_encryption_config(
-      SseDeserializer deserializer);
+    SseDeserializer deserializer,
+  );
 
   @protected
   FulaConfig sse_decode_box_autoadd_fula_config(SseDeserializer deserializer);
@@ -399,15 +431,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ObjectMetadata sse_decode_box_autoadd_object_metadata(
-      SseDeserializer deserializer);
+    SseDeserializer deserializer,
+  );
 
   @protected
   PinningConfig sse_decode_box_autoadd_pinning_config(
-      SseDeserializer deserializer);
+    SseDeserializer deserializer,
+  );
 
   @protected
   RotationReport sse_decode_box_autoadd_rotation_report(
-      SseDeserializer deserializer);
+    SseDeserializer deserializer,
+  );
 
   @protected
   int sse_decode_box_autoadd_u_32(SseDeserializer deserializer);
@@ -420,7 +455,8 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   DecryptedObjectInfo sse_decode_decrypted_object_info(
-      SseDeserializer deserializer);
+    SseDeserializer deserializer,
+  );
 
   @protected
   DirectoryEntry sse_decode_directory_entry(SseDeserializer deserializer);
@@ -466,22 +502,26 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<DirectoryEntry> sse_decode_list_directory_entry(
-      SseDeserializer deserializer);
+    SseDeserializer deserializer,
+  );
 
   @protected
   List<FileMetadata> sse_decode_list_file_metadata(
-      SseDeserializer deserializer);
+    SseDeserializer deserializer,
+  );
 
   @protected
   List<MetadataEntry> sse_decode_list_metadata_entry(
-      SseDeserializer deserializer);
+    SseDeserializer deserializer,
+  );
 
   @protected
   List<ObjectInfo> sse_decode_list_object_info(SseDeserializer deserializer);
 
   @protected
   ListObjectsResult sse_decode_list_objects_result(
-      SseDeserializer deserializer);
+    SseDeserializer deserializer,
+  );
 
   @protected
   ListOptions sse_decode_list_options(SseDeserializer deserializer);
@@ -494,7 +534,8 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<RotationFailure> sse_decode_list_rotation_failure(
-      SseDeserializer deserializer);
+    SseDeserializer deserializer,
+  );
 
   @protected
   MetadataEntry sse_decode_metadata_entry(SseDeserializer deserializer);
@@ -625,15 +666,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   JSAny cst_encode_bucket_info(BucketInfo raw) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-    return [cst_encode_String(raw.name), cst_encode_i_64(raw.createdAt)]
-        .jsify()!;
+    return [
+      cst_encode_String(raw.name),
+      cst_encode_i_64(raw.createdAt),
+    ].jsify()!;
   }
 
   @protected
   JSAny cst_encode_copy_result(CopyResult raw) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-    return [cst_encode_String(raw.etag), cst_encode_i_64(raw.lastModified)]
-        .jsify()!;
+    return [
+      cst_encode_String(raw.etag),
+      cst_encode_i_64(raw.lastModified),
+    ].jsify()!;
   }
 
   @protected
@@ -644,7 +689,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       cst_encode_String(raw.originalKey),
       cst_encode_u_64(raw.size),
       cst_encode_opt_String(raw.contentType),
-      cst_encode_list_metadata_entry(raw.metadata)
+      cst_encode_list_metadata_entry(raw.metadata),
     ].jsify()!;
   }
 
@@ -654,7 +699,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     return [
       cst_encode_String(raw.name),
       cst_encode_bool(raw.isDirectory),
-      cst_encode_list_file_metadata(raw.files)
+      cst_encode_list_file_metadata(raw.files),
     ].jsify()!;
   }
 
@@ -664,7 +709,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     return [
       cst_encode_String(raw.bucket),
       cst_encode_opt_String(raw.prefix),
-      cst_encode_list_directory_entry(raw.entries)
+      cst_encode_list_directory_entry(raw.entries),
     ].jsify()!;
   }
 
@@ -674,7 +719,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     return [
       cst_encode_opt_list_prim_u_8_strict(raw.secretKey),
       cst_encode_bool(raw.enableMetadataPrivacy),
-      cst_encode_obfuscation_mode(raw.obfuscationMode)
+      cst_encode_obfuscation_mode(raw.obfuscationMode),
     ].jsify()!;
   }
 
@@ -688,7 +733,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       cst_encode_opt_String(raw.contentType),
       cst_encode_opt_box_autoadd_i_64(raw.createdAt),
       cst_encode_opt_box_autoadd_i_64(raw.modifiedAt),
-      cst_encode_bool(raw.isEncrypted)
+      cst_encode_bool(raw.isEncrypted),
     ].jsify()!;
   }
 
@@ -705,7 +750,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       cst_encode_String(raw.endpoint),
       cst_encode_opt_String(raw.accessToken),
       cst_encode_u_64(raw.timeoutSeconds),
-      cst_encode_u_32(raw.maxRetries)
+      cst_encode_u_32(raw.maxRetries),
+      cst_encode_u_64(raw.perChunkDownloadTimeoutSeconds),
+      cst_encode_u_64(raw.bufferedDownloadMaxBytes),
     ].jsify()!;
   }
 
@@ -716,8 +763,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       return [0, cst_encode_String(raw.field0)].jsify()!;
     }
     if (raw is FulaError_NotFound) {
-      return [1, cst_encode_String(raw.bucket), cst_encode_String(raw.key)]
-          .jsify()!;
+      return [
+        1,
+        cst_encode_String(raw.bucket),
+        cst_encode_String(raw.key),
+      ].jsify()!;
     }
     if (raw is FulaError_BucketNotFound) {
       return [2, cst_encode_String(raw.field0)].jsify()!;
@@ -768,7 +818,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       cst_encode_opt_String(raw.contentType),
       cst_encode_u_64(raw.size),
       cst_encode_i_64(raw.lastModified),
-      cst_encode_list_metadata_entry(raw.metadata)
+      cst_encode_list_metadata_entry(raw.metadata),
     ].jsify()!;
   }
 
@@ -780,7 +830,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       cst_encode_opt_String(raw.contentType),
       cst_encode_u_64(raw.size),
       cst_encode_i_64(raw.lastModified),
-      cst_encode_list_metadata_entry(raw.metadata)
+      cst_encode_list_metadata_entry(raw.metadata),
     ].jsify()!;
   }
 
@@ -833,7 +883,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       cst_encode_list_object_info(raw.objects),
       cst_encode_list_String(raw.commonPrefixes),
       cst_encode_bool(raw.isTruncated),
-      cst_encode_opt_String(raw.nextToken)
+      cst_encode_opt_String(raw.nextToken),
     ].jsify()!;
   }
 
@@ -844,7 +894,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       cst_encode_opt_String(raw.prefix),
       cst_encode_opt_String(raw.delimiter),
       cst_encode_opt_box_autoadd_u_32(raw.maxKeys),
-      cst_encode_opt_String(raw.continuationToken)
+      cst_encode_opt_String(raw.continuationToken),
     ].jsify()!;
   }
 
@@ -880,7 +930,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       cst_encode_u_64(raw.size),
       cst_encode_i_64(raw.lastModified),
       cst_encode_String(raw.etag),
-      cst_encode_String(raw.storageClass)
+      cst_encode_String(raw.storageClass),
     ].jsify()!;
   }
 
@@ -890,7 +940,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     return [
       cst_encode_opt_String(raw.contentType),
       cst_encode_opt_String(raw.cacheControl),
-      cst_encode_list_metadata_entry(raw.userMetadata)
+      cst_encode_list_metadata_entry(raw.userMetadata),
     ].jsify()!;
   }
 
@@ -921,22 +971,28 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   JSAny cst_encode_pinning_config(PinningConfig raw) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-    return [cst_encode_String(raw.endpoint), cst_encode_String(raw.token)]
-        .jsify()!;
+    return [
+      cst_encode_String(raw.endpoint),
+      cst_encode_String(raw.token),
+    ].jsify()!;
   }
 
   @protected
   JSAny cst_encode_put_result(PutResult raw) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-    return [cst_encode_String(raw.etag), cst_encode_opt_String(raw.versionId)]
-        .jsify()!;
+    return [
+      cst_encode_String(raw.etag),
+      cst_encode_opt_String(raw.versionId),
+    ].jsify()!;
   }
 
   @protected
   JSAny cst_encode_rotation_failure(RotationFailure raw) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-    return [cst_encode_String(raw.storageKey), cst_encode_String(raw.error)]
-        .jsify()!;
+    return [
+      cst_encode_String(raw.storageKey),
+      cst_encode_String(raw.error),
+    ].jsify()!;
   }
 
   @protected
@@ -947,7 +1003,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       cst_encode_u_32(raw.rotated),
       cst_encode_u_32(raw.skipped),
       cst_encode_u_32(raw.failed),
-      cst_encode_list_rotation_failure(raw.failures)
+      cst_encode_list_rotation_failure(raw.failures),
     ].jsify()!;
   }
 
@@ -957,7 +1013,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     return [
       cst_encode_bool(raw.canRead),
       cst_encode_bool(raw.canWrite),
-      cst_encode_opt_box_autoadd_i_64(raw.expiresAt)
+      cst_encode_opt_box_autoadd_i_64(raw.expiresAt),
     ].jsify()!;
   }
 
@@ -975,7 +1031,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       cst_encode_u_64(raw.totalBytes),
       cst_encode_u_32(raw.currentPart),
       cst_encode_u_32(raw.totalParts),
-      cst_encode_f_64(raw.percentage)
+      cst_encode_f_64(raw.percentage),
     ].jsify()!;
   }
 
@@ -986,64 +1042,94 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   }
 
   @protected
-  int cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-      AcceptedShareHandle raw);
+  int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    AcceptedShareHandle raw,
+  );
 
   @protected
-  int cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-      EncryptedClientHandle raw);
+  int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    EncryptedClientHandle raw,
+  );
 
   @protected
-  int cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-      FulaClientHandle raw);
+  int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    FulaClientHandle raw,
+  );
 
   @protected
-  int cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-      MultipartHandle raw);
+  int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    MultipartHandle raw,
+  );
 
   @protected
-  int cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-      RotationManagerHandle raw);
+  int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    RotationManagerHandle raw,
+  );
 
   @protected
-  int cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-      AcceptedShareHandle raw);
+  int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    AcceptedShareHandle raw,
+  );
 
   @protected
-  int cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-      EncryptedClientHandle raw);
+  int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    EncryptedClientHandle raw,
+  );
 
   @protected
-  int cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-      FulaClientHandle raw);
+  int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    FulaClientHandle raw,
+  );
 
   @protected
-  int cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-      MultipartHandle raw);
+  int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    MultipartHandle raw,
+  );
 
   @protected
-  int cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-      RotationManagerHandle raw);
+  int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    RotationManagerHandle raw,
+  );
 
   @protected
-  int cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-      AcceptedShareHandle raw);
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    AcceptedShareHandle raw,
+  );
 
   @protected
-  int cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-      EncryptedClientHandle raw);
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    EncryptedClientHandle raw,
+  );
 
   @protected
-  int cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-      FulaClientHandle raw);
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    FulaClientHandle raw,
+  );
 
   @protected
-  int cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-      MultipartHandle raw);
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    MultipartHandle raw,
+  );
 
   @protected
-  int cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-      RotationManagerHandle raw);
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    RotationManagerHandle raw,
+  );
 
   @protected
   bool cst_encode_bool(bool raw);
@@ -1071,82 +1157,114 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_AnyhowException(
-      AnyhowException self, SseSerializer serializer);
+    AnyhowException self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          AcceptedShareHandle self, SseSerializer serializer);
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    AcceptedShareHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          EncryptedClientHandle self, SseSerializer serializer);
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    EncryptedClientHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          FulaClientHandle self, SseSerializer serializer);
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    FulaClientHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          MultipartHandle self, SseSerializer serializer);
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    MultipartHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          RotationManagerHandle self, SseSerializer serializer);
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    RotationManagerHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          AcceptedShareHandle self, SseSerializer serializer);
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    AcceptedShareHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          EncryptedClientHandle self, SseSerializer serializer);
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    EncryptedClientHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          FulaClientHandle self, SseSerializer serializer);
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    FulaClientHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          MultipartHandle self, SseSerializer serializer);
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    MultipartHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          RotationManagerHandle self, SseSerializer serializer);
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    RotationManagerHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          AcceptedShareHandle self, SseSerializer serializer);
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    AcceptedShareHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          EncryptedClientHandle self, SseSerializer serializer);
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    EncryptedClientHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          FulaClientHandle self, SseSerializer serializer);
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    FulaClientHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          MultipartHandle self, SseSerializer serializer);
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    MultipartHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void
-      sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          RotationManagerHandle self, SseSerializer serializer);
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    RotationManagerHandle self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_String(String self, SseSerializer serializer);
@@ -1156,35 +1274,51 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_box_autoadd_encryption_config(
-      EncryptionConfig self, SseSerializer serializer);
+    EncryptionConfig self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_fula_config(
-      FulaConfig self, SseSerializer serializer);
+    FulaConfig self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_fula_error(
-      FulaError self, SseSerializer serializer);
+    FulaError self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_i_64(
-      PlatformInt64 self, SseSerializer serializer);
+    PlatformInt64 self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_list_options(
-      ListOptions self, SseSerializer serializer);
+    ListOptions self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_object_metadata(
-      ObjectMetadata self, SseSerializer serializer);
+    ObjectMetadata self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_pinning_config(
-      PinningConfig self, SseSerializer serializer);
+    PinningConfig self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_rotation_report(
-      RotationReport self, SseSerializer serializer);
+    RotationReport self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_u_32(int self, SseSerializer serializer);
@@ -1197,19 +1331,27 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_decrypted_object_info(
-      DecryptedObjectInfo self, SseSerializer serializer);
+    DecryptedObjectInfo self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_directory_entry(
-      DirectoryEntry self, SseSerializer serializer);
+    DirectoryEntry self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_directory_listing(
-      DirectoryListing self, SseSerializer serializer);
+    DirectoryListing self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_encryption_config(
-      EncryptionConfig self, SseSerializer serializer);
+    EncryptionConfig self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_f_64(double self, SseSerializer serializer);
@@ -1228,7 +1370,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_get_object_result(
-      GetObjectResult self, SseSerializer serializer);
+    GetObjectResult self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_head_result(HeadResult self, SseSerializer serializer);
@@ -1244,27 +1388,39 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_list_bucket_info(
-      List<BucketInfo> self, SseSerializer serializer);
+    List<BucketInfo> self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_directory_entry(
-      List<DirectoryEntry> self, SseSerializer serializer);
+    List<DirectoryEntry> self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_file_metadata(
-      List<FileMetadata> self, SseSerializer serializer);
+    List<FileMetadata> self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_metadata_entry(
-      List<MetadataEntry> self, SseSerializer serializer);
+    List<MetadataEntry> self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_object_info(
-      List<ObjectInfo> self, SseSerializer serializer);
+    List<ObjectInfo> self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_objects_result(
-      ListObjectsResult self, SseSerializer serializer);
+    ListObjectsResult self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_options(ListOptions self, SseSerializer serializer);
@@ -1274,39 +1430,51 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_list_prim_u_8_strict(
-      Uint8List self, SseSerializer serializer);
+    Uint8List self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_rotation_failure(
-      List<RotationFailure> self, SseSerializer serializer);
+    List<RotationFailure> self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_metadata_entry(MetadataEntry self, SseSerializer serializer);
 
   @protected
   void sse_encode_obfuscation_mode(
-      ObfuscationMode self, SseSerializer serializer);
+    ObfuscationMode self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_object_info(ObjectInfo self, SseSerializer serializer);
 
   @protected
   void sse_encode_object_metadata(
-      ObjectMetadata self, SseSerializer serializer);
+    ObjectMetadata self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
 
   @protected
   void sse_encode_opt_box_autoadd_i_64(
-      PlatformInt64? self, SseSerializer serializer);
+    PlatformInt64? self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_opt_box_autoadd_u_32(int? self, SseSerializer serializer);
 
   @protected
   void sse_encode_opt_list_prim_u_8_strict(
-      Uint8List? self, SseSerializer serializer);
+    Uint8List? self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_pinning_config(PinningConfig self, SseSerializer serializer);
@@ -1316,18 +1484,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_rotation_failure(
-      RotationFailure self, SseSerializer serializer);
+    RotationFailure self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_rotation_report(
-      RotationReport self, SseSerializer serializer);
+    RotationReport self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_share_mode(ShareMode self, SseSerializer serializer);
 
   @protected
   void sse_encode_share_permissions(
-      SharePermissions self, SseSerializer serializer);
+    SharePermissions self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_u_32(int self, SseSerializer serializer);
@@ -1343,7 +1517,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_upload_progress(
-      UploadProgress self, SseSerializer serializer);
+    UploadProgress self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_usize(BigInt self, SseSerializer serializer);
@@ -1355,465 +1531,896 @@ class RustLibWire implements BaseWire {
   RustLibWire.fromExternalLibrary(ExternalLibrary lib);
 
   void wire__crate__api__multipart__abort_multipart(
-          NativePortType port_, int handle) =>
-      wasmModule.wire__crate__api__multipart__abort_multipart(port_, handle);
+    NativePortType port_,
+    int handle,
+  ) => wasmModule.wire__crate__api__multipart__abort_multipart(port_, handle);
 
   void wire__crate__api__sharing__accept_share(
-          NativePortType port_, int client, String token_json) =>
-      wasmModule.wire__crate__api__sharing__accept_share(
-          port_, client, token_json);
+    NativePortType port_,
+    int client,
+    String token_json,
+  ) => wasmModule.wire__crate__api__sharing__accept_share(
+    port_,
+    client,
+    token_json,
+  );
 
   void wire__crate__api__client__bucket_exists(
-          NativePortType port_, int client, String name) =>
-      wasmModule.wire__crate__api__client__bucket_exists(port_, client, name);
+    NativePortType port_,
+    int client,
+    String name,
+  ) => wasmModule.wire__crate__api__client__bucket_exists(port_, client, name);
 
   void wire__crate__api__multipart__complete_multipart(
-          NativePortType port_, int handle) =>
+    NativePortType port_,
+    int handle,
+  ) =>
       wasmModule.wire__crate__api__multipart__complete_multipart(port_, handle);
 
   void wire__crate__api__client__copy_object(
-          NativePortType port_,
-          int client,
-          String src_bucket,
-          String src_key,
-          String dst_bucket,
-          String dst_key) =>
-      wasmModule.wire__crate__api__client__copy_object(
-          port_, client, src_bucket, src_key, dst_bucket, dst_key);
+    NativePortType port_,
+    int client,
+    String src_bucket,
+    String src_key,
+    String dst_bucket,
+    String dst_key,
+  ) => wasmModule.wire__crate__api__client__copy_object(
+    port_,
+    client,
+    src_bucket,
+    src_key,
+    dst_bucket,
+    dst_key,
+  );
 
   void wire__crate__api__client__create_bucket(
-          NativePortType port_, int client, String name) =>
-      wasmModule.wire__crate__api__client__create_bucket(port_, client, name);
+    NativePortType port_,
+    int client,
+    String name,
+  ) => wasmModule.wire__crate__api__client__create_bucket(port_, client, name);
 
   void wire__crate__api__client__create_client(
-          NativePortType port_, JSAny config) =>
-      wasmModule.wire__crate__api__client__create_client(port_, config);
+    NativePortType port_,
+    JSAny config,
+  ) => wasmModule.wire__crate__api__client__create_client(port_, config);
 
   void wire__crate__api__client__create_encrypted_client(
-          NativePortType port_, JSAny config, JSAny encryption) =>
-      wasmModule.wire__crate__api__client__create_encrypted_client(
-          port_, config, encryption);
+    NativePortType port_,
+    JSAny config,
+    JSAny encryption,
+  ) => wasmModule.wire__crate__api__client__create_encrypted_client(
+    port_,
+    config,
+    encryption,
+  );
 
   void wire__crate__api__client__create_encrypted_client_with_pinning(
-          NativePortType port_,
-          JSAny config,
-          JSAny encryption,
-          JSAny pinning) =>
+    NativePortType port_,
+    JSAny config,
+    JSAny encryption,
+    JSAny pinning,
+  ) =>
       wasmModule.wire__crate__api__client__create_encrypted_client_with_pinning(
-          port_, config, encryption, pinning);
+        port_,
+        config,
+        encryption,
+        pinning,
+      );
 
   void wire__crate__api__rotation__create_rotation_manager(
-          NativePortType port_, int client) =>
-      wasmModule.wire__crate__api__rotation__create_rotation_manager(
-          port_, client);
+    NativePortType port_,
+    int client,
+  ) => wasmModule.wire__crate__api__rotation__create_rotation_manager(
+    port_,
+    client,
+  );
 
   void wire__crate__api__sharing__create_share_token(
-          NativePortType port_,
-          int client,
-          String bucket,
-          String storage_key,
-          JSAny recipient_public_key,
-          JSAny? expires_at) =>
-      wasmModule.wire__crate__api__sharing__create_share_token(
-          port_, client, bucket, storage_key, recipient_public_key, expires_at);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+    JSAny recipient_public_key,
+    JSAny? expires_at,
+  ) => wasmModule.wire__crate__api__sharing__create_share_token(
+    port_,
+    client,
+    bucket,
+    storage_key,
+    recipient_public_key,
+    expires_at,
+  );
 
   void wire__crate__api__sharing__create_share_token_with_mode(
-          NativePortType port_,
-          int client,
-          String bucket,
-          String storage_key,
-          JSAny recipient_public_key,
-          int mode,
-          JSAny? expires_at) =>
-      wasmModule.wire__crate__api__sharing__create_share_token_with_mode(
-          port_, client, bucket, storage_key, recipient_public_key, mode, expires_at);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+    JSAny recipient_public_key,
+    int mode,
+    JSAny? expires_at,
+  ) => wasmModule.wire__crate__api__sharing__create_share_token_with_mode(
+    port_,
+    client,
+    bucket,
+    storage_key,
+    recipient_public_key,
+    mode,
+    expires_at,
+  );
 
   void wire__crate__api__client__delete_bucket(
-          NativePortType port_, int client, String name) =>
-      wasmModule.wire__crate__api__client__delete_bucket(port_, client, name);
+    NativePortType port_,
+    int client,
+    String name,
+  ) => wasmModule.wire__crate__api__client__delete_bucket(port_, client, name);
 
-  void wire__crate__api__encrypted__delete_by_storage_key(NativePortType port_,
-          int client, String bucket, String storage_key) =>
-      wasmModule.wire__crate__api__encrypted__delete_by_storage_key(
-          port_, client, bucket, storage_key);
+  void wire__crate__api__encrypted__delete_by_storage_key(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+  ) => wasmModule.wire__crate__api__encrypted__delete_by_storage_key(
+    port_,
+    client,
+    bucket,
+    storage_key,
+  );
 
   void wire__crate__api__encrypted__delete_encrypted(
-          NativePortType port_, int client, String bucket, String key) =>
-      wasmModule.wire__crate__api__encrypted__delete_encrypted(
-          port_, client, bucket, key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  ) => wasmModule.wire__crate__api__encrypted__delete_encrypted(
+    port_,
+    client,
+    bucket,
+    key,
+  );
 
   void wire__crate__api__forest__delete_flat(
-          NativePortType port_, int client, String bucket, String path) =>
-      wasmModule.wire__crate__api__forest__delete_flat(
-          port_, client, bucket, path);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+  ) => wasmModule.wire__crate__api__forest__delete_flat(
+    port_,
+    client,
+    bucket,
+    path,
+  );
 
   void wire__crate__api__client__delete_object(
-          NativePortType port_, int client, String bucket, String key) =>
-      wasmModule.wire__crate__api__client__delete_object(
-          port_, client, bucket, key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  ) => wasmModule.wire__crate__api__client__delete_object(
+    port_,
+    client,
+    bucket,
+    key,
+  );
+
+  void wire__crate__api__encrypted__derive_key(
+    NativePortType port_,
+    String context,
+    JSAny input,
+  ) =>
+      wasmModule.wire__crate__api__encrypted__derive_key(port_, context, input);
+
+  void wire__crate__api__encrypted__derive_public_key_from_secret(
+    NativePortType port_,
+    JSAny secret_key_bytes,
+  ) => wasmModule.wire__crate__api__encrypted__derive_public_key_from_secret(
+    port_,
+    secret_key_bytes,
+  );
 
   void wire__crate__api__encrypted__enc_create_bucket(
-          NativePortType port_, int client, String name) =>
-      wasmModule.wire__crate__api__encrypted__enc_create_bucket(
-          port_, client, name);
+    NativePortType port_,
+    int client,
+    String name,
+  ) => wasmModule.wire__crate__api__encrypted__enc_create_bucket(
+    port_,
+    client,
+    name,
+  );
 
   void wire__crate__api__encrypted__enc_delete_bucket(
-          NativePortType port_, int client, String name) =>
-      wasmModule.wire__crate__api__encrypted__enc_delete_bucket(
-          port_, client, name);
+    NativePortType port_,
+    int client,
+    String name,
+  ) => wasmModule.wire__crate__api__encrypted__enc_delete_bucket(
+    port_,
+    client,
+    name,
+  );
 
   void wire__crate__api__encrypted__enc_list_buckets(
-          NativePortType port_, int client) =>
-      wasmModule.wire__crate__api__encrypted__enc_list_buckets(port_, client);
+    NativePortType port_,
+    int client,
+  ) => wasmModule.wire__crate__api__encrypted__enc_list_buckets(port_, client);
 
   void wire__crate__api__types__encryption_config_default(
-          NativePortType port_) =>
-      wasmModule.wire__crate__api__types__encryption_config_default(port_);
+    NativePortType port_,
+  ) => wasmModule.wire__crate__api__types__encryption_config_default(port_);
 
   void wire__crate__api__encrypted__export_secret_key(
-          NativePortType port_, int client) =>
-      wasmModule.wire__crate__api__encrypted__export_secret_key(port_, client);
+    NativePortType port_,
+    int client,
+  ) => wasmModule.wire__crate__api__encrypted__export_secret_key(port_, client);
 
   void wire__crate__api__forest__flush_forest(
-          NativePortType port_, int client, String bucket) =>
-      wasmModule.wire__crate__api__forest__flush_forest(port_, client, bucket);
+    NativePortType port_,
+    int client,
+    String bucket,
+  ) => wasmModule.wire__crate__api__forest__flush_forest(port_, client, bucket);
 
   void wire__crate__api__types__fula_config_default(NativePortType port_) =>
       wasmModule.wire__crate__api__types__fula_config_default(port_);
 
   void wire__crate__api__error__fula_error_error_code(
-          NativePortType port_, JSAny that) =>
-      wasmModule.wire__crate__api__error__fula_error_error_code(port_, that);
+    NativePortType port_,
+    JSAny that,
+  ) => wasmModule.wire__crate__api__error__fula_error_error_code(port_, that);
 
   void wire__crate__api__error__fula_error_is_access_denied(
-          NativePortType port_, JSAny that) =>
-      wasmModule.wire__crate__api__error__fula_error_is_access_denied(
-          port_, that);
+    NativePortType port_,
+    JSAny that,
+  ) => wasmModule.wire__crate__api__error__fula_error_is_access_denied(
+    port_,
+    that,
+  );
 
   void wire__crate__api__error__fula_error_is_encryption_error(
-          NativePortType port_, JSAny that) =>
-      wasmModule.wire__crate__api__error__fula_error_is_encryption_error(
-          port_, that);
+    NativePortType port_,
+    JSAny that,
+  ) => wasmModule.wire__crate__api__error__fula_error_is_encryption_error(
+    port_,
+    that,
+  );
 
   void wire__crate__api__error__fula_error_is_network_error(
-          NativePortType port_, JSAny that) =>
-      wasmModule.wire__crate__api__error__fula_error_is_network_error(
-          port_, that);
+    NativePortType port_,
+    JSAny that,
+  ) => wasmModule.wire__crate__api__error__fula_error_is_network_error(
+    port_,
+    that,
+  );
 
   void wire__crate__api__error__fula_error_is_not_found(
-          NativePortType port_, JSAny that) =>
-      wasmModule.wire__crate__api__error__fula_error_is_not_found(port_, that);
+    NativePortType port_,
+    JSAny that,
+  ) => wasmModule.wire__crate__api__error__fula_error_is_not_found(port_, that);
 
   void wire__crate__api__chunked__get_chunked(
-          NativePortType port_, int client, String bucket, String key) =>
-      wasmModule.wire__crate__api__chunked__get_chunked(
-          port_, client, bucket, key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  ) => wasmModule.wire__crate__api__chunked__get_chunked(
+    port_,
+    client,
+    bucket,
+    key,
+  );
 
   void wire__crate__api__multipart__get_completed_parts(
-          NativePortType port_, int handle) =>
-      wasmModule.wire__crate__api__multipart__get_completed_parts(
-          port_, handle);
+    NativePortType port_,
+    int handle,
+  ) => wasmModule.wire__crate__api__multipart__get_completed_parts(
+    port_,
+    handle,
+  );
 
   void wire__crate__api__encrypted__get_decrypted(
-          NativePortType port_, int client, String bucket, String key) =>
-      wasmModule.wire__crate__api__encrypted__get_decrypted(
-          port_, client, bucket, key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  ) => wasmModule.wire__crate__api__encrypted__get_decrypted(
+    port_,
+    client,
+    bucket,
+    key,
+  );
+
+  void wire__crate__api__encrypted__get_decrypted_buffered(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  ) => wasmModule.wire__crate__api__encrypted__get_decrypted_buffered(
+    port_,
+    client,
+    bucket,
+    key,
+  );
+
+  void wire__crate__api__encrypted__get_decrypted_buffered_by_storage_key(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+  ) => wasmModule
+      .wire__crate__api__encrypted__get_decrypted_buffered_by_storage_key(
+        port_,
+        client,
+        bucket,
+        storage_key,
+      );
 
   void wire__crate__api__encrypted__get_decrypted_by_storage_key(
-          NativePortType port_,
-          int client,
-          String bucket,
-          String storage_key) =>
-      wasmModule.wire__crate__api__encrypted__get_decrypted_by_storage_key(
-          port_, client, bucket, storage_key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+  ) => wasmModule.wire__crate__api__encrypted__get_decrypted_by_storage_key(
+    port_,
+    client,
+    bucket,
+    storage_key,
+  );
 
   void wire__crate__api__forest__get_flat(
-          NativePortType port_, int client, String bucket, String path) =>
-      wasmModule.wire__crate__api__forest__get_flat(
-          port_, client, bucket, path);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+  ) => wasmModule.wire__crate__api__forest__get_flat(
+    port_,
+    client,
+    bucket,
+    path,
+  );
 
   void wire__crate__api__forest__get_forest_subtree(
-          NativePortType port_, int client, String bucket, String prefix) =>
-      wasmModule.wire__crate__api__forest__get_forest_subtree(
-          port_, client, bucket, prefix);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String prefix,
+  ) => wasmModule.wire__crate__api__forest__get_forest_subtree(
+    port_,
+    client,
+    bucket,
+    prefix,
+  );
 
-  void wire__crate__api__rotation__get_kek_version(NativePortType port_,
-          int client, String bucket, String storage_key) =>
-      wasmModule.wire__crate__api__rotation__get_kek_version(
-          port_, client, bucket, storage_key);
+  void wire__crate__api__rotation__get_kek_version(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+  ) => wasmModule.wire__crate__api__rotation__get_kek_version(
+    port_,
+    client,
+    bucket,
+    storage_key,
+  );
 
   void wire__crate__api__client__get_object(
-          NativePortType port_, int client, String bucket, String key) =>
-      wasmModule.wire__crate__api__client__get_object(
-          port_, client, bucket, key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  ) => wasmModule.wire__crate__api__client__get_object(
+    port_,
+    client,
+    bucket,
+    key,
+  );
 
   void wire__crate__api__client__get_object_with_metadata(
-          NativePortType port_, int client, String bucket, String key) =>
-      wasmModule.wire__crate__api__client__get_object_with_metadata(
-          port_, client, bucket, key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  ) => wasmModule.wire__crate__api__client__get_object_with_metadata(
+    port_,
+    client,
+    bucket,
+    key,
+  );
 
   void wire__crate__api__encrypted__get_public_key(
-          NativePortType port_, int client) =>
-      wasmModule.wire__crate__api__encrypted__get_public_key(port_, client);
+    NativePortType port_,
+    int client,
+  ) => wasmModule.wire__crate__api__encrypted__get_public_key(port_, client);
 
-  void wire__crate__api__chunked__get_range(NativePortType port_, int client,
-          String bucket, String key, JSAny offset, JSAny length) =>
-      wasmModule.wire__crate__api__chunked__get_range(
-          port_, client, bucket, key, offset, length);
+  void wire__crate__api__chunked__get_range(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny offset,
+    JSAny length,
+  ) => wasmModule.wire__crate__api__chunked__get_range(
+    port_,
+    client,
+    bucket,
+    key,
+    offset,
+    length,
+  );
 
   void wire__crate__api__sharing__get_share_permissions(
-          NativePortType port_, int share) =>
+    NativePortType port_,
+    int share,
+  ) =>
       wasmModule.wire__crate__api__sharing__get_share_permissions(port_, share);
 
   void wire__crate__api__multipart__get_upload_id(
-          NativePortType port_, int handle) =>
-      wasmModule.wire__crate__api__multipart__get_upload_id(port_, handle);
+    NativePortType port_,
+    int handle,
+  ) => wasmModule.wire__crate__api__multipart__get_upload_id(port_, handle);
 
   void wire__crate__api__encrypted__get_with_private_metadata(
-          NativePortType port_,
-          int client,
-          String bucket,
-          String storage_key) =>
-      wasmModule.wire__crate__api__encrypted__get_with_private_metadata(
-          port_, client, bucket, storage_key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+  ) => wasmModule.wire__crate__api__encrypted__get_with_private_metadata(
+    port_,
+    client,
+    bucket,
+    storage_key,
+  );
 
-  void wire__crate__api__sharing__get_with_share(NativePortType port_,
-          int client, String bucket, String storage_key, int share) =>
-      wasmModule.wire__crate__api__sharing__get_with_share(
-          port_, client, bucket, storage_key, share);
+  void wire__crate__api__sharing__get_with_share(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+    String original_key,
+    int share,
+  ) => wasmModule.wire__crate__api__sharing__get_with_share(
+    port_,
+    client,
+    bucket,
+    storage_key,
+    original_key,
+    share,
+  );
 
-  void wire__crate__api__sharing__get_with_token(NativePortType port_,
-          int client, String bucket, String storage_key, String token_json) =>
-      wasmModule.wire__crate__api__sharing__get_with_token(
-          port_, client, bucket, storage_key, token_json);
+  void wire__crate__api__sharing__get_with_token(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+    String original_key,
+    String token_json,
+  ) => wasmModule.wire__crate__api__sharing__get_with_token(
+    port_,
+    client,
+    bucket,
+    storage_key,
+    original_key,
+    token_json,
+  );
 
   void wire__crate__api__forest__has_pending_changes(
-          NativePortType port_, int client, String bucket) =>
-      wasmModule.wire__crate__api__forest__has_pending_changes(
-          port_, client, bucket);
+    NativePortType port_,
+    int client,
+    String bucket,
+  ) => wasmModule.wire__crate__api__forest__has_pending_changes(
+    port_,
+    client,
+    bucket,
+  );
 
-  void wire__crate__api__encrypted__head_decrypted(NativePortType port_,
-          int client, String bucket, String storage_key) =>
-      wasmModule.wire__crate__api__encrypted__head_decrypted(
-          port_, client, bucket, storage_key);
+  void wire__crate__api__encrypted__head_decrypted(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+  ) => wasmModule.wire__crate__api__encrypted__head_decrypted(
+    port_,
+    client,
+    bucket,
+    storage_key,
+  );
 
   void wire__crate__api__client__head_object(
-          NativePortType port_, int client, String bucket, String key) =>
-      wasmModule.wire__crate__api__client__head_object(
-          port_, client, bucket, key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  ) => wasmModule.wire__crate__api__client__head_object(
+    port_,
+    client,
+    bucket,
+    key,
+  );
 
   void wire__crate__api__encrypted__is_flat_namespace(
-          NativePortType port_, int client) =>
-      wasmModule.wire__crate__api__encrypted__is_flat_namespace(port_, client);
+    NativePortType port_,
+    int client,
+  ) => wasmModule.wire__crate__api__encrypted__is_flat_namespace(port_, client);
 
   void wire__crate__api__sharing__is_share_expired(
-          NativePortType port_, int share) =>
-      wasmModule.wire__crate__api__sharing__is_share_expired(port_, share);
+    NativePortType port_,
+    int share,
+  ) => wasmModule.wire__crate__api__sharing__is_share_expired(port_, share);
 
   void wire__crate__api__client__list_buckets(
-          NativePortType port_, int client) =>
-      wasmModule.wire__crate__api__client__list_buckets(port_, client);
+    NativePortType port_,
+    int client,
+  ) => wasmModule.wire__crate__api__client__list_buckets(port_, client);
 
   void wire__crate__api__encrypted__list_decrypted(
-          NativePortType port_, int client, String bucket, JSAny options) =>
-      wasmModule.wire__crate__api__encrypted__list_decrypted(
-          port_, client, bucket, options);
+    NativePortType port_,
+    int client,
+    String bucket,
+    JSAny options,
+  ) => wasmModule.wire__crate__api__encrypted__list_decrypted(
+    port_,
+    client,
+    bucket,
+    options,
+  );
 
   void wire__crate__api__encrypted__list_directory(
-          NativePortType port_, int client, String bucket, String? prefix) =>
-      wasmModule.wire__crate__api__encrypted__list_directory(
-          port_, client, bucket, prefix);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String? prefix,
+  ) => wasmModule.wire__crate__api__encrypted__list_directory(
+    port_,
+    client,
+    bucket,
+    prefix,
+  );
 
   void wire__crate__api__forest__list_from_forest(
-          NativePortType port_, int client, String bucket) =>
-      wasmModule.wire__crate__api__forest__list_from_forest(
-          port_, client, bucket);
+    NativePortType port_,
+    int client,
+    String bucket,
+  ) => wasmModule.wire__crate__api__forest__list_from_forest(
+    port_,
+    client,
+    bucket,
+  );
 
   void wire__crate__api__client__list_objects(
-          NativePortType port_, int client, String bucket, JSAny options) =>
-      wasmModule.wire__crate__api__client__list_objects(
-          port_, client, bucket, options);
+    NativePortType port_,
+    int client,
+    String bucket,
+    JSAny options,
+  ) => wasmModule.wire__crate__api__client__list_objects(
+    port_,
+    client,
+    bucket,
+    options,
+  );
 
   void wire__crate__api__types__list_options_default(NativePortType port_) =>
       wasmModule.wire__crate__api__types__list_options_default(port_);
 
   void wire__crate__api__forest__load_forest(
-          NativePortType port_, int client, String bucket) =>
-      wasmModule.wire__crate__api__forest__load_forest(port_, client, bucket);
+    NativePortType port_,
+    int client,
+    String bucket,
+  ) => wasmModule.wire__crate__api__forest__load_forest(port_, client, bucket);
 
   void wire__crate__api__types__obfuscation_mode_default(
-          NativePortType port_) =>
-      wasmModule.wire__crate__api__types__obfuscation_mode_default(port_);
+    NativePortType port_,
+  ) => wasmModule.wire__crate__api__types__obfuscation_mode_default(port_);
 
   void wire__crate__api__client__object_exists(
-          NativePortType port_, int client, String bucket, String key) =>
-      wasmModule.wire__crate__api__client__object_exists(
-          port_, client, bucket, key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  ) => wasmModule.wire__crate__api__client__object_exists(
+    port_,
+    client,
+    bucket,
+    key,
+  );
 
   void wire__crate__api__types__object_metadata_default(NativePortType port_) =>
       wasmModule.wire__crate__api__types__object_metadata_default(port_);
 
-  void wire__crate__api__chunked__put_chunked(NativePortType port_, int client,
-          String bucket, String key, JSAny data, int? chunk_size) =>
-      wasmModule.wire__crate__api__chunked__put_chunked(
-          port_, client, bucket, key, data, chunk_size);
+  void wire__crate__api__chunked__put_chunked(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny data,
+    int? chunk_size,
+  ) => wasmModule.wire__crate__api__chunked__put_chunked(
+    port_,
+    client,
+    bucket,
+    key,
+    data,
+    chunk_size,
+  );
 
-  void wire__crate__api__encrypted__put_encrypted(NativePortType port_,
-          int client, String bucket, String key, JSAny data) =>
-      wasmModule.wire__crate__api__encrypted__put_encrypted(
-          port_, client, bucket, key, data);
+  void wire__crate__api__encrypted__put_encrypted(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny data,
+  ) => wasmModule.wire__crate__api__encrypted__put_encrypted(
+    port_,
+    client,
+    bucket,
+    key,
+    data,
+  );
 
   void wire__crate__api__encrypted__put_encrypted_with_type(
-          NativePortType port_,
-          int client,
-          String bucket,
-          String key,
-          JSAny data,
-          String content_type) =>
-      wasmModule.wire__crate__api__encrypted__put_encrypted_with_type(
-          port_, client, bucket, key, data, content_type);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny data,
+    String content_type,
+  ) => wasmModule.wire__crate__api__encrypted__put_encrypted_with_type(
+    port_,
+    client,
+    bucket,
+    key,
+    data,
+    content_type,
+  );
 
-  void wire__crate__api__forest__put_flat(NativePortType port_, int client,
-          String bucket, String path, JSAny data, String? content_type) =>
-      wasmModule.wire__crate__api__forest__put_flat(
-          port_, client, bucket, path, data, content_type);
+  void wire__crate__api__forest__put_flat(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    JSAny data,
+    String? content_type,
+  ) => wasmModule.wire__crate__api__forest__put_flat(
+    port_,
+    client,
+    bucket,
+    path,
+    data,
+    content_type,
+  );
 
   void wire__crate__api__forest__put_flat_deferred(
-          NativePortType port_,
-          int client,
-          String bucket,
-          String path,
-          JSAny data,
-          String? content_type) =>
-      wasmModule.wire__crate__api__forest__put_flat_deferred(
-          port_, client, bucket, path, data, content_type);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    JSAny data,
+    String? content_type,
+  ) => wasmModule.wire__crate__api__forest__put_flat_deferred(
+    port_,
+    client,
+    bucket,
+    path,
+    data,
+    content_type,
+  );
 
-  void wire__crate__api__client__put_object(NativePortType port_, int client,
-          String bucket, String key, JSAny data) =>
-      wasmModule.wire__crate__api__client__put_object(
-          port_, client, bucket, key, data);
+  void wire__crate__api__client__put_object(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny data,
+  ) => wasmModule.wire__crate__api__client__put_object(
+    port_,
+    client,
+    bucket,
+    key,
+    data,
+  );
 
-  void wire__crate__api__client__put_object_with_metadata(NativePortType port_,
-          int client, String bucket, String key, JSAny data, JSAny metadata) =>
-      wasmModule.wire__crate__api__client__put_object_with_metadata(
-          port_, client, bucket, key, data, metadata);
+  void wire__crate__api__client__put_object_with_metadata(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny data,
+    JSAny metadata,
+  ) => wasmModule.wire__crate__api__client__put_object_with_metadata(
+    port_,
+    client,
+    bucket,
+    key,
+    data,
+    metadata,
+  );
 
-  void wire__crate__api__rotation__rewrap_object(NativePortType port_,
-          int client, String bucket, String storage_key, int manager) =>
-      wasmModule.wire__crate__api__rotation__rewrap_object(
-          port_, client, bucket, storage_key, manager);
+  void wire__crate__api__rotation__rewrap_object(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+    int manager,
+  ) => wasmModule.wire__crate__api__rotation__rewrap_object(
+    port_,
+    client,
+    bucket,
+    storage_key,
+    manager,
+  );
 
   void wire__crate__api__rotation__rotate_bucket(
-          NativePortType port_, int client, String bucket, int manager) =>
-      wasmModule.wire__crate__api__rotation__rotate_bucket(
-          port_, client, bucket, manager);
+    NativePortType port_,
+    int client,
+    String bucket,
+    int manager,
+  ) => wasmModule.wire__crate__api__rotation__rotate_bucket(
+    port_,
+    client,
+    bucket,
+    manager,
+  );
 
   void wire__crate__api__types__rotation_report_is_success(
-          NativePortType port_, JSAny that) =>
-      wasmModule.wire__crate__api__types__rotation_report_is_success(
-          port_, that);
+    NativePortType port_,
+    JSAny that,
+  ) => wasmModule.wire__crate__api__types__rotation_report_is_success(
+    port_,
+    that,
+  );
 
   void wire__crate__api__types__rotation_report_success_rate(
-          NativePortType port_, JSAny that) =>
-      wasmModule.wire__crate__api__types__rotation_report_success_rate(
-          port_, that);
+    NativePortType port_,
+    JSAny that,
+  ) => wasmModule.wire__crate__api__types__rotation_report_success_rate(
+    port_,
+    that,
+  );
 
   void wire__crate__api__forest__save_forest(
-          NativePortType port_, int client, String bucket) =>
-      wasmModule.wire__crate__api__forest__save_forest(port_, client, bucket);
+    NativePortType port_,
+    int client,
+    String bucket,
+  ) => wasmModule.wire__crate__api__forest__save_forest(port_, client, bucket);
 
   void wire__crate__api__chunked__should_use_chunked(
-          NativePortType port_, JSAny size) =>
-      wasmModule.wire__crate__api__chunked__should_use_chunked(port_, size);
+    NativePortType port_,
+    JSAny size,
+  ) => wasmModule.wire__crate__api__chunked__should_use_chunked(port_, size);
 
   void wire__crate__api__multipart__start_multipart(
-          NativePortType port_, int client, String bucket, String key) =>
-      wasmModule.wire__crate__api__multipart__start_multipart(
-          port_, client, bucket, key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  ) => wasmModule.wire__crate__api__multipart__start_multipart(
+    port_,
+    client,
+    bucket,
+    key,
+  );
 
   void wire__crate__api__multipart__upload_large_file_simple(
-          NativePortType port_,
-          int client,
-          String bucket,
-          String key,
-          JSAny data,
-          int? chunk_size) =>
-      wasmModule.wire__crate__api__multipart__upload_large_file_simple(
-          port_, client, bucket, key, data, chunk_size);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny data,
+    int? chunk_size,
+  ) => wasmModule.wire__crate__api__multipart__upload_large_file_simple(
+    port_,
+    client,
+    bucket,
+    key,
+    data,
+    chunk_size,
+  );
 
   void wire__crate__api__multipart__upload_part(
-          NativePortType port_, int handle, int part_number, JSAny data) =>
-      wasmModule.wire__crate__api__multipart__upload_part(
-          port_, handle, part_number, data);
+    NativePortType port_,
+    int handle,
+    int part_number,
+    JSAny data,
+  ) => wasmModule.wire__crate__api__multipart__upload_part(
+    port_,
+    handle,
+    part_number,
+    data,
+  );
 
   void wire__crate__api__types__upload_progress_new(
-          NativePortType port_,
-          JSAny bytes_uploaded,
-          JSAny total_bytes,
-          int current_part,
-          int total_parts) =>
-      wasmModule.wire__crate__api__types__upload_progress_new(
-          port_, bytes_uploaded, total_bytes, current_part, total_parts);
+    NativePortType port_,
+    JSAny bytes_uploaded,
+    JSAny total_bytes,
+    int current_part,
+    int total_parts,
+  ) => wasmModule.wire__crate__api__types__upload_progress_new(
+    port_,
+    bytes_uploaded,
+    total_bytes,
+    current_part,
+    total_parts,
+  );
 
-  void rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          int ptr) =>
-      wasmModule
-          .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-              ptr);
+  void wire__crate__api__metrics__wal_append_failure_count(
+    NativePortType port_,
+  ) => wasmModule.wire__crate__api__metrics__wal_append_failure_count(port_);
 
-  void rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          int ptr) =>
-      wasmModule
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-              ptr);
+  void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+        ptr,
+      );
 
-  void rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          int ptr) =>
-      wasmModule
-          .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-              ptr);
+  void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+        ptr,
+      );
 
-  void rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          int ptr) =>
-      wasmModule
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-              ptr);
+  void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+        ptr,
+      );
 
-  void rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          int ptr) =>
-      wasmModule
-          .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-              ptr);
+  void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+        ptr,
+      );
 
-  void rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          int ptr) =>
-      wasmModule
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-              ptr);
+  void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+        ptr,
+      );
 
-  void rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          int ptr) =>
-      wasmModule
-          .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-              ptr);
+  void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+        ptr,
+      );
 
-  void rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          int ptr) =>
-      wasmModule
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-              ptr);
+  void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+        ptr,
+      );
 
-  void rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          int ptr) =>
-      wasmModule
-          .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-              ptr);
+  void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+        ptr,
+      );
 
-  void rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          int ptr) =>
-      wasmModule
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-              ptr);
+  void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+        ptr,
+      );
+
+  void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+        ptr,
+      );
 }
 
 @JS('wasm_bindgen')
@@ -1823,313 +2430,581 @@ external RustLibWasmModule get wasmModule;
 @anonymous
 extension type RustLibWasmModule._(JSObject _) implements JSObject {
   external void wire__crate__api__multipart__abort_multipart(
-      NativePortType port_, int handle);
+    NativePortType port_,
+    int handle,
+  );
 
   external void wire__crate__api__sharing__accept_share(
-      NativePortType port_, int client, String token_json);
+    NativePortType port_,
+    int client,
+    String token_json,
+  );
 
   external void wire__crate__api__client__bucket_exists(
-      NativePortType port_, int client, String name);
+    NativePortType port_,
+    int client,
+    String name,
+  );
 
   external void wire__crate__api__multipart__complete_multipart(
-      NativePortType port_, int handle);
+    NativePortType port_,
+    int handle,
+  );
 
   external void wire__crate__api__client__copy_object(
-      NativePortType port_,
-      int client,
-      String src_bucket,
-      String src_key,
-      String dst_bucket,
-      String dst_key);
+    NativePortType port_,
+    int client,
+    String src_bucket,
+    String src_key,
+    String dst_bucket,
+    String dst_key,
+  );
 
   external void wire__crate__api__client__create_bucket(
-      NativePortType port_, int client, String name);
+    NativePortType port_,
+    int client,
+    String name,
+  );
 
   external void wire__crate__api__client__create_client(
-      NativePortType port_, JSAny config);
+    NativePortType port_,
+    JSAny config,
+  );
 
   external void wire__crate__api__client__create_encrypted_client(
-      NativePortType port_, JSAny config, JSAny encryption);
+    NativePortType port_,
+    JSAny config,
+    JSAny encryption,
+  );
 
   external void wire__crate__api__client__create_encrypted_client_with_pinning(
-      NativePortType port_, JSAny config, JSAny encryption, JSAny pinning);
+    NativePortType port_,
+    JSAny config,
+    JSAny encryption,
+    JSAny pinning,
+  );
 
   external void wire__crate__api__rotation__create_rotation_manager(
-      NativePortType port_, int client);
+    NativePortType port_,
+    int client,
+  );
 
   external void wire__crate__api__sharing__create_share_token(
-      NativePortType port_,
-      int client,
-      String bucket,
-      String storage_key,
-      JSAny recipient_public_key,
-      JSAny? expires_at);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+    JSAny recipient_public_key,
+    JSAny? expires_at,
+  );
 
   external void wire__crate__api__sharing__create_share_token_with_mode(
-      NativePortType port_,
-      int client,
-      String bucket,
-      String storage_key,
-      JSAny recipient_public_key,
-      int mode,
-      JSAny? expires_at);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+    JSAny recipient_public_key,
+    int mode,
+    JSAny? expires_at,
+  );
 
   external void wire__crate__api__client__delete_bucket(
-      NativePortType port_, int client, String name);
+    NativePortType port_,
+    int client,
+    String name,
+  );
 
   external void wire__crate__api__encrypted__delete_by_storage_key(
-      NativePortType port_, int client, String bucket, String storage_key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+  );
 
   external void wire__crate__api__encrypted__delete_encrypted(
-      NativePortType port_, int client, String bucket, String key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  );
 
   external void wire__crate__api__forest__delete_flat(
-      NativePortType port_, int client, String bucket, String path);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+  );
 
   external void wire__crate__api__client__delete_object(
-      NativePortType port_, int client, String bucket, String key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  );
+
+  external void wire__crate__api__encrypted__derive_key(
+    NativePortType port_,
+    String context,
+    JSAny input,
+  );
+
+  external void wire__crate__api__encrypted__derive_public_key_from_secret(
+    NativePortType port_,
+    JSAny secret_key_bytes,
+  );
 
   external void wire__crate__api__encrypted__enc_create_bucket(
-      NativePortType port_, int client, String name);
+    NativePortType port_,
+    int client,
+    String name,
+  );
 
   external void wire__crate__api__encrypted__enc_delete_bucket(
-      NativePortType port_, int client, String name);
+    NativePortType port_,
+    int client,
+    String name,
+  );
 
   external void wire__crate__api__encrypted__enc_list_buckets(
-      NativePortType port_, int client);
+    NativePortType port_,
+    int client,
+  );
 
   external void wire__crate__api__types__encryption_config_default(
-      NativePortType port_);
+    NativePortType port_,
+  );
 
   external void wire__crate__api__encrypted__export_secret_key(
-      NativePortType port_, int client);
+    NativePortType port_,
+    int client,
+  );
 
   external void wire__crate__api__forest__flush_forest(
-      NativePortType port_, int client, String bucket);
+    NativePortType port_,
+    int client,
+    String bucket,
+  );
 
   external void wire__crate__api__types__fula_config_default(
-      NativePortType port_);
+    NativePortType port_,
+  );
 
   external void wire__crate__api__error__fula_error_error_code(
-      NativePortType port_, JSAny that);
+    NativePortType port_,
+    JSAny that,
+  );
 
   external void wire__crate__api__error__fula_error_is_access_denied(
-      NativePortType port_, JSAny that);
+    NativePortType port_,
+    JSAny that,
+  );
 
   external void wire__crate__api__error__fula_error_is_encryption_error(
-      NativePortType port_, JSAny that);
+    NativePortType port_,
+    JSAny that,
+  );
 
   external void wire__crate__api__error__fula_error_is_network_error(
-      NativePortType port_, JSAny that);
+    NativePortType port_,
+    JSAny that,
+  );
 
   external void wire__crate__api__error__fula_error_is_not_found(
-      NativePortType port_, JSAny that);
+    NativePortType port_,
+    JSAny that,
+  );
 
   external void wire__crate__api__chunked__get_chunked(
-      NativePortType port_, int client, String bucket, String key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  );
 
   external void wire__crate__api__multipart__get_completed_parts(
-      NativePortType port_, int handle);
+    NativePortType port_,
+    int handle,
+  );
 
   external void wire__crate__api__encrypted__get_decrypted(
-      NativePortType port_, int client, String bucket, String key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  );
+
+  external void wire__crate__api__encrypted__get_decrypted_buffered(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  );
+
+  external void
+  wire__crate__api__encrypted__get_decrypted_buffered_by_storage_key(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+  );
 
   external void wire__crate__api__encrypted__get_decrypted_by_storage_key(
-      NativePortType port_, int client, String bucket, String storage_key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+  );
 
   external void wire__crate__api__forest__get_flat(
-      NativePortType port_, int client, String bucket, String path);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+  );
 
   external void wire__crate__api__forest__get_forest_subtree(
-      NativePortType port_, int client, String bucket, String prefix);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String prefix,
+  );
 
   external void wire__crate__api__rotation__get_kek_version(
-      NativePortType port_, int client, String bucket, String storage_key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+  );
 
   external void wire__crate__api__client__get_object(
-      NativePortType port_, int client, String bucket, String key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  );
 
   external void wire__crate__api__client__get_object_with_metadata(
-      NativePortType port_, int client, String bucket, String key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  );
 
   external void wire__crate__api__encrypted__get_public_key(
-      NativePortType port_, int client);
+    NativePortType port_,
+    int client,
+  );
 
-  external void wire__crate__api__chunked__get_range(NativePortType port_,
-      int client, String bucket, String key, JSAny offset, JSAny length);
+  external void wire__crate__api__chunked__get_range(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny offset,
+    JSAny length,
+  );
 
   external void wire__crate__api__sharing__get_share_permissions(
-      NativePortType port_, int share);
+    NativePortType port_,
+    int share,
+  );
 
   external void wire__crate__api__multipart__get_upload_id(
-      NativePortType port_, int handle);
+    NativePortType port_,
+    int handle,
+  );
 
   external void wire__crate__api__encrypted__get_with_private_metadata(
-      NativePortType port_, int client, String bucket, String storage_key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+  );
 
-  external void wire__crate__api__sharing__get_with_share(NativePortType port_,
-      int client, String bucket, String storage_key, int share);
+  external void wire__crate__api__sharing__get_with_share(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+    String original_key,
+    int share,
+  );
 
-  external void wire__crate__api__sharing__get_with_token(NativePortType port_,
-      int client, String bucket, String storage_key, String token_json);
+  external void wire__crate__api__sharing__get_with_token(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+    String original_key,
+    String token_json,
+  );
 
   external void wire__crate__api__forest__has_pending_changes(
-      NativePortType port_, int client, String bucket);
+    NativePortType port_,
+    int client,
+    String bucket,
+  );
 
   external void wire__crate__api__encrypted__head_decrypted(
-      NativePortType port_, int client, String bucket, String storage_key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+  );
 
   external void wire__crate__api__client__head_object(
-      NativePortType port_, int client, String bucket, String key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  );
 
   external void wire__crate__api__encrypted__is_flat_namespace(
-      NativePortType port_, int client);
+    NativePortType port_,
+    int client,
+  );
 
   external void wire__crate__api__sharing__is_share_expired(
-      NativePortType port_, int share);
+    NativePortType port_,
+    int share,
+  );
 
   external void wire__crate__api__client__list_buckets(
-      NativePortType port_, int client);
+    NativePortType port_,
+    int client,
+  );
 
   external void wire__crate__api__encrypted__list_decrypted(
-      NativePortType port_, int client, String bucket, JSAny options);
+    NativePortType port_,
+    int client,
+    String bucket,
+    JSAny options,
+  );
 
   external void wire__crate__api__encrypted__list_directory(
-      NativePortType port_, int client, String bucket, String? prefix);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String? prefix,
+  );
 
   external void wire__crate__api__forest__list_from_forest(
-      NativePortType port_, int client, String bucket);
+    NativePortType port_,
+    int client,
+    String bucket,
+  );
 
   external void wire__crate__api__client__list_objects(
-      NativePortType port_, int client, String bucket, JSAny options);
+    NativePortType port_,
+    int client,
+    String bucket,
+    JSAny options,
+  );
 
   external void wire__crate__api__types__list_options_default(
-      NativePortType port_);
+    NativePortType port_,
+  );
 
   external void wire__crate__api__forest__load_forest(
-      NativePortType port_, int client, String bucket);
+    NativePortType port_,
+    int client,
+    String bucket,
+  );
 
   external void wire__crate__api__types__obfuscation_mode_default(
-      NativePortType port_);
+    NativePortType port_,
+  );
 
   external void wire__crate__api__client__object_exists(
-      NativePortType port_, int client, String bucket, String key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  );
 
   external void wire__crate__api__types__object_metadata_default(
-      NativePortType port_);
+    NativePortType port_,
+  );
 
-  external void wire__crate__api__chunked__put_chunked(NativePortType port_,
-      int client, String bucket, String key, JSAny data, int? chunk_size);
+  external void wire__crate__api__chunked__put_chunked(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny data,
+    int? chunk_size,
+  );
 
   external void wire__crate__api__encrypted__put_encrypted(
-      NativePortType port_, int client, String bucket, String key, JSAny data);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny data,
+  );
 
   external void wire__crate__api__encrypted__put_encrypted_with_type(
-      NativePortType port_,
-      int client,
-      String bucket,
-      String key,
-      JSAny data,
-      String content_type);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny data,
+    String content_type,
+  );
 
-  external void wire__crate__api__forest__put_flat(NativePortType port_,
-      int client, String bucket, String path, JSAny data, String? content_type);
+  external void wire__crate__api__forest__put_flat(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    JSAny data,
+    String? content_type,
+  );
 
   external void wire__crate__api__forest__put_flat_deferred(
-      NativePortType port_,
-      int client,
-      String bucket,
-      String path,
-      JSAny data,
-      String? content_type);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    JSAny data,
+    String? content_type,
+  );
 
   external void wire__crate__api__client__put_object(
-      NativePortType port_, int client, String bucket, String key, JSAny data);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny data,
+  );
 
   external void wire__crate__api__client__put_object_with_metadata(
-      NativePortType port_,
-      int client,
-      String bucket,
-      String key,
-      JSAny data,
-      JSAny metadata);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny data,
+    JSAny metadata,
+  );
 
-  external void wire__crate__api__rotation__rewrap_object(NativePortType port_,
-      int client, String bucket, String storage_key, int manager);
+  external void wire__crate__api__rotation__rewrap_object(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String storage_key,
+    int manager,
+  );
 
   external void wire__crate__api__rotation__rotate_bucket(
-      NativePortType port_, int client, String bucket, int manager);
+    NativePortType port_,
+    int client,
+    String bucket,
+    int manager,
+  );
 
   external void wire__crate__api__types__rotation_report_is_success(
-      NativePortType port_, JSAny that);
+    NativePortType port_,
+    JSAny that,
+  );
 
   external void wire__crate__api__types__rotation_report_success_rate(
-      NativePortType port_, JSAny that);
+    NativePortType port_,
+    JSAny that,
+  );
 
   external void wire__crate__api__forest__save_forest(
-      NativePortType port_, int client, String bucket);
+    NativePortType port_,
+    int client,
+    String bucket,
+  );
 
   external void wire__crate__api__chunked__should_use_chunked(
-      NativePortType port_, JSAny size);
+    NativePortType port_,
+    JSAny size,
+  );
 
   external void wire__crate__api__multipart__start_multipart(
-      NativePortType port_, int client, String bucket, String key);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  );
 
   external void wire__crate__api__multipart__upload_large_file_simple(
-      NativePortType port_,
-      int client,
-      String bucket,
-      String key,
-      JSAny data,
-      int? chunk_size);
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    JSAny data,
+    int? chunk_size,
+  );
 
   external void wire__crate__api__multipart__upload_part(
-      NativePortType port_, int handle, int part_number, JSAny data);
+    NativePortType port_,
+    int handle,
+    int part_number,
+    JSAny data,
+  );
 
   external void wire__crate__api__types__upload_progress_new(
-      NativePortType port_,
-      JSAny bytes_uploaded,
-      JSAny total_bytes,
-      int current_part,
-      int total_parts);
+    NativePortType port_,
+    JSAny bytes_uploaded,
+    JSAny total_bytes,
+    int current_part,
+    int total_parts,
+  );
+
+  external void wire__crate__api__metrics__wal_append_failure_count(
+    NativePortType port_,
+  );
 
   external void
-      rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          int ptr);
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    int ptr,
+  );
 
   external void
-      rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          int ptr);
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    int ptr,
+  );
 
   external void
-      rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          int ptr);
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    int ptr,
+  );
 
   external void
-      rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          int ptr);
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    int ptr,
+  );
 
   external void
-      rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          int ptr);
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    int ptr,
+  );
 
   external void
-      rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          int ptr);
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    int ptr,
+  );
 
   external void
-      rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          int ptr);
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    int ptr,
+  );
 
   external void
-      rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          int ptr);
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    int ptr,
+  );
 
   external void
-      rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          int ptr);
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    int ptr,
+  );
 
   external void
-      rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          int ptr);
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    int ptr,
+  );
 }

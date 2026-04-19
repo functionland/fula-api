@@ -11,45 +11,50 @@ import 'types.dart';
 ///
 /// The file is split into chunks, each encrypted separately.
 /// This is more efficient for large files and enables partial downloads.
-Future<PutResult> putChunked(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String key,
-        required List<int> data,
-        int? chunkSize}) =>
-    RustLib.instance.api.crateApiChunkedPutChunked(
-        client: client,
-        bucket: bucket,
-        key: key,
-        data: data,
-        chunkSize: chunkSize);
+Future<PutResult> putChunked({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String key,
+  required List<int> data,
+  int? chunkSize,
+}) => RustLib.instance.api.crateApiChunkedPutChunked(
+  client: client,
+  bucket: bucket,
+  key: key,
+  data: data,
+  chunkSize: chunkSize,
+);
 
 /// Download and decrypt a chunked file
 ///
 /// Automatically handles reassembly of chunks.
-Future<Uint8List> getChunked(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String key}) =>
-    RustLib.instance.api
-        .crateApiChunkedGetChunked(client: client, bucket: bucket, key: key);
+Future<Uint8List> getChunked({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String key,
+}) => RustLib.instance.api.crateApiChunkedGetChunked(
+  client: client,
+  bucket: bucket,
+  key: key,
+);
 
 /// Download a range of bytes from a file
 ///
 /// For chunked files, only the necessary chunks are downloaded.
 /// This is efficient for large files when you only need part of the content.
-Future<Uint8List> getRange(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String key,
-        required BigInt offset,
-        required BigInt length}) =>
-    RustLib.instance.api.crateApiChunkedGetRange(
-        client: client,
-        bucket: bucket,
-        key: key,
-        offset: offset,
-        length: length);
+Future<Uint8List> getRange({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String key,
+  required BigInt offset,
+  required BigInt length,
+}) => RustLib.instance.api.crateApiChunkedGetRange(
+  client: client,
+  bucket: bucket,
+  key: key,
+  offset: offset,
+  length: length,
+);
 
 /// Check if a file size warrants chunked upload
 ///
