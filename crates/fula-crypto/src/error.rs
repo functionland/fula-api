@@ -36,6 +36,16 @@ pub enum CryptoError {
     #[error("hash verification failed: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
 
+    /// Post-decrypt content hash mismatch against a forest-entry-bound
+    /// BLAKE3 digest (detects whole-file substitution under HPKE-to-self).
+    #[error("integrity check failed: {0}")]
+    IntegrityMismatch(String),
+
+    /// Blob version advertises a lower format version than the forest entry's
+    /// `min_version` pin allows. Blocks downgrade-to-no-AAD attacks.
+    #[error("version downgrade rejected: got {got}, required >= {required}")]
+    VersionDowngrade { got: u8, required: u8 },
+
     /// Bao verification failed
     #[error("bao verification failed: {0}")]
     BaoVerification(String),

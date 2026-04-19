@@ -68,7 +68,7 @@ pub mod test_faults {
     pub use crate::encryption::test_faults::*;
 }
 pub use error::{ClientError, Result};
-pub use multipart::{MultipartUpload, UploadProgress, ProgressCallback, upload_large_file};
+pub use multipart::{MultipartUpload, UploadProgress, ProgressCallback, upload_large_file, MultipartAbortGuard};
 pub use types::*;
 
 /// Process-wide count of WAL append failures (F11).
@@ -88,6 +88,31 @@ pub use types::*;
 #[cfg(not(target_arch = "wasm32"))]
 pub fn wal_append_failure_count() -> u64 {
     wal::append_failure_count()
+}
+
+/// Total flush-forest retry backoff sleeps observed since process start
+/// (M-2). Monotonic process-wide counter; incremented each time the
+/// `flush_forest` retry loop sleeps on a 412 concurrent-modification race
+/// before re-attempting.
+///
+/// Native-only; on wasm32 `flush_forest` does a single attempt with no
+/// retry/backoff.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn flush_backoff_count() -> u64 {
+    encryption::flush_backoff_count()
+}
+
+/// Count of WAL groups discarded on load due to partial-group truncation
+/// (M-4). A transactional multi-entry op written via the internal
+/// `append_group` path is applied all-or-none on replay: if any member is
+/// missing at load time (power-loss between writes and the trailing fsync,
+/// MAC corruption of a member line, index collision), every surviving
+/// member is dropped and this counter increments once per discarded group.
+///
+/// Monotonic, process-wide. Native-only; the WAL is compiled out on wasm32.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn wal_truncated_groups_count() -> u64 {
+    wal::truncated_groups_count()
 }
 
 // Re-export useful crypto types for encryption configuration

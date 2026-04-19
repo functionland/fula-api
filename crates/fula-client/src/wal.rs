@@ -31,6 +31,13 @@ const WAL_FILE_VERSION: u8 = 1;
 /// this counter — only genuine durability-impacting failures do. (F11.)
 static WAL_APPEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
+/// M-4: Monotonic count of WAL groups discarded on load because the on-disk
+/// record set was incomplete (fewer members than the group's declared count,
+/// or index gaps). A rising value means `append_group` writes were truncated
+/// between the per-line `write` and the trailing `sync_data` — the load path
+/// drops every surviving member so replay never sees a partial transaction.
+static WAL_TRUNCATED_GROUPS: AtomicU64 = AtomicU64::new(0);
+
 /// A single WAL record.
 ///
 /// **Format-agnostic.** The on-disk layout is deliberately the same across
@@ -73,12 +80,34 @@ pub(crate) enum WalEntry {
     ShardWrote { idx: usize, seq: u64, etag: Option<String> },
 }
 
+/// Group metadata tag for transactional multi-entry appends written via
+/// `append_group`. All records in a group share a single `id`, carry their
+/// own 0-based `index`, and the group's total `count`. On load, a group is
+/// applied atomically only when every member is present and MAC-valid; a
+/// missing or corrupt member discards the whole group and bumps
+/// `WAL_TRUNCATED_GROUPS`. (M-4.)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct WalGroupMeta {
+    /// 128-bit random hex identifier, unique per `append_group` call.
+    pub(crate) id: String,
+    /// 0-based position within the group.
+    pub(crate) index: u32,
+    /// Total number of records the group expects.
+    pub(crate) count: u32,
+}
+
 /// The on-disk WAL body before MAC. Kept deliberately small — each record is
 /// one line of JSON to avoid partial-write issues when appending.
 #[derive(Serialize, Deserialize)]
 struct WalRecord {
     version: u8,
     entry: WalEntry,
+    /// `Some` only for records written by `append_group`. `skip_serializing_if`
+    /// keeps the on-disk shape of single-entry `append` records byte-identical
+    /// to the pre-M-4 format, so MAC verification of legacy lines is
+    /// unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group: Option<WalGroupMeta>,
 }
 
 /// Resolve the WAL directory, honoring `FULA_STATE_DIR` first then falling
@@ -136,7 +165,7 @@ pub(crate) fn append(bucket: &str, mac_key: &DekKey, entry: WalEntry) -> Result<
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(ClientError::Io)?;
         }
-        let record = WalRecord { version: WAL_FILE_VERSION, entry };
+        let record = WalRecord { version: WAL_FILE_VERSION, entry, group: None };
         let json = serde_json::to_string(&record).map_err(|e| {
             ClientError::Encryption(fula_crypto::CryptoError::Encryption(format!(
                 "WAL serialize: {}", e
@@ -168,16 +197,131 @@ pub(crate) fn append_failure_count() -> u64 {
     WAL_APPEND_FAILURES.load(Ordering::Relaxed)
 }
 
+/// Observable count of WAL groups discarded on load due to partial-group
+/// truncation. Monotonic, process-wide; re-exported publicly as
+/// `wal_truncated_groups_count`. (M-4.)
+pub(crate) fn truncated_groups_count() -> u64 {
+    WAL_TRUNCATED_GROUPS.load(Ordering::Relaxed)
+}
+
+/// Append a transactional group of entries with all-or-none replay semantics.
+///
+/// Each entry is written as its own line with a shared `group.id` tag; a
+/// single `sync_data` fsync is issued after the entire group is on-disk
+/// (vs. per-entry fsync in `append`). On load, the group is applied only if
+/// every member is present — a partial group (typical of a power-loss between
+/// the writes and the fsync, or a crash mid-write) is discarded in full and
+/// `WAL_TRUNCATED_GROUPS` is incremented.
+///
+/// **Use this when** a logical op spans multiple WAL entries that must commit
+/// together (e.g., a rename expressed as `Remove` + `Insert`, or a composite
+/// upsert that edits two paths at once).
+///
+/// **Do NOT use this for** per-entry-idempotent logs such as the phase-1
+/// shard-write emit loop. Those rely on individual durability: if the 3rd of
+/// 5 shards fails to write, the first two shards must still be replayable so
+/// the next flush can reconcile them. Grouping such writes would silently
+/// drop valid reconciliation data on any partial failure.
+///
+/// Returns `Ok(())` on an empty slice. An I/O error (including a mid-group
+/// failure) increments `WAL_APPEND_FAILURES` exactly once, matching `append`'s
+/// metric contract.
+///
+/// Currently unused in production paths (all existing WAL writers are
+/// single-entry or per-entry-idempotent). Kept as defense-in-depth so new
+/// multi-step ops can opt into atomic replay without reinventing the
+/// framing. Exercised by `#[cfg(test)]` coverage.
+#[allow(dead_code)]
+pub(crate) fn append_group(
+    bucket: &str,
+    mac_key: &DekKey,
+    entries: &[WalEntry],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let Some(path) = wal_path(bucket) else {
+        // No state dir — silently no-op, matching append().
+        return Ok(());
+    };
+    let result: Result<()> = (|| {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(ClientError::Io)?;
+        }
+        // 128-bit random group id via DekKey's getrandom-backed constructor.
+        // We never use it as a key — only its random-bytes property — and the
+        // temporary DekKey is zeroized on drop, which is a harmless bonus.
+        let id_bytes = DekKey::generate();
+        let id = hex::encode(&id_bytes.as_bytes()[..16]);
+        let count = entries.len() as u32;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(ClientError::Io)?;
+        for (i, entry) in entries.iter().enumerate() {
+            let record = WalRecord {
+                version: WAL_FILE_VERSION,
+                entry: entry.clone(),
+                group: Some(WalGroupMeta {
+                    id: id.clone(),
+                    index: i as u32,
+                    count,
+                }),
+            };
+            let json = serde_json::to_string(&record).map_err(|e| {
+                ClientError::Encryption(fula_crypto::CryptoError::Encryption(format!(
+                    "WAL serialize: {}", e
+                )))
+            })?;
+            let mac = mac_line(mac_key, &json);
+            writeln!(f, "{}\t{}", json, mac).map_err(ClientError::Io)?;
+        }
+        f.flush().map_err(ClientError::Io)?;
+        f.sync_data().map_err(ClientError::Io)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        WAL_APPEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+    result
+}
+
 /// Load all well-formed entries from the bucket's WAL. Entries whose MAC or
 /// format fails verification are logged and skipped rather than aborting the
 /// whole load — a corrupt tail is preferable to losing the earlier records.
+///
+/// Group-aware (M-4): records tagged with a `group` id are accumulated and
+/// applied atomically in index order at the position of the group's first
+/// member in the file. An incomplete group (any member missing, or index
+/// collisions) is discarded and `WAL_TRUNCATED_GROUPS` is incremented once
+/// per discarded group. Non-grouped (legacy) records pass through unchanged
+/// and preserve their append order relative to groups.
 pub(crate) fn load(bucket: &str, mac_key: &DekKey) -> Result<Vec<WalEntry>> {
+    use std::collections::HashMap;
+
     let Some(path) = wal_path(bucket) else { return Ok(Vec::new()); };
     if !path.exists() {
         return Ok(Vec::new());
     }
     let contents = std::fs::read_to_string(&path).map_err(ClientError::Io)?;
-    let mut out = Vec::new();
+
+    // Two-phase load: (1) walk the file in append order and place either a
+    // Direct entry or a GroupRef placeholder into `items`; accumulate group
+    // members into `groups`. (2) flatten `items`, replacing each GroupRef
+    // with its members in index order, or discarding incomplete groups.
+    enum Item {
+        Direct(WalEntry),
+        GroupRef(String),
+    }
+    struct GroupAccum {
+        count: u32,
+        members: HashMap<u32, WalEntry>,
+    }
+
+    let mut items: Vec<Item> = Vec::new();
+    let mut groups: HashMap<String, GroupAccum> = HashMap::new();
+
     for (lineno, raw) in contents.lines().enumerate() {
         let line = raw.trim_end_matches('\n');
         if line.is_empty() {
@@ -192,7 +336,25 @@ pub(crate) fn load(bucket: &str, mac_key: &DekKey) -> Result<Vec<WalEntry>> {
             continue;
         }
         match serde_json::from_str::<WalRecord>(json) {
-            Ok(rec) if rec.version == WAL_FILE_VERSION => out.push(rec.entry),
+            Ok(rec) if rec.version == WAL_FILE_VERSION => {
+                match rec.group {
+                    None => items.push(Item::Direct(rec.entry)),
+                    Some(meta) => {
+                        // First time we see this group id, reserve its
+                        // position in the output sequence. Later members
+                        // just fold into the accumulator.
+                        if !groups.contains_key(&meta.id) {
+                            groups.insert(
+                                meta.id.clone(),
+                                GroupAccum { count: meta.count, members: HashMap::new() },
+                            );
+                            items.push(Item::GroupRef(meta.id.clone()));
+                        }
+                        let group = groups.get_mut(&meta.id).expect("just inserted");
+                        group.members.insert(meta.index, rec.entry);
+                    }
+                }
+            }
             Ok(rec) => {
                 tracing::warn!(%bucket, lineno, version = rec.version, "WAL: unknown record version");
             }
@@ -201,6 +363,37 @@ pub(crate) fn load(bucket: &str, mac_key: &DekKey) -> Result<Vec<WalEntry>> {
             }
         }
     }
+
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            Item::Direct(e) => out.push(e),
+            Item::GroupRef(id) => {
+                // Safe: every id pushed as GroupRef was inserted into `groups`
+                // at the same iteration.
+                let accum = groups.remove(&id).expect("group accumulator present");
+                let complete = (accum.members.len() as u32) == accum.count
+                    && (0..accum.count).all(|i| accum.members.contains_key(&i));
+                if complete {
+                    let mut ordered: Vec<(u32, WalEntry)> = accum.members.into_iter().collect();
+                    ordered.sort_by_key(|(i, _)| *i);
+                    for (_, entry) in ordered {
+                        out.push(entry);
+                    }
+                } else {
+                    tracing::warn!(
+                        %bucket,
+                        group_id = %id,
+                        expected = accum.count,
+                        got = accum.members.len(),
+                        "WAL: incomplete group, discarding"
+                    );
+                    WAL_TRUNCATED_GROUPS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     Ok(out)
 }
 
@@ -275,6 +468,7 @@ mod tests {
             content_hash: None,
             user_metadata: HashMap::new(),
             encrypted: true,
+            min_version: 0,
         }
     }
 
@@ -366,6 +560,126 @@ mod tests {
         let forest_dek = km.derive_path_key("forest:bkt");
         assert_ne!(wal_mac.as_bytes(), forest_dek.as_bytes(),
             "WAL MAC key and forest DEK must be domain-separated");
+    }
+
+    // M-4: `append_group` writes an all-or-none transactional group; load
+    // reconstructs it in index order at the first-member's file position.
+    #[test]
+    fn wal_complete_group_applied() {
+        let _guard = tmp_state_dir();
+        let bucket = "complete-group-bucket";
+        let mac_key = DekKey::generate();
+        let _ = clear(bucket);
+
+        let entries = vec![
+            WalEntry::Insert { key: "/g/0.txt".to_string(), entry: sample_entry("/g/0.txt") },
+            WalEntry::Remove { key: "/g/stale.txt".to_string() },
+            WalEntry::Insert { key: "/g/2.txt".to_string(), entry: sample_entry("/g/2.txt") },
+        ];
+        let before = truncated_groups_count();
+        append_group(bucket, &mac_key, &entries).expect("append_group");
+
+        let loaded = load(bucket, &mac_key).expect("load");
+        assert_eq!(loaded.len(), 3, "complete group must surface every member");
+        match &loaded[0] {
+            WalEntry::Insert { key, .. } => assert_eq!(key, "/g/0.txt"),
+            other => panic!("expected Insert at 0, got {:?}", other),
+        }
+        match &loaded[1] {
+            WalEntry::Remove { key } => assert_eq!(key, "/g/stale.txt"),
+            other => panic!("expected Remove at 1, got {:?}", other),
+        }
+        match &loaded[2] {
+            WalEntry::Insert { key, .. } => assert_eq!(key, "/g/2.txt"),
+            other => panic!("expected Insert at 2, got {:?}", other),
+        }
+
+        assert_eq!(
+            truncated_groups_count(), before,
+            "complete group must not bump the truncated-groups counter"
+        );
+    }
+
+    // M-4: a group whose tail is lost to truncation is discarded wholesale;
+    // the partial members must not leak into replay. The counter bumps once.
+    #[test]
+    fn wal_partial_group_discarded() {
+        let _guard = tmp_state_dir();
+        let bucket = "partial-group-bucket";
+        let mac_key = DekKey::generate();
+        let _ = clear(bucket);
+
+        let entries = vec![
+            WalEntry::Insert { key: "/p/0.txt".to_string(), entry: sample_entry("/p/0.txt") },
+            WalEntry::Insert { key: "/p/1.txt".to_string(), entry: sample_entry("/p/1.txt") },
+            WalEntry::Insert { key: "/p/2.txt".to_string(), entry: sample_entry("/p/2.txt") },
+        ];
+        append_group(bucket, &mac_key, &entries).expect("append_group");
+
+        // Simulate mid-group truncation by lopping the last line off the file.
+        let path = wal_path(bucket).expect("wal path");
+        let contents = std::fs::read_to_string(&path).expect("read wal");
+        let mut lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 3, "expected 3 on-disk lines before truncation");
+        lines.pop();
+        let truncated = lines.join("\n") + "\n";
+        std::fs::write(&path, truncated).expect("truncate write");
+
+        let before = truncated_groups_count();
+        let loaded = load(bucket, &mac_key).expect("load");
+        let after = truncated_groups_count();
+
+        assert!(loaded.is_empty(), "incomplete group must not surface any members");
+        assert_eq!(
+            after - before, 1,
+            "partial-group discard must bump truncated-groups exactly once"
+        );
+    }
+
+    // M-4: legacy single-entry `append` records and new group-framed records
+    // share one file without interfering; relative order is preserved.
+    #[test]
+    fn wal_legacy_and_grouped_records_coexist() {
+        let _guard = tmp_state_dir();
+        let bucket = "coexist-bucket";
+        let mac_key = DekKey::generate();
+        let _ = clear(bucket);
+
+        append(bucket, &mac_key, WalEntry::Insert {
+            key: "/legacy-1.txt".to_string(),
+            entry: sample_entry("/legacy-1.txt"),
+        }).expect("append legacy-1");
+
+        append_group(bucket, &mac_key, &[
+            WalEntry::Remove { key: "/grp/a.txt".to_string() },
+            WalEntry::Insert {
+                key: "/grp/b.txt".to_string(),
+                entry: sample_entry("/grp/b.txt"),
+            },
+        ]).expect("append_group");
+
+        append(bucket, &mac_key, WalEntry::Remove {
+            key: "/legacy-2.txt".to_string(),
+        }).expect("append legacy-2");
+
+        let loaded = load(bucket, &mac_key).expect("load");
+        assert_eq!(loaded.len(), 4, "1 legacy + 2 group + 1 legacy");
+        match &loaded[0] {
+            WalEntry::Insert { key, .. } => assert_eq!(key, "/legacy-1.txt"),
+            other => panic!("expected legacy Insert first, got {:?}", other),
+        }
+        match &loaded[1] {
+            WalEntry::Remove { key } => assert_eq!(key, "/grp/a.txt"),
+            other => panic!("expected group Remove second, got {:?}", other),
+        }
+        match &loaded[2] {
+            WalEntry::Insert { key, .. } => assert_eq!(key, "/grp/b.txt"),
+            other => panic!("expected group Insert third, got {:?}", other),
+        }
+        match &loaded[3] {
+            WalEntry::Remove { key } => assert_eq!(key, "/legacy-2.txt"),
+            other => panic!("expected legacy Remove last, got {:?}", other),
+        }
     }
 
     // F11: the failure metric must bump on genuine I/O failure and stay

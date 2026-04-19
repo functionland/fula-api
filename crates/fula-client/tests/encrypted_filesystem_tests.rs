@@ -73,6 +73,7 @@ fn test_deep_folder_structure_50_levels() {
         content_hash: None,
         user_metadata: HashMap::new(),
         encrypted: false,
+        min_version: 0,
     };
     forest.upsert_file(entry);
     
@@ -207,6 +208,7 @@ fn test_large_file_100gb_simulated() {
             meta
         },
         encrypted: false,
+        min_version: 0,
     };
     forest.upsert_file(entry);
     
@@ -358,6 +360,7 @@ fn test_large_folder_2000_files() {
                 meta
             },
             encrypted: false,
+            min_version: 0,
         };
         forest.upsert_file(entry);
         
@@ -537,6 +540,7 @@ fn test_combined_stress_scenario() {
         content_hash: None,
         user_metadata: HashMap::new(),
         encrypted: false,
+        min_version: 0,
     };
     forest.upsert_file(entry);
 
@@ -552,6 +556,7 @@ fn test_combined_stress_scenario() {
         content_hash: None,
         user_metadata: HashMap::new(),
         encrypted: false,
+        min_version: 0,
     };
     forest.upsert_file(entry);
 
@@ -568,6 +573,7 @@ fn test_combined_stress_scenario() {
             content_hash: None,
             user_metadata: HashMap::new(),
             encrypted: false,
+            min_version: 0,
         };
         forest.upsert_file(entry);
     }

@@ -151,6 +151,13 @@ pub struct ChunkedEncoder {
     dek: DekKey,
     chunk_size: usize,
     bao_encoder: BaoEncoder,
+    /// H-1: unkeyed BLAKE3 hasher fed the same plaintext as `bao_encoder`.
+    /// Emits a content hash that can be bound to the forest entry (outside
+    /// the attacker-forgeable HPKE envelope) so whole-file substitution is
+    /// detectable on download. The Bao root hash is not enough because it
+    /// lives inside the AEAD-encrypted `ChunkedFileMetadata` blob, whose
+    /// DEK is attacker-chosen under an HPKE-to-self forgery.
+    content_hasher: blake3::Hasher,
     chunks: Vec<EncryptedChunk>,
     current_chunk: Vec<u8>,
     bytes_processed: u64,
@@ -181,6 +188,7 @@ impl ChunkedEncoder {
             dek,
             chunk_size,
             bao_encoder: BaoEncoder::new(),
+            content_hasher: blake3::Hasher::new(),
             chunks: Vec::new(),
             current_chunk: Vec::with_capacity(chunk_size),
             bytes_processed: 0,
@@ -227,9 +235,18 @@ impl ChunkedEncoder {
         
         // Update Bao encoder with original plaintext for integrity
         self.bao_encoder.update(data);
+        // H-1: feed the same plaintext into the unkeyed BLAKE3 hasher so
+        // `content_hash_hex()` can be bound to the forest entry.
+        self.content_hasher.update(data);
         self.bytes_processed += data.len() as u64;
-        
+
         Ok(ready_chunks)
+    }
+
+    /// H-1: return the BLAKE3 hex digest of all plaintext fed via `update`.
+    /// Must be called before `finalize` consumes `self`.
+    pub fn content_hash_hex(&self) -> String {
+        self.content_hasher.finalize().to_hex().to_string()
     }
 
     /// Finalize the encoder and get the last chunk (if any) and metadata
@@ -440,6 +457,9 @@ pub struct AsyncStreamingEncoder {
     dek: DekKey,
     chunk_size: usize,
     bao_encoder: BaoEncoder,
+    /// H-1: unkeyed BLAKE3 hasher fed in parallel with `bao_encoder`.
+    /// See `ChunkedEncoder::content_hasher` for rationale.
+    content_hasher: blake3::Hasher,
     chunk_index: u32,
     nonces: Vec<Nonce>,
     bytes_processed: u64,
@@ -460,6 +480,7 @@ impl AsyncStreamingEncoder {
             dek,
             chunk_size,
             bao_encoder: BaoEncoder::new(),
+            content_hasher: blake3::Hasher::new(),
             chunk_index: 0,
             nonces: Vec::new(),
             bytes_processed: 0,
@@ -504,14 +525,23 @@ impl AsyncStreamingEncoder {
             
             // Update Bao encoder for integrity
             self.bao_encoder.update(&buffer[..bytes_read]);
+            // H-1: feed the same plaintext slice into the unkeyed BLAKE3
+            // hasher so `content_hash_hex()` covers the full stream.
+            self.content_hasher.update(&buffer[..bytes_read]);
             self.bytes_processed += bytes_read as u64;
-            
+
             // Encrypt this chunk
             let chunk = self.encrypt_chunk(&buffer[..bytes_read])?;
             chunks.push(chunk);
         }
-        
+
         Ok(chunks)
+    }
+
+    /// H-1: return the BLAKE3 hex digest of all plaintext streamed through
+    /// `process_reader`. Call before `finalize` consumes `self`.
+    pub fn content_hash_hex(&self) -> String {
+        self.content_hasher.finalize().to_hex().to_string()
     }
 
     /// Encrypt a single chunk of data

@@ -50,6 +50,49 @@ const DEFAULT_FOREST_CACHE_TTL_SECS: i64 = 60;
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_FLUSH_RETRIES: usize = 3;
 
+/// Base sleep for M-2 flush backoff; doubled per attempt, plus jitter.
+#[cfg(not(target_arch = "wasm32"))]
+const FLUSH_BACKOFF_BASE_MS: u64 = 50;
+/// Max jitter added to backoff delay. Uses SystemTime nanos as a non-crypto
+/// pseudo-random source — modulo bias is imperceptible at this granularity.
+#[cfg(not(target_arch = "wasm32"))]
+const FLUSH_BACKOFF_JITTER_MS: u64 = 100;
+
+/// Compute the M-2 backoff sleep duration for a given retry attempt index.
+///
+/// Schedule (base*2^attempt + 0-99ms jitter):
+///  - attempt 0 → 50-149 ms
+///  - attempt 1 → 100-199 ms
+///  - attempt 2 → 200-299 ms (not reached — MAX_FLUSH_RETRIES = 3 breaks out)
+///
+/// Jitter sourced from `SystemTime::subsec_nanos()` to avoid adding a `rand`
+/// dep. Monotonic per nanosecond, which is all the retry loop needs.
+#[cfg(not(target_arch = "wasm32"))]
+fn flush_backoff_delay(attempt: usize) -> std::time::Duration {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let base = FLUSH_BACKOFF_BASE_MS.saturating_mul(1u64 << attempt.min(8));
+    let jitter = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0)
+        % FLUSH_BACKOFF_JITTER_MS;
+    std::time::Duration::from_millis(base + jitter)
+}
+
+/// Process-wide counter bumped each time `flush_forest`'s retry loop sleeps
+/// on a 412 race (M-2). Observable via [`flush_backoff_count`] so tests and
+/// operators can confirm the backoff path is actually exercised.
+#[cfg(not(target_arch = "wasm32"))]
+static FLUSH_BACKOFF_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read the total number of flush-forest backoff sleeps observed since
+/// process start. Native-only.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn flush_backoff_count() -> u64 {
+    FLUSH_BACKOFF_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Default interval at which the background auto-flush task persists dirty
 /// forests to storage when enabled via `start_auto_flush()`.
 #[allow(dead_code)]
@@ -353,6 +396,17 @@ impl UploadManifest {
 /// - `last_manifest_sequence` (Sharded) is the manifest-level sequence. Each
 ///   shard carries its own sequence, vouched for by the manifest plaintext via
 ///   `shard_sequences: Vec<u64>` (AAD-protected).
+/// Intermediate value produced while inspecting the forest cache entry for
+/// H-1 / H-2 per-download integrity lookups. v1/v6 resolve the forest entry
+/// synchronously under the DashMap guard (no .await), while v7 hands back a
+/// cloned `Arc<RwLock<...>>` so the HAMT walk can run after the guard has
+/// been released — matching the "no await while holding DashMap" rule.
+enum CachedForForestLookup {
+    V1(Option<ForestFileEntry>),
+    V6(Option<ForestFileEntry>),
+    V7(Arc<tokio::sync::RwLock<ShardedHamtPrivateForest>>),
+}
+
 enum ForestCacheEntry {
     /// Monolithic forest (FlatMapV1 or HamtV2 or v4-AAD)
     Monolithic {
@@ -801,9 +855,13 @@ impl EncryptedClient {
 
         // Determine the storage key and metadata based on privacy settings
         let (storage_key, private_metadata_json) = if self.encryption.metadata_privacy {
-            // Create private metadata with original info
+            // Create private metadata with original info. H-1: compute BLAKE3
+            // over the plaintext *before* AEAD so the hash is bound to the
+            // forest entry (outside the attacker-forgeable HPKE envelope).
+            let content_hash = blake3::hash(&data).to_hex().to_string();
             let private_meta = PrivateMetadata::new(key, original_size)
-                .with_content_type(content_type.unwrap_or("application/octet-stream"));
+                .with_content_type(content_type.unwrap_or("application/octet-stream"))
+                .with_content_hash(content_hash);
 
             // Encrypt private metadata with the per-file DEK
             let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
@@ -966,9 +1024,14 @@ impl EncryptedClient {
         let dek = decryptor.decrypt_dek(&wrapped_key)
             .map_err(ClientError::Encryption)?;
 
+        // H-1 / H-2: resolve the forest entry once (shared by chunked and
+        // single-block branches) so we can enforce min_version and verify
+        // content_hash on either path.
+        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
+
         if is_chunked {
             // CHUNKED DOWNLOAD: Download and decrypt each chunk
-            self.get_object_chunked_internal(bucket, storage_key, &enc_metadata, &dek).await
+            self.get_object_chunked_internal(bucket, storage_key, &enc_metadata, &dek, forest_entry.as_ref()).await
         } else {
             // SINGLE OBJECT: Decrypt directly
             let nonce_b64 = enc_metadata["nonce"].as_str()
@@ -986,12 +1049,15 @@ impl EncryptedClient {
 
             let aead = Aead::new_default(&dek);
             let version = enc_metadata["version"].as_u64().unwrap_or(2);
+            Self::enforce_min_version(forest_entry.as_ref(), version)?;
             let plaintext = if version >= 4 {
                 let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
                 aead.decrypt_with_aad(&nonce, &result.data, &aad)
             } else {
                 aead.decrypt(&nonce, &result.data)
             }.map_err(ClientError::Encryption)?;
+
+            Self::enforce_content_hash(forest_entry.as_ref(), &plaintext)?;
 
             Ok(Bytes::from(plaintext))
         }
@@ -1021,6 +1087,7 @@ impl EncryptedClient {
         storage_key: &str,
         enc_metadata: &serde_json::Value,
         dek: &fula_crypto::keys::DekKey,
+        forest_entry: Option<&ForestFileEntry>,
     ) -> Result<Bytes> {
         // Parse chunked metadata
         let chunked_meta: ChunkedFileMetadata = serde_json::from_value(
@@ -1032,7 +1099,7 @@ impl EncryptedClient {
         // Delegate to the windowed download engine which keeps peak memory
         // bounded to ~window_size * chunk_size regardless of total file size.
         let mut output = Vec::with_capacity(chunked_meta.total_size as usize);
-        self.download_chunks_windowed_to_writer(bucket, storage_key, &chunked_meta, dek, &mut output).await?;
+        self.download_chunks_windowed_to_writer(bucket, storage_key, &chunked_meta, dek, &mut output, forest_entry).await?;
         Ok(Bytes::from(output))
     }
 
@@ -1048,6 +1115,7 @@ impl EncryptedClient {
         enc_metadata: &serde_json::Value,
         dek: &fula_crypto::keys::DekKey,
         writer: &mut W,
+        forest_entry: Option<&ForestFileEntry>,
     ) -> Result<u64> {
         let chunked_meta: ChunkedFileMetadata = serde_json::from_value(
             enc_metadata["chunked"].clone()
@@ -1055,7 +1123,7 @@ impl EncryptedClient {
             fula_crypto::CryptoError::Decryption(format!("Invalid chunked metadata: {}", e))
         ))?;
 
-        self.download_chunks_windowed_to_writer(bucket, storage_key, &chunked_meta, dek, writer).await
+        self.download_chunks_windowed_to_writer(bucket, storage_key, &chunked_meta, dek, writer, forest_entry).await
     }
 
     /// F8: Internal chunked-download dispatch for the buffered writer path.
@@ -1070,6 +1138,7 @@ impl EncryptedClient {
         enc_metadata: &serde_json::Value,
         dek: &fula_crypto::keys::DekKey,
         writer: &mut W,
+        forest_entry: Option<&ForestFileEntry>,
     ) -> Result<u64> {
         let chunked_meta: ChunkedFileMetadata = serde_json::from_value(
             enc_metadata["chunked"].clone()
@@ -1077,7 +1146,7 @@ impl EncryptedClient {
             fula_crypto::CryptoError::Decryption(format!("Invalid chunked metadata: {}", e))
         ))?;
 
-        self.download_chunks_buffered_to_writer(bucket, storage_key, &chunked_meta, dek, writer).await
+        self.download_chunks_buffered_to_writer(bucket, storage_key, &chunked_meta, dek, writer, forest_entry).await
     }
 
     /// Core windowed download+decrypt engine.
@@ -1089,6 +1158,19 @@ impl EncryptedClient {
     ///
     /// Used by both the `Bytes`-returning paths (via `Vec<u8>` writer) and the
     /// generic writer path.
+    ///
+    /// H-1 / H-2: `forest_entry` carries the owner's forest pin for this
+    /// storage_key. When present:
+    /// - `min_version` is checked against `chunked_meta.format` (streaming-v2
+    ///   maps to v4, legacy format to v2) before any I/O.
+    /// - `content_hash` is verified against a BLAKE3 of the full plaintext
+    ///   stream after `finalize_and_verify` (Bao root) succeeds. Plaintext
+    ///   bytes are teed to both the caller's writer and a separate BLAKE3
+    ///   hasher in the same decryption loop — no extra network or I/O cost.
+    ///   On mismatch the function returns `IntegrityMismatch` and the
+    ///   caller is contractually obliged to discard whatever bytes have
+    ///   already reached their writer (same contract as the existing Bao
+    ///   finalize path).
     async fn download_chunks_windowed_to_writer<W: std::io::Write>(
         &self,
         bucket: &str,
@@ -1096,7 +1178,15 @@ impl EncryptedClient {
         chunked_meta: &ChunkedFileMetadata,
         dek: &fula_crypto::keys::DekKey,
         writer: &mut W,
+        forest_entry: Option<&ForestFileEntry>,
     ) -> Result<u64> {
+        // H-2: pre-I/O downgrade gate for chunked files. streaming-v2 format
+        // maps to on-the-wire version 4 (uses chunk AAD); anything else is
+        // legacy (no AAD), treated as version 2. An entry with min_version=4
+        // therefore rejects a legacy-format blob before any chunk fetch.
+        let chunked_version: u8 = if chunked_meta.format == "streaming-v2" { 4 } else { 2 };
+        Self::enforce_min_version(forest_entry, chunked_version as u64)?;
+
         let num_chunks = chunked_meta.num_chunks;
         // Use VerifiedStreamingDecoder so the Bao root hash is verified at
         // finalize — this closes the truncation / tampering attack where a
@@ -1121,6 +1211,14 @@ impl EncryptedClient {
         let mut total_written: u64 = 0;
         let mut chunks_decrypted: u64 = 0;
         let window_size = Self::MAX_CONCURRENT_CHUNK_DOWNLOADS;
+        // H-1: tee plaintext through a BLAKE3 hasher when the forest entry
+        // carries a pinned content_hash. The hasher sits outside the
+        // attacker-controllable `ChunkedFileMetadata` blob — its digest is
+        // bound to the forest entry (forest DEK + sequence AAD), which is
+        // the only layer not re-wrappable under HPKE-to-self forgery.
+        let mut content_hasher: Option<blake3::Hasher> = forest_entry
+            .and_then(|e| e.content_hash.as_ref())
+            .map(|_| blake3::Hasher::new());
 
         // Process chunks in sliding windows to bound memory usage.
         // Each window downloads up to `window_size` chunks in parallel,
@@ -1168,6 +1266,9 @@ impl EncryptedClient {
             for (chunk_index, chunk_data) in &window_chunks {
                 let chunk_plaintext = decoder.decrypt_and_verify(*chunk_index, chunk_data)
                     .map_err(ClientError::Encryption)?;
+                if let Some(h) = content_hasher.as_mut() {
+                    h.update(&chunk_plaintext);
+                }
                 writer.write_all(&chunk_plaintext)
                     .map_err(ClientError::Io)?;
                 total_written += chunk_plaintext.len() as u64;
@@ -1200,6 +1301,35 @@ impl EncryptedClient {
         // Final Bao root-hash verification — the critical check that catches
         // silent truncation and tampering of chunk contents or ordering.
         decoder.finalize_and_verify().map_err(ClientError::Encryption)?;
+
+        // H-1: compare the forest-pinned content_hash against the BLAKE3 digest
+        // accumulated over the decrypted plaintext stream. Runs only when
+        // `forest_entry.content_hash` was set at upload time. On mismatch the
+        // caller must discard any bytes already emitted to `writer` — see the
+        // streaming-contract note at the top of this function.
+        if let (Some(h), Some(entry)) = (content_hasher, forest_entry) {
+            if let Some(expected_hex) = entry.content_hash.as_ref() {
+                let actual = h.finalize();
+                let expected = match blake3::Hash::from_hex(expected_hex.as_bytes()) {
+                    Ok(e) => e,
+                    Err(_) => {
+                        return Err(ClientError::Encryption(
+                            fula_crypto::CryptoError::IntegrityMismatch(
+                                "malformed content_hash in forest entry".to_string(),
+                            ),
+                        ));
+                    }
+                };
+                if actual != expected {
+                    return Err(ClientError::Encryption(
+                        fula_crypto::CryptoError::IntegrityMismatch(format!(
+                            "chunked content_hash mismatch: {} bytes written before detection",
+                            total_written
+                        )),
+                    ));
+                }
+            }
+        }
 
         Ok(total_written)
     }
@@ -1238,6 +1368,7 @@ impl EncryptedClient {
         chunked_meta: &ChunkedFileMetadata,
         dek: &fula_crypto::keys::DekKey,
         writer: &mut W,
+        forest_entry: Option<&ForestFileEntry>,
     ) -> Result<u64> {
         let ceiling = self.inner.config().buffered_download_max_bytes;
         if chunked_meta.total_size > ceiling {
@@ -1255,7 +1386,7 @@ impl EncryptedClient {
         // the caller's writer. If finalize fails, `buffer` is dropped on
         // the error-return path and the caller's writer is untouched.
         let total_written = self
-            .download_chunks_windowed_to_writer(bucket, storage_key, chunked_meta, dek, &mut buffer)
+            .download_chunks_windowed_to_writer(bucket, storage_key, chunked_meta, dek, &mut buffer, forest_entry)
             .await?;
 
         writer.write_all(&buffer).map_err(ClientError::Io)?;
@@ -1343,8 +1474,11 @@ impl EncryptedClient {
         let dek = decryptor.decrypt_dek(&wrapped_key)
             .map_err(ClientError::Encryption)?;
 
+        // H-1 / H-2: look up the forest entry once; shared by both branches.
+        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
+
         if is_chunked {
-            self.get_object_chunked_to_writer(bucket, storage_key, &enc_metadata, &dek, writer).await
+            self.get_object_chunked_to_writer(bucket, storage_key, &enc_metadata, &dek, writer, forest_entry.as_ref()).await
         } else {
             let nonce_b64 = enc_metadata["nonce"].as_str()
                 .ok_or_else(|| ClientError::Encryption(
@@ -1361,12 +1495,15 @@ impl EncryptedClient {
 
             let aead = Aead::new_default(&dek);
             let version = enc_metadata["version"].as_u64().unwrap_or(2);
+            Self::enforce_min_version(forest_entry.as_ref(), version)?;
             let plaintext = if version >= 4 {
                 let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
                 aead.decrypt_with_aad(&nonce, &result.data, &aad)
             } else {
                 aead.decrypt(&nonce, &result.data)
             }.map_err(ClientError::Encryption)?;
+
+            Self::enforce_content_hash(forest_entry.as_ref(), &plaintext)?;
 
             writer.write_all(&plaintext).map_err(ClientError::Io)?;
             Ok(plaintext.len() as u64)
@@ -1467,8 +1604,11 @@ impl EncryptedClient {
         let dek = decryptor.decrypt_dek(&wrapped_key)
             .map_err(ClientError::Encryption)?;
 
+        // H-1 / H-2: look up the forest entry once; shared by both branches.
+        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
+
         if is_chunked {
-            self.get_object_chunked_buffered_to_writer(bucket, storage_key, &enc_metadata, &dek, writer).await
+            self.get_object_chunked_buffered_to_writer(bucket, storage_key, &enc_metadata, &dek, writer, forest_entry.as_ref()).await
         } else {
             // Single-block: AEAD tag over the whole block IS the integrity
             // check — no streaming window, no Bao root. Buffered and
@@ -1488,12 +1628,15 @@ impl EncryptedClient {
 
             let aead = Aead::new_default(&dek);
             let version = enc_metadata["version"].as_u64().unwrap_or(2);
+            Self::enforce_min_version(forest_entry.as_ref(), version)?;
             let plaintext = if version >= 4 {
                 let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
                 aead.decrypt_with_aad(&nonce, &result.data, &aad)
             } else {
                 aead.decrypt(&nonce, &result.data)
             }.map_err(ClientError::Encryption)?;
+
+            Self::enforce_content_hash(forest_entry.as_ref(), &plaintext)?;
 
             writer.write_all(&plaintext).map_err(ClientError::Io)?;
             Ok(plaintext.len() as u64)
@@ -1568,6 +1711,9 @@ impl EncryptedClient {
 
         let aead = Aead::new_default(&dek);
         let version = enc_metadata["version"].as_u64().unwrap_or(2);
+        // H-1 / H-2: downgrade gate pre-decrypt, content_hash post-decrypt.
+        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
+        Self::enforce_min_version(forest_entry.as_ref(), version)?;
         let plaintext = if version >= 4 {
             let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
             aead.decrypt_with_aad(&nonce, &result.data, &aad)
@@ -1575,8 +1721,10 @@ impl EncryptedClient {
             aead.decrypt(&nonce, &result.data)
         }.map_err(ClientError::Encryption)?;
 
+        Self::enforce_content_hash(forest_entry.as_ref(), &plaintext)?;
+
         // Decrypt private metadata if present
-        let (original_key, original_size, content_type, user_metadata) = 
+        let (original_key, original_size, content_type, user_metadata) =
             if let Some(private_meta_str) = enc_metadata["private_metadata"].as_str() {
                 let encrypted_meta = EncryptedPrivateMetadata::from_json(private_meta_str)
                     .map_err(ClientError::Encryption)?;
@@ -2762,6 +2910,125 @@ impl EncryptedClient {
         Ok(decision)
     }
 
+    /// H-1 / H-2: return the full forest entry for `storage_key` so download
+    /// paths can enforce per-entry `min_version` and verify `content_hash`
+    /// after AEAD decrypt.
+    ///
+    /// Ensures the forest is loaded first so an empty cache cannot be used
+    /// to bypass verification by returning `None`. Returns `Ok(None)` only
+    /// when the loaded forest genuinely has no entry for this key
+    /// (pre-forest-write transition or share-token path where the downloader
+    /// is not the owner).
+    ///
+    /// v1/v6: in-memory map lookup (O(1)/O(log n)).
+    /// v7: walks every shard's HAMT (O(total entries)) — acceptable because
+    /// downloads run at most one lookup per call and are dominated by
+    /// network cost. See `ShardedHamtPrivateForest::find_by_storage_key`.
+    async fn forest_entry_lookup(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+    ) -> Result<Option<ForestFileEntry>> {
+        self.ensure_forest_loaded(bucket).await?;
+        // Snapshot the cache entry; for v7 we need an Arc clone and a backend
+        // before dropping the DashMap guard so we don't hold it across .await.
+        let cached = self.forest_cache.get(bucket).map(|e| match e.value() {
+            ForestCacheEntry::Monolithic { forest, .. } => {
+                CachedForForestLookup::V1(forest.find_by_storage_key(storage_key).cloned())
+            }
+            ForestCacheEntry::Sharded { forest, .. } => {
+                CachedForForestLookup::V6(forest.find_by_storage_key(storage_key).cloned())
+            }
+            ForestCacheEntry::ShardedHamt { forest, .. } => {
+                CachedForForestLookup::V7(forest.clone())
+            }
+        });
+        match cached {
+            Some(CachedForForestLookup::V1(entry)) | Some(CachedForForestLookup::V6(entry)) => {
+                Ok(entry)
+            }
+            Some(CachedForForestLookup::V7(forest_arc)) => {
+                let backend = Arc::new(S3BlobBackend::new(self.inner.clone(), bucket.to_string()));
+                let guard = forest_arc.read().await;
+                guard.find_by_storage_key(storage_key, &backend)
+                    .await
+                    .map_err(ClientError::Encryption)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// H-2: pre-decrypt downgrade gate. Rejects blobs whose advertised version
+    /// is lower than the forest entry's `min_version` pin (blocks
+    /// downgrade-to-no-AAD). Cheaper than H-1 because it runs a single `u8`
+    /// compare before any AEAD work.
+    ///
+    /// Legacy (pre-fix) entries have `min_version == 0` and always pass.
+    /// No forest entry (share-token path, or pre-forest-write transition)
+    /// also passes — downstream AEAD still protects integrity on those.
+    fn enforce_min_version(
+        entry: Option<&ForestFileEntry>,
+        version: u64,
+    ) -> Result<()> {
+        let entry = match entry {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+        let got = std::cmp::min(version, u8::MAX as u64) as u8;
+        if got < entry.min_version {
+            return Err(ClientError::Encryption(
+                fula_crypto::CryptoError::VersionDowngrade {
+                    got,
+                    required: entry.min_version,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// H-1: post-decrypt content-hash verification. Compares BLAKE3 of the
+    /// decrypted plaintext against the forest entry's `content_hash`
+    /// (blocks whole-file substitution under HPKE-to-self).
+    ///
+    /// Legacy entries carry `content_hash: None` and bypass the check to
+    /// preserve v1/v2 read compatibility. No forest entry (share-token path)
+    /// also bypasses — the share token itself binds its own integrity.
+    ///
+    /// `blake3::Hash` implements `PartialEq` in constant time, so parsing
+    /// the hex-encoded expected digest and comparing Hash-to-Hash gives a
+    /// timing-safe check without pulling in `subtle` as a direct dep.
+    fn enforce_content_hash(
+        entry: Option<&ForestFileEntry>,
+        plaintext: &[u8],
+    ) -> Result<()> {
+        let entry = match entry {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+        if let Some(expected_hex) = entry.content_hash.as_ref() {
+            let actual = blake3::hash(plaintext);
+            let expected = match blake3::Hash::from_hex(expected_hex.as_bytes()) {
+                Ok(h) => h,
+                Err(_) => {
+                    return Err(ClientError::Encryption(
+                        fula_crypto::CryptoError::IntegrityMismatch(
+                            "malformed content_hash in forest entry".to_string(),
+                        ),
+                    ));
+                }
+            };
+            if actual != expected {
+                return Err(ClientError::Encryption(
+                    fula_crypto::CryptoError::IntegrityMismatch(format!(
+                        "content_hash mismatch for {}-byte plaintext",
+                        plaintext.len()
+                    )),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Save the private forest index for a bucket (monolithic v4 format with AAD+sequence)
     pub async fn save_forest(&self, bucket: &str, forest: &PrivateForest) -> Result<()> {
         let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
@@ -3734,15 +4001,21 @@ impl EncryptedClient {
         let wrapped_dek = encryptor.encrypt_dek(&dek)
             .map_err(ClientError::Encryption)?;
 
-        // Create private metadata
+        // Create private metadata. H-1: compute BLAKE3 over the plaintext
+        // *before* AEAD so the hash lands on the forest entry (which lives
+        // under a separate AAD scheme and cannot be re-wrapped under HPKE-
+        // to-self forgery) and is available for download-side verification.
+        let content_hash = blake3::hash(&data).to_hex().to_string();
         let private_meta = PrivateMetadata::new(key, original_size)
-            .with_content_type(content_type.unwrap_or("application/octet-stream"));
+            .with_content_type(content_type.unwrap_or("application/octet-stream"))
+            .with_content_hash(content_hash);
 
         let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
             .map_err(ClientError::Encryption)?;
 
         // Mark the forest entry as encrypted so subsequent reads refuse a
-        // plaintext response from the storage backend (C-AUDIT-004).
+        // plaintext response from the storage backend (C-AUDIT-004) and
+        // pin its `min_version` to 4 (H-2).
         let mut forest_entry = ForestFileEntry::from_metadata(&private_meta, storage_key.clone());
         forest_entry.mark_encrypted();
 
@@ -4105,8 +4378,12 @@ impl EncryptedClient {
         let wrapped_dek = encryptor.encrypt_dek(&dek)
             .map_err(ClientError::Encryption)?;
 
+        // H-1: BLAKE3 over the plaintext stream — bound to the forest
+        // entry, not to the attacker-controllable ChunkedFileMetadata blob.
+        let content_hash = blake3::hash(&data).to_hex().to_string();
         let private_meta = PrivateMetadata::new(key, original_size)
-            .with_content_type(content_type.unwrap_or("application/octet-stream"));
+            .with_content_type(content_type.unwrap_or("application/octet-stream"))
+            .with_content_hash(content_hash);
         let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
             .map_err(ClientError::Encryption)?;
 
@@ -4248,12 +4525,6 @@ impl EncryptedClient {
         let wrapped_dek = encryptor.encrypt_dek(&dek)
             .map_err(ClientError::Encryption)?;
 
-        // Create private metadata
-        let private_meta = PrivateMetadata::new(key, total_size)
-            .with_content_type(content_type.unwrap_or("application/octet-stream"));
-        let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
-            .map_err(ClientError::Encryption)?;
-
         // Generate obfuscated storage key using path-derived DEK
         let path_dek = self.encryption.key_manager.derive_path_key(key);
         let storage_key = obfuscate_key(key, &path_dek, self.encryption.obfuscation_mode.clone());
@@ -4268,7 +4539,18 @@ impl EncryptedClient {
         // Memory usage bounded to ~chunk_size during encoding.
         let all_chunks = encoder.process_reader(reader).await
             .map_err(ClientError::Encryption)?;
+        // H-1: grab the content hash before `finalize` consumes the encoder.
+        let content_hash = encoder.content_hash_hex();
         let (chunked_metadata, _outboard) = encoder.finalize();
+
+        // Create private metadata (deferred until after streaming so the
+        // BLAKE3 content hash computed over the plaintext stream lands on
+        // the forest entry — H-1).
+        let private_meta = PrivateMetadata::new(key, total_size)
+            .with_content_type(content_type.unwrap_or("application/octet-stream"))
+            .with_content_hash(content_hash);
+        let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
+            .map_err(ClientError::Encryption)?;
 
         // Upload chunks in parallel with bounded concurrency
         let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_CHUNK_UPLOADS));
@@ -4622,6 +4904,16 @@ impl EncryptedClient {
                                 Vec::new()
                             });
                         self.replay_wal_entries(bucket, wal_entries).await?;
+                        // M-2: Jittered exponential backoff to break thundering-herd
+                        // under multi-writer contention. Base 50ms * 2^attempt, plus
+                        // 0-99ms jitter. Delays: 50-149ms, 100-199ms (3rd attempt
+                        // short-circuits via `attempt + 1 < MAX_FLUSH_RETRIES`).
+                        // WAL prune-between-retries: deferred — requires inner to
+                        // return applied indices; backoff alone addresses the
+                        // thundering-herd window flagged by audit.
+                        let delay = flush_backoff_delay(attempt);
+                        FLUSH_BACKOFF_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tokio::time::sleep(delay).await;
                         last_err = Some(e);
                         continue;
                     }
@@ -6072,6 +6364,12 @@ impl EncryptedClient {
     ///
     /// Delegates to the windowed download engine which keeps peak memory
     /// bounded to ~window_size * chunk_size regardless of total file size.
+    ///
+    /// Called only from the share-token (non-owner) download path, where
+    /// the reader does not own the forest and therefore has no
+    /// `ForestFileEntry` to verify against. Passes `forest_entry: None` so
+    /// the H-1 content_hash / H-2 min_version gates are skipped — the share
+    /// token's own `SnapshotBinding` is the integrity anchor for that path.
     async fn download_chunks_parallel(
         &self,
         bucket: &str,
@@ -6080,7 +6378,7 @@ impl EncryptedClient {
         dek: &fula_crypto::keys::DekKey,
     ) -> Result<Bytes> {
         let mut output = Vec::with_capacity(chunked_meta.total_size as usize);
-        self.download_chunks_windowed_to_writer(bucket, storage_key, chunked_meta, dek, &mut output).await?;
+        self.download_chunks_windowed_to_writer(bucket, storage_key, chunked_meta, dek, &mut output, None).await?;
         Ok(Bytes::from(output))
     }
 
@@ -6586,6 +6884,9 @@ impl EncryptedClient {
         // under the guard, v7 extracts the Arc and performs the async
         // upsert after dropping it.
         let now = chrono::Utc::now().timestamp();
+        // H-1: bind a BLAKE3 content hash to the forest entry. `data` here is
+        // the full plaintext — cheap single-pass hash.
+        let content_hash = blake3::hash(data).to_hex().to_string();
         let file_entry = ForestFileEntry {
             path: key.to_string(),
             storage_key: storage_key.clone(),
@@ -6594,10 +6895,13 @@ impl EncryptedClient {
             created_at: now,
             modified_at: now,
             user_metadata: HashMap::new(),
-            content_hash: None,
+            content_hash: Some(content_hash),
             // C-AUDIT-004: forest entries from encrypted uploads MUST
             // be marked so later reads refuse a plaintext backend response.
             encrypted: true,
+            // H-2: entry is written under v4 AAD-bound encryption; reject
+            // any later download that advertises a lower blob-format version.
+            min_version: 4,
         };
 
         let v7_forest_arc = {
@@ -6706,11 +7010,16 @@ impl EncryptedClient {
         let decryptor = Decryptor::new(self.encryption.key_manager.keypair());
         let dek = decryptor.decrypt_dek(&wrapped_dek)?;
 
+        // H-1 / H-2: look up forest entry for the owner-read path so the
+        // chunked engine can verify content_hash and reject legacy-format
+        // blobs pinned to streaming-v2.
+        let forest_entry = self.forest_entry_lookup(bucket, &storage_key).await?;
+
         // Delegate to the windowed parallel download path shared with the main
         // get_object_decrypted flow. Handles streaming-v2 and legacy formats
         // identically — chunk S3 layout and per-chunk nonce/AAD derivation are
         // unchanged, only the concurrency pattern differs from the old loop.
-        self.get_object_chunked_internal(bucket, &storage_key, &enc_metadata, &dek).await
+        self.get_object_chunked_internal(bucket, &storage_key, &enc_metadata, &dek, forest_entry.as_ref()).await
     }
 
     /// Download a byte range from a chunked file (partial read)
@@ -7793,7 +8102,7 @@ mod tests {
 
         let mut writer: Vec<u8> = Vec::new();
         let err = client
-            .download_chunks_buffered_to_writer("bucket", "storage-key", &meta, &dek, &mut writer)
+            .download_chunks_buffered_to_writer("bucket", "storage-key", &meta, &dek, &mut writer, None)
             .await
             .expect_err("buffered download must reject oversize manifest");
         match err {

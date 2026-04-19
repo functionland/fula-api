@@ -94,6 +94,13 @@ struct FileEntryWire {
     content_hash: Option<String>,
     user_metadata: BTreeMap<String, String>,
     encrypted: bool,
+    /// Minimum blob-format version for this entry (H-2). `0` = legacy,
+    /// `4` = written under AAD-bound v4 encryption and requires the
+    /// download path to reject lower advertised versions. `#[serde(default)]`
+    /// keeps wire compatibility with pre-H-2 shard blobs that lack the
+    /// field — postcard's strict decoder will fail without this attribute.
+    #[serde(default)]
+    min_version: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -117,6 +124,7 @@ impl From<ForestFileEntry> for FileEntryWire {
             content_hash: e.content_hash,
             user_metadata: e.user_metadata.into_iter().collect(),
             encrypted: e.encrypted,
+            min_version: e.min_version,
         }
     }
 }
@@ -133,6 +141,7 @@ impl From<FileEntryWire> for ForestFileEntry {
             content_hash: w.content_hash,
             user_metadata: w.user_metadata.into_iter().collect::<HashMap<_, _>>(),
             encrypted: w.encrypted,
+            min_version: w.min_version,
         }
     }
 }
@@ -1056,6 +1065,22 @@ impl ShardedHamtPrivateForest {
             .collect())
     }
 
+    /// H-1 / H-2: reverse lookup — find a file entry by its `storage_key`.
+    ///
+    /// Walks every shard's HAMT because storage_key is not an index. This
+    /// is O(total entries) and is only intended for the per-download
+    /// verification path (`forest_entry_lookup`), which runs at most once
+    /// per object read and is dwarfed by network cost. Callers with a
+    /// logical path should prefer `get_file(path)` (O(log n)).
+    pub async fn find_by_storage_key<B: BlobBackend + 'static>(
+        &self,
+        storage_key: &str,
+        backend: &Arc<B>,
+    ) -> Result<Option<ForestFileEntry>> {
+        let all = self.list_all_files(backend).await?;
+        Ok(all.into_iter().find(|f| f.storage_key == storage_key))
+    }
+
     /// Collect every `ForestDirectoryEntry` across every shard.
     pub async fn list_all_directories<B: BlobBackend + 'static>(
         &self,
@@ -1315,6 +1340,7 @@ mod tests {
             content_hash: None,
             user_metadata: Default::default(),
             encrypted: true,
+            min_version: 0,
         }
     }
 

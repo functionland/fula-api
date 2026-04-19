@@ -112,6 +112,109 @@ impl MultipartUpload {
     }
 }
 
+/// RAII guard that issues a best-effort multipart abort when dropped without
+/// being disarmed. Wrap around a `MultipartUpload` whose lifecycle may exit
+/// via `?`-propagation or panic (e.g., mid-upload network error) to prevent
+/// orphaned multipart uploads from lingering on S3.
+///
+/// **Mechanism** (M-3, Tier 1). On drop, if armed and a tokio runtime is
+/// current, spawns `abort_upload` as a fire-and-forget task. If no runtime
+/// is available (post-shutdown, sync contexts, or wasm32 without an active
+/// `spawn_local` context), silently no-ops — matching `wal.rs`'s "no state
+/// dir" silent-no-op pattern. The bucket's `AbortIncompleteMultipartUpload`
+/// lifecycle rule serves as the cleanup backstop in all silent-no-op paths.
+///
+/// **Contract.** On the successful-complete path, call [`disarm`] after
+/// `MultipartUpload::complete` returns `Ok`. Any other exit (error, panic,
+/// early return) fires the abort.
+///
+/// **Not covered.** Callers that orchestrate `MultipartUpload::start` →
+/// `upload_part` loop → `complete` themselves (e.g., external SDKs driving
+/// the handle by hand) must wrap their own `MultipartAbortGuard` around the
+/// orchestration. The guard is public precisely so those callers can opt in.
+///
+/// If telemetry later shows abort-failed leaks despite the S3 lifecycle
+/// backstop, promote this to Tier 2 by adding orphan-queue persistence (see
+/// plan §M-3 resolution steps 2–3).
+///
+/// [`disarm`]: MultipartAbortGuard::disarm
+pub struct MultipartAbortGuard {
+    /// Set to `Some(...)` while armed; `None` after disarm. On drop, if
+    /// still `Some`, the closure is invoked synchronously.
+    abort_fn: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl MultipartAbortGuard {
+    /// Arm a new guard for the given in-flight multipart upload. Call
+    /// [`disarm`](Self::disarm) on success; otherwise the Drop impl fires
+    /// the abort.
+    pub fn new(
+        client: Arc<FulaClient>,
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+        upload_id: impl Into<String>,
+    ) -> Self {
+        let bucket = bucket.into();
+        let key = key.into();
+        let upload_id = upload_id.into();
+        Self::from_callback(Box::new(move || {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // No runtime: tests, shutdown, sync drops. Silent no-op —
+                // the bucket lifecycle rule is the backstop.
+                let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                    tracing::debug!(
+                        %bucket, %key, %upload_id,
+                        "MultipartAbortGuard: no tokio runtime, skipping auto-abort"
+                    );
+                    return;
+                };
+                handle.spawn(async move {
+                    if let Err(e) = abort_upload(&client, &bucket, &key, &upload_id).await {
+                        tracing::warn!(
+                            %bucket, %key, %upload_id,
+                            error = %e,
+                            "MultipartAbortGuard: auto-abort failed; relying on S3 lifecycle cleanup"
+                        );
+                    }
+                });
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) = abort_upload(&client, &bucket, &key, &upload_id).await {
+                        tracing::warn!(
+                            %bucket, %key, %upload_id,
+                            error = %e,
+                            "MultipartAbortGuard: auto-abort failed; relying on S3 lifecycle cleanup"
+                        );
+                    }
+                });
+            }
+        }))
+    }
+
+    /// Construct a guard with an arbitrary synchronous callback. Used by
+    /// in-module tests to observe Drop behavior without hitting HTTP.
+    fn from_callback(cb: Box<dyn FnOnce() + Send + 'static>) -> Self {
+        Self { abort_fn: Some(cb) }
+    }
+
+    /// Disarm the guard — the abort callback will NOT fire on drop. Call on
+    /// the happy path after `MultipartUpload::complete` succeeds.
+    pub fn disarm(mut self) {
+        let _ = self.abort_fn.take();
+    }
+}
+
+impl Drop for MultipartAbortGuard {
+    fn drop(&mut self) {
+        if let Some(cb) = self.abort_fn.take() {
+            cb();
+        }
+    }
+}
+
 /// Upload a large file using multipart upload
 pub async fn upload_large_file(
     client: Arc<FulaClient>,
@@ -125,6 +228,15 @@ pub async fn upload_large_file(
     let total_parts = ((data.len() + chunk_size - 1) / chunk_size) as u32;
 
     let mut upload = MultipartUpload::start(Arc::clone(&client), bucket, key).await?;
+
+    // M-3 Tier 1: auto-abort on any `?`-propagating error below. `disarm()`
+    // on the happy path after `complete()` suppresses the drop-time abort.
+    let abort_guard = MultipartAbortGuard::new(
+        Arc::clone(&client),
+        bucket,
+        key,
+        upload.upload_id().to_string(),
+    );
 
     let mut bytes_uploaded = 0u64;
     let mut part_number = 1u32;
@@ -147,7 +259,9 @@ pub async fn upload_large_file(
         part_number += 1;
     }
 
-    upload.complete().await
+    let etag = upload.complete().await?;
+    abort_guard.disarm();
+    Ok(etag)
 }
 
 // Helper functions for multipart operations
@@ -513,5 +627,30 @@ mod tests {
         .await;
         assert!(matches!(result, Err(ClientError::AccessDenied(_))));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn abort_guard_drop_without_disarm_fires_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fired = Arc::new(AtomicUsize::new(0));
+        let f2 = Arc::clone(&fired);
+        {
+            let _guard = MultipartAbortGuard::from_callback(Box::new(move || {
+                f2.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn abort_guard_disarm_suppresses_drop_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fired = Arc::new(AtomicUsize::new(0));
+        let f2 = Arc::clone(&fired);
+        let guard = MultipartAbortGuard::from_callback(Box::new(move || {
+            f2.fetch_add(1, Ordering::SeqCst);
+        }));
+        guard.disarm();
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
     }
 }

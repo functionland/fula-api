@@ -147,6 +147,7 @@ pub fn build_v1_private_forest(files: &[SeedFile], dirs: &[SeedDir]) -> PrivateF
             content_hash: f.content_hash.clone(),
             user_metadata: f.user_metadata.clone(),
             encrypted: f.encrypted,
+            min_version: 0,
         };
         forest.files.insert(f.path.clone(), entry);
     }

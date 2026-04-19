@@ -378,3 +378,112 @@ impl Drop for EnvGuard {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M-2 — flush_forest retry loop sleeps with jittered backoff on 412 contention
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn flush_forest_backoff_under_contention() {
+    // Two writers collide on the same bucket's manifest. The loser must:
+    //  (1) retry the flush and succeed (existing NEW-7.2 behavior)
+    //  (2) sleep at least 50ms of backoff before its retry PUT (M-2)
+    //  (3) increment the observable flush_backoff_count counter (M-2)
+    let base = spawn_server().await;
+
+    let encryption = EncryptionConfig::new();
+    let secret = encryption.export_secret_key().clone();
+    let enc_a = EncryptionConfig::from_secret_key(secret.clone());
+    let enc_b = EncryptionConfig::from_secret_key(secret.clone());
+
+    let bucket = "m2-backoff-bucket";
+
+    let state_a = tempfile::tempdir().unwrap();
+    let state_b = tempfile::tempdir().unwrap();
+    let client_a_wal = state_a.path().to_path_buf();
+    let client_b_wal = state_b.path().to_path_buf();
+
+    // Seed the bucket so both clients pin a real prior_etag.
+    {
+        let _guard = EnvGuard::set("FULA_STATE_DIR", &client_a_wal);
+        let seed = make_client(&base, EncryptionConfig::from_secret_key(secret.clone()));
+        seed.create_bucket(bucket).await.expect("create bucket");
+        seed.put_object_flat(bucket, "/seed.txt", b"seed".to_vec(), None)
+            .await.expect("seed");
+    }
+
+    let client_a = {
+        let _guard = EnvGuard::set("FULA_STATE_DIR", &client_a_wal);
+        make_client(&base, enc_a)
+    };
+    let client_b = {
+        let _guard = EnvGuard::set("FULA_STATE_DIR", &client_b_wal);
+        make_client(&base, enc_b)
+    };
+
+    // Both clients load the forest and pin the same prior_etag.
+    {
+        let _guard = EnvGuard::set("FULA_STATE_DIR", &client_a_wal);
+        let _ = client_a.get_object_flat(bucket, "/seed.txt").await.expect("a read");
+    }
+    {
+        let _guard = EnvGuard::set("FULA_STATE_DIR", &client_b_wal);
+        let _ = client_b.get_object_flat(bucket, "/seed.txt").await.expect("b read");
+    }
+
+    // Both stage disjoint deferred writes so their flushes are a real race.
+    {
+        let _guard = EnvGuard::set("FULA_STATE_DIR", &client_a_wal);
+        client_a.put_object_flat_deferred(bucket, "/a.txt", b"from-a".to_vec(), None)
+            .await.expect("a put");
+    }
+    {
+        let _guard = EnvGuard::set("FULA_STATE_DIR", &client_b_wal);
+        client_b.put_object_flat_deferred(bucket, "/b.txt", b"from-b".to_vec(), None)
+            .await.expect("b put");
+    }
+
+    // Winner flushes first.
+    {
+        let _guard = EnvGuard::set("FULA_STATE_DIR", &client_a_wal);
+        client_a.flush_forest(bucket).await.expect("a flush");
+    }
+
+    // Snapshot the backoff counter + wall clock before the loser's flush.
+    let backoff_before = fula_client::flush_backoff_count();
+    let t0 = std::time::Instant::now();
+
+    // Loser flushes — 412, WAL replay, sleep (M-2), retry against winner.
+    {
+        let _guard = EnvGuard::set("FULA_STATE_DIR", &client_b_wal);
+        client_b.flush_forest(bucket).await.expect("b flush after retry");
+    }
+
+    let elapsed = t0.elapsed();
+    let backoff_after = fula_client::flush_backoff_count();
+
+    // M-2 assertion 1: the backoff counter advanced (sleep branch was taken).
+    assert!(
+        backoff_after > backoff_before,
+        "flush_backoff_count did not advance: before={} after={}; retry loop did not sleep",
+        backoff_before, backoff_after,
+    );
+
+    // M-2 assertion 2: at least one sleep of FLUSH_BACKOFF_BASE_MS (50ms)
+    // elapsed within the B flush — proves the sleep actually fires, not just
+    // that the counter was bumped. Tolerate small timer overshoot.
+    assert!(
+        elapsed >= std::time::Duration::from_millis(50),
+        "B flush finished in {:?} — too fast for a 50ms+ backoff sleep to have fired",
+        elapsed,
+    );
+
+    // Sanity: both writes survived (existing NEW-7.2 behavior unchanged).
+    let state_c = tempfile::tempdir().unwrap();
+    let _guard = EnvGuard::set("FULA_STATE_DIR", state_c.path());
+    let client_c = make_client(&base, EncryptionConfig::from_secret_key(secret));
+    let a = client_c.get_object_flat(bucket, "/a.txt").await.expect("read a");
+    let b = client_c.get_object_flat(bucket, "/b.txt").await.expect("read b");
+    assert_eq!(a.as_ref(), b"from-a");
+    assert_eq!(b.as_ref(), b"from-b");
+}

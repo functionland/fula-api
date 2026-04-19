@@ -117,6 +117,16 @@ pub async fn upload_large_file_simple(
         &key,
     ).await?;
 
+    // M-3: arm an auto-abort guard so any `?`-propagated error below will
+    // spawn an AbortMultipartUpload instead of leaving S3 to charge for the
+    // partial upload until the bucket lifecycle sweeps it.
+    let abort_guard = fula_client::MultipartAbortGuard::new(
+        client.inner.clone(),
+        &bucket,
+        &key,
+        upload.upload_id().to_string(),
+    );
+
     // Upload parts
     let mut part_number = 1u32;
     let mut offset = 0;
@@ -133,6 +143,7 @@ pub async fn upload_large_file_simple(
 
     // Complete upload
     let etag = upload.complete().await?;
+    abort_guard.disarm();
     Ok(etag)
 }
 

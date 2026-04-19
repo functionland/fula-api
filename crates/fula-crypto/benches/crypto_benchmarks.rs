@@ -171,6 +171,7 @@ fn mk_file_entry(path: &str) -> ForestFileEntry {
         content_hash: None,
         user_metadata: Default::default(),
         encrypted: false,
+        min_version: 0,
     }
 }
 
@@ -303,6 +304,7 @@ fn bench_v1_monolithic_vs_v7_write(c: &mut Criterion) {
                     content_hash: None,
                     user_metadata: Default::default(),
                     encrypted: false,
+                    min_version: 0,
                 });
             }
             f

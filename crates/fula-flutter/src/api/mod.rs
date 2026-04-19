@@ -64,7 +64,7 @@ pub use encrypted::{
 };
 
 // Re-export metrics
-pub use metrics::wal_append_failure_count;
+pub use metrics::{wal_append_failure_count, flush_backoff_count, wal_truncated_groups_count};
 
 // Re-export forest functions
 pub use forest::{

@@ -425,18 +425,197 @@ mod sharing_integration {
         let intended_recipient = KekKeyPair::generate();
         let wrong_recipient = KekKeyPair::generate();
         let dek = DekKey::generate();
-        
+
         // Token encrypted for intended_recipient
         let token = ShareBuilder::new(&owner, intended_recipient.public_key(), &dek)
             .build()
             .unwrap();
-        
+
         // Wrong recipient tries to accept
         let wrong_share_recipient = ShareRecipient::new(&wrong_recipient);
         let result = wrong_share_recipient.accept_share(&token);
-        
+
         // Should fail because wrong key
         assert!(result.is_err());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // M-5: recipient_pk bound into build_share_token_aad (v5 AAD)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn share_token_happy_path() {
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+            .path_scope("/photos/")
+            .read_only()
+            .build()
+            .unwrap();
+
+        // v5 format — post-M-5 tokens carry the recipient-pk AAD binding.
+        assert_eq!(token.version, 5);
+
+        let accepted = ShareRecipient::new(&recipient).accept_share(&token).unwrap();
+        assert_eq!(accepted.dek.as_bytes(), dek.as_bytes());
+    }
+
+    #[test]
+    fn share_token_cross_recipient_rejected() {
+        // Attacker tries to strip the AAD binding by presenting their own secret key
+        // against a token that was wrapped to R1's pk. The AAD now encodes R1's pk,
+        // and the recipient side derives recipient_pk from its own secret — so the
+        // AAD the recipient reconstructs for R2 no longer matches, surfacing as an
+        // HPKE auth failure.
+        let owner = KekKeyPair::generate();
+        let r1 = KekKeyPair::generate();
+        let r2 = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let token = ShareBuilder::new(&owner, r1.public_key(), &dek).build().unwrap();
+
+        let result = ShareRecipient::new(&r2).accept_share(&token);
+        assert!(result.is_err(), "R2 must not be able to accept an R1-wrapped token");
+    }
+
+    #[test]
+    fn enqueue_rejects_v4_legacy_token() {
+        use fula_crypto::{ShareInbox, ShareEnvelopeBuilder};
+
+        let owner = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        // Build a normal v5 envelope, then forge a pre-v5 token version on the way in.
+        let (mut envelope, _entry) = ShareEnvelopeBuilder::new(&owner, recipient.public_key(), &dek)
+            .path_scope("/photos/")
+            .build()
+            .unwrap();
+        envelope.token.version = 4;
+
+        let mut inbox = ShareInbox::new();
+        let result = inbox.enqueue_share(&envelope, recipient.public_key(), &owner);
+        assert!(
+            result.is_err(),
+            "enqueue must refuse envelopes whose token predates the recipient-pk AAD binding"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // M-6: HPKE Auth-mode ShareEnvelope + sender_public_key binding
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn envelope_sender_auth_verifies_happy_path() {
+        use fula_crypto::{ShareEnvelopeBuilder, InboxEntry};
+
+        let sender = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let (envelope, entry) = ShareEnvelopeBuilder::new(&sender, recipient.public_key(), &dek)
+            .path_scope("/shared/")
+            .label("hi")
+            .build()
+            .unwrap();
+
+        // sender_public_key on the entry matches the sender keypair.
+        assert_eq!(&entry.sender_public_key, sender.public_key().as_bytes());
+
+        // Happy-path decrypt verifies auth binding and returns the envelope.
+        let decrypted = entry.decrypt(recipient.secret_key()).unwrap();
+        assert_eq!(decrypted.token.id, envelope.token.id);
+
+        // Serde roundtrip preserves the new field.
+        let json = serde_json::to_string(&entry).unwrap();
+        let loaded: InboxEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.sender_public_key, entry.sender_public_key);
+    }
+
+    #[test]
+    fn envelope_forged_sender_pk_rejected() {
+        // An attacker (Eve) encrypts a malicious envelope for the recipient
+        // under Auth mode using Eve's own sender keypair, then tampers with
+        // the on-wire `sender_public_key` to claim the envelope came from
+        // Alice. Under HPKE Auth mode the recipient uses the claimed pk in
+        // `OpModeR::Auth`, which is incompatible with Eve's KDF output —
+        // AEAD auth fails, surfacing a generic error.
+        use fula_crypto::{ShareEnvelopeBuilder};
+
+        let alice = KekKeyPair::generate();      // claimed sender
+        let eve = KekKeyPair::generate();        // actual encrypter
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let (_env, mut entry) = ShareEnvelopeBuilder::new(&eve, recipient.public_key(), &dek)
+            .path_scope("/phish/")
+            .build()
+            .unwrap();
+
+        // Forge the identity field.
+        let mut alice_pk = [0u8; 32];
+        alice_pk.copy_from_slice(alice.public_key().as_bytes());
+        entry.sender_public_key = alice_pk;
+
+        let result = entry.decrypt(recipient.secret_key());
+        assert!(
+            result.is_err(),
+            "tampered sender_public_key must fail HPKE auth verification"
+        );
+    }
+
+    #[test]
+    fn envelope_replay_to_wrong_recipient_rejected() {
+        // An envelope encrypted for R1 cannot be opened by R2 even if
+        // R2 tampers with `recipient_key_hash` on the entry wrapper:
+        // HPKE KEM is keyed to R1's public key, so R2's secret cannot
+        // derive the shared secret, and the recipient-pk hash baked into
+        // the AAD via `build_envelope_aad` also differs on R2's side.
+        use fula_crypto::{ShareEnvelopeBuilder};
+
+        let sender = KekKeyPair::generate();
+        let r1 = KekKeyPair::generate();
+        let r2 = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let (_env, entry) = ShareEnvelopeBuilder::new(&sender, r1.public_key(), &dek)
+            .build()
+            .unwrap();
+
+        let result = entry.decrypt(r2.secret_key());
+        assert!(result.is_err(), "captured envelope must not decrypt for R2");
+    }
+
+    #[test]
+    fn envelope_token_version_downgrade_rejected() {
+        // Not a real v4 token (that code path was deleted in M-5) — instead
+        // we build a legitimate v5 envelope and then tamper with the token's
+        // version field before re-wrapping through InboxEntry::create, to
+        // exercise the post-decrypt gate at InboxEntry::decrypt. The gate
+        // enforces the M-5 recipient-pk AAD binding on the inner token even
+        // if the outer Auth-mode HPKE accepts the envelope.
+        use fula_crypto::{ShareEnvelopeBuilder, InboxEntry};
+
+        let sender = KekKeyPair::generate();
+        let recipient = KekKeyPair::generate();
+        let dek = DekKey::generate();
+
+        let (mut envelope, _entry) = ShareEnvelopeBuilder::new(&sender, recipient.public_key(), &dek)
+            .build()
+            .unwrap();
+        envelope.token.version = 4;
+
+        // Re-create entry with the downgraded envelope (bypasses enqueue_share's
+        // pre-gate to exercise the post-decrypt gate directly).
+        let entry = InboxEntry::create(&envelope, recipient.public_key(), &sender).unwrap();
+
+        let result = entry.decrypt(recipient.secret_key());
+        assert!(
+            result.is_err(),
+            "decrypt must reject envelopes whose inner token predates v5 AAD binding"
+        );
     }
 }
 
@@ -1023,6 +1202,433 @@ mod migration_security {
             "NEW-2.1 guard must refuse plaintext for encrypted=true paths; \
              got Ok({} bytes)",
             result.as_ref().map(|b| b.len()).unwrap_or(0)
+        );
+    }
+}
+
+/// H-1 / H-2 download-side verification tests.
+///
+/// H-1 pins a BLAKE3 `content_hash` into every new-upload forest entry and
+/// verifies it post-decrypt. H-2 pins a `min_version: u8` floor on the same
+/// entry and rejects blobs whose advertised format version is lower.
+///
+/// Together they defeat the HPKE-to-self substitution attack: an attacker
+/// with S3 write access (but not the recipient's private key) can construct
+/// a fresh DEK, HPKE-wrap it to the victim's public key, AEAD-encrypt any
+/// plaintext with valid AAD, and PUT at the victim's storage_key. All
+/// AEAD-level checks pass because the attacker controlled every input.
+///
+/// These tests forge exactly that attacker blob and assert the download
+/// path rejects it. Without the H-1/H-2 fixes, the decrypt would succeed
+/// silently and the caller would consume attacker-chosen bytes.
+mod h1_h2_download_verification {
+    use super::common::v1_seed::{build_v1_private_forest, index_key_for, SeedFile};
+    use super::common::{spawn_server, make_client, EnvGuard};
+    use bytes::Bytes;
+    use fula_client::{EncryptionConfig, ListObjectsOptions, ObjectMetadata};
+    use fula_crypto::{
+        Aead, ChunkedEncoder, ChunkedFileMetadata, DekKey, EncryptedForest, Encryptor, Nonce,
+    };
+
+    /// Locate the single content-ciphertext storage key for a bucket whose
+    /// forest holds exactly one flat-namespace upload. Returns the `Qm…`
+    /// storage key, skipping the forest manifest itself (also `Qm…`) and
+    /// any `__fula_*` internals.
+    async fn locate_storage_key_for_path(
+        client: &fula_client::EncryptedClient,
+        bucket: &str,
+        path: &str,
+    ) -> String {
+        let listing = client
+            .list_directory(bucket, None)
+            .await
+            .expect("list directory from forest");
+        for (_dir, files) in &listing.directories {
+            for f in files {
+                if f.original_key == path {
+                    return f.storage_key.clone();
+                }
+            }
+        }
+        panic!(
+            "forest entry for {} not found; directories={:?}",
+            path,
+            listing.directories.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Build the `x-fula-encryption` JSON blob the client writes for a
+    /// single-block (non-chunked) v4 upload. The attacker replays this
+    /// exact shape with their own fresh DEK + nonce.
+    fn build_v4_single_metadata(
+        wrapped_dek: &fula_crypto::EncryptedData,
+        nonce: &Nonce,
+        version: u64,
+    ) -> String {
+        use base64::Engine;
+        serde_json::json!({
+            "version": version,
+            "algorithm": "AES-256-GCM",
+            "nonce": base64::engine::general_purpose::STANDARD.encode(nonce.as_bytes()),
+            "wrapped_key": serde_json::to_value(wrapped_dek).unwrap(),
+            "kek_version": 1,
+            "metadata_privacy": true,
+            "obfuscation_mode": "flat",
+        })
+        .to_string()
+    }
+
+    /// Upload an attacker-controlled single-block v4 blob at `storage_key`
+    /// for a bucket owned by `public_key`. Uses fresh random DEK so the
+    /// attacker never needs the victim's secret. The blob decrypts
+    /// successfully under the victim's private key (every AEAD/HPKE
+    /// parameter is internally consistent) — the only anchor that can
+    /// catch the swap is the forest-pinned `content_hash`.
+    async fn forge_single_block_at(
+        client: &fula_client::EncryptedClient,
+        public_key: &fula_crypto::PublicKey,
+        bucket: &str,
+        storage_key: &str,
+        plaintext: &[u8],
+        version: u64,
+    ) {
+        let attacker_dek = DekKey::generate();
+        let wrapped = Encryptor::new(public_key)
+            .encrypt_dek(&attacker_dek)
+            .expect("wrap attacker DEK");
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(&attacker_dek);
+        let ciphertext = if version >= 4 {
+            let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
+            aead.encrypt_with_aad(&nonce, plaintext, &aad)
+                .expect("AEAD encrypt with AAD")
+        } else {
+            aead.encrypt(&nonce, plaintext).expect("AEAD encrypt no AAD")
+        };
+
+        let metadata_blob = build_v4_single_metadata(&wrapped, &nonce, version);
+        let metadata = ObjectMetadata::new()
+            .with_content_type("application/octet-stream")
+            .with_metadata("x-fula-encrypted", "true")
+            .with_metadata("x-fula-encryption", &metadata_blob);
+
+        client
+            .inner()
+            .put_object_with_metadata(bucket, storage_key, Bytes::from(ciphertext), Some(metadata))
+            .await
+            .expect("put forged blob");
+    }
+
+    /// H-1: an attacker who overwrites a single-block ciphertext at a known
+    /// storage_key with a self-consistent fresh-DEK blob must be rejected
+    /// at download time. Without content_hash verification the HPKE-to-
+    /// self substitution would succeed silently.
+    #[tokio::test]
+    async fn content_hash_detects_single_block_substitution() {
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let public_key = encryption.public_key().clone();
+        let secret = encryption.export_secret_key().clone();
+        let bucket = "sec-h1-single-sub";
+
+        let state = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+        let client = make_client(&base, encryption);
+        client.create_bucket(bucket).await.expect("create");
+        client
+            .put_object_flat(bucket, "/a.txt", b"ORIGINAL CONTENT".to_vec(), None)
+            .await
+            .expect("put original");
+
+        let storage_key = locate_storage_key_for_path(&client, bucket, "/a.txt").await;
+
+        forge_single_block_at(
+            &client,
+            &public_key,
+            bucket,
+            &storage_key,
+            b"ATTACKER SUBSTITUTED CONTENT",
+            4,
+        )
+        .await;
+
+        drop(client);
+        let reader = make_client(&base, EncryptionConfig::from_secret_key(secret));
+        let result = reader.get_object_flat(bucket, "/a.txt").await;
+
+        let err = match result {
+            Ok(bytes) => panic!(
+                "content_hash must reject single-block substitution; got Ok({} bytes): {:?}",
+                bytes.len(),
+                bytes
+            ),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err).to_lowercase();
+        assert!(
+            msg.contains("content_hash")
+                || msg.contains("integrity")
+                || msg.contains("mismatch"),
+            "error should mention content_hash / integrity / mismatch; got: {}",
+            msg
+        );
+    }
+
+    /// H-1 for chunked files: an attacker rebuilds the entire Bao tree
+    /// under a fresh DEK at the victim's storage_key. AEAD + Bao all
+    /// verify (attacker controlled every input) — only the forest-pinned
+    /// `content_hash` catches it.
+    #[tokio::test]
+    async fn content_hash_detects_chunked_tree_substitution() {
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let public_key = encryption.public_key().clone();
+        let secret = encryption.export_secret_key().clone();
+        let bucket = "sec-h1-chunked-sub";
+
+        let state = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+        let client = make_client(&base, encryption);
+        client.create_bucket(bucket).await.expect("create");
+
+        // > 768 KB triggers chunked upload.
+        let original_plaintext = vec![b'O'; 1_200_000];
+        client
+            .put_object_flat(bucket, "/big.bin", original_plaintext.clone(), None)
+            .await
+            .expect("put original chunked");
+
+        let storage_key = locate_storage_key_for_path(&client, bucket, "/big.bin").await;
+
+        // Purge all of the legit chunk blobs so the attacker's chunks don't
+        // have to exactly match the legit chunk count. We keep the main
+        // storage_key (we'll overwrite it) but delete every `.chunks/*`
+        // under it.
+        let chunk_prefix = format!("{}.chunks/", storage_key);
+        let legit_chunks = client
+            .inner()
+            .list_objects(
+                bucket,
+                Some(ListObjectsOptions {
+                    prefix: Some(chunk_prefix.clone()),
+                    max_keys: Some(500),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("list legit chunks")
+            .objects;
+        for obj in &legit_chunks {
+            client
+                .inner()
+                .delete_object(bucket, &obj.key)
+                .await
+                .expect("delete legit chunk");
+        }
+
+        // Attacker rebuilds the full tree with fresh DEK + fresh plaintext.
+        let attacker_plaintext = vec![b'X'; 1_200_000];
+        let attacker_dek = DekKey::generate();
+        let wrapped = Encryptor::new(&public_key)
+            .encrypt_dek(&attacker_dek)
+            .expect("wrap attacker DEK");
+
+        let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
+        let mut encoder = ChunkedEncoder::with_aad(attacker_dek.clone(), aad_prefix);
+        let mut chunks = encoder
+            .update(&attacker_plaintext)
+            .expect("encode attacker chunks");
+        let (final_chunk, chunked_metadata, _outboard) =
+            encoder.finalize().expect("finalize attacker chunks");
+        if let Some(c) = final_chunk {
+            chunks.push(c);
+        }
+
+        for chunk in chunks {
+            let chunk_key = ChunkedFileMetadata::chunk_key(&storage_key, chunk.index);
+            let metadata = ObjectMetadata::new()
+                .with_content_type("application/octet-stream")
+                .with_metadata("x-fula-chunk", "true")
+                .with_metadata("x-fula-chunk-index", &chunk.index.to_string());
+            client
+                .inner()
+                .put_object_with_metadata(bucket, &chunk_key, chunk.ciphertext, Some(metadata))
+                .await
+                .expect("put attacker chunk");
+        }
+
+        let enc_metadata = serde_json::json!({
+            "version": 4,
+            "algorithm": "AES-256-GCM",
+            "wrapped_key": serde_json::to_value(&wrapped).unwrap(),
+            "kek_version": 1,
+            "metadata_privacy": true,
+            "obfuscation_mode": "flat",
+            "chunked": serde_json::to_value(&chunked_metadata).unwrap(),
+        });
+        let main_meta = ObjectMetadata::new()
+            .with_content_type("application/octet-stream")
+            .with_metadata("x-fula-encrypted", "true")
+            .with_metadata("x-fula-chunked", "true")
+            .with_metadata("x-fula-encryption", &enc_metadata.to_string());
+        client
+            .inner()
+            .put_object_with_metadata(
+                bucket,
+                &storage_key,
+                Bytes::from_static(b"CHUNKED"),
+                Some(main_meta),
+            )
+            .await
+            .expect("put forged main index");
+
+        drop(client);
+        let reader = make_client(&base, EncryptionConfig::from_secret_key(secret));
+        let result = reader.get_object_flat(bucket, "/big.bin").await;
+
+        let err = match result {
+            Ok(bytes) => panic!(
+                "content_hash must reject chunked tree substitution; got Ok({} bytes)",
+                bytes.len()
+            ),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err).to_lowercase();
+        assert!(
+            msg.contains("content_hash")
+                || msg.contains("integrity")
+                || msg.contains("mismatch"),
+            "error should mention content_hash / integrity / mismatch; got: {}",
+            msg
+        );
+    }
+
+    /// H-2: an attacker writes a self-consistent v2-format (no-AAD) blob
+    /// at a storage_key pinned by the forest entry's `min_version = 4`.
+    /// The pre-decrypt gate must fire and reject with VersionDowngrade
+    /// before any AEAD work runs.
+    #[tokio::test]
+    async fn version_downgrade_rejected_on_v4_entry() {
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let public_key = encryption.public_key().clone();
+        let secret = encryption.export_secret_key().clone();
+        let bucket = "sec-h2-downgrade";
+
+        let state = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+        let client = make_client(&base, encryption);
+        client.create_bucket(bucket).await.expect("create");
+        client
+            .put_object_flat(bucket, "/v4.txt", b"v4-protected".to_vec(), None)
+            .await
+            .expect("put legit v4");
+
+        let storage_key = locate_storage_key_for_path(&client, bucket, "/v4.txt").await;
+
+        forge_single_block_at(
+            &client,
+            &public_key,
+            bucket,
+            &storage_key,
+            b"ATTACKER DOWNGRADE CONTENT",
+            2,
+        )
+        .await;
+
+        drop(client);
+        let reader = make_client(&base, EncryptionConfig::from_secret_key(secret));
+        let result = reader.get_object_flat(bucket, "/v4.txt").await;
+
+        let err = match result {
+            Ok(bytes) => panic!(
+                "min_version must reject v2 downgrade; got Ok({} bytes): {:?}",
+                bytes.len(),
+                bytes
+            ),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err).to_lowercase();
+        assert!(
+            msg.contains("downgrade") || msg.contains("version"),
+            "error should mention downgrade / version; got: {}",
+            msg
+        );
+    }
+
+    /// Legacy / backwards-compat: an entry carried through the v1 → v7
+    /// migration has `content_hash: None` and `min_version: 0`. The
+    /// download path must NOT falsely reject those entries — the check
+    /// is strictly additive for new uploads.
+    ///
+    /// Flow:
+    /// 1. Upload `/legit.txt` via the normal v4 path. Capture the
+    ///    storage_key the client derived for that path.
+    /// 2. Hand-build a v1 `PrivateForest` whose `/legit.txt` entry points
+    ///    at the SAME storage_key but leaves `content_hash: None` and
+    ///    `min_version: 0` (legacy shape). Overwrite the bucket's
+    ///    `index_key` with that v1 blob, simulating a pre-migration
+    ///    state that still references the v4 ciphertext.
+    /// 3. Fresh reader cold-starts, sees a v1 forest at load time, migrates
+    ///    it to v7 (carrying the legacy flags forward per the migration
+    ///    contract), then reads `/legit.txt`. Download succeeds because
+    ///    `enforce_content_hash` skips entries with `content_hash: None`
+    ///    and `enforce_min_version` passes entries with `min_version = 0`.
+    #[tokio::test]
+    async fn content_hash_none_permits_legacy_read() {
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let secret = encryption.export_secret_key().clone();
+        let bucket = "sec-h1-legacy-read";
+
+        let state = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+        let client = make_client(&base, encryption);
+        client.create_bucket(bucket).await.expect("create");
+        let plaintext = b"LEGACY-ERA CONTENT".to_vec();
+        client
+            .put_object_flat(bucket, "/legit.txt", plaintext.clone(), None)
+            .await
+            .expect("put legit");
+
+        let storage_key = locate_storage_key_for_path(&client, bucket, "/legit.txt").await;
+
+        // Seed a v1 forest entry pointing at the same storage_key as the v4
+        // upload but with legacy flags (content_hash=None, min_version=0).
+        // `seed_v1_forest` uses `storage_key_for_seed(path)` by default;
+        // override by mutating the SeedFile field directly.
+        let mut sf = SeedFile::new("/legit.txt", plaintext.len() as u64);
+        sf.storage_key = storage_key.clone();
+        sf.content_hash = None;
+        sf.encrypted = true;
+        let v1_forest = build_v1_private_forest(&[sf], &[]);
+        let km = client.encryption_config().key_manager();
+        let forest_dek = km.derive_path_key(&format!("forest:{}", bucket));
+        let enc = EncryptedForest::encrypt(&v1_forest, &forest_dek).expect("encrypt v1");
+        assert_eq!(enc.version, 1);
+        assert!(enc.sequence.is_none());
+        let bytes = enc.to_bytes().expect("serialize v1");
+        let index_key = index_key_for(&client, bucket);
+        client
+            .inner()
+            .put_object(bucket, &index_key, Bytes::from(bytes))
+            .await
+            .expect("overwrite manifest with v1");
+
+        drop(client);
+        let reader = make_client(&base, EncryptionConfig::from_secret_key(secret));
+        let result = reader
+            .get_object_flat(bucket, "/legit.txt")
+            .await
+            .expect("legacy entry (content_hash=None) must read successfully");
+        assert_eq!(
+            result.as_ref(),
+            plaintext.as_slice(),
+            "legacy-path read must return the original v4 plaintext unchanged"
         );
     }
 }

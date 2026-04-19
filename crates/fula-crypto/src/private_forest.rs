@@ -138,6 +138,13 @@ pub struct ForestFileEntry {
     /// (audit finding C-AUDIT-004).
     #[serde(default)]
     pub encrypted: bool,
+    /// Minimum blob-format version the client must accept for this entry.
+    /// `0` on legacy entries (pre-H-2); `4` once the entry is written under
+    /// v4 AAD-bound encryption. Read paths reject blobs whose declared
+    /// `version` is below this floor (audit finding H-2, defense-in-depth
+    /// against downgrade-to-no-AAD when a bucket mixes v1/v2 legacy data).
+    #[serde(default)]
+    pub min_version: u8,
 }
 
 impl ForestFileEntry {
@@ -157,14 +164,21 @@ impl ForestFileEntry {
             content_hash: metadata.content_hash.clone(),
             user_metadata: metadata.user_metadata.clone(),
             encrypted: false,
+            min_version: 0,
         }
     }
 
-    /// Mark this entry as "must be fetched encrypted". Used by the client
-    /// immediately after a successful encrypted PUT so future reads can
-    /// refuse to accept a plaintext response from the storage backend.
+    /// Mark this entry as "must be fetched encrypted" and pin it to the
+    /// v4 blob-format floor. Used by the client immediately after a
+    /// successful encrypted PUT so future reads (a) refuse to accept a
+    /// plaintext response from the storage backend (C-AUDIT-004), and
+    /// (b) refuse to honor an attacker-authored v2-format (no-AAD) blob
+    /// at the same storage_key (H-2).
     pub fn mark_encrypted(&mut self) {
         self.encrypted = true;
+        if self.min_version < 4 {
+            self.min_version = 4;
+        }
     }
 
     /// Get filename from path
@@ -2571,6 +2585,7 @@ mod tests {
             user_metadata: HashMap::new(),
             content_hash: None,
             encrypted: false,
+            min_version: 0,
         });
 
         let encrypted = EncryptedForestShard::encrypt(&shard, &dek).unwrap();
@@ -2649,6 +2664,7 @@ mod tests {
             user_metadata: HashMap::new(),
             content_hash: None,
             encrypted: false,
+            min_version: 0,
         };
 
         forest.upsert_file(entry.clone(), &dek);
@@ -2673,6 +2689,7 @@ mod tests {
             user_metadata: HashMap::new(),
             content_hash: None,
             encrypted: false,
+            min_version: 0,
         };
 
         forest.upsert_file(entry, &dek);
@@ -2701,6 +2718,7 @@ mod tests {
                 user_metadata: HashMap::new(),
                 content_hash: None,
                 encrypted: false,
+                min_version: 0,
             });
         }
 
@@ -2736,6 +2754,7 @@ mod tests {
                 user_metadata: HashMap::new(),
                 content_hash: None,
                 encrypted: false,
+                min_version: 0,
             }, &dek);
         }
 
@@ -2764,6 +2783,7 @@ mod tests {
                 user_metadata: HashMap::new(),
                 content_hash: None,
                 encrypted: false,
+                min_version: 0,
             }, &dek);
         }
 
@@ -2822,6 +2842,7 @@ mod tests {
                     user_metadata: HashMap::new(),
                     content_hash: None,
                     encrypted: false,
+                    min_version: 0,
                 }, &dek);
                 if forest.max_shard_size() > RESHARD_THRESHOLD {
                     break;
@@ -2862,6 +2883,7 @@ mod tests {
                 user_metadata: HashMap::new(),
                 content_hash: None,
                 encrypted: false,
+                min_version: 0,
             }, &dek);
         }
 
@@ -2887,6 +2909,7 @@ mod tests {
                 user_metadata: HashMap::new(),
                 content_hash: None,
                 encrypted: false,
+                min_version: 0,
             }, &dek);
         }
         for i in 0..5 {
@@ -2900,6 +2923,7 @@ mod tests {
                 user_metadata: HashMap::new(),
                 content_hash: None,
                 encrypted: false,
+                min_version: 0,
             }, &dek);
         }
 
@@ -2954,6 +2978,7 @@ mod tests {
                 user_metadata: HashMap::new(),
                 content_hash: None,
                 encrypted: false,
+                min_version: 0,
             }, &dek);
         }
         for i in 0..5 {
@@ -2967,6 +2992,7 @@ mod tests {
                 user_metadata: HashMap::new(),
                 content_hash: None,
                 encrypted: false,
+                min_version: 0,
             }, &dek);
         }
 
@@ -2995,6 +3021,7 @@ mod tests {
             user_metadata: HashMap::new(),
             content_hash: None,
             encrypted: false,
+            min_version: 0,
         });
 
         let enc = EncryptedForest::encrypt_v4(&forest, &dek, "bucket-1", 7).unwrap();
@@ -3076,6 +3103,7 @@ mod tests {
                 user_metadata: HashMap::new(),
                 content_hash: None,
                 encrypted: false,
+                min_version: 0,
             },
         );
         let enc = EncryptedForestShard::encrypt_v2(&shard, &dek, "b", 11).unwrap();

@@ -314,6 +314,70 @@ impl Encryptor {
         aad.extend_from_slice(context);
         self.encrypt_with_aad(dek.as_bytes(), &aad)
     }
+
+    /// Encrypt for the recipient with HPKE Auth mode, binding the sender's
+    /// long-term X25519 keypair into the HPKE key schedule (RFC 9180 §5 mode
+    /// `auth`). Unlike Base mode, this authenticates that `sender` possessed
+    /// their secret key at encrypt time — an attacker who knows the recipient
+    /// pk (public) cannot forge an Auth-mode ciphertext claiming a given
+    /// sender pk without the matching secret.
+    ///
+    /// `aad` is authenticated but not encrypted. Callers should bind the
+    /// recipient pk (or its hash) into `aad` so captures cannot be replayed
+    /// to a different recipient of the same sender.
+    ///
+    /// Returns `EncryptedData` with `version = 2` (same envelope format as
+    /// Base mode — the Auth binding lives inside the HPKE context, not the
+    /// on-wire header).
+    pub fn encrypt_for_recipient_auth(
+        &self,
+        sender: &KekKeyPair,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<EncryptedData> {
+        let pk_recip = <X25519HkdfSha256 as Kem>::PublicKey::from_bytes(
+            self.recipient_public.as_bytes(),
+        )
+        .map_err(|e| CryptoError::Encryption(format!("Invalid recipient public key: {:?}", e)))?;
+
+        let sk_sender = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(
+            sender.secret_key().as_bytes(),
+        )
+        .map_err(|e| CryptoError::Encryption(format!("Invalid sender secret key: {:?}", e)))?;
+        let pk_sender = <X25519HkdfSha256 as Kem>::PublicKey::from_bytes(
+            sender.public_key().as_bytes(),
+        )
+        .map_err(|e| CryptoError::Encryption(format!("Invalid sender public key: {:?}", e)))?;
+
+        let mut csprng = HpkeRng;
+        let (encapped_key, ciphertext) = hpke::single_shot_seal::<
+            ChaCha20Poly1305,
+            HkdfSha256,
+            X25519HkdfSha256,
+            _,
+        >(
+            &OpModeS::Auth((sk_sender, pk_sender)),
+            &pk_recip,
+            HPKE_INFO,
+            plaintext,
+            aad,
+            &mut csprng,
+        )
+        .map_err(|e| CryptoError::Encryption(format!("HPKE auth encryption failed: {:?}", e)))?;
+
+        let enc_bytes = encapped_key.to_bytes();
+        let mut enc_array = [0u8; 32];
+        enc_array.copy_from_slice(&enc_bytes);
+
+        Ok(EncryptedData {
+            version: 2,
+            encapsulated_key: EncapsulatedKey {
+                ephemeral_public: enc_array,
+            },
+            cipher: AeadCipher::ChaCha20Poly1305,
+            ciphertext,
+        })
+    }
 }
 
 /// Decryptor for RFC 9180 HPKE-based decryption
@@ -415,6 +479,52 @@ impl Decryptor {
         aad.extend_from_slice(context);
         let bytes = Zeroizing::new(self.decrypt_with_aad(encrypted, &aad)?);
         DekKey::from_bytes(&bytes)
+    }
+
+    /// Decrypt a ciphertext produced by [`Encryptor::encrypt_for_recipient_auth`].
+    ///
+    /// Verifies that the sender possessed the secret key matching
+    /// `sender_public_key` at encrypt time. A mismatch (tampered claim,
+    /// forged ciphertext, or a captured Base-mode envelope replayed with a
+    /// fabricated sender pk) surfaces as a generic `authentication failed`
+    /// error — mode-ID, KEM, and AEAD checks are indistinguishable from the
+    /// caller's perspective.
+    pub fn decrypt_for_recipient_auth(
+        &self,
+        sender_public_key: &PublicKey,
+        encrypted: &EncryptedData,
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
+        let sk_recip = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(
+            self.secret.as_bytes(),
+        )
+        .map_err(|e| CryptoError::Decryption(format!("Invalid secret key: {:?}", e)))?;
+
+        let pk_sender = <X25519HkdfSha256 as Kem>::PublicKey::from_bytes(
+            sender_public_key.as_bytes(),
+        )
+        .map_err(|_| CryptoError::Decryption("authentication failed".to_string()))?;
+
+        let enc_key = <X25519HkdfSha256 as Kem>::EncappedKey::from_bytes(
+            encrypted.encapsulated_key.as_bytes(),
+        )
+        .map_err(|_| CryptoError::Decryption("authentication failed".to_string()))?;
+
+        let plaintext = hpke::single_shot_open::<
+            ChaCha20Poly1305,
+            HkdfSha256,
+            X25519HkdfSha256,
+        >(
+            &OpModeR::Auth(pk_sender),
+            &sk_recip,
+            &enc_key,
+            HPKE_INFO,
+            &encrypted.ciphertext,
+            aad,
+        )
+        .map_err(|_| CryptoError::Decryption("authentication failed".to_string()))?;
+
+        Ok(plaintext)
     }
 }
 

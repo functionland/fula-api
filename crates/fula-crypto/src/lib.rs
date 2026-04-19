@@ -106,18 +106,14 @@ pub use keys::{DekKey, KekKeyPair, KeyManager, PublicKey, SecretKey};
 pub use private_forest::{
     PrivateForest, EncryptedForest, ForestFileEntry, ForestDirectoryEntry, ForestFormat,
     derive_index_key, generate_flat_key,
-    // Sharded forest (S-001)
-    ShardManifest, ForestShard, EncryptedShardManifest, EncryptedForestShard,
-    ShardedPrivateForest, ForestEvent, ForestOrManifest,
-    detect_forest_format, derive_shard_key, shard_for_path, compute_initial_shard_count,
-    RESHARD_THRESHOLD, MAX_SHARDS,
+    ForestEvent, ForestOrManifest,
+    detect_forest_format, derive_shard_key, compute_initial_shard_count,
+    MAX_SHARDS,
     // Sharded-HAMT forest (v7)
     ShardV7, ShardManifestV7, EncryptedShardManifestV7,
     V7StorageKey, V7_STORAGE_KEY_LEN,
     manifest_v7_aad, hamt_node_v7_aad, compute_v7_node_key,
 };
-#[allow(deprecated)]
-pub use private_forest::SHARDED_MIGRATION_THRESHOLD;
 pub use wnfs_hamt::{BlobBackend, V7NodeStore, V7_NODE_PREFIX};
 pub use private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, PublicMetadata, KeyObfuscation, obfuscate_key};
 pub use rotation::{KeyRotationManager, FileSystemRotation, WrappedKeyInfo, RotationResult};
