@@ -264,6 +264,111 @@ impl ShareToken {
     }
 }
 
+/// Share-token AAD version 4 sentinel. Tokens with `version >= SHARE_TOKEN_AAD_V4`
+/// bind every non-`wrapped_key` field into the DEK-wrap AAD.
+pub(crate) const SHARE_TOKEN_AAD_V4: u8 = 4;
+
+/// Build the canonical AAD bytes that bind share-token metadata to the wrapped DEK.
+///
+/// The encoding is a fixed, length-prefixed binary form (NOT serde_json), because
+/// JSON is non-canonical across language/version boundaries. Every non-wrapped_key
+/// field of `ShareToken` is covered; any mutation collapses AEAD authenticity and
+/// yields a generic "authentication failed" on unwrap.
+///
+/// Layout (all integers big-endian):
+/// - domain: `b"fula:v4:share-token|"` (constant, outside the caller-controlled region)
+/// - id: `<u32 len><bytes>`
+/// - path_scope: `<u32 len><bytes>`
+/// - expires_at: `<u8 tag>` then `<i64>` if Some
+/// - created_at: `<i64>`
+/// - permissions: `[can_read, can_write, can_delete]` each as `u8` 0/1
+/// - version: `<u8>`
+/// - mode: `<u8>` (0=Temporal, 1=Snapshot)
+/// - snapshot_binding: `<u8 tag>` then for Some:
+///     `<u32 len><content_hash bytes>`
+///     `<u64 size>` `<i64 modified_at>`
+///     `<u8 tag>` then `<u32 len><storage_key bytes>` if Some
+/// - nonce: `<u8 tag>` then `<u32 len><bytes>` if Some
+/// - chunked_metadata: `<u8 tag>` then `<u32 len><bytes>` if Some
+/// - encryption_version: `<u8 tag>` then `<u8>` if Some
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_share_token_aad(
+    id: &str,
+    path_scope: &str,
+    expires_at: Option<i64>,
+    created_at: i64,
+    permissions: &SharePermissions,
+    version: u8,
+    mode: ShareMode,
+    snapshot_binding: Option<&SnapshotBinding>,
+    nonce: Option<&[u8]>,
+    chunked_metadata: Option<&[u8]>,
+    encryption_version: Option<u8>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(b"fula:v4:share-token|");
+
+    fn push_bytes(out: &mut Vec<u8>, b: &[u8]) {
+        debug_assert!(
+            b.len() <= u32::MAX as usize,
+            "share token AAD field exceeds u32 length prefix"
+        );
+        out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+        out.extend_from_slice(b);
+    }
+    fn push_opt_bytes(out: &mut Vec<u8>, b: Option<&[u8]>) {
+        match b {
+            None => out.push(0u8),
+            Some(bytes) => {
+                out.push(1u8);
+                push_bytes(out, bytes);
+            }
+        }
+    }
+
+    push_bytes(&mut out, id.as_bytes());
+    push_bytes(&mut out, path_scope.as_bytes());
+
+    match expires_at {
+        None => out.push(0u8),
+        Some(ts) => {
+            out.push(1u8);
+            out.extend_from_slice(&ts.to_be_bytes());
+        }
+    }
+    out.extend_from_slice(&created_at.to_be_bytes());
+    out.push(permissions.can_read as u8);
+    out.push(permissions.can_write as u8);
+    out.push(permissions.can_delete as u8);
+    out.push(version);
+    out.push(match mode {
+        ShareMode::Temporal => 0u8,
+        ShareMode::Snapshot => 1u8,
+    });
+
+    match snapshot_binding {
+        None => out.push(0u8),
+        Some(b) => {
+            out.push(1u8);
+            push_bytes(&mut out, b.content_hash.as_bytes());
+            out.extend_from_slice(&b.size.to_be_bytes());
+            out.extend_from_slice(&b.modified_at.to_be_bytes());
+            push_opt_bytes(&mut out, b.storage_key.as_deref().map(|s| s.as_bytes()));
+        }
+    }
+
+    push_opt_bytes(&mut out, nonce);
+    push_opt_bytes(&mut out, chunked_metadata);
+    match encryption_version {
+        None => out.push(0u8),
+        Some(v) => {
+            out.push(1u8);
+            out.push(v);
+        }
+    }
+    out
+}
+
 /// Builder for creating share tokens
 pub struct ShareBuilder<'a> {
     #[allow(dead_code)] // Reserved for future signing of share tokens
@@ -399,6 +504,12 @@ impl<'a> ShareBuilder<'a> {
     }
 
     /// Build the share token
+    ///
+    /// Produces a `version = 4` token whose wrapped DEK binds every metadata
+    /// field (path_scope, expiry, permissions, mode, snapshot_binding, nonce,
+    /// chunked_metadata, encryption_version, id, created_at) into AAD. Any
+    /// post-build mutation of those fields causes `accept_share` to fail with
+    /// a generic authentication error.
     pub fn build(self) -> Result<ShareToken> {
         // Validate snapshot mode has binding
         if self.mode == ShareMode::Snapshot && self.snapshot_binding.is_none() {
@@ -409,19 +520,37 @@ impl<'a> ShareBuilder<'a> {
 
         // Generate a unique share ID
         let id = generate_share_id();
+        let created_at = current_timestamp();
+        let version = SHARE_TOKEN_AAD_V4;
 
-        // Encrypt the DEK for the recipient
+        // Build the AAD over every field we will store in the token. The
+        // wrapped_key itself is excluded (it IS the ciphertext).
+        let aad = build_share_token_aad(
+            &id,
+            &self.path_scope,
+            self.expires_at,
+            created_at,
+            &self.permissions,
+            version,
+            self.mode,
+            self.snapshot_binding.as_ref(),
+            self.nonce.as_deref().map(|s| s.as_bytes()),
+            self.chunked_metadata.as_deref().map(|s| s.as_bytes()),
+            self.encryption_version,
+        );
+
+        // Encrypt the DEK for the recipient, binding the AAD.
         let encryptor = Encryptor::new(self.recipient_public_key);
-        let wrapped_key = encryptor.encrypt_dek(self.dek)?;
+        let wrapped_key = encryptor.encrypt_dek_with_context(self.dek, &aad)?;
 
         Ok(ShareToken {
             id,
             wrapped_key,
             path_scope: self.path_scope,
             expires_at: self.expires_at,
-            created_at: current_timestamp(),
+            created_at,
             permissions: self.permissions,
-            version: 3, // Bump version for new format with nonce
+            version,
             mode: self.mode,
             snapshot_binding: self.snapshot_binding,
             nonce: self.nonce,
@@ -571,15 +700,45 @@ impl ShareRecipient {
     }
 
     /// Decrypt and validate a share token
+    ///
+    /// For `version >= 4` tokens the metadata fields are bound into the
+    /// wrap-AAD. Any mutation (path_scope, expiry, permissions, mode,
+    /// snapshot_binding, nonce, chunked_metadata, encryption_version, id,
+    /// created_at) causes decryption to fail with a generic authentication
+    /// error. `version < 4` tokens use the legacy unauthenticated path for
+    /// backward compatibility with tokens issued before this change.
+    ///
+    /// The version gate is strict: there is no fallback-on-failure. A failed
+    /// v4 unwrap must NEVER silently retry the legacy path, because that would
+    /// give an attacker a downgrade oracle to strip AAD binding.
     pub fn accept_share(&self, token: &ShareToken) -> Result<AcceptedShare> {
         // Check expiry first
         if token.is_expired() {
             return Err(CryptoError::ShareExpired);
         }
 
-        // Decrypt the DEK
         let decryptor = Decryptor::from_secret_key(&self.secret_key);
-        let dek = decryptor.decrypt_dek(&token.wrapped_key)?;
+        let dek = if token.version >= SHARE_TOKEN_AAD_V4 {
+            // Rebuild the AAD over the exact fields we observe on the token.
+            // Any mutation produces a different AAD → generic auth failure.
+            let aad = build_share_token_aad(
+                &token.id,
+                &token.path_scope,
+                token.expires_at,
+                token.created_at,
+                &token.permissions,
+                token.version,
+                token.mode,
+                token.snapshot_binding.as_ref(),
+                token.nonce.as_deref().map(|s| s.as_bytes()),
+                token.chunked_metadata.as_deref().map(|s| s.as_bytes()),
+                token.encryption_version,
+            );
+            decryptor.decrypt_dek_with_context(&token.wrapped_key, &aad)?
+        } else {
+            // Legacy (version < 4) tokens: no AAD binding.
+            decryptor.decrypt_dek(&token.wrapped_key)?
+        };
 
         Ok(AcceptedShare {
             dek,
@@ -1222,6 +1381,294 @@ mod tests {
             );
 
             println!("Test case {}: PASSED", i);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // F2: Share-Token Metadata AAD Binding
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // Every non-`wrapped_key` field on a `version >= 4` ShareToken is bound
+    // into the wrap-AAD. Any mutation of those fields must cause `accept_share`
+    // to fail with a generic authentication error, proving a recipient cannot
+    // silently widen scope / strip expiry / elevate permissions by rewriting
+    // the outer struct.
+    mod f2_share_token_aad_binding {
+        use super::*;
+
+        /// `AcceptedShare` does not derive `Debug`, so `Result::unwrap_err` is
+        /// unusable. This helper asserts a generic decryption failure.
+        fn assert_auth_failure(result: Result<AcceptedShare>) {
+            match result {
+                Ok(_) => panic!("expected auth failure, got Ok"),
+                Err(CryptoError::Decryption(_)) => {}
+                Err(other) => panic!("expected Decryption error, got {:?}", other),
+            }
+        }
+
+        fn build_v4_token() -> (KekKeyPair, KekKeyPair, DekKey, ShareToken) {
+            let owner = KekKeyPair::generate();
+            let recipient = KekKeyPair::generate();
+            let dek = DekKey::generate();
+            let token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+                .path_scope("/photos/vacation/")
+                .expires_in(3600)
+                .read_only()
+                .nonce("nonce-b64-abc")
+                .chunked_metadata(r#"{"chunks":1}"#)
+                .encryption_version(4)
+                .build()
+                .unwrap();
+            (owner, recipient, dek, token)
+        }
+
+        #[test]
+        fn round_trip_v4_succeeds() {
+            let (_owner, recipient, dek, token) = build_v4_token();
+            assert_eq!(token.version, SHARE_TOKEN_AAD_V4);
+            let accepted = ShareRecipient::new(&recipient).accept_share(&token).unwrap();
+            assert_eq!(accepted.dek.as_bytes(), dek.as_bytes());
+            assert_eq!(accepted.path_scope, "/photos/vacation/");
+        }
+
+        #[test]
+        fn mutated_path_scope_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.path_scope = "/".to_string();
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn mutated_expires_at_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.expires_at = Some(current_timestamp() + 86400 * 365);
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn removed_expiry_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.expires_at = None;
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn mutated_created_at_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.created_at = 1;
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn mutated_permissions_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.permissions = SharePermissions::full();
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn mutated_mode_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.mode = ShareMode::Snapshot;
+            token.snapshot_binding = Some(SnapshotBinding::new("h", 0, 0));
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn mutated_snapshot_binding_rejected() {
+            let owner = KekKeyPair::generate();
+            let recipient = KekKeyPair::generate();
+            let dek = DekKey::generate();
+            let mut token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+                .path_scope("/snap/")
+                .snapshot(SnapshotBinding::new("hash-a", 100, 1000))
+                .build()
+                .unwrap();
+            // Swap the binding to a different content-hash
+            token.snapshot_binding = Some(SnapshotBinding::new("hash-b", 100, 1000));
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn mutated_nonce_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.nonce = Some("different-nonce".to_string());
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn removed_nonce_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.nonce = None;
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn added_nonce_rejected() {
+            let owner = KekKeyPair::generate();
+            let recipient = KekKeyPair::generate();
+            let dek = DekKey::generate();
+            // Build a token WITHOUT nonce
+            let mut token = ShareBuilder::new(&owner, recipient.public_key(), &dek)
+                .build()
+                .unwrap();
+            assert!(token.nonce.is_none());
+            // Attempt to inject a nonce the producer never signed
+            token.nonce = Some("injected".to_string());
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn mutated_chunked_metadata_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.chunked_metadata = Some(r#"{"chunks":2}"#.to_string());
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn mutated_encryption_version_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.encryption_version = Some(2);
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn mutated_id_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.id = "deadbeef".to_string();
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn downgraded_version_rejected() {
+            // An attacker rewrites version back to 3 so a downstream reader
+            // takes the legacy (unauthenticated) path. Because wrapped_key was
+            // produced with v4 AAD, the legacy path's `fula:v2:dek-wrap` AAD
+            // won't match → generic auth failure. No downgrade oracle.
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.version = 3;
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&token));
+        }
+
+        #[test]
+        fn cross_token_wrapped_key_substitution_rejected() {
+            // Attacker takes wrapped_key from token B and pastes it onto
+            // token A's metadata. Both were built v4, but the AADs differ by
+            // at least the `id` → token A no longer unwraps.
+            let owner = KekKeyPair::generate();
+            let recipient = KekKeyPair::generate();
+            let dek_a = DekKey::generate();
+            let dek_b = DekKey::generate();
+            let token_a = ShareBuilder::new(&owner, recipient.public_key(), &dek_a)
+                .path_scope("/a/")
+                .build()
+                .unwrap();
+            let token_b = ShareBuilder::new(&owner, recipient.public_key(), &dek_b)
+                .path_scope("/b/")
+                .build()
+                .unwrap();
+            let mut franken = token_a.clone();
+            franken.wrapped_key = token_b.wrapped_key.clone();
+            assert_auth_failure(ShareRecipient::new(&recipient).accept_share(&franken));
+        }
+
+        #[test]
+        fn legacy_v3_token_still_decrypts_via_legacy_path() {
+            // Simulate a pre-F2 token on the wire: version < 4, wrapped with
+            // plain `encrypt_dek`. Recipient must still accept via legacy
+            // path so existing deployed tokens continue to work.
+            let recipient = KekKeyPair::generate();
+            let dek = DekKey::generate();
+
+            let encryptor = Encryptor::new(recipient.public_key());
+            let wrapped_key = encryptor.encrypt_dek(&dek).unwrap();
+
+            let legacy_token = ShareToken {
+                id: "legacy".to_string(),
+                wrapped_key,
+                path_scope: "/legacy/".to_string(),
+                expires_at: None,
+                created_at: current_timestamp(),
+                permissions: SharePermissions::read_only(),
+                version: 3, // Pre-AAD-binding
+                mode: ShareMode::Temporal,
+                snapshot_binding: None,
+                nonce: None,
+                chunked_metadata: None,
+                encryption_version: None,
+            };
+
+            let accepted = ShareRecipient::new(&recipient)
+                .accept_share(&legacy_token)
+                .expect("legacy v3 token must accept via legacy path");
+            assert_eq!(accepted.dek.as_bytes(), dek.as_bytes());
+        }
+
+        #[test]
+        fn legacy_v3_with_mutated_fields_still_decrypts() {
+            // By construction v3 does NOT bind metadata. Mutating fields on a
+            // v3 token MUST still succeed — this is the backward-compat
+            // envelope. We document it explicitly so the semantics are clear.
+            let recipient = KekKeyPair::generate();
+            let dek = DekKey::generate();
+            let encryptor = Encryptor::new(recipient.public_key());
+            let wrapped_key = encryptor.encrypt_dek(&dek).unwrap();
+
+            let mut legacy_token = ShareToken {
+                id: "legacy".to_string(),
+                wrapped_key,
+                path_scope: "/a/".to_string(),
+                expires_at: None,
+                created_at: current_timestamp(),
+                permissions: SharePermissions::read_only(),
+                version: 3,
+                mode: ShareMode::Temporal,
+                snapshot_binding: None,
+                nonce: None,
+                chunked_metadata: None,
+                encryption_version: None,
+            };
+            // Mutate a field — legacy path doesn't bind it, so decryption
+            // still succeeds. This is the *reason* F2 needed to happen; the
+            // test exists to make the behaviour regression-visible.
+            legacy_token.path_scope = "/mutated/".to_string();
+            let accepted = ShareRecipient::new(&recipient)
+                .accept_share(&legacy_token)
+                .expect("legacy path is intentionally non-binding");
+            assert_eq!(accepted.dek.as_bytes(), dek.as_bytes());
+        }
+
+        #[test]
+        fn aad_encoding_is_canonical_for_identical_inputs() {
+            // Two AADs built from the same inputs must be byte-identical.
+            let perms = SharePermissions::read_write();
+            let aad1 = build_share_token_aad(
+                "id-x", "/p/", Some(123), 456, &perms, 4, ShareMode::Temporal,
+                None, Some(b"n"), Some(b"m"), Some(4),
+            );
+            let aad2 = build_share_token_aad(
+                "id-x", "/p/", Some(123), 456, &perms, 4, ShareMode::Temporal,
+                None, Some(b"n"), Some(b"m"), Some(4),
+            );
+            assert_eq!(aad1, aad2);
+            // Any single-bit change in input yields a different AAD
+            let aad3 = build_share_token_aad(
+                "id-x", "/p/", Some(124), 456, &perms, 4, ShareMode::Temporal,
+                None, Some(b"n"), Some(b"m"), Some(4),
+            );
+            assert_ne!(aad1, aad3);
+        }
+
+        #[test]
+        fn aad_domain_prefix_prevents_cross_context_substitution() {
+            // The share-token AAD prefix must differ from the subtree prefix.
+            // Otherwise a subtree token's wrapped DEK could be pasted into
+            // a share-token envelope.
+            let aad = build_share_token_aad(
+                "id", "/", None, 0, &SharePermissions::read_only(), 4,
+                ShareMode::Temporal, None, None, None, None,
+            );
+            assert!(aad.starts_with(b"fula:v4:share-token|"));
         }
     }
 }

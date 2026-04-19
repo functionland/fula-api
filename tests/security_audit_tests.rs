@@ -1,6 +1,8 @@
 //! Security Audit Tests
-//! 
+//!
 //! Tests to verify security audit fixes are working correctly.
+
+mod common;
 
 /// Test module for bucket ownership checks (Finding #1)
 mod bucket_ownership {
@@ -541,9 +543,486 @@ mod rotation_integration {
         // Rotate and clear previous
         manager.rotate_kek().unwrap();
         manager.clear_previous();
-        
+
         // Should NOT be able to unwrap v1 anymore
         let result = manager.unwrap_dek(&wrapped_v1);
         assert!(result.is_err());
+    }
+}
+
+/// Integration-level migration security tests — closes audit gaps G5 (v1 → v7
+/// migration security) and G9 (AAD-swap attacks). These run the full
+/// `EncryptedClient` stack against the in-process gateway defined in
+/// `tests/common/mod.rs` and exercise attack scenarios that can't be
+/// reproduced with pure crypto-unit tests.
+mod migration_security {
+    use super::common::v1_seed::{seed_v1_forest, index_key_for, SeedFile};
+    use super::common::{spawn_server, make_client, EnvGuard};
+    use bytes::Bytes;
+    use fula_client::EncryptionConfig;
+
+    /// The `__fula_forest_v1_backup/<unix_ms>` object that migration writes
+    /// before overwriting `index_key` must be the encrypted v1 blob — NOT
+    /// a raw-JSON dump. Decrypting requires the bucket's forest DEK; a
+    /// server compromise that exfiltrates the backup must not reveal the
+    /// plaintext forest index.
+    #[tokio::test]
+    async fn test_migration_v1_backup_is_encrypted() {
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let bucket = "sec-v1-backup-enc";
+
+        let state = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+        let client = make_client(&base, encryption);
+        client.create_bucket(bucket).await.expect("create bucket");
+        seed_v1_forest(&client, bucket, &[SeedFile::new("/a.txt", 4)], &[]).await;
+
+        client.migrate_to_sharded(bucket).await.expect("migrate");
+
+        use fula_client::ListObjectsOptions;
+        let backups = client
+            .inner()
+            .list_objects(
+                bucket,
+                Some(ListObjectsOptions {
+                    prefix: Some("__fula_forest_v1_backup/".to_string()),
+                    max_keys: Some(10),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("list backups")
+            .objects;
+        assert_eq!(backups.len(), 1, "migration must write exactly one backup");
+
+        let backup = client
+            .inner()
+            .get_object(bucket, &backups[0].key)
+            .await
+            .expect("get backup");
+
+        // The v1 EncryptedForest envelope IS plaintext JSON at the outer
+        // level but wraps AEAD-encrypted inner ciphertext (see
+        // `private_forest.rs::EncryptedForest`). We verify the backup is
+        // semantically the original v1 blob — meaning it round-trips
+        // through `decrypt` under the bucket's forest DEK and yields the
+        // same files we seeded. If the backup were a naive plaintext dump
+        // of `PrivateForest` (no AEAD layer), `decrypt` would fail.
+        use fula_crypto::EncryptedForest;
+        let outer: EncryptedForest = serde_json::from_slice(&backup)
+            .expect("v1 backup must deserialize as EncryptedForest");
+        assert_eq!(outer.version, 1, "backup must be v1 shape");
+        assert!(!outer.ciphertext.is_empty(), "backup must carry a ciphertext field");
+        let km = client.encryption_config().key_manager();
+        let forest_dek = km.derive_path_key(&format!("forest:{}", bucket));
+        let decrypted = outer
+            .decrypt(&forest_dek)
+            .expect("backup must decrypt under forest DEK");
+        assert!(
+            decrypted.files.contains_key("/a.txt"),
+            "decrypted backup must contain /a.txt"
+        );
+    }
+
+    /// Flipping a byte in the stored v1 ciphertext must surface as an AEAD
+    /// failure on the next load — migration must NOT silently fall through
+    /// to a partial forest or zero-file state, and must NOT write a backup
+    /// of the tampered blob.
+    #[tokio::test]
+    async fn test_migration_rejects_tampered_v1_blob() {
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let bucket = "sec-tampered-v1";
+
+        let state = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+        let client = make_client(&base, encryption);
+        client.create_bucket(bucket).await.expect("create bucket");
+        seed_v1_forest(&client, bucket, &[SeedFile::new("/a.txt", 4)], &[]).await;
+
+        // Fetch the v1 blob, flip a byte in the ciphertext region, put it
+        // back at the same key. Using the outer JSON envelope: locate the
+        // "ciphertext" field and mutate one byte of the base64 string. A
+        // cheap way: find the second occurrence of `"` after `"ciphertext":`
+        // and flip the byte before it.
+        let index_key = index_key_for(&client, bucket);
+        let v1 = client
+            .inner()
+            .get_object(bucket, &index_key)
+            .await
+            .expect("get v1");
+        let mut bytes = v1.to_vec();
+        // Flip one byte near the middle — any byte mutation inside the
+        // serialized EncryptedForest will cause either JSON deser failure
+        // or AEAD tag mismatch; both are acceptable fail-closed outcomes.
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x01;
+        client
+            .inner()
+            .put_object(bucket, &index_key, Bytes::from(bytes))
+            .await
+            .expect("re-put tampered");
+
+        let result = client.migrate_to_sharded(bucket).await;
+        assert!(
+            result.is_err(),
+            "migration of a tampered v1 blob must fail; got {:?}",
+            result.as_ref().map(|_| "Ok")
+        );
+
+        // No __fula_forest_v1_backup/* should have been written — migration
+        // aborted before the backup COPY.
+        use fula_client::ListObjectsOptions;
+        let backups = client
+            .inner()
+            .list_objects(
+                bucket,
+                Some(ListObjectsOptions {
+                    prefix: Some("__fula_forest_v1_backup/".to_string()),
+                    max_keys: Some(10),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("list backups")
+            .objects;
+        assert_eq!(
+            backups.len(),
+            0,
+            "tampered v1 blob must NOT produce a backup; got {:?}",
+            backups.iter().map(|o| &o.key).collect::<Vec<_>>()
+        );
+    }
+
+    /// Ciphertext binds its AAD to the storage key via `fula:v4:content:{key}`
+    /// (encryption.rs:725). A server-side rename (copy ciphertext bytes from
+    /// key A to key B) must fail decryption at key B — AAD mismatch.
+    #[tokio::test]
+    async fn test_content_aad_rejects_storage_key_swap() {
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let bucket = "sec-aad-swap-content";
+
+        let state = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+        let client = make_client(&base, encryption);
+        client.create_bucket(bucket).await.expect("create bucket");
+
+        // Upload one encrypted object at path /a.txt.
+        client
+            .put_object_flat(bucket, "/a.txt", b"payload A".to_vec(), None)
+            .await
+            .expect("put a");
+
+        // Locate its encrypted storage object, grab the raw ciphertext bytes,
+        // and re-upload them at a different storage key. Then attempt a
+        // decrypted read through the client — it should discover the
+        // cached path entry for /a.txt, fetch via the original storage key
+        // (which still works), so the swap we need to perform is at the
+        // *storage-key* level inside the HAMT, not via the user-facing path.
+        //
+        // Practical approach: upload two different objects at different
+        // paths, then have one's ciphertext copied over the other's storage
+        // key. When we fetch it, decryption must fail because the AAD
+        // includes the *other* storage key.
+        client
+            .put_object_flat(bucket, "/b.txt", b"payload B".to_vec(), None)
+            .await
+            .expect("put b");
+
+        // Find storage keys by listing.
+        use fula_client::ListObjectsOptions;
+        let raw = client
+            .inner()
+            .list_objects(bucket, Some(ListObjectsOptions {
+                max_keys: Some(100),
+                ..Default::default()
+            }))
+            .await
+            .expect("list raw")
+            .objects;
+        // `EncryptionConfig::new()` defaults to `KeyObfuscation::FlatNamespace`
+        // which produces `Qm<hex44>`-style storage keys (see
+        // `fula-crypto::private_forest::generate_flat_key`). The forest manifest
+        // itself ALSO lives at a `Qm<hex44>` key via `derive_index_key`, so
+        // we must explicitly exclude it — otherwise the swap below would
+        // corrupt the manifest rather than a content ciphertext, and the
+        // test would pass for the wrong reason.
+        let manifest_key = index_key_for(&client, bucket);
+        let storage_keys: Vec<String> = raw
+            .iter()
+            .map(|o| o.key.clone())
+            .filter(|k| k.starts_with("Qm") && !k.starts_with("__fula_") && k != &manifest_key)
+            .collect();
+        assert!(
+            storage_keys.len() >= 2,
+            "expected at least two content-ciphertext objects; got {:?} (manifest_key={})",
+            storage_keys,
+            manifest_key
+        );
+
+        // Fetch A's ciphertext, upload under B's storage key. Now B's
+        // storage slot has A's ciphertext — decrypting with AAD built from
+        // B's storage key must fail.
+        let a_body = client
+            .inner()
+            .get_object(bucket, &storage_keys[0])
+            .await
+            .expect("get A ciphertext");
+        client
+            .inner()
+            .put_object(bucket, &storage_keys[1], a_body)
+            .await
+            .expect("swap ciphertexts");
+
+        // After the server-side swap, one of the two paths' decryption is
+        // guaranteed to fail with an AAD mismatch — the one whose forest
+        // entry points at the storage key that now has the wrong
+        // ciphertext. We don't know which path that is without inspecting
+        // the obfuscation, so we try BOTH: at least one must fail closed.
+        let a_result = client.get_object_decrypted(bucket, "/a.txt").await;
+        let b_result = client.get_object_decrypted(bucket, "/b.txt").await;
+        assert!(
+            a_result.is_err() || b_result.is_err(),
+            "AAD binding must reject at least one path after server-side \
+             ciphertext swap; got A={:?} B={:?}",
+            a_result.as_ref().map(|b| b.len()),
+            b_result.as_ref().map(|b| b.len())
+        );
+    }
+
+    /// The v7 manifest's AAD is `fula:manifest:v7:<bucket>:<seq>`. Copying a
+    /// manifest blob from one bucket's `index_key` to another bucket's
+    /// `index_key` must fail to decrypt — AAD mismatch on the bucket name.
+    #[tokio::test]
+    async fn test_manifest_v7_aad_rejects_bucket_swap() {
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let secret = encryption.export_secret_key().clone();
+        let bucket_a = "sec-aad-bucket-a";
+        let bucket_b = "sec-aad-bucket-b";
+
+        // EnvGuard holds a non-reentrant global mutex until drop; we need
+        // two different state dirs (session 1 migrates, session 2 reads),
+        // so each guard must be scoped so the previous one is dropped
+        // before the next is acquired. Holding two on the same thread
+        // deadlocks.
+        let index_a;
+        let index_b;
+        let manifest_bytes: Bytes;
+        {
+            let state = tempfile::tempdir().unwrap();
+            let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+            let client = make_client(&base, encryption);
+            client.create_bucket(bucket_a).await.expect("create A");
+            client.create_bucket(bucket_b).await.expect("create B");
+
+            // Seed + migrate only bucket_a — that's the only bucket that
+            // needs a real v7 manifest. bucket_b starts empty; after the
+            // swap below it will be serving bucket_a's manifest bytes
+            // from its own index_key, which is exactly the AAD-mismatch
+            // scenario we want to test.
+            seed_v1_forest(&client, bucket_a, &[SeedFile::new("/bootstrap.txt", 4)], &[]).await;
+            client.migrate_to_sharded(bucket_a).await.expect("migrate A");
+            assert!(client.is_forest_sharded_hamt(bucket_a));
+
+            index_a = index_key_for(&client, bucket_a);
+            index_b = index_key_for(&client, bucket_b);
+            assert_ne!(index_a, index_b, "per-bucket index keys must differ");
+            manifest_bytes = client
+                .inner()
+                .get_object(bucket_a, &index_a)
+                .await
+                .expect("fetch A manifest");
+            client
+                .inner()
+                .put_object(bucket_b, &index_b, manifest_bytes.clone())
+                .await
+                .expect("swap manifest A→B");
+            drop(client);
+        } // session-1 guard dropped here — lock released
+
+        // Session 2: fresh state dir, same KEK. Must detect AAD mismatch.
+        let state2 = tempfile::tempdir().unwrap();
+        let _guard2 = EnvGuard::set("FULA_STATE_DIR", state2.path());
+        let reader = make_client(
+            &base,
+            EncryptionConfig::from_secret_key(secret),
+        );
+        let result = reader.list_directory(bucket_b, Some("/")).await;
+        assert!(
+            result.is_err(),
+            "manifest AAD must reject the swapped manifest; got {:?}",
+            result.as_ref().map(|d| d.directories.len())
+        );
+    }
+
+    /// After a successful v7 migration, a malicious server cannot
+    /// convince the client to silently serve v1 content. The code path
+    /// accepts two outcomes:
+    ///
+    /// 1. "version downgrade detected" error — when the v1/v2 legacy
+    ///    decoder sees evidence of a prior-observed v4+ sequence (in-memory
+    ///    cache only; encryption.rs:~1680).
+    /// 2. Transparent re-migration to v7 — the legacy v1/v2 branch triggers
+    ///    `migrate_v1_to_v7_internal` on `observed_seq.is_none()`
+    ///    (encryption.rs:1702), which turns the rolled-back blob back into
+    ///    v7 on the next load.
+    ///
+    /// Either outcome is security-equivalent (no v1 content is served long-
+    /// term). The test verifies at minimum that the bucket is NOT left in a
+    /// servable v1 state after the first cold-start list.
+    #[tokio::test]
+    async fn test_version_downgrade_blocked_after_v7_pin() {
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let secret = encryption.export_secret_key().clone();
+        let bucket = "sec-downgrade-blocked";
+
+        let state = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+        // Session 1: seed v1, migrate to v7.
+        let client = make_client(
+            &base,
+            EncryptionConfig::from_secret_key(secret.clone()),
+        );
+        client.create_bucket(bucket).await.expect("create bucket");
+        seed_v1_forest(&client, bucket, &[SeedFile::new("/a.txt", 4)], &[]).await;
+        client.migrate_to_sharded(bucket).await.expect("migrate");
+        assert!(client.is_forest_sharded_hamt(bucket));
+
+        // Capture the v1 backup (this is a real, well-formed v1 blob from
+        // this bucket). Overwrite the v7 manifest at `index_key` with it —
+        // simulating a server-side rollback / malicious downgrade.
+        use fula_client::ListObjectsOptions;
+        let backups = client
+            .inner()
+            .list_objects(
+                bucket,
+                Some(ListObjectsOptions {
+                    prefix: Some("__fula_forest_v1_backup/".to_string()),
+                    max_keys: Some(10),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("list backups")
+            .objects;
+        assert_eq!(backups.len(), 1);
+        let v1_blob = client
+            .inner()
+            .get_object(bucket, &backups[0].key)
+            .await
+            .expect("fetch v1 backup");
+        let index_key = index_key_for(&client, bucket);
+        client
+            .inner()
+            .put_object(bucket, &index_key, v1_blob)
+            .await
+            .expect("rollback index_key to v1");
+
+        // Drop the migrator client so its in-memory cache can't paper over
+        // the downgrade — the new cold-start client must go back to disk
+        // for the manifest-version pin.
+        drop(client);
+
+        // Session 2: fresh client, same state dir → must see the pinned v7
+        // and refuse the server-side v1 rollback.
+        let reader = make_client(
+            &base,
+            EncryptionConfig::from_secret_key(secret),
+        );
+        let result = reader.list_directory(bucket, Some("/")).await;
+        match result {
+            Err(e) => {
+                // Acceptable: explicit downgrade / decryption error.
+                let msg = format!("{}", e).to_lowercase();
+                assert!(
+                    msg.contains("downgrade")
+                        || msg.contains("version")
+                        || msg.contains("decrypt")
+                        || msg.contains("authentication"),
+                    "unexpected error shape: {}",
+                    e
+                );
+            }
+            Ok(_) => {
+                // Acceptable only if the cold-start transparently re-
+                // migrated the rolled-back v1 blob back to v7. Otherwise
+                // we'd be silently serving v1 content indefinitely.
+                assert!(
+                    reader.is_forest_sharded_hamt(bucket),
+                    "v7-pinned bucket must either error OR transparently re-migrate \
+                     the rolled-back v1 blob back to v7; reader shows bucket as non-v7 \
+                     after cold-start list — that would be a silent downgrade."
+                );
+            }
+        }
+    }
+
+    /// NEW-2.1 guard (encryption.rs:832–835, 2273–2296): a fresh client
+    /// with an empty forest cache that hits a path flagged `encrypted=true`
+    /// in the forest must *first* load the forest, *then* refuse to return
+    /// plaintext bytes if the server happens to supply them. We can't
+    /// directly force the server to return plaintext for an encrypted path
+    /// (the client always fetches via the encrypted storage key), but we
+    /// CAN validate the guard fires by putting a non-encrypted-prefixed
+    /// object at the storage key the client will hit and observing that
+    /// the read fails closed rather than succeeding with plaintext.
+    #[tokio::test]
+    async fn test_plaintext_refused_for_encrypted_flagged_path() {
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let secret = encryption.export_secret_key().clone();
+        let bucket = "sec-plaintext-refused";
+
+        let state = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+        // Seed a v1 forest with /secret.txt flagged encrypted=true.
+        let seeder = make_client(
+            &base,
+            EncryptionConfig::from_secret_key(secret.clone()),
+        );
+        seeder.create_bucket(bucket).await.expect("create bucket");
+        let secret_file = SeedFile::new("/secret.txt", 11).with_encrypted(true);
+        seed_v1_forest(&seeder, bucket, &[secret_file], &[]).await;
+
+        // Manually put a plaintext object at the storage key the client
+        // will look up. The storage key for a seeded entry is deterministic
+        // via v1_seed::storage_key_for_seed — we can reconstruct it.
+        let storage_key = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"seed-v1:");
+            h.update(b"/secret.txt");
+            let out = h.finalize();
+            format!("Qm{}", hex::encode(&out.as_bytes()[..22]))
+        };
+        seeder
+            .inner()
+            .put_object(bucket, &storage_key, Bytes::from_static(b"RAW PLAINTEXT BYTES"))
+            .await
+            .expect("put plaintext at encrypted path");
+
+        // Drop the seeder so the reader starts with a cold cache.
+        drop(seeder);
+
+        let reader = make_client(
+            &base,
+            EncryptionConfig::from_secret_key(secret),
+        );
+        let result = reader.get_object_decrypted(bucket, "/secret.txt").await;
+        assert!(
+            result.is_err(),
+            "NEW-2.1 guard must refuse plaintext for encrypted=true paths; \
+             got Ok({} bytes)",
+            result.as_ref().map(|b| b.len()).unwrap_or(0)
+        );
     }
 }

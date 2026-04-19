@@ -38,6 +38,7 @@ serde = { workspace = true }
 fula-blockstore = { path = "crates/fula-blockstore" }
 fula-core = { path = "crates/fula-core" }
 fula-cli = { path = "crates/fula-cli" }
+fula-client = { path = "crates/fula-client", features = ["test-fault-injection"] }
 fula-crypto = { path = "crates/fula-crypto" }
 chrono = { workspace = true }
 reqwest = { workspace = true, features = ["json", "multipart"] }

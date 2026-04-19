@@ -353,8 +353,67 @@ impl std::fmt::Debug for SubtreeRotationResult {
 // SUBTREE SHARE TOKEN - Share a subtree with its key
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Subtree-share-token AAD version 4 sentinel. Tokens with
+/// `version >= SUBTREE_SHARE_TOKEN_AAD_V4` bind every non-`wrapped_dek`
+/// field into the DEK-wrap AAD.
+pub(crate) const SUBTREE_SHARE_TOKEN_AAD_V4: u8 = 4;
+
+/// Build the canonical AAD bytes that bind subtree-share-token metadata to
+/// the wrapped DEK. Analogous to `sharing::build_share_token_aad` but with a
+/// distinct domain prefix so tokens from one flow cannot be substituted into
+/// the other.
+///
+/// Layout (all integers big-endian):
+/// - domain: `b"fula:v4:subtree-share-token|"`
+/// - id: `<u32 len><bytes>`
+/// - path_prefix: `<u32 len><bytes>`
+/// - expires_at: `<u8 tag>` then `<i64>` if Some
+/// - created_at: `<i64>`
+/// - permissions: `[can_read, can_write, can_delete]` each as `u8` 0/1
+/// - subtree_version: `<u32>`
+/// - version: `<u8>`
+pub(crate) fn build_subtree_share_token_aad(
+    id: &str,
+    path_prefix: &str,
+    expires_at: Option<i64>,
+    created_at: i64,
+    permissions: &SharePermissions,
+    subtree_version: u32,
+    version: u8,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    out.extend_from_slice(b"fula:v4:subtree-share-token|");
+
+    fn push_bytes(out: &mut Vec<u8>, b: &[u8]) {
+        debug_assert!(
+            b.len() <= u32::MAX as usize,
+            "subtree share token AAD field exceeds u32 length prefix"
+        );
+        out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+        out.extend_from_slice(b);
+    }
+
+    push_bytes(&mut out, id.as_bytes());
+    push_bytes(&mut out, path_prefix.as_bytes());
+
+    match expires_at {
+        None => out.push(0u8),
+        Some(ts) => {
+            out.push(1u8);
+            out.extend_from_slice(&ts.to_be_bytes());
+        }
+    }
+    out.extend_from_slice(&created_at.to_be_bytes());
+    out.push(permissions.can_read as u8);
+    out.push(permissions.can_write as u8);
+    out.push(permissions.can_delete as u8);
+    out.extend_from_slice(&subtree_version.to_be_bytes());
+    out.push(version);
+    out
+}
+
 /// A share token specifically for subtree access
-/// 
+///
 /// Unlike per-file shares, this grants access to an entire subtree.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubtreeShareToken {
@@ -372,6 +431,11 @@ pub struct SubtreeShareToken {
     pub permissions: SharePermissions,
     /// Version of the subtree key
     pub subtree_version: u32,
+    /// Share-token format version. `>= 4` means metadata is bound into the
+    /// wrap-AAD. Older tokens lacked this field; `#[serde(default)]` maps them
+    /// to `0` so the legacy unauthenticated decrypt path is used.
+    #[serde(default)]
+    pub version: u8,
 }
 
 impl SubtreeShareToken {
@@ -467,18 +531,20 @@ impl<'a> SubtreeShareBuilder<'a> {
     }
     
     /// Build the subtree share token
+    ///
+    /// Produces a `version = 4` token whose wrapped subtree DEK binds
+    /// every metadata field (id, path_prefix, expiry, created_at,
+    /// permissions, subtree_version, version) into AAD. Any post-build
+    /// mutation causes `accept_share` to fail with a generic auth error.
     pub fn build(self) -> Result<SubtreeShareToken> {
         // Generate unique ID
         use rand::RngCore;
         let mut id_bytes = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut id_bytes);
         let id = hex::encode(id_bytes);
-        
-        // Encrypt the subtree DEK for the recipient
-        let encryptor = Encryptor::new(self.recipient_public_key);
-        let wrapped_dek = encryptor.encrypt_dek(self.subtree_dek)?;
-        
-        // Normalize path prefix
+
+        // Normalize path prefix BEFORE binding so the AAD covers the
+        // canonical form the recipient will see.
         let path_prefix = if self.path_prefix.starts_with('/') {
             self.path_prefix
         } else {
@@ -489,15 +555,33 @@ impl<'a> SubtreeShareBuilder<'a> {
         } else {
             format!("{}/", path_prefix)
         };
-        
+
+        let created_at = current_timestamp();
+        let version = SUBTREE_SHARE_TOKEN_AAD_V4;
+
+        let aad = build_subtree_share_token_aad(
+            &id,
+            &path_prefix,
+            self.expires_at,
+            created_at,
+            &self.permissions,
+            self.subtree_version,
+            version,
+        );
+
+        // Encrypt the subtree DEK for the recipient, binding the AAD.
+        let encryptor = Encryptor::new(self.recipient_public_key);
+        let wrapped_dek = encryptor.encrypt_dek_with_context(self.subtree_dek, &aad)?;
+
         Ok(SubtreeShareToken {
             id,
             path_prefix,
             wrapped_dek,
             expires_at: self.expires_at,
-            created_at: current_timestamp(),
+            created_at,
             permissions: self.permissions,
             subtree_version: self.subtree_version,
+            version,
         })
     }
 }
@@ -515,14 +599,31 @@ impl SubtreeShareRecipient {
     }
     
     /// Accept a subtree share and extract the DEK
+    ///
+    /// Version gate is strict: `version >= 4` tokens MUST unwrap through the
+    /// AAD-bound path; there is no silent fallback to the legacy path on
+    /// failure (that would be a downgrade oracle).
     pub fn accept_share(&self, token: &SubtreeShareToken) -> Result<AcceptedSubtreeShare> {
         if token.is_expired() {
             return Err(CryptoError::ShareExpired);
         }
-        
+
         let decryptor = Decryptor::from_secret_key(&self.secret_key);
-        let dek = decryptor.decrypt_dek(&token.wrapped_dek)?;
-        
+        let dek = if token.version >= SUBTREE_SHARE_TOKEN_AAD_V4 {
+            let aad = build_subtree_share_token_aad(
+                &token.id,
+                &token.path_prefix,
+                token.expires_at,
+                token.created_at,
+                &token.permissions,
+                token.subtree_version,
+                token.version,
+            );
+            decryptor.decrypt_dek_with_context(&token.wrapped_dek, &aad)?
+        } else {
+            decryptor.decrypt_dek(&token.wrapped_dek)?
+        };
+
         Ok(AcceptedSubtreeShare {
             path_prefix: token.path_prefix.clone(),
             dek,
@@ -832,5 +933,190 @@ mod tests {
         assert_eq!(restored.id, token.id);
         assert_eq!(restored.path_prefix, token.path_prefix);
         assert_eq!(restored.subtree_version, token.subtree_version);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // F2: Subtree-Share-Token Metadata AAD Binding
+    // ═══════════════════════════════════════════════════════════════════════
+    mod f2_subtree_share_token_aad_binding {
+        use super::*;
+
+        fn build_v4_token() -> (KekKeyPair, KekKeyPair, DekKey, SubtreeShareToken) {
+            let owner = KekKeyPair::generate();
+            let recipient = KekKeyPair::generate();
+            let dek = DekKey::generate();
+            let token = SubtreeShareBuilder::new(
+                &owner,
+                recipient.public_key(),
+                &dek,
+                "/photos/",
+                7,
+            )
+                .expires_in(3600)
+                .read_only()
+                .build()
+                .unwrap();
+            (owner, recipient, dek, token)
+        }
+
+        #[test]
+        fn round_trip_v4_succeeds() {
+            let (_owner, recipient, dek, token) = build_v4_token();
+            assert_eq!(token.version, SUBTREE_SHARE_TOKEN_AAD_V4);
+            let accepted = SubtreeShareRecipient::new(&recipient)
+                .accept_share(&token)
+                .unwrap();
+            assert_eq!(accepted.dek.as_bytes(), dek.as_bytes());
+            assert_eq!(accepted.path_prefix, "/photos/");
+        }
+
+        #[test]
+        fn mutated_path_prefix_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.path_prefix = "/".to_string();
+            let err = SubtreeShareRecipient::new(&recipient)
+                .accept_share(&token)
+                .unwrap_err();
+            assert!(matches!(err, CryptoError::Decryption(_)), "got: {:?}", err);
+        }
+
+        #[test]
+        fn mutated_expiry_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.expires_at = Some(current_timestamp() + 86400 * 365);
+            let err = SubtreeShareRecipient::new(&recipient)
+                .accept_share(&token)
+                .unwrap_err();
+            assert!(matches!(err, CryptoError::Decryption(_)), "got: {:?}", err);
+        }
+
+        #[test]
+        fn mutated_permissions_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.permissions = SharePermissions::full();
+            let err = SubtreeShareRecipient::new(&recipient)
+                .accept_share(&token)
+                .unwrap_err();
+            assert!(matches!(err, CryptoError::Decryption(_)), "got: {:?}", err);
+        }
+
+        #[test]
+        fn mutated_subtree_version_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.subtree_version = 99;
+            let err = SubtreeShareRecipient::new(&recipient)
+                .accept_share(&token)
+                .unwrap_err();
+            assert!(matches!(err, CryptoError::Decryption(_)), "got: {:?}", err);
+        }
+
+        #[test]
+        fn mutated_id_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.id = "deadbeef".to_string();
+            let err = SubtreeShareRecipient::new(&recipient)
+                .accept_share(&token)
+                .unwrap_err();
+            assert!(matches!(err, CryptoError::Decryption(_)), "got: {:?}", err);
+        }
+
+        #[test]
+        fn downgraded_version_rejected() {
+            let (_owner, recipient, _dek, mut token) = build_v4_token();
+            token.version = 0; // Force legacy path
+            let err = SubtreeShareRecipient::new(&recipient)
+                .accept_share(&token)
+                .unwrap_err();
+            assert!(matches!(err, CryptoError::Decryption(_)), "got: {:?}", err);
+        }
+
+        #[test]
+        fn legacy_token_still_decrypts() {
+            // Pre-F2 format: no version field on disk, serde defaults to 0.
+            let recipient = KekKeyPair::generate();
+            let dek = DekKey::generate();
+
+            let encryptor = Encryptor::new(recipient.public_key());
+            let wrapped_dek = encryptor.encrypt_dek(&dek).unwrap();
+
+            let legacy = SubtreeShareToken {
+                id: "legacy".to_string(),
+                path_prefix: "/legacy/".to_string(),
+                wrapped_dek,
+                expires_at: None,
+                created_at: current_timestamp(),
+                permissions: SharePermissions::read_only(),
+                subtree_version: 1,
+                version: 0,
+            };
+
+            let accepted = SubtreeShareRecipient::new(&recipient)
+                .accept_share(&legacy)
+                .expect("legacy subtree token must decrypt via legacy path");
+            assert_eq!(accepted.dek.as_bytes(), dek.as_bytes());
+        }
+
+        #[test]
+        fn legacy_on_wire_has_no_version_field() {
+            // Round-trip through JSON to simulate a pre-F2 token observed on
+            // the wire. `#[serde(default)]` must map the missing field to 0
+            // (legacy path), preserving compatibility.
+            let recipient = KekKeyPair::generate();
+            let dek = DekKey::generate();
+            let encryptor = Encryptor::new(recipient.public_key());
+            let wrapped = encryptor.encrypt_dek(&dek).unwrap();
+
+            // Hand-crafted legacy JSON — note no "version" field.
+            let legacy_json = serde_json::json!({
+                "id": "legacy",
+                "path_prefix": "/legacy/",
+                "wrapped_dek": wrapped,
+                "expires_at": null,
+                "created_at": current_timestamp(),
+                "permissions": {"can_read": true, "can_write": false, "can_delete": false},
+                "subtree_version": 1
+            })
+            .to_string();
+
+            let token: SubtreeShareToken = serde_json::from_str(&legacy_json)
+                .expect("pre-F2 JSON must deserialize with missing `version`");
+            assert_eq!(token.version, 0);
+            let accepted = SubtreeShareRecipient::new(&recipient)
+                .accept_share(&token)
+                .expect("legacy subtree token deserialized from wire must accept");
+            assert_eq!(accepted.dek.as_bytes(), dek.as_bytes());
+        }
+
+        #[test]
+        fn cross_token_wrapped_dek_substitution_rejected() {
+            let owner = KekKeyPair::generate();
+            let recipient = KekKeyPair::generate();
+            let dek_a = DekKey::generate();
+            let dek_b = DekKey::generate();
+            let token_a = SubtreeShareBuilder::new(
+                &owner, recipient.public_key(), &dek_a, "/a/", 1,
+            ).build().unwrap();
+            let token_b = SubtreeShareBuilder::new(
+                &owner, recipient.public_key(), &dek_b, "/b/", 1,
+            ).build().unwrap();
+            let mut franken = token_a.clone();
+            franken.wrapped_dek = token_b.wrapped_dek.clone();
+            let err = SubtreeShareRecipient::new(&recipient)
+                .accept_share(&franken)
+                .unwrap_err();
+            assert!(matches!(err, CryptoError::Decryption(_)), "got: {:?}", err);
+        }
+
+        #[test]
+        fn share_token_and_subtree_aad_differ() {
+            // Domain prefixes must differ so a share-token wrap cannot be
+            // substituted for a subtree-token wrap (or vice versa).
+            let subtree_aad = build_subtree_share_token_aad(
+                "id", "/", None, 0, &SharePermissions::read_only(), 1, 4,
+            );
+            assert!(subtree_aad.starts_with(b"fula:v4:subtree-share-token|"));
+            // share-token prefix is different — test at that module's level
+            // (sharing.rs:aad_domain_prefix_prevents_cross_context_substitution)
+        }
     }
 }

@@ -27,6 +27,7 @@ use fula_crypto::{
     wnfs_hamt::BlobBackend,
     sharded_hamt_forest::ShardedHamtPrivateForest,
     ChunkedEncoder, ChunkedFileMetadata, should_use_chunked,
+    BaoEncoder,
     CryptoError,
 };
 use std::sync::Arc;
@@ -35,6 +36,8 @@ use dashmap::DashMap;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::wal::{self, WalEntry};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::orphan_queue;
 
 /// Default forest cache TTL in seconds
 const DEFAULT_FOREST_CACHE_TTL_SECS: i64 = 60;
@@ -84,6 +87,58 @@ impl Drop for AutoFlushHandle {
 #[cfg(not(target_arch = "wasm32"))]
 const MIGRATION_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
+/// Tick interval used by the heartbeat task. Honours the
+/// `FULA_MIGRATION_HEARTBEAT_INTERVAL_MS` env override when set to any positive
+/// integer; otherwise defaults to `MIGRATION_HEARTBEAT_INTERVAL_SECS`. The env
+/// hook lets integration tests exercise the heartbeat loop on a sub-second
+/// cadence without waiting out the full 30-second cycle.
+#[cfg(not(target_arch = "wasm32"))]
+fn migration_heartbeat_interval() -> std::time::Duration {
+    if let Ok(v) = std::env::var("FULA_MIGRATION_HEARTBEAT_INTERVAL_MS") {
+        if let Ok(ms) = v.parse::<u64>() {
+            if ms > 0 {
+                return std::time::Duration::from_millis(ms);
+            }
+        }
+    }
+    std::time::Duration::from_secs(MIGRATION_HEARTBEAT_INTERVAL_SECS)
+}
+
+/// Test-only crash-injection atomics. Never set in production; guarded by the
+/// `test-fault-injection` feature so the symbols are not even present without
+/// it. `migrate_v1_to_v7_internal` checks these at two well-defined points so
+/// integration tests can observe the post-crash on-disk state.
+#[cfg(feature = "test-fault-injection")]
+pub mod test_faults {
+    use std::sync::atomic::AtomicBool;
+
+    /// If `true`, `migrate_v1_to_v7_internal` returns `DeferredTransientError`
+    /// immediately after `flush_dirty` writes the HAMT node blobs but before
+    /// the Phase B manifest PUT.
+    pub static CRASH_AFTER_PHASE_A_FLUSH: AtomicBool = AtomicBool::new(false);
+
+    /// If `true`, `migrate_v1_to_v7_internal` returns
+    /// `DeferredTransientError` immediately after the Phase B manifest PUT
+    /// succeeds (server now holds v7 at `index_key`) but before the in-process
+    /// cache swap / `persist_manifest_version` call. Simulates a client crash
+    /// after the server has committed the migration.
+    pub static CRASH_AFTER_PHASE_B_PUT_BEFORE_CACHE_SWAP: AtomicBool = AtomicBool::new(false);
+
+    /// If `true`, the orphan-cleanup path (`cleanup_orphaned_storage`) forces
+    /// the main-object `delete_object` to fail without touching the network.
+    /// Used by F7 integration tests to verify that failed cleanups land in
+    /// the persistent orphan queue, and that a later cleanup call drains
+    /// them after the flag is cleared. Has no effect on any other code path.
+    pub static FORCE_ORPHAN_CLEANUP_MAIN_FAIL: AtomicBool = AtomicBool::new(false);
+
+    /// If `true`, `cleanup_orphaned_storage` skips its refcount short-circuit
+    /// (i.e. treats `storage_key_still_referenced` as always `false`). Used
+    /// only by F7 integration tests to exercise the cleanup path on v7
+    /// buckets, where the refcount check conservatively returns `true` until
+    /// v7 reference traversal is wired. Never set in production.
+    pub static BYPASS_ORPHAN_CLEANUP_REFCHECK: AtomicBool = AtomicBool::new(false);
+}
+
 /// If set, a v7 manifest that fails to decrypt triggers an automatic attempt
 /// to load the most recent `__fula_forest_v1_backup/<unix_ms>` blob as a v1
 /// monolithic forest. Exists as a compile-time escape hatch — the fallback
@@ -125,7 +180,7 @@ struct HeartbeatGuard {
 impl HeartbeatGuard {
     fn spawn(client: FulaClient, bucket: String, token: String) -> Self {
         let handle = tokio::spawn(async move {
-            let interval_dur = std::time::Duration::from_secs(MIGRATION_HEARTBEAT_INTERVAL_SECS);
+            let interval_dur = migration_heartbeat_interval();
             loop {
                 tokio::time::sleep(interval_dur).await;
                 match client.heartbeat_migration_lock(&bucket, &token).await {
@@ -331,12 +386,19 @@ enum ForestCacheEntry {
     /// The forest holds per-shard root storage keys, sequences,
     /// and interior nodes load lazily through `V7NodeStore`.
     ///
-    /// Wrapped in `Arc<tokio::sync::Mutex<_>>` because mutation methods
+    /// Wrapped in `Arc<tokio::sync::RwLock<_>>` because mutation methods
     /// (`upsert_file`, `flush_dirty`) are async and would require holding
     /// a `DashMap::RefMut` across an `await`, which deadlocks DashMap's
-    /// shard locks.
+    /// shard locks. RwLock (vs Mutex) lets concurrent read-path ops
+    /// (`get_file`, `list_recursive`, …) share the forest.
     ShardedHamt {
-        forest: Arc<tokio::sync::Mutex<ShardedHamtPrivateForest>>,
+        // Outer lock is an `RwLock` (not `Mutex`) so read-only forest
+        // operations (`get_file`, `list_recursive`, `extract_subtree`,
+        // manifest inspection) can run concurrently. Writers
+        // (`upsert_file`, `remove_file`, `flush_dirty`, reconcile) still
+        // serialise via `write().await`. Closes F6 (lock-held-across-await
+        // contention for readers).
+        forest: Arc<tokio::sync::RwLock<ShardedHamtPrivateForest>>,
         loaded_at: i64,
         /// ETag of the manifest object itself.
         manifest_etag: Option<String>,
@@ -360,12 +422,12 @@ impl ForestCacheEntry {
             ForestCacheEntry::Sharded { forest, .. } => {
                 forest.manifest_dirty || !forest.dirty_shards.is_empty()
             }
-            // `tokio::sync::Mutex::try_lock` is a synchronous probe. When
+            // `tokio::sync::RwLock::try_read` is a synchronous probe. When
             // uncontended we read the forest's authoritative dirty state.
-            // When contended (a flush or mutation is in flight), fall back
-            // to `true` — the cache entry is in active use, so callers
-            // should not treat it as stale and evict while we're mid-flush.
-            ForestCacheEntry::ShardedHamt { forest, .. } => match forest.try_lock() {
+            // When contended (a writer is in flight), fall back to `true` —
+            // the cache entry is in active use, so callers should not treat
+            // it as stale and evict while we're mid-flush.
+            ForestCacheEntry::ShardedHamt { forest, .. } => match forest.try_read() {
                 Ok(guard) => guard.is_dirty(),
                 Err(_) => true,
             },
@@ -533,6 +595,37 @@ pub struct EncryptedClient {
     /// WAL on every call — recovery fires once per bucket per process lifetime.
     #[cfg(not(target_arch = "wasm32"))]
     wal_recovered_buckets: DashMap<String, ()>,
+    /// Buckets for which an orphan-queue drain is currently running (NEW-F7).
+    /// Presence = drain in flight; used by `cleanup_orphaned_storage` so two
+    /// concurrent cleanups don't race on the same bucket's queue file.
+    /// A lost race is harmless (just skipped), so a simple insert/remove set
+    /// is sufficient — no heavy lock needed.
+    #[cfg(not(target_arch = "wasm32"))]
+    orphan_drain_in_flight: DashMap<String, ()>,
+}
+
+/// F10: wrap a chunk-fetch future in a per-chunk timeout so one stuck
+/// chunk cannot stall a windowed download up to the global reqwest
+/// timeout. Error mapping lives here so the production call site and
+/// the unit test share one source of truth — any drift in the wording
+/// or variant breaks both callers simultaneously.
+#[cfg(not(target_arch = "wasm32"))]
+async fn fetch_chunk_with_timeout<F>(
+    fut: F,
+    chunk_index: u32,
+    timeout: std::time::Duration,
+) -> Result<Bytes>
+where
+    F: std::future::Future<Output = Result<Bytes>>,
+{
+    tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| {
+            ClientError::DownloadFailed(format!(
+                "chunk {} download timed out after {:?}",
+                chunk_index, timeout
+            ))
+        })?
 }
 
 impl EncryptedClient {
@@ -548,6 +641,8 @@ impl EncryptedClient {
             seq_floors: DashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             wal_recovered_buckets: DashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            orphan_drain_in_flight: DashMap::new(),
         })
     }
 
@@ -580,6 +675,8 @@ impl EncryptedClient {
             seq_floors: DashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             wal_recovered_buckets: DashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            orphan_drain_in_flight: DashMap::new(),
         })
     }
 
@@ -958,6 +1055,28 @@ impl EncryptedClient {
         self.download_chunks_windowed_to_writer(bucket, storage_key, &chunked_meta, dek, writer).await
     }
 
+    /// F8: Internal chunked-download dispatch for the buffered writer path.
+    ///
+    /// Parses `chunked_meta` and delegates to
+    /// `download_chunks_buffered_to_writer`. Used only by the public
+    /// `get_object_decrypted_buffered_*` APIs.
+    async fn get_object_chunked_buffered_to_writer<W: std::io::Write>(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        enc_metadata: &serde_json::Value,
+        dek: &fula_crypto::keys::DekKey,
+        writer: &mut W,
+    ) -> Result<u64> {
+        let chunked_meta: ChunkedFileMetadata = serde_json::from_value(
+            enc_metadata["chunked"].clone()
+        ).map_err(|e| ClientError::Encryption(
+            fula_crypto::CryptoError::Decryption(format!("Invalid chunked metadata: {}", e))
+        ))?;
+
+        self.download_chunks_buffered_to_writer(bucket, storage_key, &chunked_meta, dek, writer).await
+    }
+
     /// Core windowed download+decrypt engine.
     ///
     /// Processes chunks in sliding windows of `MAX_CONCURRENT_CHUNK_DOWNLOADS`,
@@ -1011,11 +1130,23 @@ impl EncryptedClient {
             // concurrency — tokio::spawn + Semaphore pulls in tokio's `rt`
             // feature which isn't available on wasm32.
             use futures::StreamExt;
+            // F10: bound per-chunk fetch so one stuck chunk cannot stall the
+            // stream up to the global reqwest timeout.
+            #[cfg(not(target_arch = "wasm32"))]
+            let per_chunk_timeout = self.inner.config().per_chunk_download_timeout;
             let futs = (window_start..window_end).map(|chunk_index| {
                 let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk_index as u32);
                 let client = self.inner.clone();
                 let bucket = bucket.to_string();
                 async move {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let data = fetch_chunk_with_timeout(
+                        client.get_object(&bucket, &chunk_key),
+                        chunk_index as u32,
+                        per_chunk_timeout,
+                    )
+                    .await?;
+                    #[cfg(target_arch = "wasm32")]
                     let data = client.get_object(&bucket, &chunk_key).await?;
                     Ok::<(u32, Bytes), ClientError>((chunk_index as u32, data))
                 }
@@ -1067,6 +1198,64 @@ impl EncryptedClient {
         // silent truncation and tampering of chunk contents or ordering.
         decoder.finalize_and_verify().map_err(ClientError::Encryption)?;
 
+        Ok(total_written)
+    }
+
+    /// F8: Buffered chunked-download engine.
+    ///
+    /// Like `download_chunks_windowed_to_writer`, but accumulates every
+    /// decrypted chunk into an in-memory buffer and emits to the caller's
+    /// writer **only after** `finalize_and_verify` passes. The streaming
+    /// variant writes per-chunk plaintext as it arrives, so an adversarial
+    /// truncation / chunk-reorder is only caught at root-hash finalize —
+    /// by which point partial plaintext has already been handed to the
+    /// caller. That model is fine for ordinary reads but problematic for
+    /// disaster-recovery consumers that want all-or-nothing root-verified
+    /// output.
+    ///
+    /// Pre-checks `chunked_meta.total_size` against
+    /// `config().buffered_download_max_bytes` before any network I/O. If
+    /// the declared size exceeds the ceiling, returns an error without
+    /// allocating. This is intentional: the buffered path holds the full
+    /// plaintext in RAM, so an unbounded ceiling would let a malicious
+    /// manifest OOM the client.
+    ///
+    /// Note on atomicity: "root-verified before emission" is a stronger
+    /// guarantee than the streaming variant provides, but `write_all`
+    /// after verification is still not atomic on all writers — if the
+    /// caller's writer is a filesystem and `write_all` fails mid-flush,
+    /// partial plaintext can still land on disk. F8 gives you
+    /// root-verified-before-emission, not crash-safe atomicity. Callers
+    /// that need true all-or-nothing semantics should write to a temp
+    /// path and rename on success.
+    async fn download_chunks_buffered_to_writer<W: std::io::Write>(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        chunked_meta: &ChunkedFileMetadata,
+        dek: &fula_crypto::keys::DekKey,
+        writer: &mut W,
+    ) -> Result<u64> {
+        let ceiling = self.inner.config().buffered_download_max_bytes;
+        if chunked_meta.total_size > ceiling {
+            return Err(ClientError::DownloadFailed(format!(
+                "buffered download exceeds configured ceiling: \
+                 declared total_size={} bytes, buffered_download_max_bytes={} bytes \
+                 (use the streaming variant `get_object_decrypted_to_writer` for large files)",
+                chunked_meta.total_size, ceiling,
+            )));
+        }
+
+        let mut buffer: Vec<u8> = Vec::with_capacity(chunked_meta.total_size as usize);
+        // The windowed engine writes straight to `&mut buffer`, but only
+        // AFTER `finalize_and_verify` clears do we surface the bytes to
+        // the caller's writer. If finalize fails, `buffer` is dropped on
+        // the error-return path and the caller's writer is untouched.
+        let total_written = self
+            .download_chunks_windowed_to_writer(bucket, storage_key, chunked_meta, dek, &mut buffer)
+            .await?;
+
+        writer.write_all(&buffer).map_err(ClientError::Io)?;
         Ok(total_written)
     }
 
@@ -1154,6 +1343,133 @@ impl EncryptedClient {
         if is_chunked {
             self.get_object_chunked_to_writer(bucket, storage_key, &enc_metadata, &dek, writer).await
         } else {
+            let nonce_b64 = enc_metadata["nonce"].as_str()
+                .ok_or_else(|| ClientError::Encryption(
+                    fula_crypto::CryptoError::Decryption("Missing nonce".to_string())
+                ))?;
+            let nonce_bytes = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                nonce_b64,
+            ).map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(e.to_string())
+            ))?;
+            let nonce = Nonce::from_bytes(&nonce_bytes)
+                .map_err(ClientError::Encryption)?;
+
+            let aead = Aead::new_default(&dek);
+            let version = enc_metadata["version"].as_u64().unwrap_or(2);
+            let plaintext = if version >= 4 {
+                let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
+                aead.decrypt_with_aad(&nonce, &result.data, &aad)
+            } else {
+                aead.decrypt(&nonce, &result.data)
+            }.map_err(ClientError::Encryption)?;
+
+            writer.write_all(&plaintext).map_err(ClientError::Io)?;
+            Ok(plaintext.len() as u64)
+        }
+    }
+
+    /// F8: Get and decrypt an object, writing output only after the full
+    /// plaintext has been root-hash verified.
+    ///
+    /// Like `get_object_decrypted_to_writer`, but buffers the entire
+    /// decrypted plaintext in memory and calls the Bao `finalize_and_verify`
+    /// step **before** any bytes are written to the caller's writer. Useful
+    /// for disaster-recovery consumers that must not observe plaintext until
+    /// the entire file has passed the root-hash check (closes the truncation
+    /// / chunk-reorder window inherent to the streaming variant).
+    ///
+    /// Rejects files larger than `Config::buffered_download_max_bytes`
+    /// (default 256 MB) before any network I/O — buffered downloads hold
+    /// the full plaintext in RAM. Callers with larger files should use the
+    /// streaming variant and handle the weaker mid-stream guarantee.
+    ///
+    /// Single-block (non-chunked) files have no streaming window and no
+    /// Bao root; for those the AEAD tag over the block is itself the
+    /// integrity check, and this path behaves identically to the streaming
+    /// variant.
+    ///
+    /// Atomicity caveat: the final `write_all` after root verification is
+    /// not itself atomic. If the caller's writer is a filesystem and
+    /// `write_all` fails mid-flush, partial plaintext can still land on
+    /// disk. Callers needing true all-or-nothing semantics should write
+    /// to a temp path and rename on success.
+    pub async fn get_object_decrypted_buffered_to_writer<W: std::io::Write>(
+        &self,
+        bucket: &str,
+        key: &str,
+        writer: &mut W,
+    ) -> Result<u64> {
+        let storage_key = if self.encryption.metadata_privacy {
+            let path_dek = self.encryption.key_manager.derive_path_key(key);
+            obfuscate_key(key, &path_dek, self.encryption.obfuscation_mode.clone())
+        } else {
+            key.to_string()
+        };
+
+        self.get_object_decrypted_buffered_to_writer_by_storage_key(bucket, &storage_key, writer).await
+    }
+
+    /// F8: Buffered download variant of
+    /// `get_object_decrypted_to_writer_by_storage_key`.
+    ///
+    /// See `get_object_decrypted_buffered_to_writer` for semantics.
+    pub async fn get_object_decrypted_buffered_to_writer_by_storage_key<W: std::io::Write>(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        writer: &mut W,
+    ) -> Result<u64> {
+        let result = self.inner.get_object_with_metadata(bucket, storage_key).await?;
+
+        let is_encrypted = result.metadata
+            .get("x-fula-encrypted")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        if !is_encrypted {
+            if self.forest_entry_requires_encryption(bucket, storage_key).await? {
+                return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                    "storage backend served plaintext for an encrypted path".to_string()
+                )));
+            }
+            writer.write_all(&result.data).map_err(ClientError::Io)?;
+            return Ok(result.data.len() as u64);
+        }
+
+        let is_chunked = result.metadata
+            .get("x-fula-chunked")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        let enc_metadata_str = result.metadata
+            .get("x-fula-encryption")
+            .ok_or_else(|| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption("Missing encryption metadata".to_string())
+            ))?;
+
+        let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
+            .map_err(|e| ClientError::Encryption(
+                fula_crypto::CryptoError::Decryption(e.to_string())
+            ))?;
+
+        let wrapped_key: EncryptedData = serde_json::from_value(
+            enc_metadata["wrapped_key"].clone()
+        ).map_err(|e| ClientError::Encryption(
+            fula_crypto::CryptoError::Decryption(e.to_string())
+        ))?;
+
+        let decryptor = Decryptor::new(self.encryption.key_manager.keypair());
+        let dek = decryptor.decrypt_dek(&wrapped_key)
+            .map_err(ClientError::Encryption)?;
+
+        if is_chunked {
+            self.get_object_chunked_buffered_to_writer(bucket, storage_key, &enc_metadata, &dek, writer).await
+        } else {
+            // Single-block: AEAD tag over the whole block IS the integrity
+            // check — no streaming window, no Bao root. Buffered and
+            // streaming variants behave identically here.
             let nonce_b64 = enc_metadata["nonce"].as_str()
                 .ok_or_else(|| ClientError::Encryption(
                     fula_crypto::CryptoError::Decryption("Missing nonce".to_string())
@@ -1483,17 +1799,22 @@ impl EncryptedClient {
     }
 
     /// List objects as a directory tree structure.
-    /// 
+    ///
     /// Groups files by their original directory paths for easy tree rendering.
     /// Does NOT download file content - only metadata.
+    ///
+    /// This call returns every matching entry in one `DirectoryListing` and
+    /// therefore has memory cost O(files-under-prefix). For large prefixes
+    /// prefer [`Self::list_directory_paginated`].
     pub async fn list_directory(
         &self,
         bucket: &str,
         prefix: Option<&str>,
     ) -> Result<DirectoryListing> {
-        // For FlatNamespace, use the forest directly
+        // For FlatNamespace, use the forest directly. No pagination bounds:
+        // the v7 arm drains every page internally, v1/v6 return one page.
         if self.encryption.obfuscation_mode == KeyObfuscation::FlatNamespace {
-            return self.list_directory_from_forest(bucket, prefix).await;
+            return self.list_directory_from_forest(bucket, prefix, None, None).await;
         }
 
         let options = prefix.map(|p| ListObjectsOptions {
@@ -1502,23 +1823,120 @@ impl EncryptedClient {
         });
 
         let files = self.list_objects_decrypted(bucket, options).await?;
-        
+
         let mut directories: HashMap<String, Vec<FileMetadata>> = HashMap::new();
-        
+
         for file in files {
             let dir = if let Some(last_slash) = file.original_key.rfind('/') {
                 file.original_key[..last_slash].to_string()
             } else {
                 "/".to_string()
             };
-            
+
             directories.entry(dir).or_default().push(file);
         }
-        
+
         Ok(DirectoryListing {
             bucket: bucket.to_string(),
             prefix: prefix.map(|s| s.to_string()),
             directories,
+            is_truncated: false,
+            next_continuation_token: None,
+        })
+    }
+
+    /// Paginated directory listing for large prefixes.
+    ///
+    /// Unlike [`Self::list_directory`], this returns at most one page of
+    /// results and sets `is_truncated` / `next_continuation_token` when
+    /// more entries remain. Callers should loop until `is_truncated` is
+    /// `false`. Memory cost is bounded to ≈ one page + accumulated
+    /// directory metadata for that page.
+    ///
+    /// Arguments:
+    /// - `continuation_token`: opaque token from a prior call's
+    ///   `next_continuation_token`. Pass `None` for the first page.
+    /// - `max_keys`: soft cap on entries per page (shard-grained for v7 —
+    ///   see `ShardedHamtPrivateForest::list_recursive_page`). `None`
+    ///   falls back to an internal default of 10_000.
+    ///
+    /// For non-FlatNamespace modes this delegates to the raw-S3 listing
+    /// path (`list_objects_decrypted` with equivalent options) which
+    /// already supports server-side pagination.
+    ///
+    /// Consistency: the cursor is NOT a snapshot. Writes that land between
+    /// pages may add, remove, or shift entries the caller has not yet seen.
+    /// Treat the paginated result set as eventually-consistent rather than
+    /// a point-in-time view.
+    pub async fn list_directory_paginated(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        continuation_token: Option<&str>,
+        max_keys: Option<usize>,
+    ) -> Result<DirectoryListing> {
+        const DEFAULT_MAX_KEYS: usize = 10_000;
+        let effective_max = Some(max_keys.unwrap_or(DEFAULT_MAX_KEYS));
+
+        if self.encryption.obfuscation_mode == KeyObfuscation::FlatNamespace {
+            return self
+                .list_directory_from_forest(bucket, prefix, continuation_token, effective_max)
+                .await;
+        }
+
+        // Non-FlatNamespace: route through the server's native listing API.
+        let options = ListObjectsOptions {
+            prefix: prefix.map(|p| p.to_string()),
+            continuation_token: continuation_token.map(|s| s.to_string()),
+            max_keys,
+            ..Default::default()
+        };
+        let list_result = self.inner.list_objects(bucket, Some(options)).await?;
+        let server_truncated = list_result.is_truncated;
+        let server_next = list_result.next_continuation_token.clone();
+
+        use futures::stream::StreamExt;
+        let files: Vec<FileMetadata> = futures::stream::iter(
+            list_result.objects.into_iter().map(|obj| async move {
+                let size = obj.size;
+                match self.head_object_decrypted(bucket, &obj.key).await {
+                    Ok(metadata) => metadata,
+                    Err(e) => {
+                        tracing::warn!("Failed to get metadata for {}: {:?}", obj.key, e);
+                        FileMetadata {
+                            storage_key: obj.key.clone(),
+                            original_key: obj.key,
+                            original_size: size,
+                            content_type: None,
+                            created_at: None,
+                            modified_at: None,
+                            user_metadata: HashMap::new(),
+                            is_encrypted: false,
+                        }
+                    }
+                }
+            }),
+        )
+        .buffer_unordered(Self::MAX_CONCURRENT_HEADS)
+        .collect()
+        .await;
+
+        let mut directories: HashMap<String, Vec<FileMetadata>> = HashMap::new();
+        for file in files {
+            let dir = if let Some(last_slash) = file.original_key.rfind('/') {
+                file.original_key[..last_slash].to_string()
+            } else {
+                "/".to_string()
+            };
+            directories.entry(dir).or_default().push(file);
+        }
+
+        Ok(DirectoryListing {
+            bucket: bucket.to_string(),
+            prefix: prefix.map(|s| s.to_string()),
+            directories,
+            is_truncated: server_truncated,
+            next_continuation_token: server_next,
         })
     }
 
@@ -1926,7 +2344,7 @@ impl EncryptedClient {
                             bucket.to_string(),
                             forest_dek.clone(),
                         );
-                        let forest_arc = Arc::new(tokio::sync::Mutex::new(forest));
+                        let forest_arc = Arc::new(tokio::sync::RwLock::new(forest));
                         self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::ShardedHamt {
                             forest: forest_arc,
                             loaded_at: now,
@@ -1966,7 +2384,7 @@ impl EncryptedClient {
                 );
                 let now = chrono::Utc::now().timestamp();
                 self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::ShardedHamt {
-                    forest: Arc::new(tokio::sync::Mutex::new(v7)),
+                    forest: Arc::new(tokio::sync::RwLock::new(v7)),
                     loaded_at: now,
                     manifest_etag: None,
                     last_manifest_sequence: None,
@@ -2162,16 +2580,46 @@ impl EncryptedClient {
     }
 
     /// Read the persisted prior-observed manifest version for `bucket`, if any.
+    ///
+    /// NEW-F9: the on-disk format is `<version>\t<hex_mac>\n` where MAC is a
+    /// BLAKE3 keyed hash over the version string using a bucket-scoped key
+    /// (`derive_manifest_version_mac_key`). This prevents a local process with
+    /// user-write permission from forcing a silent downgrade by editing the
+    /// plaintext file. The old bare-number format is still accepted (with a
+    /// warning) so pre-upgrade pin files continue to work read-only; the next
+    /// write upgrades them to the MAC'd format. A MAC-present-but-invalid
+    /// file is treated as untrusted and returns `None` — we must NOT fall
+    /// back to the bare value when a MAC is present but wrong, because that
+    /// is the active-tamper case.
     #[cfg(not(target_arch = "wasm32"))]
     fn load_persisted_manifest_version(&self, bucket: &str) -> Option<u8> {
         let path = self.manifest_version_path(bucket)?;
         let bytes = std::fs::read(&path).ok()?;
         let s = std::str::from_utf8(&bytes).ok()?.trim();
-        s.parse::<u8>().ok()
+        if let Some((version_str, mac_hex)) = s.rsplit_once('\t') {
+            let mac_key = wal::derive_manifest_version_mac_key(
+                &self.encryption.key_manager,
+                bucket,
+            );
+            if !wal::verify_mac(&mac_key, version_str, mac_hex) {
+                tracing::warn!(%bucket, "manifest-version pin MAC invalid; ignoring file");
+                return None;
+            }
+            version_str.parse::<u8>().ok()
+        } else {
+            tracing::warn!(
+                %bucket,
+                "manifest-version pin has legacy (unauthenticated) format; \
+                 will upgrade to MAC'd format on next write"
+            );
+            s.parse::<u8>().ok()
+        }
     }
 
     /// Atomically write the manifest version for `bucket`. Monotonic: writes
     /// nothing if the new version is not strictly greater than what's on disk.
+    ///
+    /// NEW-F9: writes the MAC'd format `<version>\t<hex_mac>\n`.
     #[cfg(not(target_arch = "wasm32"))]
     fn persist_manifest_version(&self, bucket: &str, version: u8) {
         let Some(path) = self.manifest_version_path(bucket) else { return; };
@@ -2182,10 +2630,17 @@ impl EncryptedClient {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let mac_key = wal::derive_manifest_version_mac_key(
+            &self.encryption.key_manager,
+            bucket,
+        );
+        let version_str = version.to_string();
+        let mac_hex = wal::mac_line(&mac_key, &version_str);
+        let contents = format!("{}\t{}\n", version_str, mac_hex);
         // tmp + rename for atomicity. Best-effort: if the write fails we log and
         // continue; the in-memory guard still catches intra-session downgrades.
         let tmp = path.with_extension("tmp");
-        let write_ok = std::fs::write(&tmp, version.to_string().as_bytes()).is_ok();
+        let write_ok = std::fs::write(&tmp, contents.as_bytes()).is_ok();
         if !write_ok {
             tracing::warn!(?path, "failed to write manifest-version tmp file");
             return;
@@ -2284,10 +2739,19 @@ impl EncryptedClient {
                         .map(|e| e.encrypted)
                         .unwrap_or(false)
                 }
-                // v7 read path isn't wired yet — fail closed: treat the
-                // entry as requiring encryption so callers refuse to serve
-                // plaintext bytes. Once the v7 traversal lands, this arm
-                // will do a real HAMT lookup.
+                // F4 — v7 invariant: every v7 upsert made by
+                // `EncryptedClient` writes `encrypted: true`. Both
+                // direct-upsert sites enforce this via `debug_assert!`
+                // on the entry being passed to
+                // `ShardedHamtPrivateForest::upsert_file`, and the
+                // v1→v7 migration preserves the v1 flag (which is
+                // also always `true` when authored by this crate).
+                // Returning `true` here is therefore exhaustive, not
+                // a speculative fallback: no production code path
+                // inserts a plaintext v7 entry. If future work adds
+                // optional v7 plaintext support, the upsert-side
+                // debug_asserts must be relaxed and a real HAMT
+                // reverse lookup wired here at the same time.
                 ForestCacheEntry::ShardedHamt { .. } => true,
             },
             None => false,
@@ -2593,7 +3057,7 @@ impl EncryptedClient {
 
         // Snapshot prior etag + seq and clone out the forest Arc.  The
         // DashMap guard is dropped at the end of this block so we can
-        // `.lock().await` the forest mutex below without holding a shard
+        // `.write().await` the forest RwLock below without holding a shard
         // lock across the await.
         let (forest_arc, prior_etag, prior_seq) = {
             let entry = self.forest_cache.get(bucket)
@@ -2617,7 +3081,7 @@ impl EncryptedClient {
         // is bound to the post-flush sequence we'll commit in phase 2.
         let backend = Arc::new(S3BlobBackend::new(self.inner.clone(), bucket.to_string()));
         let manifest_snapshot = {
-            let mut guard = forest_arc.lock().await;
+            let mut guard = forest_arc.write().await;
             guard.flush_dirty(&backend).await
                 .map_err(ClientError::Encryption)?;
             guard.manifest().clone()
@@ -2972,6 +3436,13 @@ impl EncryptedClient {
         let backend = Arc::new(S3BlobBackend::new(self.inner.clone(), bucket.to_string()));
 
         // Replay files. HAMT insert is commutative per key; ordering irrelevant.
+        // F4: entries are passed through verbatim — `encrypted` preserves the
+        // v1 value. Production v1 entries are always `encrypted: true`
+        // (EncryptedClient paths call `mark_encrypted` before upsert), so
+        // `forest_entry_requires_encryption`'s unconditional v7-true answer
+        // remains correct after migration. Tests that construct plaintext v1
+        // entries stress-test the forest structure, not the read-path
+        // encryption check.
         for entry in v1_forest.files.values() {
             if let Err(e) = v7.upsert_file(entry.clone(), &backend).await {
                 release_best_effort(lock_token.clone()).await;
@@ -2998,6 +3469,18 @@ impl EncryptedClient {
             release_best_effort(lock_token.clone()).await;
             return Ok(MigrationOutcome::DeferredTransientError {
                 reason: format!("flush_dirty during migration failed: {}", e),
+            });
+        }
+
+        // Fault injection point: simulate a client crash between Phase A and
+        // Phase B. Node blobs are already on disk; manifest PUT has not fired.
+        #[cfg(feature = "test-fault-injection")]
+        if test_faults::CRASH_AFTER_PHASE_A_FLUSH
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            release_best_effort(lock_token.clone()).await;
+            return Ok(MigrationOutcome::DeferredTransientError {
+                reason: "test-fault-injection: CRASH_AFTER_PHASE_A_FLUSH".to_string(),
             });
         }
 
@@ -3046,10 +3529,25 @@ impl EncryptedClient {
             }
         };
 
+        // Fault injection point: simulate a client crash AFTER the Phase B
+        // conditional PUT has succeeded (server now serves v7 at index_key)
+        // but BEFORE the in-process cache swap / `persist_manifest_version`.
+        // Cold-start of the next session must re-detect v7 from the server.
+        #[cfg(feature = "test-fault-injection")]
+        if test_faults::CRASH_AFTER_PHASE_B_PUT_BEFORE_CACHE_SWAP
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            release_best_effort(lock_token.clone()).await;
+            return Ok(MigrationOutcome::DeferredTransientError {
+                reason: "test-fault-injection: CRASH_AFTER_PHASE_B_PUT_BEFORE_CACHE_SWAP"
+                    .to_string(),
+            });
+        }
+
         // ── Step 8: Install the migrated forest into the cache ─────────────
         let new_etag = if put_result.etag.is_empty() { None } else { Some(put_result.etag) };
         let now = chrono::Utc::now().timestamp();
-        let forest_arc = Arc::new(tokio::sync::Mutex::new(v7));
+        let forest_arc = Arc::new(tokio::sync::RwLock::new(v7));
         self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::ShardedHamt {
             forest: forest_arc,
             loaded_at: now,
@@ -3133,7 +3631,7 @@ impl EncryptedClient {
         } else if let Some(arc) = v7_forest {
             // v7 keeps a per-shard `entry_count` in the manifest so total
             // counts are O(1) without walking the HAMT.
-            let guard = arc.lock().await;
+            let guard = arc.read().await;
             guard.manifest().shards.iter()
                 .map(|s| s.entry_count as usize)
                 .sum()
@@ -3194,14 +3692,14 @@ impl EncryptedClient {
         // Generate flat storage key from cached forest.
         //
         // For v7 we can't derive the key while holding the DashMap guard —
-        // ShardedHamtPrivateForest is behind a `tokio::sync::Mutex` and taking
-        // its `.lock().await` across the DashMap guard would deadlock the
+        // ShardedHamtPrivateForest is behind a `tokio::sync::RwLock` and taking
+        // its `.read().await` across the DashMap guard would deadlock the
         // DashMap shard. The sync formats finalize inline; for v7 we extract
-        // the Arc, drop the guard, lock the mutex to copy `shard_salt`, drop
-        // the lock, then compute the key.
+        // the Arc, drop the guard, read the forest to copy `shard_salt`, drop
+        // the read guard, then compute the key.
         enum KeyPath {
             Ready(String),
-            V7(Arc<tokio::sync::Mutex<ShardedHamtPrivateForest>>),
+            V7(Arc<tokio::sync::RwLock<ShardedHamtPrivateForest>>),
         }
         let path = {
             let cache_entry = self.forest_cache.get(bucket)
@@ -3221,7 +3719,7 @@ impl EncryptedClient {
             KeyPath::Ready(sk) => sk,
             KeyPath::V7(forest_arc) => {
                 let salt = {
-                    let guard = forest_arc.lock().await;
+                    let guard = forest_arc.read().await;
                     guard.manifest().shard_salt.clone()
                 };
                 generate_flat_key(key, &dek, &salt)
@@ -3336,9 +3834,16 @@ impl EncryptedClient {
                 S3BlobBackend::new(self.inner.clone(), bucket.to_string())
             );
             let old = {
-                let mut guard = forest_arc.lock().await;
+                let mut guard = forest_arc.write().await;
                 let prior = guard.get_file(key, &backend).await
                     .map_err(ClientError::Encryption)?;
+                // F4: lock the v7-encrypted invariant (see chunked-upload
+                // site for the full rationale).
+                debug_assert!(
+                    forest_entry.encrypted,
+                    "v7 upsert invariant violated: entry for {} has encrypted=false",
+                    forest_entry.path
+                );
                 guard.upsert_file(forest_entry, &backend).await
                     .map_err(ClientError::Encryption)?;
                 prior.map(|e| e.storage_key)
@@ -3889,6 +4394,35 @@ impl EncryptedClient {
             fula_crypto::CryptoError::Decryption(format!("Invalid chunked metadata in manifest: {}", e))
         ))?;
 
+        // Verify `data` matches the original upload BEFORE reusing any stored nonce.
+        // Each chunk's nonce was generated once at upload time and persisted in
+        // `chunked_meta.chunk_nonces`. If `data` differs from the original bytes,
+        // re-encrypting under the same (DEK, nonce) pair leaks the keystream XOR
+        // of the two plaintexts and collapses AEAD authenticity. The BAO root
+        // hash already stored in `chunked_meta` is the existing whole-file
+        // fingerprint — reusing it avoids a schema change and works for all
+        // pre-existing manifests.
+        if data.len() as u64 != chunked_meta.total_size {
+            return Err(ClientError::Encryption(CryptoError::BaoVerification(
+                format!(
+                    "resume_upload: data length {} does not match manifest total_size {} — refusing to reuse stored nonces with different plaintext",
+                    data.len(),
+                    chunked_meta.total_size,
+                ),
+            )));
+        }
+        let mut bao = BaoEncoder::new();
+        bao.update(data);
+        let computed = bao.finalize();
+        let expected_root = chunked_meta
+            .get_root_hash()
+            .map_err(ClientError::Encryption)?;
+        if computed.root_hash().as_bytes() != expected_root.as_bytes() {
+            return Err(ClientError::Encryption(CryptoError::BaoVerification(
+                "resume_upload: data content does not match original upload (BAO root hash mismatch) — refusing to reuse stored nonces with different plaintext".to_string(),
+            )));
+        }
+
         // Re-derive the DEK: we need the wrapped key + our secret key
         let wrapped_dek: EncryptedData = serde_json::from_value(
             index_meta["wrapped_key"].clone()
@@ -4267,7 +4801,7 @@ impl EncryptedClient {
         };
 
         // v7 replay runs on a distinct cache shape (ShardedHamt holds an
-        // `Arc<tokio::sync::Mutex<ShardedHamtPrivateForest>>`). Detect once
+        // `Arc<tokio::sync::RwLock<ShardedHamtPrivateForest>>`). Detect once
         // here; the body below dispatches to this branch before touching
         // the v6-style manifest fields that don't exist on v7.
         if is_v7 {
@@ -4304,7 +4838,7 @@ impl EncryptedClient {
             }
 
             {
-                let mut guard = forest_arc.lock().await;
+                let mut guard = forest_arc.write().await;
                 if !shard_writes.is_empty() {
                     let num_shards = guard.manifest().shards.len();
                     for (idx, (seq, etag)) in shard_writes {
@@ -4321,6 +4855,10 @@ impl EncryptedClient {
                 for wentry in entries {
                     match wentry {
                         WalEntry::Insert { key: _, entry: forest_entry } => {
+                            // F4: WAL entries originate from prior upserts
+                            // that already enforced the v7 invariant
+                            // (`encrypted: true`) at the upsert site — no
+                            // additional assert here.
                             guard.upsert_file(forest_entry, &backend).await
                                 .map_err(ClientError::Encryption)?;
                         }
@@ -4494,8 +5032,8 @@ impl EncryptedClient {
 
         if self.is_forest_sharded_hamt(bucket) {
             // v7 read path: walk the HAMT to resolve `key` → `ForestFileEntry`.
-            // Scope the DashMap guard so it is dropped before we `.lock().await`
-            // on the v7 forest mutex (DashMap → forest-lock is the deadlock
+            // Scope the DashMap guard so it is dropped before we `.read().await`
+            // on the v7 forest RwLock (DashMap → forest-lock is the deadlock
             // direction; the reverse is safe).
             let forest_arc = {
                 let entry = self.forest_cache.get(bucket)
@@ -4510,7 +5048,8 @@ impl EncryptedClient {
             };
             let backend = Arc::new(S3BlobBackend::new(self.inner.clone(), bucket.to_string()));
             let entry_opt = {
-                let mut guard = forest_arc.lock().await;
+                // get_file now takes &self — concurrent readers don't serialise.
+                let guard = forest_arc.read().await;
                 guard.get_file(key, &backend).await.map_err(ClientError::Encryption)?
             };
             let entry = entry_opt.ok_or_else(|| ClientError::NotFound {
@@ -4563,13 +5102,28 @@ impl EncryptedClient {
     }
 
     /// List directory from forest index (FlatNamespace mode)
-    /// 
+    ///
     /// This is much faster than HEAD requests because the forest already
     /// contains all metadata.
+    ///
+    /// `continuation_token` / `max_keys` activate the paginated v7 walk:
+    /// - `continuation_token = None`, `max_keys = None` → walk the whole prefix
+    ///   (unchanged from pre-F5 behaviour).
+    /// - `continuation_token = Some(tok)` → resume from the opaque token
+    ///   returned by a previous call's `next_continuation_token`.
+    /// - `max_keys = Some(n)` → stop after the first shard whose walk pushes
+    ///   total matches ≥ `n` (shard-grained soft cap — see
+    ///   `ShardedHamtPrivateForest::list_recursive_page`).
+    ///
+    /// v1 / v6 arms ignore `continuation_token` and `max_keys`: those
+    /// forests are already fully in-memory, so pagination is a no-op and the
+    /// full matching set is returned in one page.
     async fn list_directory_from_forest(
         &self,
         bucket: &str,
         prefix: Option<&str>,
+        continuation_token: Option<&str>,
+        max_keys: Option<usize>,
     ) -> Result<DirectoryListing> {
         self.ensure_forest_loaded(bucket).await?;
 
@@ -4616,19 +5170,55 @@ impl EncryptedClient {
             let backend: Arc<S3BlobBackend> = Arc::new(
                 S3BlobBackend::new(self.inner.clone(), bucket.to_string())
             );
-            let files = {
-                let mut guard = forest_arc.lock().await;
-                guard.list_recursive(prefix_str, &backend).await
-                    .map_err(ClientError::Encryption)?
+            // F5: route through the shard-grained paginated walk. When the
+            // caller passes no bounds the loop drains every page, matching
+            // pre-pagination semantics; when bounds are present we stop
+            // after one page and return the opaque `next_continuation_token`.
+            // F6: `list_recursive_page` takes `&self`, so concurrent readers
+            // share the outer `RwLock` in `read()` mode.
+            let cursor_bytes_first: Option<Vec<u8>> = match continuation_token {
+                None => None,
+                Some(tok) => Some(hex::decode(tok).map_err(|e| ClientError::Encryption(
+                    fula_crypto::CryptoError::Hamt(format!(
+                        "list_directory: invalid continuation_token: {}", e
+                    ))
+                ))?),
             };
-            for fentry in &files {
-                let (dir, metadata) = build_entry(fentry);
-                directories.entry(dir).or_default().push(metadata);
+            let paginated = continuation_token.is_some() || max_keys.is_some();
+            let cap = max_keys.unwrap_or(0); // 0 = no cap in list_recursive_page
+            let mut cursor_bytes = cursor_bytes_first;
+            let mut final_next: Option<Vec<u8>> = None;
+            loop {
+                let (page, next) = {
+                    let guard = forest_arc.read().await;
+                    guard.list_recursive_page(prefix_str, cursor_bytes.as_deref(), cap, &backend).await
+                        .map_err(ClientError::Encryption)?
+                };
+                for fentry in &page {
+                    let (dir, metadata) = build_entry(fentry);
+                    directories.entry(dir).or_default().push(metadata);
+                }
+                // Paginated caller: return the first page and stop.
+                if paginated {
+                    final_next = next;
+                    break;
+                }
+                // Unpaginated caller (legacy): drain every page.
+                match next {
+                    Some(c) => cursor_bytes = Some(c),
+                    None => break,
+                }
             }
+            let (is_truncated, next_token) = match final_next {
+                Some(bytes) => (true, Some(hex::encode(bytes))),
+                None => (false, None),
+            };
             return Ok(DirectoryListing {
                 bucket: bucket.to_string(),
                 prefix: prefix.map(|s| s.to_string()),
                 directories,
+                is_truncated,
+                next_continuation_token: next_token,
             });
         }
 
@@ -4659,10 +5249,14 @@ impl EncryptedClient {
             }
         }
 
+        // v1 / v6 forests are fully in-memory — pagination is a no-op and
+        // we always return the complete matching set in a single page.
         Ok(DirectoryListing {
             bucket: bucket.to_string(),
             prefix: prefix.map(|s| s.to_string()),
             directories,
+            is_truncated: false,
+            next_continuation_token: None,
         })
     }
 
@@ -4704,7 +5298,7 @@ impl EncryptedClient {
                 S3BlobBackend::new(self.inner.clone(), bucket.to_string())
             );
             let entries = {
-                let mut guard = forest_arc.lock().await;
+                let guard = forest_arc.read().await;
                 guard.list_all_files(&backend).await
                     .map_err(ClientError::Encryption)?
             };
@@ -4748,12 +5342,69 @@ impl EncryptedClient {
         enc_meta["chunked"]["num_chunks"].as_u64().map(|n| n as u32)
     }
 
-    /// Delete all chunk objects for a chunked file (best-effort, errors ignored).
-    async fn delete_chunk_objects(&self, bucket: &str, storage_key: &str, num_chunks: u32) {
+    /// Delete all chunk objects for a chunked file.
+    ///
+    /// Returns the number of chunks whose delete failed. Errors are logged
+    /// (not silently dropped, as pre-F7) so partial-orphan state is visible
+    /// to operators; the aggregate count lets the caller decide whether to
+    /// enqueue for later retry. Deletes run concurrently with a
+    /// `buffer_unordered` cap so a chunked file of N chunks does not hold
+    /// the caller for O(N) serial round-trips.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn delete_chunk_objects(&self, bucket: &str, storage_key: &str, num_chunks: u32) -> u32 {
+        use futures::StreamExt;
+        let concurrency = 16usize;
+        let bucket_s = bucket.to_string();
+        let key_s = storage_key.to_string();
+        let failed = futures::stream::iter(0..num_chunks)
+            .map(|i| {
+                let bucket = bucket_s.clone();
+                let key = key_s.clone();
+                let client = self.inner.clone();
+                async move {
+                    let chunk_key = ChunkedFileMetadata::chunk_key(&key, i);
+                    match client.delete_object(&bucket, &chunk_key).await {
+                        Ok(()) => None,
+                        Err(e) => {
+                            tracing::warn!(
+                                bucket = %bucket,
+                                storage_key = %key,
+                                chunk_index = i,
+                                error = ?e,
+                                "delete_chunk_objects: failed to delete chunk"
+                            );
+                            Some(i)
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(concurrency)
+            .filter_map(|r| async move { r })
+            .count()
+            .await;
+        failed as u32
+    }
+
+    /// WASM fallback retains the pre-F7 serial path since there's no
+    /// persistent queue to retry into and `buffer_unordered` pulls in
+    /// concurrency primitives the wasm target doesn't support uniformly.
+    #[cfg(target_arch = "wasm32")]
+    async fn delete_chunk_objects(&self, bucket: &str, storage_key: &str, num_chunks: u32) -> u32 {
+        let mut failed = 0u32;
         for i in 0..num_chunks {
             let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, i);
-            let _ = self.inner.delete_object(bucket, &chunk_key).await;
+            if let Err(e) = self.inner.delete_object(bucket, &chunk_key).await {
+                tracing::warn!(
+                    bucket = %bucket,
+                    storage_key = %storage_key,
+                    chunk_index = i,
+                    error = ?e,
+                    "delete_chunk_objects: failed to delete chunk"
+                );
+                failed += 1;
+            }
         }
+        failed
     }
 
     /// Return true if any file entry in the (already-loaded) forest for `bucket`
@@ -4787,15 +5438,32 @@ impl EncryptedClient {
     /// own index before issuing an IPFS unpin, so shared CIDs are never
     /// unpinned prematurely.
     ///
-    /// All errors are logged and swallowed: an orphaned S3 object is
-    /// recoverable garbage, but failing the upload would lose the new data.
+    /// Failures are surfaced via the NEW-F7 persistent orphan queue: any
+    /// chunk-delete or main-object-delete that errors causes a queue entry
+    /// to be appended (deduped on storage_key) so a future session can
+    /// retry the cleanup. A lazy drain runs at the top of this function to
+    /// reclaim objects from prior failed sessions without holding
+    /// `ensure_forest_loaded` on network I/O.
     async fn cleanup_orphaned_storage(
         &self,
         bucket: &str,
         storage_key: &str,
         num_chunks: Option<u32>,
     ) {
-        if self.storage_key_still_referenced(bucket, storage_key) {
+        // F7: opportunistically drain the persistent queue first. This runs
+        // lazily — we only pay the drain cost when cleanup was already
+        // going to fire, and we never fail the outer upload if the drain
+        // has trouble.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.drain_orphan_queue(bucket).await;
+
+        #[cfg(feature = "test-fault-injection")]
+        let bypass_refcheck = test_faults::BYPASS_ORPHAN_CLEANUP_REFCHECK
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(feature = "test-fault-injection"))]
+        let bypass_refcheck = false;
+
+        if !bypass_refcheck && self.storage_key_still_referenced(bucket, storage_key) {
             tracing::debug!(
                 bucket = %bucket,
                 storage_key = %storage_key,
@@ -4804,18 +5472,168 @@ impl EncryptedClient {
             return;
         }
 
+        let mut chunk_failures: u32 = 0;
         if let Some(n) = num_chunks {
-            self.delete_chunk_objects(bucket, storage_key, n).await;
+            chunk_failures = self.delete_chunk_objects(bucket, storage_key, n).await;
         }
 
-        if let Err(e) = self.inner.delete_object(bucket, storage_key).await {
+        #[cfg(feature = "test-fault-injection")]
+        let forced_fail = test_faults::FORCE_ORPHAN_CLEANUP_MAIN_FAIL
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(feature = "test-fault-injection"))]
+        let forced_fail = false;
+
+        let main_failed = if forced_fail {
+            tracing::warn!(
+                bucket = %bucket,
+                storage_key = %storage_key,
+                "test-fault-injection: FORCE_ORPHAN_CLEANUP_MAIN_FAIL — treating as failed delete"
+            );
+            true
+        } else if let Err(e) = self.inner.delete_object(bucket, storage_key).await {
             tracing::warn!(
                 bucket = %bucket,
                 storage_key = %storage_key,
                 error = ?e,
-                "Failed to delete orphaned storage key (best-effort; server-side GC may reclaim later)"
+                "Failed to delete orphaned storage key (best-effort; enqueued for retry)"
             );
+            true
+        } else {
+            false
+        };
+
+        // F7: if anything failed, persist the orphan for a future session to retry.
+        #[cfg(not(target_arch = "wasm32"))]
+        if main_failed || chunk_failures > 0 {
+            let mac_key = orphan_queue::derive_orphan_queue_mac_key(
+                &self.encryption.key_manager, bucket,
+            );
+            let entry = orphan_queue::OrphanEntry {
+                storage_key: storage_key.to_string(),
+                num_chunks,
+            };
+            match orphan_queue::append_dedup(bucket, &mac_key, entry) {
+                Ok(true) => tracing::info!(
+                    bucket = %bucket,
+                    storage_key = %storage_key,
+                    chunk_failures,
+                    main_failed,
+                    "orphan_queue: enqueued for retry"
+                ),
+                Ok(false) => tracing::debug!(
+                    bucket = %bucket,
+                    storage_key = %storage_key,
+                    "orphan_queue: already queued, not duplicated"
+                ),
+                Err(e) => tracing::warn!(
+                    bucket = %bucket,
+                    storage_key = %storage_key,
+                    error = ?e,
+                    "orphan_queue: failed to enqueue; server-side GC may reclaim later"
+                ),
+            }
         }
+        // Silence unused warning when wasm32.
+        #[cfg(target_arch = "wasm32")]
+        let _ = (main_failed, chunk_failures);
+    }
+
+    /// F7: attempt to delete any objects recorded in the persistent orphan
+    /// queue for `bucket`. Entries whose re-cleanup succeeds are dropped;
+    /// entries whose re-cleanup still fails stay queued for the next session.
+    ///
+    /// Concurrency: a per-bucket "in flight" marker in `orphan_drain_in_flight`
+    /// ensures two concurrent cleanup calls don't redundantly drain the same
+    /// queue. A lost race is harmless — the loser simply skips, the winner
+    /// drains.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn drain_orphan_queue(&self, bucket: &str) {
+        // Try-acquire the bucket's drain slot. If another task is already
+        // draining we skip; the drain is idempotent so duplicating work is
+        // wasteful but not incorrect.
+        if self.orphan_drain_in_flight.insert(bucket.to_string(), ()).is_some() {
+            return;
+        }
+
+        // Guard ensures we remove the marker even on panic.
+        struct DrainGuard<'a> {
+            map: &'a DashMap<String, ()>,
+            bucket: String,
+        }
+        impl<'a> Drop for DrainGuard<'a> {
+            fn drop(&mut self) {
+                self.map.remove(&self.bucket);
+            }
+        }
+        let _guard = DrainGuard {
+            map: &self.orphan_drain_in_flight,
+            bucket: bucket.to_string(),
+        };
+
+        let mac_key = orphan_queue::derive_orphan_queue_mac_key(
+            &self.encryption.key_manager, bucket,
+        );
+        let queued = match orphan_queue::load(bucket, &mac_key) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(bucket = %bucket, error = ?e, "orphan_queue: load failed; skipping drain");
+                return;
+            }
+        };
+        if queued.is_empty() {
+            return;
+        }
+
+        tracing::info!(bucket = %bucket, queue_depth = queued.len(), "orphan_queue: drain starting");
+
+        #[cfg(feature = "test-fault-injection")]
+        let bypass_refcheck = test_faults::BYPASS_ORPHAN_CLEANUP_REFCHECK
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(feature = "test-fault-injection"))]
+        let bypass_refcheck = false;
+
+        let mut keep: Vec<orphan_queue::OrphanEntry> = Vec::new();
+        let mut drained = 0usize;
+        for entry in &queued {
+            // Re-check the reference guard — a content-addressed re-upload
+            // could have revived this storage key between enqueue and drain.
+            if !bypass_refcheck && self.storage_key_still_referenced(bucket, &entry.storage_key) {
+                // Live again. Drop it from the queue rather than retry.
+                drained += 1;
+                continue;
+            }
+            let chunk_failures = if let Some(n) = entry.num_chunks {
+                self.delete_chunk_objects(bucket, &entry.storage_key, n).await
+            } else {
+                0
+            };
+            // The fault mirrors a transient server-side delete failure. A real
+            // server outage would reject the drain's delete attempt as well —
+            // so honor the flag here too; otherwise the queue would drain
+            // during the outage and defeat the simulation.
+            #[cfg(feature = "test-fault-injection")]
+            let forced_fail = test_faults::FORCE_ORPHAN_CLEANUP_MAIN_FAIL
+                .load(std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(feature = "test-fault-injection"))]
+            let forced_fail = false;
+            let main_failed = forced_fail
+                || self.inner.delete_object(bucket, &entry.storage_key).await.is_err();
+            if main_failed || chunk_failures > 0 {
+                keep.push(entry.clone());
+            } else {
+                drained += 1;
+            }
+        }
+
+        if let Err(e) = orphan_queue::rewrite(bucket, &mac_key, &keep) {
+            tracing::warn!(bucket = %bucket, error = ?e, "orphan_queue: rewrite failed after drain");
+        }
+        tracing::info!(
+            bucket = %bucket,
+            drained,
+            remaining = keep.len(),
+            "orphan_queue: drain complete"
+        );
     }
 
     /// Delete a file in FlatNamespace mode
@@ -4847,7 +5665,7 @@ impl EncryptedClient {
                 S3BlobBackend::new(self.inner.clone(), bucket.to_string())
             );
             let removed = {
-                let mut guard = forest_arc.lock().await;
+                let mut guard = forest_arc.write().await;
                 guard.remove_file(key, &backend).await
                     .map_err(ClientError::Encryption)?
             };
@@ -5027,7 +5845,7 @@ impl EncryptedClient {
                 S3BlobBackend::new(self.inner.clone(), bucket.to_string())
             );
             let subtree = {
-                let mut guard = forest_arc.lock().await;
+                let guard = forest_arc.read().await;
                 guard.extract_subtree(prefix, &backend).await
                     .map_err(ClientError::Encryption)?
             };
@@ -5759,7 +6577,7 @@ impl EncryptedClient {
         
         // Update forest cache if we have one.
         //
-        // v7 mutates an `Arc<tokio::sync::Mutex<ShardedHamtPrivateForest>>`
+        // v7 mutates an `Arc<tokio::sync::RwLock<ShardedHamtPrivateForest>>`
         // whose `upsert_file` is async and cannot be called while holding
         // the DashMap guard. Split the match: sync formats mutate in place
         // under the guard, v7 extracts the Arc and performs the async
@@ -5806,7 +6624,17 @@ impl EncryptedClient {
                 S3BlobBackend::new(self.inner.clone(), bucket.to_string())
             );
             {
-                let mut guard = forest_arc.lock().await;
+                let mut guard = forest_arc.write().await;
+                // F4: lock the v7-encrypted invariant. Every entry upserted
+                // into v7 must be encrypted; `forest_entry_requires_encryption`
+                // depends on this to answer correctly without a HAMT reverse
+                // lookup. If plaintext v7 support is ever added, this assert
+                // fires and forces the author to wire the lookup side too.
+                debug_assert!(
+                    file_entry.encrypted,
+                    "v7 upsert invariant violated: entry for {} has encrypted=false",
+                    file_entry.path
+                );
                 guard.upsert_file(file_entry, &backend).await
                     .map_err(ClientError::Encryption)?;
             }
@@ -6054,8 +6882,13 @@ impl FileMetadata {
     }
 }
 
-/// Directory listing result
+/// Directory listing result.
+///
+/// Marked `#[non_exhaustive]` so future pagination / metadata fields can be
+/// added without breaking external consumers that match on or construct the
+/// struct with a literal.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DirectoryListing {
     /// Bucket name
     pub bucket: String,
@@ -6063,6 +6896,13 @@ pub struct DirectoryListing {
     pub prefix: Option<String>,
     /// Files grouped by directory path
     pub directories: HashMap<String, Vec<FileMetadata>>,
+    /// True when the server/forest has more entries that were not returned in
+    /// this page. Follow up with `list_directory_paginated` passing
+    /// `next_continuation_token` to retrieve the next page.
+    pub is_truncated: bool,
+    /// Opaque token identifying the next page (hex-encoded). `None` iff
+    /// `is_truncated == false`.
+    pub next_continuation_token: Option<String>,
 }
 
 impl DirectoryListing {
@@ -6206,7 +7046,7 @@ mod tests {
 
         let dek = DekKey::from_bytes(&[0x42u8; 32]).unwrap();
         let forest = ShardedHamtPrivateForest::from_manifest(manifest, "bucket", dek);
-        let forest_arc = Arc::new(tokio::sync::Mutex::new(forest));
+        let forest_arc = Arc::new(tokio::sync::RwLock::new(forest));
         let clean = ForestCacheEntry::ShardedHamt {
             forest: forest_arc,
             loaded_at: 42,
@@ -6350,7 +7190,7 @@ mod tests {
         let dek = DekKey::from_bytes(&[0x01u8; 32]).unwrap();
         let v7 = ShardedHamtPrivateForest::from_manifest(manifest, "bucket", dek);
         client.forest_cache.insert("bucket".to_string(), ForestCacheEntry::ShardedHamt {
-            forest: Arc::new(tokio::sync::Mutex::new(v7)),
+            forest: Arc::new(tokio::sync::RwLock::new(v7)),
             loaded_at: chrono::Utc::now().timestamp(),
             manifest_etag: Some("cached".to_string()),
             last_manifest_sequence: Some(1),
@@ -6384,5 +7224,590 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap();
         assert_eq!(parsed, ts);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // F1: resume_upload nonce-reuse protection
+    //
+    // resume_upload reuses per-chunk nonces stored in the manifest against
+    // caller-supplied `data`. Without a content check, a caller passing
+    // different bytes would encrypt new plaintext under the same (DEK, nonce)
+    // pair — classic AEAD keystream reuse. The check reuses the BAO root hash
+    // already in ChunkedFileMetadata, so no schema change is required.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod f1_resume_nonce_reuse_protection {
+        use super::*;
+        use fula_crypto::chunked::{ChunkedEncoder, MIN_CHUNK_SIZE};
+        use fula_crypto::keys::DekKey;
+
+        /// Build an on-disk UploadManifest whose `index_metadata_json` has a
+        /// real `chunked` block derived from `original_data`. `wrapped_key` is
+        /// a placeholder — the F1 check fires before we ever parse it, so
+        /// tests never need a valid HPKE-wrapped DEK.
+        fn make_manifest_with_real_chunked_meta(
+            dir: &std::path::Path,
+            original_data: &[u8],
+        ) -> std::path::PathBuf {
+            let dek = DekKey::generate();
+            let aad = b"fula:v4:chunk:QmF1Test".to_vec();
+            let mut encoder = ChunkedEncoder::with_aad_and_chunk_size(
+                dek, aad, MIN_CHUNK_SIZE,
+            );
+            let _ = encoder.update(original_data).unwrap();
+            let (_final_chunk, chunked_meta, _outboard) = encoder.finalize().unwrap();
+
+            let index_metadata = serde_json::json!({
+                "version": 4,
+                "algorithm": "AES-256-GCM",
+                "wrapped_key": { "placeholder": "f1 check fires before this is parsed" },
+                "kek_version": 1u32,
+                "metadata_privacy": true,
+                "obfuscation_mode": "flat",
+                "chunked": serde_json::to_value(&chunked_meta).unwrap(),
+            })
+            .to_string();
+
+            let manifest_chunks: Vec<ManifestChunk> = (0..chunked_meta.num_chunks)
+                .map(|i| ManifestChunk {
+                    index: i,
+                    chunk_key: ChunkedFileMetadata::chunk_key("QmF1Test", i),
+                    uploaded: false,
+                })
+                .collect();
+
+            let manifest = UploadManifest {
+                bucket: "f1-test-bucket".to_string(),
+                storage_key: "QmF1Test".to_string(),
+                original_key: "f1-test.bin".to_string(),
+                num_chunks: chunked_meta.num_chunks,
+                chunks: manifest_chunks,
+                index_metadata_json: index_metadata,
+            };
+            let path = dir.join("f1_upload_manifest.json");
+            manifest.save(&path).expect("save manifest");
+            path
+        }
+
+        fn make_test_client() -> EncryptedClient {
+            let cfg = Config::new("http://127.0.0.1:1");
+            let enc = EncryptionConfig::new();
+            EncryptedClient::new(cfg, enc).expect("client builds")
+        }
+
+        #[tokio::test]
+        async fn rejects_data_with_same_length_but_different_content() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let original = vec![0xAAu8; MIN_CHUNK_SIZE * 3 + 500];
+            let tampered = vec![0xBBu8; original.len()]; // same length, different bytes
+
+            let manifest_path = make_manifest_with_real_chunked_meta(
+                tmp.path(), &original,
+            );
+            let client = make_test_client();
+
+            let err = client
+                .resume_upload(&manifest_path, &tampered)
+                .await
+                .expect_err("must reject tampered data");
+
+            match err {
+                ClientError::Encryption(CryptoError::BaoVerification(msg)) => {
+                    assert!(
+                        msg.contains("root hash mismatch"),
+                        "expected BAO root-hash mismatch message, got: {}",
+                        msg,
+                    );
+                }
+                other => panic!("expected BaoVerification, got {:?}", other),
+            }
+        }
+
+        #[tokio::test]
+        async fn rejects_data_with_wrong_length() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let original = vec![0xCCu8; MIN_CHUNK_SIZE * 2 + 100];
+            let truncated = &original[..original.len() - 500]; // shorter
+
+            let manifest_path = make_manifest_with_real_chunked_meta(
+                tmp.path(), &original,
+            );
+            let client = make_test_client();
+
+            let err = client
+                .resume_upload(&manifest_path, truncated)
+                .await
+                .expect_err("must reject wrong-length data");
+
+            match err {
+                ClientError::Encryption(CryptoError::BaoVerification(msg)) => {
+                    assert!(
+                        msg.contains("does not match manifest total_size"),
+                        "expected length-mismatch message, got: {}",
+                        msg,
+                    );
+                }
+                other => panic!("expected BaoVerification, got {:?}", other),
+            }
+        }
+
+        #[tokio::test]
+        async fn accepts_matching_data_past_f1_guard() {
+            // Guards against a future refactor flipping `!=` / `==` on the BAO
+            // check. With matching data the F1 guard lets the call through;
+            // the later wrapped_key parse fails on our placeholder JSON — that
+            // distinct failure proves the F1 check was not the one to reject.
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let original = vec![0xEEu8; MIN_CHUNK_SIZE * 2 + 300];
+
+            let manifest_path = make_manifest_with_real_chunked_meta(
+                tmp.path(), &original,
+            );
+            let client = make_test_client();
+
+            let err = client
+                .resume_upload(&manifest_path, &original)
+                .await
+                .expect_err("placeholder wrapped_key must fail at parse stage");
+
+            match err {
+                ClientError::Encryption(CryptoError::BaoVerification(msg)) => {
+                    panic!("F1 guard wrongly rejected matching data: {}", msg);
+                }
+                ClientError::Encryption(CryptoError::Decryption(msg)) => {
+                    assert!(
+                        msg.contains("wrapped key") || msg.contains("Invalid wrapped key"),
+                        "expected wrapped_key parse failure, got: {}",
+                        msg,
+                    );
+                }
+                other => panic!(
+                    "expected wrapped_key parse failure (proving F1 passed), got {:?}",
+                    other,
+                ),
+            }
+        }
+
+        #[tokio::test]
+        async fn rejects_extended_data() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let original = vec![0xDDu8; MIN_CHUNK_SIZE * 2 + 100];
+            let mut extended = original.clone();
+            extended.extend_from_slice(&[0xEE; 200]); // longer
+
+            let manifest_path = make_manifest_with_real_chunked_meta(
+                tmp.path(), &original,
+            );
+            let client = make_test_client();
+
+            let err = client
+                .resume_upload(&manifest_path, &extended)
+                .await
+                .expect_err("must reject extended data");
+
+            match err {
+                ClientError::Encryption(CryptoError::BaoVerification(msg)) => {
+                    assert!(msg.contains("does not match manifest total_size"));
+                }
+                other => panic!("expected BaoVerification, got {:?}", other),
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // F9: manifest-version pin MAC
+    //
+    // The manifest-version pin file prevents a gateway from silently
+    // downgrading a bucket's forest format. Prior to F9 it was an
+    // unauthenticated `u8` string on disk — any local process with user-write
+    // permission could roll it back. The fix wraps it in a BLAKE3 keyed-hash
+    // MAC whose key is derived from the user's encryption key with a
+    // bucket-scoped domain separator. Legacy bare-number pin files are still
+    // accepted (with a warning) so pre-upgrade installs continue to work;
+    // a MAC-present-but-invalid file is treated as untrusted and returns
+    // `None`, which is the active-tamper case.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod f9_manifest_version_pin_mac {
+        use super::*;
+        use std::sync::Mutex;
+
+        // Tests mutate FULA_STATE_DIR; serialize across cargo's parallel
+        // runner so concurrent tests cannot read each other's env var.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        struct StateDirGuard {
+            _dir: tempfile::TempDir,
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+
+        fn tmp_state_dir() -> StateDirGuard {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("FULA_STATE_DIR", dir.path());
+            StateDirGuard { _dir: dir, _lock: lock }
+        }
+
+        fn make_test_client() -> EncryptedClient {
+            let cfg = Config::new("http://127.0.0.1:1");
+            let enc = EncryptionConfig::new();
+            EncryptedClient::new(cfg, enc).expect("client builds")
+        }
+
+        /// Writing a version then reading it back returns the same value —
+        /// the MAC'd on-disk format round-trips cleanly.
+        #[test]
+        fn round_trip_mac_format() {
+            let _g = tmp_state_dir();
+            let client = make_test_client();
+
+            client.persist_manifest_version("bucket-rt", 6);
+            let loaded = client.load_persisted_manifest_version("bucket-rt");
+            assert_eq!(loaded, Some(6));
+
+            // On-disk format must be `<version>\t<hex_mac>\n`, not a bare
+            // number. This guards against a future refactor accidentally
+            // writing the pre-F9 unauthenticated format.
+            let path = client.manifest_version_path("bucket-rt").expect("path");
+            let contents = std::fs::read_to_string(&path).expect("read");
+            assert!(contents.contains('\t'), "must be tab-separated MAC format");
+            let (ver, mac_hex) = contents.trim_end().rsplit_once('\t').expect("tab");
+            assert_eq!(ver, "6");
+            assert_eq!(
+                hex::decode(mac_hex).expect("hex").len(),
+                32,
+                "MAC must be 32 bytes (BLAKE3 keyed output)",
+            );
+        }
+
+        /// A MAC that does not verify against the bucket-scoped key means
+        /// an adversary rewrote the file. `load` must return `None` rather
+        /// than trust the stored value — this is the active-tamper case.
+        #[test]
+        fn tampered_mac_returns_none() {
+            let _g = tmp_state_dir();
+            let client = make_test_client();
+
+            client.persist_manifest_version("bucket-tm", 6);
+            let path = client.manifest_version_path("bucket-tm").expect("path");
+            let contents = std::fs::read_to_string(&path).expect("read");
+            let (ver, _old_mac) = contents.trim_end().rsplit_once('\t').expect("tab");
+
+            // Swap in a MAC that has the right shape (64 hex chars = 32B)
+            // but is not the true MAC for this (key, version). The load
+            // path must reject this rather than trust the version field.
+            let bogus_mac = "0".repeat(64);
+            std::fs::write(&path, format!("{}\t{}\n", ver, bogus_mac)).expect("write");
+
+            let loaded = client.load_persisted_manifest_version("bucket-tm");
+            assert_eq!(loaded, None, "tampered MAC must not be trusted");
+        }
+
+        /// An adversary who rewrites the version but keeps the old MAC
+        /// must be rejected: the MAC is computed over the version string,
+        /// so a version change without a matching MAC recomputation fails
+        /// `verify_mac`. Downgrading 7 → 1 through this channel must not
+        /// succeed.
+        #[test]
+        fn tampered_version_with_stale_mac_returns_none() {
+            let _g = tmp_state_dir();
+            let client = make_test_client();
+
+            client.persist_manifest_version("bucket-tv", 7);
+            let path = client.manifest_version_path("bucket-tv").expect("path");
+            let contents = std::fs::read_to_string(&path).expect("read");
+            let (_old_ver, mac_hex) = contents.trim_end().rsplit_once('\t').expect("tab");
+
+            // Rewrite the version field while keeping the old MAC. This
+            // simulates the exact rollback attack the MAC is designed to
+            // prevent.
+            std::fs::write(&path, format!("1\t{}\n", mac_hex)).expect("write");
+
+            let loaded = client.load_persisted_manifest_version("bucket-tv");
+            assert_eq!(
+                loaded, None,
+                "rollback via version-only rewrite must be rejected",
+            );
+        }
+
+        /// The MAC key is derived with a bucket-scoped domain separator
+        /// (`forest-manifest-version-mac:{bucket}`), so a file written for
+        /// bucket A must not verify for bucket B even on the same client.
+        /// Without this, an attacker who can write to one bucket's pin
+        /// file could cross-contaminate another bucket's version state.
+        #[test]
+        fn cross_bucket_mac_rejected() {
+            let _g = tmp_state_dir();
+            let client = make_test_client();
+
+            // Write a valid pin for bucket A, then copy the raw bytes to
+            // bucket B's pin path. B's MAC key is different → verification
+            // must fail.
+            client.persist_manifest_version("bucket-A", 5);
+            let path_a = client.manifest_version_path("bucket-A").expect("A path");
+            let contents_a = std::fs::read(&path_a).expect("read A");
+
+            let path_b = client.manifest_version_path("bucket-B").expect("B path");
+            if let Some(parent) = path_b.parent() {
+                std::fs::create_dir_all(parent).expect("mkdir B");
+            }
+            std::fs::write(&path_b, &contents_a).expect("write B");
+
+            let loaded_b = client.load_persisted_manifest_version("bucket-B");
+            assert_eq!(
+                loaded_b, None,
+                "cross-bucket MAC must not verify (domain separator bound to bucket)",
+            );
+
+            // Sanity: A still loads.
+            assert_eq!(
+                client.load_persisted_manifest_version("bucket-A"),
+                Some(5),
+            );
+        }
+
+        /// Legacy (pre-F9) pin files are bare numbers without a MAC. They
+        /// must still be accepted read-only — refusing them would break
+        /// any install that upgraded from a pre-F9 build and would
+        /// silently undermine the downgrade-guard on the very first post-
+        /// upgrade run. The next write upgrades them to the MAC'd format.
+        #[test]
+        fn legacy_bare_format_accepted_and_upgraded() {
+            let _g = tmp_state_dir();
+            let client = make_test_client();
+
+            let path = client.manifest_version_path("bucket-legacy").expect("path");
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("mkdir");
+            }
+            // Pre-F9 format: bare number, no tab, no MAC.
+            std::fs::write(&path, b"6").expect("write legacy");
+
+            let loaded = client.load_persisted_manifest_version("bucket-legacy");
+            assert_eq!(
+                loaded,
+                Some(6),
+                "legacy bare-number pin must still be readable",
+            );
+
+            // The next (monotonic) write upgrades the file to the MAC'd
+            // format. Reading afterwards must round-trip through the new
+            // code path — proving the upgrade actually happened.
+            client.persist_manifest_version("bucket-legacy", 7);
+            let upgraded = std::fs::read_to_string(&path).expect("read upgraded");
+            assert!(
+                upgraded.contains('\t'),
+                "post-write file must be MAC'd format, got {:?}",
+                upgraded,
+            );
+            assert_eq!(
+                client.load_persisted_manifest_version("bucket-legacy"),
+                Some(7),
+            );
+        }
+    }
+
+    // F10 — per-chunk download timeout.
+    //
+    // The download path wraps every chunk fetch in
+    // `tokio::time::timeout(per_chunk_download_timeout, …)` and maps elapsed
+    // into `ClientError::DownloadFailed` with a message identifying the
+    // stalled chunk. These tests cover: (a) Config default is 5 min;
+    // (b) a stalled future surfaces the documented error shape.
+    #[cfg(not(target_arch = "wasm32"))]
+    mod f10_per_chunk_download_timeout {
+        use super::*;
+        use std::time::Duration;
+
+        #[test]
+        fn default_is_five_minutes() {
+            let cfg = Config::default();
+            assert_eq!(cfg.per_chunk_download_timeout, Duration::from_secs(300));
+        }
+
+        // Exercises the real `fetch_chunk_with_timeout` helper that the
+        // production download loop calls. A stalled (`pending`) future is
+        // injected so the timeout branch fires deterministically under
+        // `start_paused = true`. Because both production and this test
+        // share one helper, any drift in the error variant or message
+        // breaks the production path and this test in lockstep.
+        #[tokio::test(flavor = "current_thread", start_paused = true)]
+        async fn stalled_fetch_surfaces_download_failed() {
+            let per_chunk_timeout = Duration::from_millis(50);
+            let chunk_index: u32 = 7;
+
+            // Never completes; relies on tokio's paused-time timer to
+            // cancel it deterministically.
+            let stalled = futures::future::pending::<Result<Bytes>>();
+            let result: Result<Bytes> =
+                fetch_chunk_with_timeout(stalled, chunk_index, per_chunk_timeout).await;
+
+            match result {
+                Err(ClientError::DownloadFailed(msg)) => {
+                    assert!(
+                        msg.contains("chunk 7"),
+                        "error must name the stalled chunk index, got: {msg}"
+                    );
+                    assert!(
+                        msg.contains("50ms"),
+                        "error must include the configured timeout, got: {msg}"
+                    );
+                }
+                other => panic!("expected DownloadFailed, got {other:?}"),
+            }
+        }
+
+        // Happy-path: a future that completes with Ok must pass through
+        // the timeout wrap unchanged. Guards against a future refactor
+        // accidentally mapping Ok into Err (e.g. `?` on the wrong layer).
+        #[tokio::test(flavor = "current_thread", start_paused = true)]
+        async fn ok_passes_through() {
+            let payload = Bytes::from_static(b"hello");
+            let fut = async { Ok::<Bytes, ClientError>(payload.clone()) };
+            let result = fetch_chunk_with_timeout(fut, 3, Duration::from_secs(10)).await;
+            assert_eq!(result.unwrap(), payload);
+        }
+
+        // Inner-error path: a future that completes with Err(inner) must
+        // surface `inner` verbatim — the timeout wrap must not rewrap
+        // upstream errors into DownloadFailed.
+        #[tokio::test(flavor = "current_thread", start_paused = true)]
+        async fn inner_error_preserved() {
+            let fut = async {
+                Err::<Bytes, ClientError>(ClientError::BucketNotFound("chunks-bkt".into()))
+            };
+            let result = fetch_chunk_with_timeout(fut, 4, Duration::from_secs(10)).await;
+            match result {
+                Err(ClientError::BucketNotFound(msg)) => assert!(msg.contains("chunks-bkt")),
+                other => panic!("expected BucketNotFound to pass through, got {other:?}"),
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // F4: v7 `forest_entry_requires_encryption` invariant
+    //
+    // The v7 arm of `forest_entry_requires_encryption` returns `true`
+    // unconditionally. This is exhaustive (not a fallback) because every v7
+    // upsert writes `encrypted: true` — enforced by `debug_assert!`s at every
+    // v7 upsert site. The test below pins the observable behaviour so a
+    // future refactor can't silently weaken the fail-closed answer.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn v7_forest_entry_requires_encryption_returns_true() {
+        use fula_crypto::keys::DekKey;
+        use fula_crypto::private_forest::{ShardManifestV7, ShardV7};
+
+        let cfg = Config::new("http://127.0.0.1:1");
+        let enc = EncryptionConfig::new();
+        let client = EncryptedClient::new(cfg, enc).expect("client builds");
+
+        // Seed the forest cache with an empty v7 entry. The check must
+        // return `true` even for a storage_key that has no matching entry,
+        // because the v7 path is fail-closed: no v7 storage_key ever
+        // belongs to a plaintext object, by invariant.
+        let manifest = ShardManifestV7 {
+            version: 7,
+            format: "sharded-hamt-v7".to_string(),
+            num_shards: 1,
+            shard_salt: vec![0u8; 32],
+            root: "/".to_string(),
+            created_at: 0,
+            modified_at: 0,
+            shards: vec![ShardV7 {
+                root: None,
+                seq: 0,
+                etag: None,
+                entry_count: 0,
+            }],
+        };
+        let dek = DekKey::from_bytes(&[0x05u8; 32]).unwrap();
+        let v7 = ShardedHamtPrivateForest::from_manifest(manifest, "bucket", dek);
+        client.forest_cache.insert(
+            "bucket".to_string(),
+            ForestCacheEntry::ShardedHamt {
+                forest: Arc::new(tokio::sync::RwLock::new(v7)),
+                loaded_at: chrono::Utc::now().timestamp(),
+                manifest_etag: Some("seeded".to_string()),
+                last_manifest_sequence: Some(1),
+            },
+        );
+
+        let requires = client
+            .forest_entry_requires_encryption("bucket", "any-storage-key")
+            .await
+            .expect("seeded v7 cache must not trigger a load");
+        assert!(
+            requires,
+            "v7 invariant: every entry is encrypted; check must answer true"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // F8: buffered chunked-download ceiling check
+    //
+    // `download_chunks_buffered_to_writer` must reject any chunked_meta
+    // whose declared `total_size` exceeds `Config::buffered_download_max_bytes`
+    // BEFORE any network I/O. The ceiling exists because the buffered path
+    // holds the full plaintext in RAM; without it, a malicious manifest
+    // could OOM the client.
+    //
+    // This unit-level test points the client at an unreachable host and
+    // relies on the check returning `DownloadFailed` before any socket
+    // connection is attempted. A later integration test (in
+    // `tests/f8_buffered_download_tests.rs`) exercises the full
+    // tamper-detected-during-decode path with a real in-memory gateway.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn f8_buffered_download_rejects_oversize_manifest() {
+        use fula_crypto::chunked::ChunkedFileMetadata;
+        use fula_crypto::keys::DekKey;
+
+        // Small ceiling so even a toy manifest triggers the guard.
+        let mut cfg = Config::new("http://127.0.0.1:1");
+        cfg.buffered_download_max_bytes = 1024; // 1 KiB
+        let enc = EncryptionConfig::new();
+        let client = EncryptedClient::new(cfg, enc).expect("client builds");
+
+        // Minimal metadata whose declared total_size exceeds the ceiling.
+        // Everything else is dummy — the check short-circuits before any
+        // per-chunk field is consulted.
+        let meta = ChunkedFileMetadata {
+            format: "streaming-v2".to_string(),
+            chunk_size: 64 * 1024,
+            num_chunks: 3,
+            total_size: 10 * 1024, // 10 KiB > 1 KiB ceiling
+            root_hash: "00".repeat(32),
+            chunk_nonces: vec![],
+            content_type: None,
+        };
+        let dek = DekKey::from_bytes(&[0x42u8; 32]).unwrap();
+
+        let mut writer: Vec<u8> = Vec::new();
+        let err = client
+            .download_chunks_buffered_to_writer("bucket", "storage-key", &meta, &dek, &mut writer)
+            .await
+            .expect_err("buffered download must reject oversize manifest");
+        match err {
+            ClientError::DownloadFailed(msg) => assert!(
+                msg.contains("buffered download exceeds configured ceiling"),
+                "expected buffered-ceiling error, got: {}",
+                msg
+            ),
+            other => panic!(
+                "expected DownloadFailed, got {:?} — the ceiling guard must fire \
+                 before any network I/O",
+                other
+            ),
+        }
+        assert!(
+            writer.is_empty(),
+            "writer must not be touched when the size guard rejects the manifest"
+        );
     }
 }

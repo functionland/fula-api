@@ -282,7 +282,20 @@ type ForestHamt = Node<Vec<u8>, HamtEntryWire, Blake3Hasher>;
 /// its conditional-write contract (out of scope for this module).
 pub struct ShardedHamtPrivateForest {
     manifest: ShardManifestV7,
-    loaded_shards: Vec<LoadedShard>,
+    // Per-shard lazy-load cache. Wrapping each slot in its own RwLock is what
+    // lets the public read API (`get_file`, `list_recursive`, …) take `&self`
+    // instead of `&mut self`: the only mutation a read path needs is
+    // `NotLoaded → {LoadedEmpty | Loaded}` on first access, and that mutation
+    // is per-slot so reads against distinct shards never contend.
+    //
+    // Closes F6 (forest lock held across await) when callers put this
+    // forest behind an async `RwLock` and call `.read().await` on the
+    // read path: many concurrent readers can then proceed in parallel rather
+    // than serialising through one outer `Mutex`.
+    //
+    // Uses `async_lock::RwLock` (tokio-free) so the crate stays wasm-clean
+    // when the `tokio-runtime` feature is disabled.
+    loaded_shards: Vec<async_lock::RwLock<LoadedShard>>,
     dirty_shards: Vec<bool>,
     forest_dek: DekKey,
     bucket: String,
@@ -300,7 +313,9 @@ impl ShardedHamtPrivateForest {
         let num = manifest.num_shards;
         Self {
             manifest,
-            loaded_shards: (0..num).map(|_| LoadedShard::NotLoaded).collect(),
+            loaded_shards: (0..num)
+                .map(|_| async_lock::RwLock::new(LoadedShard::NotLoaded))
+                .collect(),
             dirty_shards: vec![false; num],
             forest_dek,
             bucket: bucket.into(),
@@ -322,7 +337,9 @@ impl ShardedHamtPrivateForest {
             // Brand-new shards are known-empty — no need to go through a
             // `NotLoaded → LoadedEmpty` transition that would query the
             // backend for objects that cannot exist yet.
-            loaded_shards: (0..actual_num).map(|_| LoadedShard::LoadedEmpty).collect(),
+            loaded_shards: (0..actual_num)
+                .map(|_| async_lock::RwLock::new(LoadedShard::LoadedEmpty))
+                .collect(),
             dirty_shards: vec![false; actual_num],
             forest_dek,
             bucket: bucket.into(),
@@ -420,33 +437,47 @@ impl ShardedHamtPrivateForest {
     /// Materialize a shard's root if not already loaded. Idempotent; a
     /// manifest with `root = None` resolves to `LoadedEmpty` without any
     /// backend traffic.
+    ///
+    /// Takes `&self` (not `&mut self`) so read-only callers can invoke it
+    /// without forcing the whole forest behind an exclusive lock. Uses a
+    /// fast-path `.read()` check to skip the load when a concurrent caller
+    /// has already materialized the shard, then a double-checked `.write()`
+    /// to avoid racing two loaders on the same NotLoaded shard.
     async fn ensure_shard_loaded<B: BlobBackend + 'static>(
-        &mut self,
+        &self,
         shard_idx: usize,
         backend: &Arc<B>,
     ) -> Result<()> {
-        if !matches!(self.loaded_shards[shard_idx], LoadedShard::NotLoaded) {
+        // Fast path: shard is already resolved (LoadedEmpty or Loaded).
+        if !matches!(*self.loaded_shards[shard_idx].read().await, LoadedShard::NotLoaded) {
+            return Ok(());
+        }
+        // Slow path: take the shard's write lock, re-check, then load. The
+        // re-check handles the case where another task transitioned
+        // NotLoaded → Loaded while we were waiting for the write lock.
+        let mut guard = self.loaded_shards[shard_idx].write().await;
+        if !matches!(&*guard, LoadedShard::NotLoaded) {
             return Ok(());
         }
         match self.manifest.shards[shard_idx].root {
             None => {
-                self.loaded_shards[shard_idx] = LoadedShard::LoadedEmpty;
+                *guard = LoadedShard::LoadedEmpty;
             }
             Some(root_key) => {
                 let store = self.reader_store_for(shard_idx, backend);
                 let node: ForestHamt = Node::load(&root_key, &store).await?;
-                self.loaded_shards[shard_idx] = LoadedShard::Loaded(Arc::new(node));
+                *guard = LoadedShard::Loaded(Arc::new(node));
             }
         }
         Ok(())
     }
 
     /// Take ownership of (or create) the in-memory root for writing. Leaves
-    /// `loaded_shards[idx]` temporarily as `NotLoaded` — the caller MUST
-    /// reinstall the returned Arc (possibly mutated via `Arc::make_mut`
-    /// inside `Node::set`) before yielding.
-    fn take_loaded_root(&mut self, shard_idx: usize) -> Arc<ForestHamt> {
-        match std::mem::replace(&mut self.loaded_shards[shard_idx], LoadedShard::NotLoaded) {
+    /// the slot temporarily as `NotLoaded` — the caller MUST reinstall the
+    /// returned Arc (possibly mutated via `Arc::make_mut` inside `Node::set`)
+    /// via `install_loaded_root_into` before the guard drops.
+    fn take_loaded_root_from(guard: &mut LoadedShard) -> Arc<ForestHamt> {
+        match std::mem::replace(guard, LoadedShard::NotLoaded) {
             LoadedShard::NotLoaded => {
                 unreachable!("callers must ensure_shard_loaded before take_loaded_root")
             }
@@ -456,8 +487,8 @@ impl ShardedHamtPrivateForest {
     }
 
     /// Reinstall a shard root after mutation.
-    fn install_loaded_root(&mut self, shard_idx: usize, node: Arc<ForestHamt>) {
-        self.loaded_shards[shard_idx] = LoadedShard::Loaded(node);
+    fn install_loaded_root_into(guard: &mut LoadedShard, node: Arc<ForestHamt>) {
+        *guard = LoadedShard::Loaded(node);
     }
 
     /// Walk up from `leaf_dir` toward `/`, ensuring each ancestor's `D:`
@@ -483,7 +514,14 @@ impl ShardedHamtPrivateForest {
             let reader = self.reader_store_for(shard_idx, backend);
             let parent_key = dir_key(&parent);
 
-            let prior_parent = match &self.loaded_shards[shard_idx] {
+            // Take the shard's write lock for the read-then-mutate sequence.
+            // The write method holds `&mut self`, so the outer lock in the
+            // caller (fula-client) guarantees exclusive access — this
+            // per-shard lock is primarily there to satisfy the interior-
+            // mutability API on `&self` read paths.
+            let mut guard = self.loaded_shards[shard_idx].write().await;
+
+            let prior_parent = match &*guard {
                 LoadedShard::NotLoaded => unreachable!("ensure_shard_loaded above"),
                 LoadedShard::LoadedEmpty => None,
                 LoadedShard::Loaded(node) => node.get(&parent_key, &reader).await?,
@@ -516,14 +554,15 @@ impl ShardedHamtPrivateForest {
                     ),
                 };
 
-            let mut root = self.take_loaded_root(shard_idx);
+            let mut root = Self::take_loaded_root_from(&mut *guard);
             root.set(
                 parent_key,
                 HamtEntryWire::from(HamtEntry::Dir(new_parent_entry)),
                 &reader,
             )
             .await?;
-            self.install_loaded_root(shard_idx, root);
+            Self::install_loaded_root_into(&mut *guard, root);
+            drop(guard);
 
             if freshly_created {
                 let shard = &mut self.manifest.shards[shard_idx];
@@ -570,7 +609,12 @@ impl ShardedHamtPrivateForest {
         let file_lookup_key = file_key(&file_path);
         let dir_lookup_key = dir_key(&parent);
 
-        let (had_file, prior_dir) = match &self.loaded_shards[shard_idx] {
+        // Acquire the shard's write lock across the entire read-then-mutate
+        // sequence. Writers take `&mut self` on the outer forest, so under
+        // the fula-client outer `RwLock` no reader can observe a torn state.
+        let mut guard = self.loaded_shards[shard_idx].write().await;
+
+        let (had_file, prior_dir) = match &*guard {
             LoadedShard::NotLoaded => unreachable!("ensure_shard_loaded above"),
             LoadedShard::LoadedEmpty => (false, None),
             LoadedShard::Loaded(node) => {
@@ -611,7 +655,7 @@ impl ShardedHamtPrivateForest {
         };
 
         // Take the root for mutation, perform both writes, reinstall.
-        let mut root = self.take_loaded_root(shard_idx);
+        let mut root = Self::take_loaded_root_from(&mut *guard);
         root.set(
             file_lookup_key,
             HamtEntryWire::from(HamtEntry::File(entry)),
@@ -624,7 +668,8 @@ impl ShardedHamtPrivateForest {
             &reader,
         )
         .await?;
-        self.install_loaded_root(shard_idx, root);
+        Self::install_loaded_root_into(&mut *guard, root);
+        drop(guard);
 
         // Entry-count accounting: each new unique key adds 1. `Node::set`
         // overwrites in place when the key already exists, so we only count
@@ -671,7 +716,9 @@ impl ShardedHamtPrivateForest {
         let reader = self.reader_store_for(shard_idx, backend);
         let lookup_key = dir_key(&dir_path);
 
-        let prior = match &self.loaded_shards[shard_idx] {
+        let mut guard = self.loaded_shards[shard_idx].write().await;
+
+        let prior = match &*guard {
             LoadedShard::NotLoaded => unreachable!("ensure_shard_loaded above"),
             LoadedShard::LoadedEmpty => None,
             LoadedShard::Loaded(node) => node.get(&lookup_key, &reader).await?,
@@ -687,14 +734,15 @@ impl ShardedHamtPrivateForest {
             None => false,
         };
 
-        let mut root = self.take_loaded_root(shard_idx);
+        let mut root = Self::take_loaded_root_from(&mut *guard);
         root.set(
             lookup_key,
             HamtEntryWire::from(HamtEntry::Dir(entry)),
             &reader,
         )
         .await?;
-        self.install_loaded_root(shard_idx, root);
+        Self::install_loaded_root_into(&mut *guard, root);
+        drop(guard);
 
         if !had_dir {
             let shard = &mut self.manifest.shards[shard_idx];
@@ -727,20 +775,22 @@ impl ShardedHamtPrivateForest {
         let file_lookup_key = file_key(path);
         let dir_lookup_key = dir_key(&parent);
 
+        let mut guard = self.loaded_shards[shard_idx].write().await;
+
         // Short-circuit: empty shard can't contain this file.
-        if matches!(self.loaded_shards[shard_idx], LoadedShard::LoadedEmpty) {
+        if matches!(&*guard, LoadedShard::LoadedEmpty) {
             return Ok(None);
         }
 
         // Pull the existing dir entry so we can rewrite it without the
         // removed child.
-        let prior_dir = match &self.loaded_shards[shard_idx] {
+        let prior_dir = match &*guard {
             LoadedShard::NotLoaded => unreachable!("ensure_shard_loaded above"),
             LoadedShard::LoadedEmpty => unreachable!("short-circuited above"),
             LoadedShard::Loaded(node) => node.get(&dir_lookup_key, &reader).await?,
         };
 
-        let mut root = self.take_loaded_root(shard_idx);
+        let mut root = Self::take_loaded_root_from(&mut *guard);
         let removed_pair = root.remove(&file_lookup_key, &reader).await?;
 
         let removed_file: Option<ForestFileEntry> = match removed_pair {
@@ -748,7 +798,7 @@ impl ShardedHamtPrivateForest {
                 HamtEntry::File(f) => Some(f),
                 HamtEntry::Dir(_) => {
                     // Inconsistent type tag — restore the root and fail loudly.
-                    self.install_loaded_root(shard_idx, root);
+                    Self::install_loaded_root_into(&mut *guard, root);
                     return Err(CryptoError::Hamt(format!(
                         "file key F:{} resolved to a Dir entry — type-tagged HAMT invariant violated",
                         path
@@ -777,7 +827,7 @@ impl ShardedHamtPrivateForest {
                     .await?;
                 }
                 Some(HamtEntry::File(_)) => {
-                    self.install_loaded_root(shard_idx, root);
+                    Self::install_loaded_root_into(&mut *guard, root);
                     return Err(CryptoError::Hamt(format!(
                         "directory key D:{} resolved to a File entry — type-tagged HAMT invariant violated",
                         parent
@@ -789,7 +839,8 @@ impl ShardedHamtPrivateForest {
             }
         }
 
-        self.install_loaded_root(shard_idx, root);
+        Self::install_loaded_root_into(&mut *guard, root);
+        drop(guard);
 
         if removed_file.is_some() {
             let shard = &mut self.manifest.shards[shard_idx];
@@ -802,8 +853,11 @@ impl ShardedHamtPrivateForest {
 
     /// Fetch a file by its logical path. Lazy — only the nodes along the
     /// hash path are fetched, not the whole shard.
+    ///
+    /// Takes `&self` so concurrent readers can share a forest wrapped in
+    /// an async `RwLock` (`async_lock::RwLock` or `tokio::sync::RwLock`).
     pub async fn get_file<B: BlobBackend + 'static>(
-        &mut self,
+        &self,
         path: &str,
         backend: &Arc<B>,
     ) -> Result<Option<ForestFileEntry>> {
@@ -813,7 +867,8 @@ impl ShardedHamtPrivateForest {
         let reader = self.reader_store_for(shard_idx, backend);
         let key = file_key(path);
 
-        match &self.loaded_shards[shard_idx] {
+        let guard = self.loaded_shards[shard_idx].read().await;
+        match &*guard {
             LoadedShard::NotLoaded => unreachable!("ensure_shard_loaded above"),
             LoadedShard::LoadedEmpty => Ok(None),
             LoadedShard::Loaded(node) => match node.get(&key, &reader).await? {
@@ -832,7 +887,7 @@ impl ShardedHamtPrivateForest {
     /// Fetch a directory entry by path. Used by listing callers to walk the
     /// `files: Vec<String>` / `subdirs: Vec<String>` children in parallel.
     pub async fn get_directory<B: BlobBackend + 'static>(
-        &mut self,
+        &self,
         dir_path: &str,
         backend: &Arc<B>,
     ) -> Result<Option<ForestDirectoryEntry>> {
@@ -843,7 +898,8 @@ impl ShardedHamtPrivateForest {
         let reader = self.reader_store_for(shard_idx, backend);
         let key = dir_key(&normalized);
 
-        match &self.loaded_shards[shard_idx] {
+        let guard = self.loaded_shards[shard_idx].read().await;
+        match &*guard {
             LoadedShard::NotLoaded => unreachable!("ensure_shard_loaded above"),
             LoadedShard::LoadedEmpty => Ok(None),
             LoadedShard::Loaded(node) => match node.get(&key, &reader).await? {
@@ -864,7 +920,7 @@ impl ShardedHamtPrivateForest {
     /// each child are independent and can be issued in parallel by a
     /// higher-level caller if desired.
     pub async fn list_directory<B: BlobBackend + 'static>(
-        &mut self,
+        &self,
         dir_path: &str,
         backend: &Arc<B>,
     ) -> Result<Vec<ForestFileEntry>> {
@@ -880,7 +936,8 @@ impl ShardedHamtPrivateForest {
         let reader = self.reader_store_for(shard_idx, backend);
 
         let mut out = Vec::with_capacity(children.len());
-        match &self.loaded_shards[shard_idx] {
+        let guard = self.loaded_shards[shard_idx].read().await;
+        match &*guard {
             LoadedShard::NotLoaded => unreachable!("get_directory loaded this above"),
             LoadedShard::LoadedEmpty => {
                 // Shard loaded empty but we found a dir entry — impossible,
@@ -952,7 +1009,7 @@ impl ShardedHamtPrivateForest {
     /// `list_directory` instead; this method is intended for bulk-sync /
     /// sharing flows.
     async fn collect_all_entries<B: BlobBackend + 'static>(
-        &mut self,
+        &self,
         backend: &Arc<B>,
     ) -> Result<Vec<HamtEntry>> {
         let num = self.manifest.shards.len();
@@ -960,7 +1017,8 @@ impl ShardedHamtPrivateForest {
         for shard_idx in 0..num {
             self.ensure_shard_loaded(shard_idx, backend).await?;
             let reader = self.reader_store_for(shard_idx, backend);
-            match &self.loaded_shards[shard_idx] {
+            let guard = self.loaded_shards[shard_idx].read().await;
+            match &*guard {
                 LoadedShard::NotLoaded => unreachable!("ensure_shard_loaded above"),
                 LoadedShard::LoadedEmpty => {}
                 LoadedShard::Loaded(node) => {
@@ -985,7 +1043,7 @@ impl ShardedHamtPrivateForest {
     /// Equivalent to `PrivateForest::list_all_files` / `ShardedPrivateForest::
     /// list_all_files` on v1 and v6 forests, returning owned entries.
     pub async fn list_all_files<B: BlobBackend + 'static>(
-        &mut self,
+        &self,
         backend: &Arc<B>,
     ) -> Result<Vec<ForestFileEntry>> {
         let all = self.collect_all_entries(backend).await?;
@@ -1000,7 +1058,7 @@ impl ShardedHamtPrivateForest {
 
     /// Collect every `ForestDirectoryEntry` across every shard.
     pub async fn list_all_directories<B: BlobBackend + 'static>(
-        &mut self,
+        &self,
         backend: &Arc<B>,
     ) -> Result<Vec<ForestDirectoryEntry>> {
         let all = self.collect_all_entries(backend).await?;
@@ -1019,13 +1077,101 @@ impl ShardedHamtPrivateForest {
     /// (prefix doesn't correspond to a single shard under dir-local routing
     /// once nested children are considered). Matches the semantics of
     /// `PrivateForest::list_recursive` on v1 forests.
+    ///
+    /// Callers that need to page results (F5) should use
+    /// [`Self::list_recursive_page`] — this method still loads every match
+    /// into memory at once, kept for legacy / small-dataset callers.
     pub async fn list_recursive<B: BlobBackend + 'static>(
-        &mut self,
+        &self,
         prefix: &str,
         backend: &Arc<B>,
     ) -> Result<Vec<ForestFileEntry>> {
         let all = self.list_all_files(backend).await?;
         Ok(all.into_iter().filter(|f| f.path.starts_with(prefix)).collect())
+    }
+
+    /// Paginated variant of [`Self::list_recursive`].
+    ///
+    /// Walks shards starting from `cursor` (or shard 0 if `None`), emits every
+    /// file whose `path` begins with `prefix`, and stops *after the first
+    /// shard whose walk pushes the running total ≥ `max_keys`* — or once all
+    /// shards are exhausted. Returns `(page, next_cursor)`. When
+    /// `next_cursor` is `None` the caller has seen the whole prefix.
+    ///
+    /// `max_keys` is a **soft cap, not a hard cap**. Page granularity is one
+    /// shard: a shard is either fully walked or skipped. If a single shard
+    /// contains more than `max_keys` matches, the returned page will contain
+    /// all of them (we cannot resume mid-shard because a v7 HAMT's
+    /// `flat_map` traversal has no stable ordering we could bookmark).
+    /// `max_keys == 0` means "no cap — walk every shard".
+    ///
+    /// The cursor is an opaque `Vec<u8>`; callers should treat it as a
+    /// black-box token. Encoding today: postcard-encoded `u32` next-shard
+    /// index; future refinements (within-shard offsets) would extend the
+    /// opaque cursor without breaking the signature.
+    pub async fn list_recursive_page<B: BlobBackend + 'static>(
+        &self,
+        prefix: &str,
+        cursor: Option<&[u8]>,
+        max_keys: usize,
+        backend: &Arc<B>,
+    ) -> Result<(Vec<ForestFileEntry>, Option<Vec<u8>>)> {
+        let num = self.manifest.shards.len() as u32;
+        let start = match cursor {
+            None => 0u32,
+            Some(bytes) => postcard::from_bytes::<u32>(bytes).map_err(|e| {
+                CryptoError::Hamt(format!("list_recursive_page: invalid cursor: {}", e))
+            })?,
+        };
+        if start >= num {
+            return Ok((Vec::new(), None));
+        }
+
+        let mut out: Vec<ForestFileEntry> = Vec::new();
+        let mut next_shard = start;
+        while (next_shard as usize) < num as usize {
+            let shard_idx = next_shard as usize;
+            self.ensure_shard_loaded(shard_idx, backend).await?;
+            let reader = self.reader_store_for(shard_idx, backend);
+            let guard = self.loaded_shards[shard_idx].read().await;
+            match &*guard {
+                LoadedShard::NotLoaded => unreachable!("ensure_shard_loaded above"),
+                LoadedShard::LoadedEmpty => {}
+                LoadedShard::Loaded(node) => {
+                    let wires: Vec<HamtEntryWire> = node
+                        .flat_map(
+                            &|pair: &Pair<Vec<u8>, HamtEntryWire>| Ok(pair.value.clone()),
+                            &reader,
+                        )
+                        .await?;
+                    for w in wires {
+                        if let HamtEntry::File(f) = HamtEntry::from(w) {
+                            if f.path.starts_with(prefix) {
+                                out.push(f);
+                            }
+                        }
+                    }
+                }
+            }
+            drop(guard);
+            next_shard = next_shard.saturating_add(1);
+
+            // Stop once we've filled the page. `max_keys == 0` means
+            // "no cap" — callers that want unbounded listing can use
+            // `list_recursive` instead, but we accept this for symmetry.
+            if max_keys > 0 && out.len() >= max_keys {
+                break;
+            }
+        }
+
+        let next_cursor = if (next_shard as usize) >= num as usize {
+            None
+        } else {
+            Some(postcard::to_allocvec(&next_shard).map_err(|e| {
+                CryptoError::Hamt(format!("list_recursive_page: cursor encode: {}", e))
+            })?)
+        };
+        Ok((out, next_cursor))
     }
 
     /// Extract a subtree rooted at `prefix` into a fresh monolithic
@@ -1038,7 +1184,7 @@ impl ShardedHamtPrivateForest {
     /// `FlatMapV1` forest — intentional, because the whole point of the
     /// export is that it's a small, self-contained, monolithic artifact.
     pub async fn extract_subtree<B: BlobBackend + 'static>(
-        &mut self,
+        &self,
         prefix: &str,
         backend: &Arc<B>,
     ) -> Result<PrivateForest> {
@@ -1115,19 +1261,22 @@ impl ShardedHamtPrivateForest {
                 backend.clone(),
             );
 
-            let new_root = match &self.loaded_shards[idx] {
-                LoadedShard::NotLoaded => {
-                    return Err(CryptoError::Hamt(format!(
-                        "shard {} marked dirty but NotLoaded — internal invariant violation",
-                        idx
-                    )));
-                }
-                LoadedShard::LoadedEmpty => None,
-                LoadedShard::Loaded(node) => {
-                    if node.is_empty() {
-                        None
-                    } else {
-                        Some(node.store(&store).await?)
+            let new_root = {
+                let guard = self.loaded_shards[idx].read().await;
+                match &*guard {
+                    LoadedShard::NotLoaded => {
+                        return Err(CryptoError::Hamt(format!(
+                            "shard {} marked dirty but NotLoaded — internal invariant violation",
+                            idx
+                        )));
+                    }
+                    LoadedShard::LoadedEmpty => None,
+                    LoadedShard::Loaded(node) => {
+                        if node.is_empty() {
+                            None
+                        } else {
+                            Some(node.store(&store).await?)
+                        }
                     }
                 }
             };
@@ -1835,5 +1984,82 @@ mod tests {
             total - removed_idxs.len(),
             "remaining count after removals"
         );
+    }
+
+    // F6 — concurrent readers on `Arc<RwLock<ShardedHamtPrivateForest>>`
+    // must be able to run in parallel once wrapped in `.read().await`
+    // guards. Before the F6 refactor the public read API took `&mut self`,
+    // which forced every reader to serialize through one outer `Mutex`.
+    // This test is a structural proof that the API surface now supports
+    // many concurrent readers on a shared forest; a thread panic would
+    // be observed as a join failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn f6_concurrent_readers_share_forest() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-f6", test_dek(), 16);
+        for i in 0..50 {
+            let path = format!("/d/f{:03}.bin", i);
+            forest.upsert_file(file_entry(&path, i as u64), &backend).await.unwrap();
+        }
+        let _ = forest.flush_dirty(&backend).await.unwrap();
+
+        let shared = Arc::new(tokio::sync::RwLock::new(forest));
+        let mut tasks = Vec::new();
+        for t in 0..16 {
+            let shared = shared.clone();
+            let backend = backend.clone();
+            tasks.push(tokio::spawn(async move {
+                // Each task holds a read guard across a listing + several
+                // per-file lookups. With a `Mutex` outer lock these would
+                // serialize; with `RwLock::read().await` they must proceed
+                // in parallel without deadlocking.
+                let guard = shared.read().await;
+                let all = guard.list_recursive("/d/", &backend).await.unwrap();
+                assert_eq!(all.len(), 50);
+                for i in 0..5 {
+                    let idx = (t * 5 + i) % 50;
+                    let path = format!("/d/f{:03}.bin", idx);
+                    let got = guard.get_file(&path, &backend).await.unwrap();
+                    assert_eq!(got.unwrap().size, idx as u64);
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
+    // F5 — `list_recursive_page` returns shard-grained pages and round-trips
+    // through its opaque cursor to cover every matching file.
+    #[tokio::test]
+    async fn f5_list_recursive_page_covers_all_matches() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-f5", test_dek(), 16);
+        let total = 200usize;
+        for i in 0..total {
+            let path = format!("/x/f{:04}.bin", i);
+            forest.upsert_file(file_entry(&path, i as u64), &backend).await.unwrap();
+        }
+        let _ = forest.flush_dirty(&backend).await.unwrap();
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut pages = 0usize;
+        loop {
+            let (page, next) = forest
+                .list_recursive_page("/x/", cursor.as_deref(), 25, &backend)
+                .await
+                .unwrap();
+            for f in page {
+                assert!(seen.insert(f.path), "duplicate path across pages");
+            }
+            pages += 1;
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+            assert!(pages < 1000, "pagination failed to terminate");
+        }
+        assert_eq!(seen.len(), total, "paginated walk must see every match");
     }
 }

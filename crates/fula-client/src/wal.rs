@@ -15,6 +15,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fula_crypto::keys::DekKey;
 use fula_crypto::private_forest::ForestFileEntry;
@@ -23,6 +24,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ClientError, Result};
 
 const WAL_FILE_VERSION: u8 = 1;
+
+/// Monotonically-increasing count of `append()` invocations that entered
+/// the on-disk I/O path and returned `Err`. The no-state-dir early return
+/// is a documented silent no-op (matches the WASM path) and does not bump
+/// this counter — only genuine durability-impacting failures do. (F11.)
+static WAL_APPEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// A single WAL record.
 ///
@@ -92,12 +99,12 @@ fn wal_path(bucket: &str) -> Option<PathBuf> {
     Some(dir.join(format!("{}.wal", bucket_id)))
 }
 
-fn mac_line(mac_key: &DekKey, line: &str) -> String {
+pub(crate) fn mac_line(mac_key: &DekKey, line: &str) -> String {
     let mac = blake3::keyed_hash(mac_key.as_bytes(), line.as_bytes());
     hex::encode(mac.as_bytes())
 }
 
-fn verify_mac(mac_key: &DekKey, line: &str, mac_hex: &str) -> bool {
+pub(crate) fn verify_mac(mac_key: &DekKey, line: &str, mac_hex: &str) -> bool {
     let Ok(actual) = hex::decode(mac_hex) else { return false; };
     if actual.len() != 32 {
         return false;
@@ -112,31 +119,53 @@ fn verify_mac(mac_key: &DekKey, line: &str, mac_hex: &str) -> bool {
 }
 
 /// Append a single entry to the bucket's WAL. The line format is
-/// `<json>\t<hex_mac>\n`. Appends are flushed before returning so a crash
-/// between append and flush cannot tear a record.
+/// `<json>\t<hex_mac>\n`. After writing, the record is both flushed (libc
+/// buffers) and `sync_data`'d (kernel page cache → disk), so neither a
+/// process crash nor a power loss can lose a record that this function
+/// returned `Ok` for. (NEW-F12.)
 pub(crate) fn append(bucket: &str, mac_key: &DekKey, entry: WalEntry) -> Result<()> {
     let Some(path) = wal_path(bucket) else {
         // No state dir — silently continue (matches the no-op WASM path).
         return Ok(());
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(ClientError::Io)?;
+    // F11: bump the failure counter once per real I/O-path failure so
+    // operators can alert on WAL durability incidents. The closure owns
+    // `entry` (WalRecord moves it in) so we do the move + fallible work
+    // here, then react to the outcome outside.
+    let result: Result<()> = (move || {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(ClientError::Io)?;
+        }
+        let record = WalRecord { version: WAL_FILE_VERSION, entry };
+        let json = serde_json::to_string(&record).map_err(|e| {
+            ClientError::Encryption(fula_crypto::CryptoError::Encryption(format!(
+                "WAL serialize: {}", e
+            )))
+        })?;
+        let mac = mac_line(mac_key, &json);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(ClientError::Io)?;
+        writeln!(f, "{}\t{}", json, mac).map_err(ClientError::Io)?;
+        f.flush().map_err(ClientError::Io)?;
+        f.sync_data().map_err(ClientError::Io)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        WAL_APPEND_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
-    let record = WalRecord { version: WAL_FILE_VERSION, entry };
-    let json = serde_json::to_string(&record).map_err(|e| {
-        ClientError::Encryption(fula_crypto::CryptoError::Encryption(format!(
-            "WAL serialize: {}", e
-        )))
-    })?;
-    let mac = mac_line(mac_key, &json);
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(ClientError::Io)?;
-    writeln!(f, "{}\t{}", json, mac).map_err(ClientError::Io)?;
-    f.flush().map_err(ClientError::Io)?;
-    Ok(())
+    result
+}
+
+/// Observable count of WAL append failures since process start. Never
+/// resets; monotonic. Intended for metrics / operator alerting — a rising
+/// value means in-memory dirty forest state is out-running its on-disk
+/// crash-recovery log. (F11.)
+#[allow(dead_code)] // Exposed for observability consumers + the F11 test.
+pub(crate) fn append_failure_count() -> u64 {
+    WAL_APPEND_FAILURES.load(Ordering::Relaxed)
 }
 
 /// Load all well-formed entries from the bucket's WAL. Entries whose MAC or
@@ -199,6 +228,16 @@ pub(crate) fn derive_mac_key(
     km.derive_path_key(&format!("forest-wal-mac:{}", bucket))
 }
 
+/// Derive a MAC key for the manifest-version pin file. Distinct domain
+/// separator from the WAL MAC so the two keys cannot cross-verify each
+/// other's records. (NEW-F9.)
+pub(crate) fn derive_manifest_version_mac_key(
+    km: &fula_crypto::keys::KeyManager,
+    bucket: &str,
+) -> DekKey {
+    km.derive_path_key(&format!("forest-manifest-version-mac:{}", bucket))
+}
+
 /// Test-only: expose the wal file path so tests can corrupt / inspect it.
 #[cfg(test)]
 #[allow(dead_code)]
@@ -211,18 +250,15 @@ mod tests {
     use super::*;
     use fula_crypto::private_forest::ForestFileEntry;
     use std::collections::HashMap;
-    use std::sync::Mutex;
 
-    // Serialize env-var mutation across parallel cargo test threads.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
+    // Shared with orphan_queue::tests — see lib.rs::TEST_ENV_LOCK.
     struct StateDirGuard {
         _dir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     fn tmp_state_dir() -> StateDirGuard {
-        let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("FULA_STATE_DIR", dir.path());
         StateDirGuard { _dir: dir, _lock: lock }
@@ -330,6 +366,47 @@ mod tests {
         let forest_dek = km.derive_path_key("forest:bkt");
         assert_ne!(wal_mac.as_bytes(), forest_dek.as_bytes(),
             "WAL MAC key and forest DEK must be domain-separated");
+    }
+
+    // F11: the failure metric must bump on genuine I/O failure and stay
+    // flat on both no-op early-return and successful appends.
+    #[test]
+    fn append_failure_bumps_counter_only_on_error() {
+        let _guard = tmp_state_dir();
+        let bucket = "append-failure-bucket";
+        let mac_key = DekKey::generate();
+        let _ = clear(bucket);
+
+        // Sabotage: create a regular file at `<state>/fula` so
+        // create_dir_all(.../fula/wal) fails with NotADirectory-class Io.
+        let state_path = std::env::var("FULA_STATE_DIR")
+            .expect("tmp_state_dir sets FULA_STATE_DIR");
+        let fula_blocker = PathBuf::from(&state_path).join("fula");
+        std::fs::write(&fula_blocker, b"blocker")
+            .expect("write blocker file");
+
+        let before = append_failure_count();
+        let err = append(bucket, &mac_key, WalEntry::Insert {
+            key: "/x.txt".to_string(),
+            entry: sample_entry("/x.txt"),
+        }).expect_err("append must fail when `fula` is a regular file");
+        let after = append_failure_count();
+
+        assert!(matches!(err, ClientError::Io(_)),
+            "expected Io error, got {:?}", err);
+        assert_eq!(after - before, 1,
+            "counter must increment exactly once per failed append");
+
+        // Success path: remove the blocker, append again — counter must NOT move.
+        std::fs::remove_file(&fula_blocker).expect("remove blocker");
+        let before_ok = append_failure_count();
+        append(bucket, &mac_key, WalEntry::Insert {
+            key: "/y.txt".to_string(),
+            entry: sample_entry("/y.txt"),
+        }).expect("append succeeds after blocker removed");
+        let after_ok = append_failure_count();
+        assert_eq!(after_ok, before_ok,
+            "counter must stay flat on successful append");
     }
 }
 

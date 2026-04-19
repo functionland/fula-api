@@ -1862,6 +1862,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "argon2",
+ "async-lock",
  "async-recursion",
  "async-trait",
  "bao-tree",

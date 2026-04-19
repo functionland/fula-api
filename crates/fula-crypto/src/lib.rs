@@ -110,12 +110,14 @@ pub use private_forest::{
     ShardManifest, ForestShard, EncryptedShardManifest, EncryptedForestShard,
     ShardedPrivateForest, ForestEvent, ForestOrManifest,
     detect_forest_format, derive_shard_key, shard_for_path, compute_initial_shard_count,
-    SHARDED_MIGRATION_THRESHOLD, RESHARD_THRESHOLD, MAX_SHARDS,
+    RESHARD_THRESHOLD, MAX_SHARDS,
     // Sharded-HAMT forest (v7)
     ShardV7, ShardManifestV7, EncryptedShardManifestV7,
     V7StorageKey, V7_STORAGE_KEY_LEN,
     manifest_v7_aad, hamt_node_v7_aad, compute_v7_node_key,
 };
+#[allow(deprecated)]
+pub use private_forest::SHARDED_MIGRATION_THRESHOLD;
 pub use wnfs_hamt::{BlobBackend, V7NodeStore, V7_NODE_PREFIX};
 pub use private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, PublicMetadata, KeyObfuscation, obfuscate_key};
 pub use rotation::{KeyRotationManager, FileSystemRotation, WrappedKeyInfo, RotationResult};

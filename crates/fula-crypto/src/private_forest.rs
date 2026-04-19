@@ -747,6 +747,7 @@ impl EncryptedForest {
 // ============================================================================
 
 /// Threshold for automatic migration from monolithic to sharded format
+#[deprecated(note = "Migration now triggers on first v1/v2 load via observed_seq.is_none(); see fula-client/src/encryption.rs (load_forest). This constant is no longer consulted by any live call site.")]
 pub const SHARDED_MIGRATION_THRESHOLD: usize = 5_000;
 
 /// Per-shard entry limit before resharding (doubling shard count)

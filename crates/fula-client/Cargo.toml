@@ -63,3 +63,6 @@ default = []
 encryption = []
 # Enable WASM support for web browsers (automatic via target config)
 wasm = []
+# Exposes crash-injection atomics in encryption.rs so integration tests can
+# simulate abort between migration phases. Off in production builds.
+test-fault-injection = []

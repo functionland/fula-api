@@ -82,14 +82,13 @@ async fn test_v7_migration_produces_v7_format() {
     client.create_bucket(bucket).await.expect("create bucket");
 
     client.put_object_flat(bucket, "/hello.txt", b"v1-value".to_vec(), None)
-        .await.expect("seed v1 write");
+        .await.expect("seed write");
 
-    assert!(
-        !client.is_forest_sharded_hamt(bucket),
-        "bucket must still be v1 monolithic before migrate"
-    );
-
-    client.migrate_to_sharded(bucket).await.expect("migrate to v7");
+    // Production now auto-migrates on first load (encryption.rs:~1702 —
+    // `should_trigger_migration = observed_seq.is_none()` fires on any
+    // v1/v2 blob regardless of file count). An explicit migrate_to_sharded
+    // is therefore idempotent against an already-migrated bucket.
+    client.migrate_to_sharded(bucket).await.expect("migrate to v7 (idempotent)");
 
     assert!(
         client.is_forest_sharded_hamt(bucket),
@@ -278,10 +277,15 @@ async fn test_v7_fresh_client_reads_migrated_bucket() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn test_v1_stays_v1_below_threshold() {
+async fn test_small_bucket_auto_migrates_to_v7_on_first_load() {
+    // Regression: this used to be `test_v1_stays_v1_below_threshold`, back
+    // when migration was gated on file count. Production now fires on every
+    // first v1/v2 load (encryption.rs:~1702). Flip the invariant: a small
+    // bucket must end up v7-HAMT after normal use, and basic read/delete
+    // operations must stay correct through the auto-migration.
     let base = spawn_server().await;
     let encryption = EncryptionConfig::new();
-    let bucket = "v1-stays-v1";
+    let bucket = "small-auto-migrates-v7";
 
     let state = tempfile::tempdir().unwrap();
     let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
@@ -289,7 +293,6 @@ async fn test_v1_stays_v1_below_threshold() {
     let client = make_client(&base, encryption);
     client.create_bucket(bucket).await.expect("create bucket");
 
-    // Write a handful of files — well under the 5,000 SHARDED_MIGRATION_THRESHOLD.
     for i in 0..25 {
         client.put_object_flat(
             bucket,
@@ -299,31 +302,115 @@ async fn test_v1_stays_v1_below_threshold() {
         ).await.expect("put");
     }
 
-    // Read a few back to force forest load/cache hydration paths.
     for i in [0, 7, 24] {
         let got = client.get_object_flat(bucket, &format!("/file-{:03}.txt", i))
             .await.expect("read");
         assert_eq!(got.as_ref(), format!("body-{}", i).as_bytes());
     }
 
-    // The bucket must NOT have been auto-migrated. Both sharded variants must
-    // be false (i.e. the cache entry is still a monolithic forest).
+    assert!(
+        client.is_forest_sharded_hamt(bucket),
+        "first-load migration must produce v7, even for small buckets"
+    );
     assert!(
         !client.is_forest_sharded(bucket),
-        "small bucket must not auto-migrate to v6"
-    );
-    assert!(
-        !client.is_forest_sharded_hamt(bucket),
-        "small bucket must not auto-migrate to v7"
+        "v7 must not show as v6 (Sharded)"
     );
 
-    // Delete + re-read still works on v1.
     client.delete_object_flat(bucket, "/file-007.txt")
-        .await.expect("v1 delete");
+        .await.expect("v7 delete");
     let deleted = client.get_object_flat(bucket, "/file-007.txt").await;
-    assert!(deleted.is_err(), "deleted v1 entry must not be readable");
+    assert!(deleted.is_err(), "deleted v7 entry must not be readable");
 
-    // Still v1 after a delete.
-    assert!(!client.is_forest_sharded_hamt(bucket));
-    assert!(!client.is_forest_sharded(bucket));
+    assert!(client.is_forest_sharded_hamt(bucket));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 6 — F5: list_directory_paginated walks a large v7 prefix page-by-page
+//
+// Seeds a v7 bucket with N files under /big/ and iterates the paginated API
+// with a modest `max_keys`. The union of all pages must equal the seeded
+// set, each intermediate page must report is_truncated=true with a fresh
+// continuation_token, and the final page must report is_truncated=false.
+// This is the end-to-end assertion that F5 is fixed: the `list_recursive_page`
+// crypto primitive is reached via `list_directory_paginated` → the fula-client
+// forest path, exercising hex cursor encode/decode, shard-grained paging, and
+// the public DirectoryListing shape.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_v7_list_directory_paginated_round_trips() {
+    let base = spawn_server().await;
+    let encryption = EncryptionConfig::new();
+    let bucket = "v7-paginated";
+
+    let state = tempfile::tempdir().unwrap();
+    let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+    let client = make_client(&base, encryption);
+    client.create_bucket(bucket).await.expect("create bucket");
+
+    // 64 files under /big/ — enough to span multiple v7 shards.
+    let total = 64usize;
+    let mut expected: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for i in 0..total {
+        let key = format!("/big/entry-{:03}.bin", i);
+        client.put_object_flat(bucket, &key, format!("v{}", i).into_bytes(), None)
+            .await.expect("seed");
+        expected.insert(key);
+    }
+
+    client.migrate_to_sharded(bucket).await.expect("migrate to v7");
+    assert!(client.is_forest_sharded_hamt(bucket));
+
+    // Walk /big/ one shard-grained page at a time.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cursor: Option<String> = None;
+    let mut page_count = 0usize;
+    loop {
+        let listing = client
+            .list_directory_paginated(bucket, Some("/big"), cursor.as_deref(), Some(8))
+            .await
+            .expect("paginated page");
+        page_count += 1;
+        for files in listing.directories.values() {
+            for f in files {
+                seen.insert(f.original_key.clone());
+            }
+        }
+        if listing.is_truncated {
+            assert!(
+                listing.next_continuation_token.is_some(),
+                "is_truncated=true must come with a cursor"
+            );
+            cursor = listing.next_continuation_token;
+        } else {
+            assert!(
+                listing.next_continuation_token.is_none(),
+                "is_truncated=false must have cursor=None"
+            );
+            break;
+        }
+        // Safety guard — paging must terminate; bail if runaway.
+        assert!(page_count < 1024, "pagination did not converge");
+    }
+    // Structural assumption: 64 files + max_keys=8 spans ≥2 v7 shards under the
+    // default shard count and BLAKE3 key distribution. If the shard config or
+    // hash distribution shifts enough to land all 64 in one shard, bump `total`
+    // rather than deleting this assertion — it guards the "pagination actually
+    // paginated" invariant that the test is supposed to prove.
+    assert!(page_count >= 2, "expected >=2 pages for {} entries with max_keys=8, got {}", total, page_count);
+    assert_eq!(seen, expected, "pagination lost or duplicated entries");
+
+    // Sanity: the unpaginated API returns the whole set in one shot, matching
+    // `seen`. This proves the legacy path still works after the refactor.
+    let whole = client.list_directory(bucket, Some("/big"))
+        .await.expect("unpaginated list_directory");
+    assert!(!whole.is_truncated);
+    assert!(whole.next_continuation_token.is_none());
+    let whole_set: std::collections::HashSet<String> = whole.directories.values()
+        .flatten()
+        .map(|f| f.original_key.clone())
+        .collect();
+    assert_eq!(whole_set, expected);
 }

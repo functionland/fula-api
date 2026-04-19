@@ -296,6 +296,24 @@ impl Encryptor {
     pub fn encrypt_dek(&self, dek: &DekKey) -> Result<EncryptedData> {
         self.encrypt_with_aad(dek.as_bytes(), b"fula:v2:dek-wrap")
     }
+
+    /// Encrypt a DEK, binding additional `context` bytes into the AAD.
+    ///
+    /// The full AAD is `b"fula:v2:dek-wrap|" ++ context`. `context` is expected
+    /// to be a canonical, length-prefixed encoding of the surrounding metadata
+    /// (e.g. share-token fields) so any post-wrap mutation of that metadata
+    /// breaks unwrap authenticity. Callers own domain separation inside
+    /// `context` (e.g. `b"fula:v4:share-token|..."`).
+    pub fn encrypt_dek_with_context(
+        &self,
+        dek: &DekKey,
+        context: &[u8],
+    ) -> Result<EncryptedData> {
+        let mut aad = Vec::with_capacity(b"fula:v2:dek-wrap|".len() + context.len());
+        aad.extend_from_slice(b"fula:v2:dek-wrap|");
+        aad.extend_from_slice(context);
+        self.encrypt_with_aad(dek.as_bytes(), &aad)
+    }
 }
 
 /// Decryptor for RFC 9180 HPKE-based decryption
@@ -378,6 +396,24 @@ impl Decryptor {
     /// Uses AAD context "fula:v2:dek-wrap" (must match encryption)
     pub fn decrypt_dek(&self, encrypted: &EncryptedData) -> Result<DekKey> {
         let bytes = Zeroizing::new(self.decrypt_with_aad(encrypted, b"fula:v2:dek-wrap")?);
+        DekKey::from_bytes(&bytes)
+    }
+
+    /// Decrypt a wrapped DEK whose AAD binds additional `context` bytes.
+    ///
+    /// Mirror of [`Encryptor::encrypt_dek_with_context`]. The AAD is
+    /// `b"fula:v2:dek-wrap|" ++ context` and `context` must byte-for-byte match
+    /// what the producer bound. Any mutation of the caller-bound metadata
+    /// collapses to the generic `authentication failed` error.
+    pub fn decrypt_dek_with_context(
+        &self,
+        encrypted: &EncryptedData,
+        context: &[u8],
+    ) -> Result<DekKey> {
+        let mut aad = Vec::with_capacity(b"fula:v2:dek-wrap|".len() + context.len());
+        aad.extend_from_slice(b"fula:v2:dek-wrap|");
+        aad.extend_from_slice(context);
+        let bytes = Zeroizing::new(self.decrypt_with_aad(encrypted, &aad)?);
         DekKey::from_bytes(&bytes)
     }
 }

@@ -44,11 +44,29 @@ mod error;
 mod multipart;
 mod types;
 #[cfg(not(target_arch = "wasm32"))]
+mod orphan_queue;
+#[cfg(not(target_arch = "wasm32"))]
 mod wal;
+
+// Cross-module test serializer. Unit tests in wal.rs and orphan_queue.rs both
+// mutate `FULA_STATE_DIR`; without a single shared lock, tests in each module
+// can set the env var concurrently and read each other's temp dir.
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub use client::FulaClient;
 pub use config::Config;
 pub use encryption::{EncryptedClient, EncryptionConfig, DecryptedObjectInfo, FileMetadata, DirectoryListing, PinningCredentials};
+
+/// Crash-injection atomics used by the workspace integration tests to
+/// simulate client-side aborts between phases of `migrate_v1_to_v7_internal`.
+/// Only present when the `test-fault-injection` feature is enabled; off in
+/// every production build.
+#[cfg(feature = "test-fault-injection")]
+pub mod test_faults {
+    pub use crate::encryption::test_faults::*;
+}
 pub use error::{ClientError, Result};
 pub use multipart::{MultipartUpload, UploadProgress, ProgressCallback, upload_large_file};
 pub use types::*;

@@ -47,6 +47,7 @@ hex = { workspace = true }
 tokio = { workspace = true, optional = true }
 async-trait = { workspace = true }
 async-recursion = { workspace = true }
+async-lock = "3"
 futures = { workspace = true }
 
 # IPLD/CID

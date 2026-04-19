@@ -52,6 +52,14 @@ impl FulaClient {
         &self.config
     }
 
+    /// Access the pooled HTTP client for internal modules (e.g. multipart
+    /// helpers) that need to issue raw requests. Exposing this keeps
+    /// connection pooling and configured timeouts intact instead of minting
+    /// a fresh `reqwest::Client` per call. (NEW-F3.)
+    pub(crate) fn http_client(&self) -> &Client {
+        &self.http
+    }
+
     // ==================== Bucket Operations ====================
 
     /// List all buckets
