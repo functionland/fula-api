@@ -3,6 +3,7 @@
 use crate::{ClientError, FulaClient, Result};
 use bytes::Bytes;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 /// Progress callback type
@@ -201,6 +202,10 @@ where
 /// timeout, decode) are always transient. S3-reported statuses 429/500/502/503/504
 /// are transient; everything else (auth, 4xx policy errors, malformed response)
 /// is not.
+///
+/// Native-only: `retry_idempotent` short-circuits to a single attempt on
+/// wasm32 (no sleep primitive), so the classifier has no caller there.
+#[cfg(not(target_arch = "wasm32"))]
 fn is_transient(err: &ClientError) -> bool {
     match err {
         ClientError::Http(e) => {

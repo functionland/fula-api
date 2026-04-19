@@ -27,9 +27,12 @@ use fula_crypto::{
     wnfs_hamt::BlobBackend,
     sharded_hamt_forest::ShardedHamtPrivateForest,
     ChunkedEncoder, ChunkedFileMetadata, should_use_chunked,
-    BaoEncoder,
     CryptoError,
 };
+// BaoEncoder is only used by `resume_upload` (native-only). On wasm32 the
+// item is never referenced, so the import would produce `unused_imports`.
+#[cfg(not(target_arch = "wasm32"))]
+use fula_crypto::BaoEncoder;
 use std::sync::Arc;
 use std::collections::HashMap;
 use dashmap::DashMap;
