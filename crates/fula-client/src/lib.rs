@@ -71,6 +71,25 @@ pub use error::{ClientError, Result};
 pub use multipart::{MultipartUpload, UploadProgress, ProgressCallback, upload_large_file};
 pub use types::*;
 
+/// Process-wide count of WAL append failures (F11).
+///
+/// The WAL is the crash-recovery log for in-memory forest upserts. When
+/// `wal::append` fails, the in-memory dirty state has outrun its on-disk
+/// record — a subsequent crash / power-loss can lose the upsert even
+/// though the client reported success. This counter increments on every
+/// such failure so operators can alert on rising values.
+///
+/// The counter is monotonic and process-wide (not per-client); it does
+/// not reset. Wire it into your metrics pipeline alongside whatever
+/// `tracing::warn!` subscriber you already have — the two are
+/// complementary (log for the incident, counter for the rate).
+///
+/// Not available on wasm32; the WAL is native-only.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn wal_append_failure_count() -> u64 {
+    wal::append_failure_count()
+}
+
 // Re-export useful crypto types for encryption configuration
 pub use fula_crypto::private_metadata::KeyObfuscation;
 pub use fula_crypto::private_forest::{PrivateForest, ForestFileEntry, ForestDirectoryEntry};

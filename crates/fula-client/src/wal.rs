@@ -162,8 +162,8 @@ pub(crate) fn append(bucket: &str, mac_key: &DekKey, entry: WalEntry) -> Result<
 /// Observable count of WAL append failures since process start. Never
 /// resets; monotonic. Intended for metrics / operator alerting — a rising
 /// value means in-memory dirty forest state is out-running its on-disk
-/// crash-recovery log. (F11.)
-#[allow(dead_code)] // Exposed for observability consumers + the F11 test.
+/// crash-recovery log. Re-exported publicly from the crate root as
+/// `wal_append_failure_count`. (F11.)
 pub(crate) fn append_failure_count() -> u64 {
     WAL_APPEND_FAILURES.load(Ordering::Relaxed)
 }
