@@ -1049,8 +1049,8 @@ impl ShardedHamtPrivateForest {
 
     /// Collect every `ForestFileEntry` across every shard.
     ///
-    /// Equivalent to `PrivateForest::list_all_files` / `ShardedPrivateForest::
-    /// list_all_files` on v1 and v6 forests, returning owned entries.
+    /// Equivalent to `PrivateForest::list_all_files` on v1 monolithic
+    /// forests, returning owned entries.
     pub async fn list_all_files<B: BlobBackend + 'static>(
         &self,
         backend: &Arc<B>,

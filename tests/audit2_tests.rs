@@ -413,7 +413,7 @@ mod forest_cache_dirty_protection {
             modified_at: now,
             content_hash: None,
             user_metadata: HashMap::new(),
-            encrypted: false,
+            encrypted: false, min_version: 0,
         };
 
         forest.upsert_file(entry);
@@ -445,7 +445,7 @@ mod forest_cache_dirty_protection {
                 modified_at: now,
                 content_hash: None,
                 user_metadata: HashMap::new(),
-                encrypted: false,
+                encrypted: false, min_version: 0,
             };
             forest.upsert_file(entry);
         }
@@ -486,7 +486,7 @@ mod forest_cache_dirty_protection {
             modified_at: now,
             content_hash: None,
             user_metadata: HashMap::new(),
-            encrypted: false,
+            encrypted: false, min_version: 0,
         };
         forest.upsert_file(entry);
         assert_eq!(forest.file_count(), 1);
@@ -799,7 +799,7 @@ mod forest_format_compat {
             modified_at: now,
             content_hash: None,
             user_metadata: HashMap::new(),
-            encrypted: false,
+            encrypted: false, min_version: 0,
         });
 
         let encrypted = EncryptedForest::encrypt(&forest, &dek).unwrap();
@@ -807,7 +807,6 @@ mod forest_format_compat {
 
         match detect_forest_format(&bytes).unwrap() {
             ForestOrManifest::Monolithic(_) => { /* expected */ }
-            ForestOrManifest::Manifest(_) => panic!("Expected Monolithic format, got v6 manifest"),
             ForestOrManifest::ManifestV7(_) => panic!("Expected Monolithic format, got v7 manifest"),
         }
     }
@@ -831,7 +830,7 @@ mod forest_format_compat {
                 modified_at: now,
                 content_hash: None,
                 user_metadata: HashMap::new(),
-                encrypted: false,
+                encrypted: false, min_version: 0,
             });
         }
 
@@ -1164,7 +1163,7 @@ mod realistic_environment {
             modified_at: now,
             content_hash: None,
             user_metadata: HashMap::new(),
-            encrypted: false,
+            encrypted: false, min_version: 0,
         });
 
         // 3. Save (encrypt + serialize) — this is what "flush" does
@@ -1187,7 +1186,7 @@ mod realistic_environment {
             modified_at: now,
             content_hash: None,
             user_metadata: HashMap::new(),
-            encrypted: false,
+            encrypted: false, min_version: 0,
         });
         assert_eq!(loaded.file_count(), 2);
 

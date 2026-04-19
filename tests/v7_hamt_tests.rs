@@ -92,11 +92,7 @@ async fn test_v7_migration_produces_v7_format() {
 
     assert!(
         client.is_forest_sharded_hamt(bucket),
-        "migrate_to_sharded must produce v7 (ShardedHamt), not v6"
-    );
-    assert!(
-        !client.is_forest_sharded(bucket),
-        "v7 must not show as v6 (Sharded)"
+        "migrate_to_sharded must produce v7 (ShardedHamt)"
     );
 
     // Read after migration: the v1 entry must still be reachable through v7.
@@ -311,10 +307,6 @@ async fn test_small_bucket_auto_migrates_to_v7_on_first_load() {
     assert!(
         client.is_forest_sharded_hamt(bucket),
         "first-load migration must produce v7, even for small buckets"
-    );
-    assert!(
-        !client.is_forest_sharded(bucket),
-        "v7 must not show as v6 (Sharded)"
     );
 
     client.delete_object_flat(bucket, "/file-007.txt")

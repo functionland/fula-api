@@ -243,6 +243,7 @@ async fn test_v1_to_v7_preserves_subtree_deks() {
             content_hash: None,
             user_metadata: HashMap::new(),
             encrypted: false,
+            min_version: 0,
         },
     );
 
@@ -389,9 +390,8 @@ async fn test_migration_defers_when_wal_has_pending_entries() {
         msg
     );
 
-    // Bucket is still in v1 state: neither flavor of sharded shows up.
+    // Bucket is still in v1 state: v7 didn't take over.
     assert!(!client.is_forest_sharded_hamt(bucket));
-    assert!(!client.is_forest_sharded(bucket));
 }
 
 /// Happy-path migration writes a `__fula_forest_v1_backup/<unix_ms>` blob
