@@ -1261,6 +1261,77 @@ mod migration_security {
         );
     }
 
+    /// S-1.2 M1/M3 guard: a crash between the Phase 1.5 page PUT and the
+    /// Phase 2 root PUT (simulated via `test_faults::CRASH_AFTER_PAGE_PUT_BEFORE_ROOT_PUT`)
+    /// leaves S3 with fresh pages + a stale root. The next flush must re-drive
+    /// the root PUT and leave the bucket consistent — a fresh reader on a new
+    /// state dir must see the post-crash writes.
+    ///
+    /// The page PUTs are index-addressed and the WAL records `PageWrote`
+    /// before each PUT, so a re-PUT on retry simply overwrites the same key
+    /// with the same seq'd content. Nothing leaks into the orphan queue.
+    #[tokio::test]
+    async fn test_crash_between_page_put_and_root_put_is_recovered() {
+        use fula_client::test_faults::CRASH_AFTER_PAGE_PUT_BEFORE_ROOT_PUT;
+        use std::sync::atomic::Ordering;
+
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let secret = encryption.export_secret_key().clone();
+        let bucket = "sec-page-crash-recovered";
+
+        let state = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+        let writer = make_client(&base, EncryptionConfig::from_secret_key(secret.clone()));
+        writer.create_bucket(bucket).await.expect("create bucket");
+        seed_v1_forest(
+            &writer,
+            bucket,
+            &[SeedFile::new("/a.txt", 4)],
+            &[],
+        )
+        .await;
+        writer.migrate_to_sharded(bucket).await.expect("migrate");
+        assert!(writer.is_forest_sharded_hamt(bucket));
+
+        // Stage a write that will dirty pages, then arm the crash point so
+        // the first flush succeeds in Phase 1 / 1.5 but panics-by-error
+        // before the root PUT.
+        writer
+            .put_object_flat_deferred(bucket, "/new.txt", b"new-after-crash".to_vec(), None)
+            .await
+            .expect("stage deferred");
+        CRASH_AFTER_PAGE_PUT_BEFORE_ROOT_PUT.store(true, Ordering::Relaxed);
+        let crash_result = writer.flush_forest(bucket).await;
+        assert!(
+            crash_result.is_err(),
+            "fault injection must make the first flush fail"
+        );
+        CRASH_AFTER_PAGE_PUT_BEFORE_ROOT_PUT.store(false, Ordering::Relaxed);
+
+        // Next flush (from the same in-memory state, WAL still populated):
+        // the page PUTs get re-driven at the next-seq (idempotent at the
+        // same keys); the root PUT lands on the second pass.
+        writer
+            .flush_forest(bucket)
+            .await
+            .expect("second flush must recover");
+
+        drop(writer);
+
+        // Fresh reader: must see the post-crash write at /new.txt and the
+        // original /a.txt. This fails if the root still points at stale
+        // page etags, or if any page AEAD AAD check trips.
+        let reader = make_client(&base, EncryptionConfig::from_secret_key(secret));
+        let new_body = reader
+            .get_object_flat(bucket, "/new.txt")
+            .await
+            .expect("read /new.txt");
+        assert_eq!(new_body.as_ref(), b"new-after-crash");
+        assert!(reader.is_forest_sharded_hamt(bucket));
+    }
+
     /// F-1.3 D4 guard: after the root manifest commits but the dir-index PUT
     /// never lands (simulated by deleting the dir-index blob post-migration),
     /// `load_directory_index` observes a 404 and the loader falls back to

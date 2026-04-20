@@ -3041,6 +3041,22 @@ impl EncryptedClient {
             None
         };
 
+        // Fault injection point: simulate a client crash between Phase 1.5 /
+        // Phase 1.6 and Phase 2. Pages + dir-index are already on S3 under
+        // fresh seqs; the root PUT has not fired, so the old root still
+        // points to stale page etags. Recovery relies on the WAL-tracked
+        // PageWrote / DirIndexWrote entries and the next retry flush.
+        #[cfg(feature = "test-fault-injection")]
+        if test_faults::CRASH_AFTER_PAGE_PUT_BEFORE_ROOT_PUT
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(ClientError::Encryption(
+                fula_crypto::CryptoError::Encryption(
+                    "test-fault-injection: CRASH_AFTER_PAGE_PUT_BEFORE_ROOT_PUT".to_string(),
+                )
+            ));
+        }
+
         // Phase 2: encrypt + conditionally PUT the manifest root.
         let next_seq = prior_seq.unwrap_or(0).saturating_add(1);
         let encrypted_manifest = EncryptedShardManifestV7::encrypt_v7(
