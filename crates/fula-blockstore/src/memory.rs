@@ -132,17 +132,30 @@ impl PinStore for MemoryBlockStore {
 pub struct CachedBlockStore<S: BlockStore> {
     inner: S,
     cache: Arc<parking_lot::Mutex<lru::LruCache<Cid, Bytes>>>,
+    hits: Arc<std::sync::atomic::AtomicU64>,
+    misses: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<S: BlockStore> CachedBlockStore<S> {
-    /// Create a new cached store with the given capacity
+    /// Create a new cached store with the given entry capacity
     pub fn new(inner: S, capacity: usize) -> Self {
         Self {
             inner,
             cache: Arc::new(parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(capacity).unwrap(),
             ))),
+            hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Create a new cached store sized by megabytes, using `MAX_BLOCK_SIZE`
+    /// (1 MiB) as the upper-bound per-entry estimate. Results in at least one
+    /// entry of headroom.
+    pub fn with_mb(inner: S, mb: usize) -> Self {
+        let bytes = mb.saturating_mul(1024 * 1024);
+        let capacity = (bytes / crate::MAX_BLOCK_SIZE).max(1);
+        Self::new(inner, capacity)
     }
 
     /// Clear the cache
@@ -153,6 +166,21 @@ impl<S: BlockStore> CachedBlockStore<S> {
     /// Get cache statistics
     pub fn cache_len(&self) -> usize {
         self.cache.lock().len()
+    }
+
+    /// Borrow the inner (wrapped) block store
+    pub fn inner_ref(&self) -> &S {
+        &self.inner
+    }
+
+    /// Cache hit count since creation
+    pub fn hits(&self) -> u64 {
+        self.hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Cache miss count since creation
+    pub fn misses(&self) -> u64 {
+        self.misses.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -167,9 +195,11 @@ impl<S: BlockStore> BlockStore for CachedBlockStore<S> {
     async fn get_block(&self, cid: &Cid) -> Result<Bytes> {
         // Check cache first
         if let Some(data) = self.cache.lock().get(cid) {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(data.clone());
         }
 
+        self.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Fetch from inner store
         let data = self.inner.get_block(cid).await?;
         self.cache.lock().put(*cid, data.clone());
@@ -266,15 +296,52 @@ mod tests {
     async fn test_cached_store() {
         let inner = MemoryBlockStore::new();
         let cached = CachedBlockStore::new(inner, 100);
-        
+
         let data = b"cached data";
         let cid = cached.put_block(data).await.unwrap();
-        
+
         // Should be in cache
         assert_eq!(cached.cache_len(), 1);
-        
+
         // Get should hit cache
         let retrieved = cached.get_block(&cid).await.unwrap();
         assert_eq!(data.as_slice(), retrieved.as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_cached_store_hit_miss_counters() {
+        // A fresh get() on a cold cache counts as a miss; a second get() of
+        // the same block counts as a hit.
+        let inner = MemoryBlockStore::new();
+        // Round-trip through the inner store to learn the CID, then wrap.
+        let cid = inner.put_block(b"payload").await.unwrap();
+        let cached = CachedBlockStore::new(inner, 10);
+
+        assert_eq!(cached.hits(), 0);
+        assert_eq!(cached.misses(), 0);
+
+        // First read fills the cache (miss).
+        let _ = cached.get_block(&cid).await.unwrap();
+        assert_eq!(cached.hits(), 0);
+        assert_eq!(cached.misses(), 1);
+
+        // Second read hits the cache.
+        let _ = cached.get_block(&cid).await.unwrap();
+        assert_eq!(cached.hits(), 1);
+        assert_eq!(cached.misses(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cached_store_with_mb_helper() {
+        // with_mb converts MB to entry capacity using MAX_BLOCK_SIZE (1 MiB).
+        let cached = CachedBlockStore::with_mb(MemoryBlockStore::new(), 4);
+        // 4 MB / 1 MiB-per-entry = 4 entries of headroom.
+        // Quick sanity: put more than 4 blocks and confirm the cache doesn't
+        // exceed the configured cap.
+        for i in 0..10u32 {
+            let data = i.to_le_bytes();
+            cached.put_block(&data).await.unwrap();
+        }
+        assert!(cached.cache_len() <= 4);
     }
 }

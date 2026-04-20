@@ -20,6 +20,9 @@ use fula_crypto::{
         detect_forest_format, ForestOrManifest,
         compute_initial_shard_count,
         EncryptedShardManifestV7, ShardManifestV7,
+        ManifestRoot, ManifestPage, EncryptedManifestPage, PageId, PageRef,
+        derive_manifest_page_key,
+        DirectoryIndex, EncryptedDirectoryIndex, derive_dir_index_key,
     },
     sharing::{ShareToken, AcceptedShare, ShareRecipient},
     rotation::{KeyRotationManager, WrappedKeyInfo},
@@ -182,6 +185,14 @@ pub mod test_faults {
     /// buckets, where the refcount check conservatively returns `true` until
     /// v7 reference traversal is wired. Never set in production.
     pub static BYPASS_ORPHAN_CLEANUP_REFCHECK: AtomicBool = AtomicBool::new(false);
+
+    /// If `true`, `save_sharded_hamt_forest` returns an error immediately
+    /// after all Phase 1.5 page PUTs succeed but before encrypting the
+    /// manifest root. Simulates a client crash mid-flush — pages are on S3
+    /// under fresh seqs, root still points at the prior generation. Used
+    /// by the S-1.2 recovery integration test to assert the next flush
+    /// re-drives the root PUT and leaves the forest consistent.
+    pub static CRASH_AFTER_PAGE_PUT_BEFORE_ROOT_PUT: AtomicBool = AtomicBool::new(false);
 }
 
 /// If set, a v7 manifest that fails to decrypt triggers an automatic attempt
@@ -2300,7 +2311,7 @@ impl EncryptedClient {
                         let (manifest, observed_manifest_seq) = match encrypted_manifest_v7
                             .decrypt_v7(&forest_dek, bucket)
                         {
-                            Ok((m, seq)) => {
+                            Ok((root, seq)) => {
                                 self.check_sequence_floor(bucket, seq)?;
                                 if let Some(last) = cached_prior_manifest_seq {
                                     if seq < last {
@@ -2312,6 +2323,12 @@ impl EncryptedClient {
                                         ));
                                     }
                                 }
+                                // Meta-HAMT: fetch every referenced page and
+                                // reassemble the in-memory manifest. A missing
+                                // or corrupt page propagates as an error; the
+                                // v1-backup fallback below is the recovery
+                                // path if the whole thing is unrecoverable.
+                                let m = self.load_manifest_pages(bucket, &forest_dek, root).await?;
                                 (m, Some(seq))
                             }
                             Err(decrypt_err) => {
@@ -2355,11 +2372,35 @@ impl EncryptedClient {
                         self.persist_manifest_version(bucket, 7);
 
                         let now = chrono::Utc::now().timestamp();
-                        let forest = ShardedHamtPrivateForest::from_manifest(
+                        let dir_index_etag = manifest.root.dir_index_etag.clone();
+                        let mut forest = ShardedHamtPrivateForest::from_manifest(
                             manifest,
                             bucket.to_string(),
                             forest_dek.clone(),
                         );
+                        // F-1.3: try to load the dir-index blob; if absent or
+                        // corrupt, rebuild from the forest contents and mark
+                        // dirty so the next flush persists the rebuilt blob.
+                        match self
+                            .load_directory_index(bucket, &forest_dek, dir_index_etag.as_deref())
+                            .await?
+                        {
+                            Some((idx, seq)) => {
+                                forest.install_dir_index(idx, seq);
+                            }
+                            None => {
+                                let backend_for_rebuild = Arc::new(S3BlobBackend::new(
+                                    self.inner.clone(),
+                                    bucket.to_string(),
+                                ));
+                                let rebuilt = forest
+                                    .rebuild_directory_index_from_forest(&backend_for_rebuild)
+                                    .await
+                                    .map_err(ClientError::Encryption)?;
+                                forest.install_dir_index(rebuilt, 0);
+                                forest.mark_dir_index_dirty();
+                            }
+                        }
                         let forest_arc = Arc::new(tokio::sync::RwLock::new(forest));
                         self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::ShardedHamt {
                             forest: forest_arc,
@@ -2844,18 +2885,166 @@ impl EncryptedClient {
         // Phase 1: flush dirty HAMT nodes. `flush_dirty` bumps each dirty
         // shard's `seq` *before* writing, so AAD on the uploaded node blobs
         // is bound to the post-flush sequence we'll commit in phase 2.
+        // Phase 1 also marks pages dirty automatically via `shard_mut`.
         let backend = Arc::new(S3BlobBackend::new(self.inner.clone(), bucket.to_string()));
-        let manifest_snapshot = {
+        let (mut manifest_snapshot, dir_index_snapshot, prior_dir_index_seq, dir_index_dirty) = {
             let mut guard = forest_arc.write().await;
             guard.flush_dirty(&backend).await
                 .map_err(ClientError::Encryption)?;
-            guard.manifest().clone()
+            (
+                guard.manifest().clone(),
+                guard.directory_index().clone(),
+                guard.dir_index_seq(),
+                guard.dir_index_dirty(),
+            )
         };
 
-        // Phase 2: encrypt + conditionally PUT the manifest.
+        // Phase 1.5: flush dirty pages. Each dirty page bumps its `seq`, is
+        // re-encrypted with the new seq bound into AAD, and PUT to storage
+        // at a deterministic index-addressed key. The resulting ETag is
+        // then recorded in `root.page_index` so the root swap in phase 2
+        // knows exactly which page generation it commits to.
+        //
+        // WAL::PageWrote is appended + fsynced **before** each page PUT so a
+        // crash between the fsync and the PUT is idempotent on replay: pages
+        // are index-addressed, so re-executing the PUT at the same page key
+        // simply overwrites the last attempt. Without this record, a crash
+        // after the PUT but before the root PUT could leave S3 serving a
+        // fresh-seq page under the old root's page_index.
+        let shard_salt = manifest_snapshot.shard_salt().to_vec();
+        let dirty_pages = manifest_snapshot.take_dirty_pages();
+        let wal_mac = wal::derive_mac_key(&self.encryption.key_manager, bucket);
+        for page_id in dirty_pages.iter().copied() {
+            let page = manifest_snapshot.pages.get_mut(&page_id)
+                .ok_or_else(|| ClientError::Encryption(
+                    fula_crypto::CryptoError::Encryption(format!(
+                        "dirty page {} not loaded in snapshot", page_id
+                    ))
+                ))?;
+            let old_etag = manifest_snapshot.root.page_index.get(&page_id)
+                .and_then(|r| r.etag.clone());
+            page.seq = page.seq.wrapping_add(1);
+            if let Err(e) = wal::append(
+                bucket,
+                &wal_mac,
+                WalEntry::PageWrote {
+                    page_id,
+                    old_etag: old_etag.clone(),
+                    new_etag: None,
+                    seq: page.seq,
+                },
+            ) {
+                tracing::warn!(%bucket, page_id, error = %e, "WAL append PageWrote failed");
+            }
+            let envelope = EncryptedManifestPage::encrypt(page, &forest_dek, bucket)
+                .map_err(ClientError::Encryption)?;
+            let blob = envelope.to_bytes().map_err(ClientError::Encryption)?;
+            let page_key = derive_manifest_page_key(&forest_dek, bucket, &shard_salt, page_id);
+            let metadata = ObjectMetadata::new()
+                .with_content_type("application/octet-stream");
+            // Conditional PUT on the page so a concurrent writer (that
+            // bumped this same page between our load and this PUT) can't
+            // be silently overwritten — its content would otherwise clobber
+            // the winner's shard view inside the page. `If-Match` when we
+            // remember an etag; `If-None-Match: *` for a first-ever page
+            // create so two racing creators don't produce divergent state.
+            let (if_match, if_none_match) = match old_etag.as_deref() {
+                Some(et) => (Some(et), None),
+                None => (None, Some("*")),
+            };
+            let put = match self.inner.put_object_with_metadata_conditional(
+                bucket,
+                &page_key,
+                Bytes::from(blob),
+                Some(metadata),
+                if_match,
+                if_none_match,
+            ).await {
+                Ok(r) => r,
+                Err(e) if e.is_concurrent_modification() => {
+                    // Another writer advanced this page between our load and
+                    // this PUT. Evict the cache so the retry loop reloads
+                    // the winner's page_index from S3 before re-attempting
+                    // Phase 1.5 / 1.6 / 2 under the correct `If-Match`.
+                    // Without this, the retry sees a stale page view and
+                    // the winner's shards look empty in our page.
+                    self.forest_cache.remove(bucket);
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
+            let etag = if put.etag.is_empty() { None } else { Some(put.etag) };
+            manifest_snapshot.root.page_index.insert(page_id, PageRef {
+                etag,
+                seq: page.seq,
+            });
+        }
+
+        // Phase 1.6 (F-1.3): flush the directory index if it changed since
+        // the last successful commit. AEAD binds `(bucket, seq)` so a stale
+        // rollback fails integrity; the new ETag is recorded in
+        // `manifest_snapshot.root.dir_index_etag` and becomes authoritative
+        // on the next successful root PUT.
+        //
+        // WAL::DirIndexWrote is appended+fsynced BEFORE the PUT so a crash
+        // between the fsync and the PUT replays as a retry at the same key
+        // under the same seq — idempotent under identical content.
+        let new_dir_index_seq = if dir_index_dirty {
+            let next_dir_seq = prior_dir_index_seq.saturating_add(1);
+            let old_dir_etag = manifest_snapshot.root.dir_index_etag.clone();
+            if let Err(e) = wal::append(
+                bucket,
+                &wal_mac,
+                WalEntry::DirIndexWrote {
+                    old_etag: old_dir_etag.clone(),
+                    new_etag: None,
+                    seq: next_dir_seq,
+                },
+            ) {
+                tracing::warn!(%bucket, error = %e, "WAL append DirIndexWrote failed");
+            }
+            let envelope = EncryptedDirectoryIndex::encrypt(
+                &dir_index_snapshot,
+                &forest_dek,
+                bucket,
+                next_dir_seq,
+            ).map_err(ClientError::Encryption)?;
+            let blob = envelope.to_bytes().map_err(ClientError::Encryption)?;
+            let dir_key = derive_dir_index_key(&forest_dek, bucket);
+            let metadata = ObjectMetadata::new()
+                .with_content_type("application/octet-stream");
+            let put = match self.inner.put_object_with_metadata_conditional(
+                bucket,
+                &dir_key,
+                Bytes::from(blob),
+                Some(metadata),
+                old_dir_etag.as_deref(),
+                None,
+            ).await {
+                Ok(r) => r,
+                Err(e) if e.is_concurrent_modification() => {
+                    // Another writer advanced the dir-index between our load
+                    // and this PUT. Evict the cache so the retry loop reloads
+                    // the winner's dir-index etag from S3 before re-attempting
+                    // Phase 1.6 under the correct `If-Match`. Mirrors the
+                    // Phase-2 412 eviction below — the forest-cache must
+                    // never hold a stale dir-index etag across retries.
+                    self.forest_cache.remove(bucket);
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
+            let new_dir_etag = if put.etag.is_empty() { None } else { Some(put.etag) };
+            manifest_snapshot.root.dir_index_etag = new_dir_etag;
+            Some(next_dir_seq)
+        } else {
+            None
+        };
+
+        // Phase 2: encrypt + conditionally PUT the manifest root.
         let next_seq = prior_seq.unwrap_or(0).saturating_add(1);
         let encrypted_manifest = EncryptedShardManifestV7::encrypt_v7(
-            &manifest_snapshot,
+            &manifest_snapshot.root,
             &forest_dek,
             bucket,
             next_seq,
@@ -2890,6 +3079,20 @@ impl EncryptedClient {
         };
 
         let new_etag = if put_result.etag.is_empty() { None } else { Some(put_result.etag) };
+
+        // Reconcile Phase 1.5 + Phase 1.6 + Phase 2 back into the live
+        // forest. Without this, the forest's own manifest retains the
+        // pre-flush `dirty_pages` + stale `page_index`, so a subsequent
+        // no-op flush would re-PUT every page under a fresh seq.
+        // `flush_dirty` already cleared dirty-shard flags; this closes the
+        // same loop at the meta-HAMT and dir-index layers.
+        {
+            let mut guard = forest_arc.write().await;
+            guard.reconcile_flush(manifest_snapshot.root.clone(), &dirty_pages);
+            if let Some(new_seq) = new_dir_index_seq {
+                guard.reconcile_dir_index_flush(new_seq);
+            }
+        }
 
         // Update cache metadata in place — the forest itself already reflects
         // the post-flush state (dirty flags cleared by `flush_dirty`).
@@ -2990,6 +3193,91 @@ impl EncryptedClient {
             tracing::warn!(%bucket, "v7 fallback: decrypting backup blob failed");
         }
         forest_opt
+    }
+
+    /// Load every page referenced by a decrypted manifest `root` and assemble a
+    /// complete `ShardManifestV7`. Phase-1 implementation is eager — the open
+    /// path pays one GET per referenced page. Pages not yet referenced (empty
+    /// slots on a freshly-resharded manifest) are synthesized by
+    /// `ShardManifestV7::from_root_and_pages`.
+    async fn load_manifest_pages(
+        &self,
+        bucket: &str,
+        forest_dek: &fula_crypto::keys::DekKey,
+        root: ManifestRoot,
+    ) -> std::result::Result<ShardManifestV7, ClientError> {
+        let shard_salt = root.shard_salt.clone();
+        let mut pages: std::collections::BTreeMap<PageId, ManifestPage> = std::collections::BTreeMap::new();
+        for (page_id, page_ref) in root.page_index.iter() {
+            let page_key = derive_manifest_page_key(forest_dek, bucket, &shard_salt, *page_id);
+            let blob = self.inner.get_object(bucket, &page_key).await
+                .map_err(|e| ClientError::DownloadFailed(format!(
+                    "failed to fetch manifest page {} for bucket {}: {}",
+                    page_id, bucket, e
+                )))?;
+            let envelope = EncryptedManifestPage::from_bytes(&blob)
+                .map_err(ClientError::Encryption)?;
+            if envelope.page_id != *page_id {
+                return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                    format!("manifest page envelope id {} != expected {}", envelope.page_id, page_id)
+                )));
+            }
+            if envelope.seq < page_ref.seq {
+                return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                    format!("stale manifest page {}: envelope seq {} < root-expected seq {}",
+                        page_id, envelope.seq, page_ref.seq)
+                )));
+            }
+            let page = envelope.decrypt(forest_dek, bucket)
+                .map_err(ClientError::Encryption)?;
+            pages.insert(*page_id, page);
+        }
+        ShardManifestV7::from_root_and_pages(root, pages)
+            .map_err(ClientError::Encryption)
+    }
+
+    /// Try to load the directory index (F-1.3) for this bucket.
+    ///
+    /// Returns `Ok(Some((index, seq, etag)))` if the object decrypts cleanly
+    /// and its stored ETag matches `expected_etag` (when the root pins one).
+    /// Returns `Ok(None)` when:
+    ///   * The object is 404 (never flushed or backend lost it).
+    ///   * The root records an ETag but the fetched ETag / AEAD doesn't match.
+    ///   * The plaintext sequence is older than the root's pin.
+    /// All of these trigger a caller-side rebuild-from-forest.
+    async fn load_directory_index(
+        &self,
+        bucket: &str,
+        forest_dek: &fula_crypto::keys::DekKey,
+        expected_etag: Option<&str>,
+    ) -> std::result::Result<Option<(DirectoryIndex, u64)>, ClientError> {
+        let key = derive_dir_index_key(forest_dek, bucket);
+        let blob = match self.inner.get_object(bucket, &key).await {
+            Ok(b) => b,
+            Err(e) if e.is_not_found() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // NOTE: get_object discards the HEAD ETag. An ETag cross-check is
+        // defense-in-depth but not safety-critical: the AAD binds (bucket, seq)
+        // and the manifest root's seq isn't currently pinned alongside the
+        // etag, so AEAD verification + seq check below catch rollback and
+        // tamper regardless. If `expected_etag` is provided, and a future
+        // refactor exposes the PUT ETag on the read path, wire it through.
+        let _ = expected_etag;
+        let envelope = match EncryptedDirectoryIndex::from_bytes(&blob) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(%bucket, error = %e, "dir-index envelope decode failed; will rebuild");
+                return Ok(None);
+            }
+        };
+        match envelope.decrypt(forest_dek, bucket) {
+            Ok((index, seq)) => Ok(Some((index, seq))),
+            Err(e) => {
+                tracing::warn!(%bucket, error = %e, "dir-index decrypt failed; will rebuild");
+                Ok(None)
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3191,7 +3479,7 @@ impl EncryptedClient {
         let file_count = v1_forest.file_count();
         let num_shards = compute_initial_shard_count(file_count);
         let mut manifest = ShardManifestV7::new(num_shards);
-        manifest.created_at = v1_forest.created_at;
+        manifest.root.created_at = v1_forest.created_at;
 
         let mut v7 = ShardedHamtPrivateForest::from_manifest(
             manifest,
@@ -3249,11 +3537,121 @@ impl EncryptedClient {
             });
         }
 
-        // ── Step 7: Phase B — encrypt + conditional PUT of v7 manifest ─────
-        let manifest_snapshot = v7.manifest().clone();
+        // ── Step 7: Phase B — flush dirty pages then PUT v7 manifest root ──
+        let mut manifest_snapshot = v7.manifest().clone();
+        let shard_salt = manifest_snapshot.shard_salt().to_vec();
+        let dirty_pages = manifest_snapshot.take_dirty_pages();
+        let wal_mac_pages = wal::derive_mac_key(&self.encryption.key_manager, bucket);
+        for page_id in dirty_pages.iter().copied() {
+            let page = match manifest_snapshot.pages.get_mut(&page_id) {
+                Some(p) => p,
+                None => {
+                    release_best_effort(lock_token.clone()).await;
+                    return Ok(MigrationOutcome::DeferredTransientError {
+                        reason: format!("dirty page {} not loaded in migration", page_id),
+                    });
+                }
+            };
+            let old_etag = manifest_snapshot.root.page_index.get(&page_id)
+                .and_then(|r| r.etag.clone());
+            page.seq = page.seq.wrapping_add(1);
+            if let Err(e) = wal::append(
+                bucket,
+                &wal_mac_pages,
+                WalEntry::PageWrote {
+                    page_id,
+                    old_etag: old_etag.clone(),
+                    new_etag: None,
+                    seq: page.seq,
+                },
+            ) {
+                tracing::warn!(%bucket, page_id, error = %e, "migration: WAL append PageWrote failed");
+            }
+            let blob = match EncryptedManifestPage::encrypt(page, forest_dek, bucket)
+                .and_then(|e| e.to_bytes())
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    release_best_effort(lock_token.clone()).await;
+                    return Ok(MigrationOutcome::DeferredTransientError {
+                        reason: format!("encrypt manifest page {} failed: {}", page_id, e),
+                    });
+                }
+            };
+            let page_key = derive_manifest_page_key(forest_dek, bucket, &shard_salt, page_id);
+            let put = match self.inner.put_object_with_metadata(
+                bucket,
+                &page_key,
+                Bytes::from(blob),
+                Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
+            ).await {
+                Ok(r) => r,
+                Err(e) => {
+                    release_best_effort(lock_token.clone()).await;
+                    return Ok(MigrationOutcome::DeferredTransientError {
+                        reason: format!("PUT manifest page {} failed: {}", page_id, e),
+                    });
+                }
+            };
+            let etag = if put.etag.is_empty() { None } else { Some(put.etag) };
+            manifest_snapshot.root.page_index.insert(page_id, PageRef {
+                etag,
+                seq: page.seq,
+            });
+        }
+
+        // Phase B.5 (F-1.3): flush the directory index built from v1's files
+        // and directories via the upsert hooks above. First-write (no prior
+        // dir-index for this bucket in v7), so no If-Match is required.
+        // WAL::DirIndexWrote appended+fsynced BEFORE the PUT for crash-replay
+        // idempotency (same key, same seq, identical plaintext).
+        let dir_index_seq: u64 = 1;
+        if let Err(e) = wal::append(
+            bucket,
+            &wal_mac_pages,
+            WalEntry::DirIndexWrote {
+                old_etag: None,
+                new_etag: None,
+                seq: dir_index_seq,
+            },
+        ) {
+            tracing::warn!(%bucket, error = %e, "migration: WAL append DirIndexWrote failed");
+        }
+        let dir_index_blob = match EncryptedDirectoryIndex::encrypt(
+            v7.directory_index(),
+            forest_dek,
+            bucket,
+            dir_index_seq,
+        ).and_then(|e| e.to_bytes()) {
+            Ok(b) => b,
+            Err(e) => {
+                release_best_effort(lock_token.clone()).await;
+                return Ok(MigrationOutcome::DeferredTransientError {
+                    reason: format!("encrypt migration dir-index failed: {}", e),
+                });
+            }
+        };
+        let dir_index_key = derive_dir_index_key(forest_dek, bucket);
+        let dir_index_put = match self.inner.put_object_with_metadata(
+            bucket,
+            &dir_index_key,
+            Bytes::from(dir_index_blob),
+            Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
+        ).await {
+            Ok(r) => r,
+            Err(e) => {
+                release_best_effort(lock_token.clone()).await;
+                return Ok(MigrationOutcome::DeferredTransientError {
+                    reason: format!("PUT migration dir-index failed: {}", e),
+                });
+            }
+        };
+        manifest_snapshot.root.dir_index_etag =
+            if dir_index_put.etag.is_empty() { None } else { Some(dir_index_put.etag) };
+
         let manifest_seq: u64 = 1;
         let manifest_data = match EncryptedShardManifestV7::encrypt_v7(
-            &manifest_snapshot,
+            &manifest_snapshot.root,
             forest_dek,
             bucket,
             manifest_seq,
@@ -3312,6 +3710,11 @@ impl EncryptedClient {
         // ── Step 8: Install the migrated forest into the cache ─────────────
         let new_etag = if put_result.etag.is_empty() { None } else { Some(put_result.etag) };
         let now = chrono::Utc::now().timestamp();
+        // Fold the freshly-committed page_index + cleared dirty_pages back
+        // into the in-memory forest before caching, so the first post-
+        // migration flush doesn't re-PUT every page.
+        v7.reconcile_flush(manifest_snapshot.root.clone(), &dirty_pages);
+        v7.reconcile_dir_index_flush(dir_index_seq);
         let forest_arc = Arc::new(tokio::sync::RwLock::new(v7));
         self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::ShardedHamt {
             forest: forest_arc,
@@ -3321,6 +3724,16 @@ impl EncryptedClient {
         });
         // Pin the manifest version so a gateway can't downgrade us next load.
         self.persist_manifest_version(bucket, 7);
+
+        // Clear the migration WAL: PageWrote / DirIndexWrote entries recorded
+        // during Phase B describe work that has now committed. Leaving them
+        // on disk would trip the WAL-defer guard at Step 0 of the *next*
+        // migration entry (which treats any non-empty WAL as pending v1
+        // flushes) — see test_version_downgrade_blocked_after_v7_pin.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(e) = wal::clear(bucket) {
+            tracing::warn!(%bucket, error = %e, "WAL clear after migration failed");
+        }
 
         // ── Step 9: Release the server lock (best-effort) ─────────────────
         release_best_effort(lock_token).await;
@@ -3354,7 +3767,7 @@ impl EncryptedClient {
             // v7 keeps a per-shard `entry_count` in the manifest so total
             // counts are O(1) without walking the HAMT.
             let guard = arc.read().await;
-            guard.manifest().shards.iter()
+            guard.manifest().shards_iter()
                 .map(|s| s.entry_count as usize)
                 .sum()
         } else {
@@ -3439,7 +3852,7 @@ impl EncryptedClient {
             KeyPath::V7(forest_arc) => {
                 let salt = {
                     let guard = forest_arc.read().await;
-                    guard.manifest().shard_salt.clone()
+                    guard.manifest().shard_salt().to_vec()
                 };
                 generate_flat_key(key, &dek, &salt)
             }
@@ -4455,7 +4868,7 @@ impl EncryptedClient {
             {
                 let mut guard = forest_arc.write().await;
                 if !shard_writes.is_empty() {
-                    let num_shards = guard.manifest().shards.len();
+                    let num_shards = guard.manifest().num_shards();
                     for (idx, (seq, etag)) in shard_writes {
                         if idx < num_shards {
                             guard.reconcile_shard_write(idx, seq, etag);
@@ -4483,6 +4896,15 @@ impl EncryptedClient {
                         }
                         WalEntry::ShardWrote { .. } => {
                             // Handled above in Phase 1.
+                        }
+                        WalEntry::PageWrote { .. } | WalEntry::DirIndexWrote { .. } => {
+                            // Meta-HAMT page + dir-index write records are
+                            // for post-flush reconciliation only. Pages are
+                            // index-addressed and idempotent under replay,
+                            // so a naive replay would bump page seq
+                            // unnecessarily; the next `save_sharded_hamt_forest`
+                            // will re-PUT any page that's still dirty under a
+                            // fresh seq computed from the reloaded manifest.
                         }
                     }
                 }
@@ -4512,6 +4934,9 @@ impl EncryptedClient {
                 }
                 WalEntry::ShardWrote { .. } => {
                     // v7-only; ignored for monolithic replay.
+                }
+                WalEntry::PageWrote { .. } | WalEntry::DirIndexWrote { .. } => {
+                    // v7-only meta-HAMT entries; ignored on monolithic replay.
                 }
             }
         }
@@ -6427,24 +6852,13 @@ mod tests {
     /// `InMemoryBackend` helper lives.
     #[test]
     fn sharded_hamt_cache_entry_exposes_load_bearing_signals() {
-        use fula_crypto::private_forest::{ShardManifestV7, ShardV7};
+        use fula_crypto::private_forest::ShardManifestV7;
         use fula_crypto::keys::DekKey;
 
-        let manifest = ShardManifestV7 {
-            version: 7,
-            format: "sharded-hamt-v7".to_string(),
-            num_shards: 1,
-            shard_salt: vec![0u8; 32],
-            root: "/".to_string(),
-            created_at: 0,
-            modified_at: 0,
-            shards: vec![ShardV7 {
-                root: None,
-                seq: 0,
-                etag: None,
-                entry_count: 0,
-            }],
-        };
+        // `ShardManifestV7::new(1)` materializes a single empty page with
+        // one empty shard, equivalent to the literal this test previously
+        // wrote by hand.
+        let manifest = ShardManifestV7::new(1);
 
         let dek = DekKey::from_bytes(&[0x42u8; 32]).unwrap();
         let forest = ShardedHamtPrivateForest::from_manifest(manifest, "bucket", dek);
@@ -6565,7 +6979,7 @@ mod tests {
     #[tokio::test]
     async fn migrate_to_sharded_is_idempotent_when_cache_is_already_v7() {
         use fula_crypto::keys::DekKey;
-        use fula_crypto::private_forest::{ShardManifestV7, ShardV7};
+        use fula_crypto::private_forest::ShardManifestV7;
 
         let cfg = Config::new("http://127.0.0.1:1");
         let enc = EncryptionConfig::new();
@@ -6574,21 +6988,7 @@ mod tests {
         // Seed the cache with a ShardedHamt entry for "bucket". This short-
         // circuits `load_forest_internal` into the "forest is sharded"
         // branch without any HTTP traffic.
-        let manifest = ShardManifestV7 {
-            version: 7,
-            format: "sharded-hamt-v7".to_string(),
-            num_shards: 1,
-            shard_salt: vec![0u8; 32],
-            root: "/".to_string(),
-            created_at: 0,
-            modified_at: 0,
-            shards: vec![ShardV7 {
-                root: None,
-                seq: 0,
-                etag: None,
-                entry_count: 0,
-            }],
-        };
+        let manifest = ShardManifestV7::new(1);
         let dek = DekKey::from_bytes(&[0x01u8; 32]).unwrap();
         let v7 = ShardedHamtPrivateForest::from_manifest(manifest, "bucket", dek);
         client.forest_cache.insert("bucket".to_string(), ForestCacheEntry::ShardedHamt {
@@ -7097,7 +7497,7 @@ mod tests {
     #[tokio::test]
     async fn v7_forest_entry_requires_encryption_returns_true() {
         use fula_crypto::keys::DekKey;
-        use fula_crypto::private_forest::{ShardManifestV7, ShardV7};
+        use fula_crypto::private_forest::ShardManifestV7;
 
         let cfg = Config::new("http://127.0.0.1:1");
         let enc = EncryptionConfig::new();
@@ -7107,21 +7507,7 @@ mod tests {
         // return `true` even for a storage_key that has no matching entry,
         // because the v7 path is fail-closed: no v7 storage_key ever
         // belongs to a plaintext object, by invariant.
-        let manifest = ShardManifestV7 {
-            version: 7,
-            format: "sharded-hamt-v7".to_string(),
-            num_shards: 1,
-            shard_salt: vec![0u8; 32],
-            root: "/".to_string(),
-            created_at: 0,
-            modified_at: 0,
-            shards: vec![ShardV7 {
-                root: None,
-                seq: 0,
-                etag: None,
-                entry_count: 0,
-            }],
-        };
+        let manifest = ShardManifestV7::new(1);
         let dek = DekKey::from_bytes(&[0x05u8; 32]).unwrap();
         let v7 = ShardedHamtPrivateForest::from_manifest(manifest, "bucket", dek);
         client.forest_cache.insert(

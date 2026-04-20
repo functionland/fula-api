@@ -113,6 +113,13 @@ pub use private_forest::{
     ShardV7, ShardManifestV7, EncryptedShardManifestV7,
     V7StorageKey, V7_STORAGE_KEY_LEN,
     manifest_v7_aad, hamt_node_v7_aad, compute_v7_node_key,
+    // Meta-HAMT manifest (S-1.2)
+    ManifestRoot, ManifestPage, EncryptedManifestPage, PageRef, PageId,
+    PAGE_SIZE, MAX_PAGES, derive_manifest_page_key, manifest_page_aad,
+    page_id_for_shard, shard_slot_in_page,
+    // Directory index (F-1.3)
+    DirectoryIndex, DirEntry, EncryptedDirectoryIndex,
+    derive_dir_index_key, dir_index_aad,
 };
 pub use wnfs_hamt::{BlobBackend, V7NodeStore, V7_NODE_PREFIX};
 pub use private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, PublicMetadata, KeyObfuscation, obfuscate_key};

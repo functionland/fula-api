@@ -40,9 +40,9 @@ impl AppState {
     /// Create a new application state
     pub async fn new(config: GatewayConfig) -> anyhow::Result<Self> {
         // Initialize block store based on configuration
-        let block_store = if config.use_memory_store {
+        let inner = if config.use_memory_store {
             info!("Using in-memory block store (data will not persist)");
-            Arc::new(FlexibleBlockStore::Memory(MemoryBlockStore::new()))
+            FlexibleBlockStore::Memory(MemoryBlockStore::new())
         } else {
             // Try to connect to IPFS with optional pinning service
             match Self::create_ipfs_store(&config).await {
@@ -51,16 +51,24 @@ impl AppState {
                     if config.pinning_service_endpoint.is_some() {
                         info!("Pinning service configured");
                     }
-                    Arc::new(FlexibleBlockStore::IpfsPinning(store))
+                    FlexibleBlockStore::IpfsPinning(store)
                 }
                 Err(e) => {
                     warn!(
                         "Failed to connect to IPFS ({}), falling back to in-memory storage",
                         e
                     );
-                    Arc::new(FlexibleBlockStore::Memory(MemoryBlockStore::new()))
+                    FlexibleBlockStore::Memory(MemoryBlockStore::new())
                 }
             }
+        };
+
+        // Optionally wrap in an LRU block cache
+        let block_store = if config.block_cache_mb > 0 {
+            info!("LRU block cache enabled ({} MB)", config.block_cache_mb);
+            Arc::new(inner.with_cache_mb(config.block_cache_mb))
+        } else {
+            Arc::new(inner)
         };
 
         // Log storage mode

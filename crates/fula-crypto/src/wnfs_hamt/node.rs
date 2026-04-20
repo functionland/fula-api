@@ -20,6 +20,14 @@ use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+/// Cap on concurrent sibling fetches during `flat_map` traversal. HAMT
+/// fan-out is up to 16 per node (bitmask is `u16`), so this cap fully
+/// covers a single level without over-subscribing I/O. Recursion still
+/// happens inside each branch; worst-case in-flight futures compound as
+/// `cap^depth`, but HAMT depth is logarithmic in entries per shard
+/// (~log_16), which keeps peak memory bounded in practice.
+const FLAT_MAP_SIBLING_CONCURRENCY: usize = 16;
+
 //--------------------------------------------------------------------------------------------------
 // Type definitions
 //--------------------------------------------------------------------------------------------------
@@ -160,6 +168,14 @@ where
 
     /// Visit every leaf `Pair` in the subtree, applying `f` and collecting
     /// results. Stored children are fetched on demand.
+    ///
+    /// Sibling `Pointer::Link` children are resolved concurrently (bounded
+    /// by `FLAT_MAP_SIBLING_CONCURRENCY`), since their storage keys are all
+    /// already known from the current node's decrypted pointer list. The
+    /// down-path chain inside each branch is still serial — that's a
+    /// requirement of the AEAD node encryption model (a child's storage
+    /// key is only known after its parent is decrypted). Input pointer
+    /// order is preserved in the output.
     #[cfg_attr(not(target_arch = "wasm32"), async_recursion)]
     #[cfg_attr(target_arch = "wasm32", async_recursion(?Send))]
     pub async fn flat_map<F, T>(
@@ -171,21 +187,31 @@ where
         F: Fn(&Pair<K, V>) -> Result<T> + Send + Sync,
         T: Send,
     {
-        let mut out = Vec::new();
-        for p in &self.pointers {
-            match p {
-                Pointer::Values(values) => {
-                    for pair in values {
-                        out.push(f(pair)?);
+        use futures::stream::{self, StreamExt, TryStreamExt};
+        // Build the per-pointer future list with `std::iter::Iterator::map`
+        // (not `StreamExt::map`) so each future's captured lifetimes bind to
+        // `self` / `f` / `store` concretely. `StreamExt::map` infers an HRTB
+        // that the `async_recursion` macro's rewritten body can't satisfy.
+        let per_pointer_futs: Vec<_> = self
+            .pointers
+            .iter()
+            .map(|p| async move {
+                match p {
+                    Pointer::Values(values) => {
+                        values.iter().map(f).collect::<Result<Vec<T>>>()
+                    }
+                    Pointer::Link(child_ptr) => {
+                        let child = child_ptr.resolve_owned(store).await?;
+                        child.flat_map(f, store).await
                     }
                 }
-                Pointer::Link(child_ptr) => {
-                    let child = child_ptr.resolve_owned(store).await?;
-                    out.extend(child.flat_map(f, store).await?);
-                }
-            }
-        }
-        Ok(out)
+            })
+            .collect();
+        let per_pointer: Vec<Vec<T>> = stream::iter(per_pointer_futs)
+            .buffered(FLAT_MAP_SIBLING_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(per_pointer.into_iter().flatten().collect())
     }
 
     //----------------------------------------------------------------------------------------------

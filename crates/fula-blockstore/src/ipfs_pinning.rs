@@ -9,7 +9,7 @@
 
 use crate::{
     ipfs::{IpfsBlockStore, IpfsConfig},
-    memory::MemoryBlockStore,
+    memory::{CachedBlockStore, MemoryBlockStore},
     pinning_service::{Pin, PinningServiceClient, PinningServiceConfig, PinningStatus},
     BlockStore, BlockStoreError, PinStore, Result,
 };
@@ -39,10 +39,6 @@ pub struct IpfsPinningConfig {
     pub pin_timeout: Duration,
     /// Poll interval when waiting for pin
     pub pin_poll_interval: Duration,
-    /// Use local cache for reads
-    pub enable_cache: bool,
-    /// Cache capacity
-    pub cache_capacity: usize,
 }
 
 impl Default for IpfsPinningConfig {
@@ -54,8 +50,6 @@ impl Default for IpfsPinningConfig {
             wait_for_pin: false,
             pin_timeout: Duration::from_secs(300), // 5 minutes
             pin_poll_interval: Duration::from_secs(5),
-            enable_cache: true,
-            cache_capacity: 10_000,
         }
     }
 }
@@ -101,7 +95,12 @@ impl IpfsPinningConfig {
     }
 }
 
-/// Combined IPFS + Pinning Service block store
+/// Combined IPFS + Pinning Service block store.
+///
+/// Block-level caching lives in `CachedBlockStore` at the outer
+/// `FlexibleBlockStore::Cached` layer; this struct no longer caches blocks
+/// itself. It only owns the IPFS data client, the pinning service client,
+/// and the pin-request tracking map.
 pub struct IpfsPinningBlockStore {
     /// IPFS block store for data operations
     ipfs: IpfsBlockStore,
@@ -109,8 +108,6 @@ pub struct IpfsPinningBlockStore {
     pinning_client: Option<PinningServiceClient>,
     /// Configuration
     config: IpfsPinningConfig,
-    /// Local cache for frequently accessed blocks
-    cache: Arc<DashMap<Cid, Bytes>>,
     /// Map of CID -> request_id for pin tracking
     pin_requests: Arc<DashMap<String, String>>,
 }
@@ -128,17 +125,10 @@ impl IpfsPinningBlockStore {
             None
         };
 
-        let cache_capacity = if config.enable_cache {
-            config.cache_capacity
-        } else {
-            0
-        };
-
         Ok(Self {
             ipfs,
             pinning_client,
             config,
-            cache: Arc::new(DashMap::with_capacity(cache_capacity)),
             pin_requests: Arc::new(DashMap::new()),
         })
     }
@@ -306,13 +296,7 @@ impl BlockStore for IpfsPinningBlockStore {
     #[instrument(skip(self, data), fields(size = data.len()))]
     async fn put_block(&self, data: &[u8]) -> Result<Cid> {
         // Put to IPFS
-        let cid = self.ipfs.put_block(data).await?;
-
-        // Cache the data
-        if self.config.enable_cache {
-            self.cache.insert(cid, Bytes::copy_from_slice(data));
-        }
-
+        //
         // NOTE: We deliberately DO NOT pin individual blocks here.
         // Instead, the root CID should be pinned at upload completion.
         // IPFS recursive pinning will automatically pin all referenced blocks.
@@ -321,43 +305,20 @@ impl BlockStore for IpfsPinningBlockStore {
         // Pinning should happen at:
         // - put_object() completion for single objects
         // - complete_multipart_upload() for multipart uploads
-
-        Ok(cid)
+        self.ipfs.put_block(data).await
     }
 
     #[instrument(skip(self))]
     async fn get_block(&self, cid: &Cid) -> Result<Bytes> {
-        // Check cache first
-        if let Some(data) = self.cache.get(cid) {
-            return Ok(data.value().clone());
-        }
-
-        // Fetch from IPFS
-        let data = self.ipfs.get_block(cid).await?;
-
-        // Cache for future reads
-        if self.config.enable_cache {
-            self.cache.insert(*cid, data.clone());
-        }
-
-        Ok(data)
+        self.ipfs.get_block(cid).await
     }
 
     async fn has_block(&self, cid: &Cid) -> Result<bool> {
-        // Check cache first
-        if self.cache.contains_key(cid) {
-            return Ok(true);
-        }
-
-        // Check IPFS
         self.ipfs.has_block(cid).await
     }
 
     #[instrument(skip(self))]
     async fn delete_block(&self, cid: &Cid) -> Result<()> {
-        // Remove from cache
-        self.cache.remove(cid);
-
         // Unpin first
         let _ = self.unpin_cid(cid).await;
 
@@ -366,21 +327,13 @@ impl BlockStore for IpfsPinningBlockStore {
     }
 
     async fn block_size(&self, cid: &Cid) -> Result<u64> {
-        // Check cache first
-        if let Some(data) = self.cache.get(cid) {
-            return Ok(data.value().len() as u64);
-        }
-
         self.ipfs.block_size(cid).await
     }
 
     async fn put_ipld<T: serde::Serialize + Send + Sync>(&self, data: &T) -> Result<Cid> {
-        let cid = self.ipfs.put_ipld(data).await?;
-
         // NOTE: We deliberately DO NOT pin IPLD nodes inline.
         // Pin the root CID at upload completion for recursive pinning.
-
-        Ok(cid)
+        self.ipfs.put_ipld(data).await
     }
 
     async fn get_ipld<T: serde::de::DeserializeOwned>(&self, cid: &Cid) -> Result<T> {
@@ -487,12 +440,15 @@ impl PinStore for IpfsPinningBlockStore {
 }
 
 /// Fallback-capable block store that uses IPFS with pinning when available,
-/// or falls back to memory storage
+/// or falls back to memory storage. Can optionally be wrapped in an LRU
+/// cache via the `Cached` variant.
 pub enum FlexibleBlockStore {
     /// IPFS with pinning service
     IpfsPinning(IpfsPinningBlockStore),
     /// In-memory storage (fallback)
     Memory(MemoryBlockStore),
+    /// LRU-cached wrapper around any of the above (or further nesting)
+    Cached(CachedBlockStore<Box<FlexibleBlockStore>>),
 }
 
 impl FlexibleBlockStore {
@@ -510,9 +466,31 @@ impl FlexibleBlockStore {
         }
     }
 
-    /// Check if using real IPFS or memory fallback
+    /// Wrap this block store in an LRU cache sized by megabytes.
+    pub fn with_cache_mb(self, mb: usize) -> Self {
+        Self::Cached(CachedBlockStore::with_mb(Box::new(self), mb))
+    }
+
+    /// Check if using real IPFS or memory fallback (recursing through caches)
     pub fn is_persistent(&self) -> bool {
-        matches!(self, Self::IpfsPinning(_))
+        match self {
+            Self::IpfsPinning(_) => true,
+            Self::Memory(_) => false,
+            Self::Cached(cached) => {
+                // Recurse through the wrapped box to find the underlying variant
+                // via its BlockStore impl (safe — no behavioral coupling).
+                // We can't borrow the Box'd FlexibleBlockStore through
+                // CachedBlockStore directly, so expose a helper below.
+                cached.inner_is_persistent()
+            }
+        }
+    }
+}
+
+impl CachedBlockStore<Box<FlexibleBlockStore>> {
+    /// Check whether the wrapped store is persistent (recurses).
+    pub fn inner_is_persistent(&self) -> bool {
+        self.inner_ref().is_persistent()
     }
 }
 
@@ -522,6 +500,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.put_block(data).await,
             Self::Memory(store) => store.put_block(data).await,
+            Self::Cached(store) => store.put_block(data).await,
         }
     }
 
@@ -529,6 +508,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.get_block(cid).await,
             Self::Memory(store) => store.get_block(cid).await,
+            Self::Cached(store) => store.get_block(cid).await,
         }
     }
 
@@ -536,6 +516,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.has_block(cid).await,
             Self::Memory(store) => store.has_block(cid).await,
+            Self::Cached(store) => store.has_block(cid).await,
         }
     }
 
@@ -543,6 +524,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.delete_block(cid).await,
             Self::Memory(store) => store.delete_block(cid).await,
+            Self::Cached(store) => store.delete_block(cid).await,
         }
     }
 
@@ -550,6 +532,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.block_size(cid).await,
             Self::Memory(store) => store.block_size(cid).await,
+            Self::Cached(store) => store.block_size(cid).await,
         }
     }
 
@@ -557,6 +540,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.put_ipld(data).await,
             Self::Memory(store) => store.put_ipld(data).await,
+            Self::Cached(store) => store.put_ipld(data).await,
         }
     }
 
@@ -564,6 +548,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.get_ipld(cid).await,
             Self::Memory(store) => store.get_ipld(cid).await,
+            Self::Cached(store) => store.get_ipld(cid).await,
         }
     }
 }
@@ -577,6 +562,7 @@ impl PinStore for FlexibleBlockStore {
                 // Memory store doesn't need pinning, just succeed silently
                 Ok(())
             }
+            Self::Cached(store) => store.inner_ref().pin(cid, name).await,
         }
     }
 
@@ -587,6 +573,7 @@ impl PinStore for FlexibleBlockStore {
                 // Memory store doesn't need pinning, just succeed silently
                 Ok(())
             }
+            Self::Cached(store) => store.inner_ref().pin_with_token(cid, name, token).await,
         }
     }
 
@@ -594,6 +581,7 @@ impl PinStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.unpin(cid).await,
             Self::Memory(_) => Ok(()),
+            Self::Cached(store) => store.inner_ref().unpin(cid).await,
         }
     }
 
@@ -601,6 +589,7 @@ impl PinStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.is_pinned(cid).await,
             Self::Memory(_) => Ok(true), // Memory store "pins" everything
+            Self::Cached(store) => store.inner_ref().is_pinned(cid).await,
         }
     }
 
@@ -608,6 +597,7 @@ impl PinStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.list_pins().await,
             Self::Memory(_) => Ok(Vec::new()),
+            Self::Cached(store) => store.inner_ref().list_pins().await,
         }
     }
 
@@ -615,6 +605,7 @@ impl PinStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.pin_status(cid).await,
             Self::Memory(_) => Ok(crate::PinStatus::Pinned), // Memory store "pins" everything
+            Self::Cached(store) => store.inner_ref().pin_status(cid).await,
         }
     }
 }

@@ -11,7 +11,8 @@
 use bytes::Bytes;
 use fula_client::EncryptedClient;
 use fula_crypto::{
-    derive_index_key, EncryptedForest, ForestDirectoryEntry, ForestFileEntry, PrivateForest,
+    derive_dir_index_key, derive_index_key, EncryptedForest, ForestDirectoryEntry,
+    ForestFileEntry, PrivateForest,
 };
 use std::collections::HashMap;
 
@@ -198,4 +199,13 @@ pub fn index_key_for(client: &EncryptedClient, bucket: &str) -> String {
     let km = client.encryption_config().key_manager();
     let forest_dek = km.derive_path_key(&format!("forest:{}", bucket));
     derive_index_key(&forest_dek, bucket)
+}
+
+/// Return the deterministic F-1.3 directory-index key for a bucket. Used by
+/// tests that need to overwrite or delete the dir-index blob directly to
+/// exercise the rebuild-from-forest recovery path.
+pub fn dir_index_key_for(client: &EncryptedClient, bucket: &str) -> String {
+    let km = client.encryption_config().key_manager();
+    let forest_dek = km.derive_path_key(&format!("forest:{}", bucket));
+    derive_dir_index_key(&forest_dek, bucket)
 }

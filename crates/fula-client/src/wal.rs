@@ -78,6 +78,30 @@ pub(crate) enum WalEntry {
     /// retry's AEAD seq check would refuse to read our own shard.
     #[serde(rename = "shard_wrote")]
     ShardWrote { idx: usize, seq: u64, etag: Option<String> },
+    /// Phase-1.5 of a sharded-HAMT v7 flush succeeded for manifest page
+    /// `page_id` (meta-HAMT). Written+fsynced BEFORE the corresponding PUT
+    /// so a crash between the fsync and the PUT is idempotent: on replay we
+    /// re-PUT under the same page key with the same seq. On a 412 race the
+    /// `new_etag` / `new_seq` let us reconcile: the winner's root may
+    /// reference a stale page, and without this record the retry's AEAD seq
+    /// check would refuse to read our page back.
+    #[serde(rename = "page_wrote")]
+    PageWrote {
+        page_id: u16,
+        old_etag: Option<String>,
+        new_etag: Option<String>,
+        seq: u64,
+    },
+    /// The encrypted directory-index object was PUT successfully but the
+    /// manifest-root update tying `new_etag` into `root.dir_index_etag` may
+    /// still race. Replay re-issues the dir-index PUT (idempotent at the
+    /// same key) and then retries the root PUT so listings stay consistent.
+    #[serde(rename = "dir_index_wrote")]
+    DirIndexWrote {
+        old_etag: Option<String>,
+        new_etag: Option<String>,
+        seq: u64,
+    },
 }
 
 /// Group metadata tag for transactional multi-entry appends written via

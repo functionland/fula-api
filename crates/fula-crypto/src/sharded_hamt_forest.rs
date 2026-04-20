@@ -39,7 +39,7 @@ use crate::subtree_keys::EncryptedSubtreeDek;
 use crate::wnfs_hamt::{BlobBackend, V7NodeStore};
 use crate::{CryptoError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 // `Node` / `Pair` are crate-private today; re-export inside this module for brevity.
@@ -195,6 +195,21 @@ const FILE_KEY_PREFIX: &[u8] = b"F:";
 /// Type-tag prefix for directory keys in the HAMT.
 const DIR_KEY_PREFIX: &[u8] = b"D:";
 
+/// Maximum concurrent HAMT sibling fetches during parallel traversal.
+/// HAMT fan-out is 32; a lower cap trades peak memory against
+/// fully-populated-node fan-out. Per-node memory is small (~5 KB), so 16
+/// is safe on both server and client devices.
+pub const MAX_CONCURRENT_HAMT_SIBLINGS: usize = 16;
+
+/// Maximum concurrent shard walks inside full-bucket enumeration
+/// (`collect_all_entries` and callers). Each in-flight walk holds decrypted
+/// node memory in scope, so this cap is stricter on memory-constrained
+/// client devices.
+#[cfg(any(target_arch = "wasm32", target_os = "ios", target_os = "android"))]
+pub const MAX_CONCURRENT_SHARD_WALKS: usize = 2;
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+pub const MAX_CONCURRENT_SHARD_WALKS: usize = 4;
+
 /// Build the HAMT key for a file path.
 fn file_key(path: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(FILE_KEY_PREFIX.len() + path.len());
@@ -308,6 +323,18 @@ pub struct ShardedHamtPrivateForest {
     dirty_shards: Vec<bool>,
     forest_dek: DekKey,
     bucket: String,
+    /// In-memory directory index (F-1.3). Mutated alongside every
+    /// `upsert_file` / `remove_file` / directory mutation so `list_subdirs`
+    /// can answer O(1). Persisted separately from the manifest — flushed by
+    /// the client layer (`encryption.rs::save_sharded_hamt_forest`) alongside
+    /// Phase 2 of the meta-HAMT commit.
+    dir_index: crate::private_forest::DirectoryIndex,
+    /// Sequence of the last successfully flushed dir-index blob. Bumped
+    /// before each re-PUT so stale ciphertexts fail AAD check.
+    dir_index_seq: u64,
+    /// True when `dir_index` has diverged from the on-disk blob. Flush path
+    /// tests this, PUTs a new blob if set, and clears it on success.
+    dir_index_dirty: bool,
 }
 
 impl ShardedHamtPrivateForest {
@@ -319,7 +346,7 @@ impl ShardedHamtPrivateForest {
         bucket: impl Into<String>,
         forest_dek: DekKey,
     ) -> Self {
-        let num = manifest.num_shards;
+        let num = manifest.num_shards();
         Self {
             manifest,
             loaded_shards: (0..num)
@@ -328,6 +355,9 @@ impl ShardedHamtPrivateForest {
             dirty_shards: vec![false; num],
             forest_dek,
             bucket: bucket.into(),
+            dir_index: crate::private_forest::DirectoryIndex::new(),
+            dir_index_seq: 0,
+            dir_index_dirty: false,
         }
     }
 
@@ -340,7 +370,7 @@ impl ShardedHamtPrivateForest {
         num_shards: usize,
     ) -> Self {
         let manifest = ShardManifestV7::new(num_shards);
-        let actual_num = manifest.num_shards;
+        let actual_num = manifest.num_shards();
         Self {
             manifest,
             // Brand-new shards are known-empty — no need to go through a
@@ -352,6 +382,12 @@ impl ShardedHamtPrivateForest {
             dirty_shards: vec![false; actual_num],
             forest_dek,
             bucket: bucket.into(),
+            // Fresh forest: start with a root-only index so mkdir on `/foo`
+            // doesn't require a rebuild on first use. `dir_index_seq` stays 0
+            // until the first successful flush (prior_seq is bound into AAD).
+            dir_index: crate::private_forest::DirectoryIndex::new(),
+            dir_index_seq: 0,
+            dir_index_dirty: true,
         }
     }
 
@@ -365,6 +401,62 @@ impl ShardedHamtPrivateForest {
     /// value.
     pub fn bucket(&self) -> &str {
         &self.bucket
+    }
+
+    /// Immutable reference to the in-memory directory index (F-1.3). The
+    /// client layer uses this for O(1) `list_subdirs` and flushes it as a
+    /// separate encrypted object at [`crate::private_forest::derive_dir_index_key`].
+    pub fn directory_index(&self) -> &crate::private_forest::DirectoryIndex {
+        &self.dir_index
+    }
+
+    /// Seed the dir-index from an externally-loaded / externally-rebuilt
+    /// value. Used on the load path to install the decrypted blob from S3,
+    /// and by `migrate_monolithic_to_v7` to install a seeded index.
+    pub fn install_dir_index(
+        &mut self,
+        index: crate::private_forest::DirectoryIndex,
+        seq: u64,
+    ) {
+        self.dir_index = index;
+        self.dir_index_seq = seq;
+        self.dir_index_dirty = false;
+    }
+
+    /// True when the dir-index has unflushed mutations.
+    pub fn dir_index_dirty(&self) -> bool {
+        self.dir_index_dirty
+    }
+
+    /// Last successfully flushed dir-index sequence. Bumped by
+    /// `reconcile_dir_index_flush` after a successful PUT.
+    pub fn dir_index_seq(&self) -> u64 {
+        self.dir_index_seq
+    }
+
+    /// Apply the post-flush dir-index reconciliation: record the new seq
+    /// and clear the dirty flag. Counterpart to `reconcile_flush` for the
+    /// meta-HAMT layer.
+    pub fn reconcile_dir_index_flush(&mut self, new_seq: u64) {
+        self.dir_index_seq = new_seq;
+        self.dir_index_dirty = false;
+    }
+
+    /// Force the dir-index into a dirty state so the next flush persists
+    /// whatever is currently in memory. Used by the load path after a
+    /// `rebuild_directory_index_from_forest` — the in-memory value is
+    /// correct, but storage doesn't know about it yet.
+    pub fn mark_dir_index_dirty(&mut self) {
+        self.dir_index_dirty = true;
+    }
+
+    /// O(1) list of immediate subdirectories beneath `dir_path`, answered
+    /// from the in-memory [`crate::private_forest::DirectoryIndex`]. Falls
+    /// back to an empty list if the path isn't recorded — callers that need
+    /// a definitive answer on a possibly-unpopulated dir-index should
+    /// `rebuild_directory_index_from_forest` first.
+    pub fn list_subdirs(&self, dir_path: &str) -> Vec<String> {
+        self.dir_index.list_subdirs(dir_path)
     }
 
     /// DEK (forest-level) — exposed so the caller can encrypt the manifest
@@ -404,8 +496,8 @@ impl ShardedHamtPrivateForest {
         shard_for_path_v6(
             file_path,
             &self.forest_dek,
-            &self.manifest.shard_salt,
-            self.manifest.num_shards,
+            self.manifest.shard_salt(),
+            self.manifest.num_shards(),
         )
     }
 
@@ -417,8 +509,8 @@ impl ShardedHamtPrivateForest {
         shard_for_path_v6(
             &routing,
             &self.forest_dek,
-            &self.manifest.shard_salt,
-            self.manifest.num_shards,
+            self.manifest.shard_salt(),
+            self.manifest.num_shards(),
         )
     }
 
@@ -428,7 +520,7 @@ impl ShardedHamtPrivateForest {
     /// deliberately absent from node AAD — HAMT flushes only rewrite nodes on
     /// the path of change, so a seq-bound AAD would invalidate untouched
     /// subtree ciphertexts on every flush. Replay protection for shard root
-    /// swaps lives at the manifest layer (ETag + `manifest.shards[i].seq`).
+    /// swaps lives at the manifest layer (ETag + `manifest.shard(i).seq`).
     fn reader_store_for<B: BlobBackend + 'static>(
         &self,
         shard_idx: usize,
@@ -437,7 +529,7 @@ impl ShardedHamtPrivateForest {
         V7NodeStore::new(
             self.bucket.clone(),
             shard_idx as u16,
-            self.manifest.shard_salt.clone(),
+            self.manifest.shard_salt().to_vec(),
             self.forest_dek.clone(),
             backend.clone(),
         )
@@ -468,7 +560,7 @@ impl ShardedHamtPrivateForest {
         if !matches!(&*guard, LoadedShard::NotLoaded) {
             return Ok(());
         }
-        match self.manifest.shards[shard_idx].root {
+        match self.manifest.shard(shard_idx).root {
             None => {
                 *guard = LoadedShard::LoadedEmpty;
             }
@@ -574,7 +666,7 @@ impl ShardedHamtPrivateForest {
             drop(guard);
 
             if freshly_created {
-                let shard = &mut self.manifest.shards[shard_idx];
+                let shard = self.manifest.shard_mut(shard_idx);
                 shard.entry_count = shard.entry_count.saturating_add(1);
             }
             self.dirty_shards[shard_idx] = true;
@@ -685,7 +777,7 @@ impl ShardedHamtPrivateForest {
         // the first occurrence. `saturating_add` is defensive: a u32 of
         // 4 billion entries is already well past any realistic shard size,
         // but we refuse to wrap silently.
-        let shard = &mut self.manifest.shards[shard_idx];
+        let shard = self.manifest.shard_mut(shard_idx);
         if !had_file {
             shard.entry_count = shard.entry_count.saturating_add(1);
         }
@@ -698,6 +790,13 @@ impl ShardedHamtPrivateForest {
         // first ancestor that already lists its child, so steady-state
         // writes in a pre-existing directory only touch the leaf shard.
         self.ensure_ancestor_chain(&parent, backend).await?;
+
+        // Keep the in-memory DirectoryIndex consistent with the forest. Only
+        // count new inserts (overwrites don't change file_count).
+        if !had_file {
+            self.dir_index.insert_file(&file_path);
+            self.dir_index_dirty = true;
+        }
 
         Ok(())
     }
@@ -754,7 +853,7 @@ impl ShardedHamtPrivateForest {
         drop(guard);
 
         if !had_dir {
-            let shard = &mut self.manifest.shards[shard_idx];
+            let shard = self.manifest.shard_mut(shard_idx);
             shard.entry_count = shard.entry_count.saturating_add(1);
         }
         self.dirty_shards[shard_idx] = true;
@@ -762,6 +861,11 @@ impl ShardedHamtPrivateForest {
         // Wire this dir into its ancestor chain so `list_directory(parent)`
         // reports it. Root ("/") short-circuits immediately inside the helper.
         self.ensure_ancestor_chain(&dir_path, backend).await?;
+
+        // Mirror the dir's existence in the DirectoryIndex so `list_subdirs`
+        // resolves it without touching the HAMT.
+        self.dir_index.ensure_dir(&dir_path);
+        self.dir_index_dirty = true;
 
         Ok(())
     }
@@ -852,9 +956,15 @@ impl ShardedHamtPrivateForest {
         drop(guard);
 
         if removed_file.is_some() {
-            let shard = &mut self.manifest.shards[shard_idx];
+            let shard = self.manifest.shard_mut(shard_idx);
             shard.entry_count = shard.entry_count.saturating_sub(1);
             self.dirty_shards[shard_idx] = true;
+
+            // Mirror the deletion in the directory index so subsequent
+            // `file_count`/`list_subdirs` queries are coherent without
+            // a forest walk.
+            self.dir_index.remove_file(path);
+            self.dir_index_dirty = true;
         }
 
         Ok(removed_file)
@@ -944,29 +1054,48 @@ impl ShardedHamtPrivateForest {
         let shard_idx = self.shard_for_dir(&normalize_dir_path(dir_path));
         let reader = self.reader_store_for(shard_idx, backend);
 
-        let mut out = Vec::with_capacity(children.len());
         let guard = self.loaded_shards[shard_idx].read().await;
         match &*guard {
             LoadedShard::NotLoaded => unreachable!("get_directory loaded this above"),
             LoadedShard::LoadedEmpty => {
                 // Shard loaded empty but we found a dir entry — impossible,
                 // but handle gracefully.
-                return Ok(Vec::new());
+                Ok(Vec::new())
             }
             LoadedShard::Loaded(node) => {
-                for child in children {
-                    if let Some(wire) = node.get(&file_key(&child), &reader).await? {
-                        if let HamtEntry::File(f) = HamtEntry::from(wire) {
-                            out.push(f);
+                // P-4a: parallelize the N independent child lookups.
+                // Each child hashes into the same shard (dir-local routing)
+                // but has an independent down-path; concurrent fetches
+                // overlap HTTP latency. `buffered` (not `buffer_unordered`)
+                // preserves the input order so callers observing the output
+                // sequence don't see reshuffled results.
+                use futures::stream::{self, StreamExt, TryStreamExt};
+                let node = Arc::clone(node);
+                let reader_ref = &reader;
+                let entries: Vec<Option<ForestFileEntry>> = stream::iter(children.into_iter())
+                    .map(|child| {
+                        let node = Arc::clone(&node);
+                        async move {
+                            let maybe = node.get(&file_key(&child), reader_ref).await?;
+                            // Silently skip type-mismatches here (a stale dir
+                            // entry pointing at a removed file is possible
+                            // across crashes and is not an integrity failure
+                            // of the HAMT itself).
+                            Ok::<Option<ForestFileEntry>, CryptoError>(maybe.and_then(|wire| {
+                                if let HamtEntry::File(f) = HamtEntry::from(wire) {
+                                    Some(f)
+                                } else {
+                                    None
+                                }
+                            }))
                         }
-                    }
-                    // Silently skip type-mismatches here (a stale dir entry
-                    // pointing at a removed file is possible across crashes
-                    // and is not an integrity failure of the HAMT itself).
-                }
+                    })
+                    .buffered(MAX_CONCURRENT_HAMT_SIBLINGS)
+                    .try_collect()
+                    .await?;
+                Ok(entries.into_iter().flatten().collect())
             }
         }
-        Ok(out)
     }
 
     //----------------------------------------------------------------------------------------------
@@ -977,8 +1106,8 @@ impl ShardedHamtPrivateForest {
     /// next `flush_dirty` re-PUTs from the post-recorded sequence.
     ///
     /// Contract (mirrors v6's `shard_sequences` / `shard_etags` reconcile):
-    ///   * `manifest.shards[idx].seq` advances to `max(current, observed)`.
-    ///   * `manifest.shards[idx].etag` is overwritten with the observed
+    ///   * `manifest.shard(idx).seq` advances to `max(current, observed)`.
+    ///   * `manifest.shard(idx).etag` is overwritten with the observed
     ///     ETag (may be `None` if the server didn't return one).
     ///   * The shard is marked dirty so the next flush bumps seq further
     ///     and rewrites the nodes under the newly-bound AAD.
@@ -992,15 +1121,34 @@ impl ShardedHamtPrivateForest {
         observed_seq: u64,
         observed_etag: Option<String>,
     ) {
-        if idx >= self.manifest.shards.len() {
+        if idx >= self.manifest.num_shards() {
             return;
         }
-        let cur = self.manifest.shards[idx].seq;
-        if observed_seq > cur {
-            self.manifest.shards[idx].seq = observed_seq;
+        let shard = self.manifest.shard_mut(idx);
+        if observed_seq > shard.seq {
+            shard.seq = observed_seq;
         }
-        self.manifest.shards[idx].etag = observed_etag;
+        shard.etag = observed_etag;
         self.dirty_shards[idx] = true;
+    }
+
+    /// After a successful two-phase commit (Phase 1.5 page PUTs + Phase 2
+    /// root PUT), fold the new root and the drained page IDs back into
+    /// this forest so subsequent flushes see the authoritative state.
+    ///
+    /// Without this, the forest would keep its stale `page_index` /
+    /// `dirty_pages` set from before the flush and re-PUT every page on the
+    /// next no-op flush under an incremented seq. Counterpart to
+    /// `reconcile_shard_write` for the meta-HAMT layer.
+    pub fn reconcile_flush(
+        &mut self,
+        new_root: crate::private_forest::ManifestRoot,
+        drained_page_ids: &std::collections::BTreeSet<crate::private_forest::PageId>,
+    ) {
+        self.manifest.root = new_root;
+        for page_id in drained_page_ids {
+            self.manifest.dirty_pages.remove(page_id);
+        }
     }
 
     //----------------------------------------------------------------------------------------------
@@ -1021,30 +1169,34 @@ impl ShardedHamtPrivateForest {
         &self,
         backend: &Arc<B>,
     ) -> Result<Vec<HamtEntry>> {
-        let num = self.manifest.shards.len();
-        let mut all = Vec::new();
-        for shard_idx in 0..num {
-            self.ensure_shard_loaded(shard_idx, backend).await?;
-            let reader = self.reader_store_for(shard_idx, backend);
-            let guard = self.loaded_shards[shard_idx].read().await;
-            match &*guard {
-                LoadedShard::NotLoaded => unreachable!("ensure_shard_loaded above"),
-                LoadedShard::LoadedEmpty => {}
-                LoadedShard::Loaded(node) => {
-                    let wires: Vec<HamtEntryWire> = node
-                        .flat_map(
-                            &|pair: &Pair<Vec<u8>, HamtEntryWire>| Ok(pair.value.clone()),
-                            &reader,
-                        )
-                        .await?;
-                    all.reserve(wires.len());
-                    for w in wires {
-                        all.push(HamtEntry::from(w));
+        use futures::stream::{self, StreamExt, TryStreamExt};
+        let num = self.manifest.num_shards();
+        let per_shard: Vec<Vec<HamtEntry>> = stream::iter(0..num)
+            .map(|shard_idx| async move {
+                self.ensure_shard_loaded(shard_idx, backend).await?;
+                let reader = self.reader_store_for(shard_idx, backend);
+                let guard = self.loaded_shards[shard_idx].read().await;
+                let out: Vec<HamtEntry> = match &*guard {
+                    LoadedShard::NotLoaded => {
+                        unreachable!("ensure_shard_loaded above")
                     }
-                }
-            }
-        }
-        Ok(all)
+                    LoadedShard::LoadedEmpty => Vec::new(),
+                    LoadedShard::Loaded(node) => {
+                        let wires: Vec<HamtEntryWire> = node
+                            .flat_map(
+                                &|pair: &Pair<Vec<u8>, HamtEntryWire>| Ok(pair.value.clone()),
+                                &reader,
+                            )
+                            .await?;
+                        wires.into_iter().map(HamtEntry::from).collect()
+                    }
+                };
+                Ok::<Vec<HamtEntry>, CryptoError>(out)
+            })
+            .buffer_unordered(MAX_CONCURRENT_SHARD_WALKS)
+            .try_collect()
+            .await?;
+        Ok(per_shard.into_iter().flatten().collect())
     }
 
     /// Collect every `ForestFileEntry` across every shard.
@@ -1096,6 +1248,33 @@ impl ShardedHamtPrivateForest {
             .collect())
     }
 
+    /// Rebuild the [`DirectoryIndex`] (F-1.3) from the live forest state.
+    ///
+    /// Used as the fallback path when:
+    ///   * `load_forest` finds `root.dir_index_etag` but the object at
+    ///     [`derive_dir_index_key`] is missing, decrypts to garbage, or
+    ///     carries a mismatching ETag (plan D3 / D4).
+    ///   * `migrate_monolithic_to_v7` finalizes and needs a v7-side index
+    ///     seeded from the freshly-populated shards.
+    ///
+    /// O(total entries) — walks every shard via
+    /// [`Self::collect_all_entries`]. Rare (post-corruption or migration
+    /// finalization); not on the hot list/lookup path.
+    pub async fn rebuild_directory_index_from_forest<B: BlobBackend + 'static>(
+        &self,
+        backend: &Arc<B>,
+    ) -> Result<crate::private_forest::DirectoryIndex> {
+        let all = self.collect_all_entries(backend).await?;
+        let mut index = crate::private_forest::DirectoryIndex::new();
+        for entry in all {
+            match entry {
+                HamtEntry::File(f) => index.insert_file(&f.path),
+                HamtEntry::Dir(d) => index.ensure_dir(&d.path),
+            }
+        }
+        Ok(index)
+    }
+
     /// Collect every file whose `path` starts with `prefix`.
     ///
     /// Prefix-filtered variant of `list_all_files`. Still walks every shard
@@ -1141,7 +1320,7 @@ impl ShardedHamtPrivateForest {
         max_keys: usize,
         backend: &Arc<B>,
     ) -> Result<(Vec<ForestFileEntry>, Option<Vec<u8>>)> {
-        let num = self.manifest.shards.len() as u32;
+        let num = self.manifest.num_shards() as u32;
         let start = match cursor {
             None => 0u32,
             Some(bytes) => postcard::from_bytes::<u32>(bytes).map_err(|e| {
@@ -1197,6 +1376,83 @@ impl ShardedHamtPrivateForest {
             })?)
         };
         Ok((out, next_cursor))
+    }
+
+    /// Collect every file and directory under `prefix` by walking the
+    /// directory graph, not by scanning every shard.
+    ///
+    /// This is the shard-local alternative to [`Self::list_recursive`] (which
+    /// calls `list_all_files` and filters by path prefix, touching every
+    /// shard regardless of how localized the prefix is). The walker starts
+    /// at `prefix`, follows its `subdirs` list to descendants, and fetches
+    /// each directory's direct files in parallel. Cost is O(entries under
+    /// prefix), bounded by the number of subtree shards — not by the global
+    /// shard count.
+    ///
+    /// Returns `(files, directories)`. The root directory (at `prefix`) is
+    /// included in `directories` if it exists. Stale subdir entries that
+    /// resolve to `None` are silently skipped (consistent with the
+    /// idempotency-on-remove documentation near the type definition).
+    ///
+    /// Order inside each return vec mirrors a BFS traversal of the subtree.
+    pub async fn list_subtree<B: BlobBackend + 'static>(
+        &self,
+        prefix: &str,
+        backend: &Arc<B>,
+    ) -> Result<(Vec<ForestFileEntry>, Vec<ForestDirectoryEntry>)> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        let mut files_out: Vec<ForestFileEntry> = Vec::new();
+        let mut dirs_out: Vec<ForestDirectoryEntry> = Vec::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        queue.push_back(normalize_dir_path(prefix));
+
+        while let Some(dir_path) = queue.pop_front() {
+            let Some(dir_entry) = self.get_directory(&dir_path, backend).await? else {
+                continue;
+            };
+
+            for sub in &dir_entry.subdirs {
+                queue.push_back(sub.clone());
+            }
+
+            // Fetch this directory's direct files in parallel. Reuses
+            // dir-local routing: every child path hashes into the same shard
+            // as `dir_path`, so we reuse one reader.
+            let shard_idx = self.shard_for_dir(&dir_path);
+            let reader = self.reader_store_for(shard_idx, backend);
+            let guard = self.loaded_shards[shard_idx].read().await;
+            if let LoadedShard::Loaded(node) = &*guard {
+                let node = Arc::clone(node);
+                let reader_ref = &reader;
+                let children = dir_entry.files.clone();
+                let fs: Vec<Option<ForestFileEntry>> = stream::iter(children.into_iter())
+                    .map(|child| {
+                        let node = Arc::clone(&node);
+                        async move {
+                            let maybe = node.get(&file_key(&child), reader_ref).await?;
+                            Ok::<Option<ForestFileEntry>, CryptoError>(maybe.and_then(
+                                |wire| {
+                                    if let HamtEntry::File(f) = HamtEntry::from(wire) {
+                                        Some(f)
+                                    } else {
+                                        None
+                                    }
+                                },
+                            ))
+                        }
+                    })
+                    .buffered(MAX_CONCURRENT_HAMT_SIBLINGS)
+                    .try_collect()
+                    .await?;
+                files_out.extend(fs.into_iter().flatten());
+            }
+            drop(guard);
+
+            dirs_out.push(dir_entry);
+        }
+
+        Ok((files_out, dirs_out))
     }
 
     /// Extract a subtree rooted at `prefix` into a fresh monolithic
@@ -1265,7 +1521,8 @@ impl ShardedHamtPrivateForest {
         &mut self,
         backend: &Arc<B>,
     ) -> Result<&ShardManifestV7> {
-        for idx in 0..self.manifest.shards.len() {
+        let num = self.manifest.num_shards();
+        for idx in 0..num {
             if !self.dirty_shards[idx] {
                 continue;
             }
@@ -1275,13 +1532,13 @@ impl ShardedHamtPrivateForest {
             // ciphertexts — those are bound by `(bucket, shard_idx)` only
             // so that path-of-change flushes don't strand untouched
             // subtree nodes sealed under older sequences.
-            let new_seq = self.manifest.shards[idx].seq.wrapping_add(1);
-            self.manifest.shards[idx].seq = new_seq;
+            let new_seq = self.manifest.shard(idx).seq.wrapping_add(1);
+            self.manifest.shard_mut(idx).seq = new_seq;
 
             let store: V7NodeStore<B> = V7NodeStore::new(
                 self.bucket.clone(),
                 idx as u16,
-                self.manifest.shard_salt.clone(),
+                self.manifest.shard_salt().to_vec(),
                 self.forest_dek.clone(),
                 backend.clone(),
             );
@@ -1306,7 +1563,7 @@ impl ShardedHamtPrivateForest {
                 }
             };
 
-            self.manifest.shards[idx].root = new_root;
+            self.manifest.shard_mut(idx).root = new_root;
             self.dirty_shards[idx] = false;
         }
         self.manifest.touch();
@@ -1474,6 +1731,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_subtree_returns_only_entries_under_prefix() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-a", test_dek(), 16);
+
+        // Plant two disjoint subtrees. list_subtree("/alpha") should return
+        // only the alpha entries, never the beta ones.
+        for path in [
+            "/alpha/a.txt",
+            "/alpha/nested/b.txt",
+            "/alpha/nested/deep/c.txt",
+            "/beta/x.txt",
+            "/beta/y.txt",
+        ] {
+            forest
+                .upsert_file(file_entry(path, 1), &backend)
+                .await
+                .unwrap();
+        }
+
+        let (files, dirs) = forest.list_subtree("/alpha", &backend).await.unwrap();
+
+        let file_paths: HashSet<_> = files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(file_paths.len(), 3);
+        assert!(file_paths.contains("/alpha/a.txt"));
+        assert!(file_paths.contains("/alpha/nested/b.txt"));
+        assert!(file_paths.contains("/alpha/nested/deep/c.txt"));
+        // Nothing from the sibling subtree leaks.
+        for f in &files {
+            assert!(
+                f.path.starts_with("/alpha"),
+                "unexpected file leaked into /alpha subtree: {}",
+                f.path
+            );
+        }
+
+        let dir_paths: HashSet<_> = dirs.iter().map(|d| d.path.clone()).collect();
+        assert!(dir_paths.contains("/alpha"));
+        assert!(dir_paths.contains("/alpha/nested"));
+        assert!(dir_paths.contains("/alpha/nested/deep"));
+        assert!(!dir_paths.contains("/beta"));
+    }
+
+    #[tokio::test]
+    async fn list_subtree_matches_list_recursive_results() {
+        // S-3 parity test: list_subtree must return the same set of files
+        // that list_recursive returns, but via the BFS walker (shard-local)
+        // rather than the full-bucket scan. Any divergence signals a bug.
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-p", test_dek(), 32);
+
+        let paths = [
+            "/docs/a.md",
+            "/docs/b.md",
+            "/docs/inner/c.md",
+            "/docs/inner/d.md",
+            "/docs/inner/more/e.md",
+            "/images/x.png",
+            "/images/y.png",
+        ];
+        for p in paths.iter() {
+            forest
+                .upsert_file(file_entry(p, 42), &backend)
+                .await
+                .unwrap();
+        }
+
+        let (subtree_files, _subtree_dirs) =
+            forest.list_subtree("/docs", &backend).await.unwrap();
+        let recursive = forest.list_recursive("/docs", &backend).await.unwrap();
+
+        let a: HashSet<_> = subtree_files.iter().map(|f| f.path.clone()).collect();
+        let b: HashSet<_> = recursive.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(a, b, "list_subtree and list_recursive must agree on /docs");
+    }
+
+    #[tokio::test]
+    async fn list_subtree_handles_missing_prefix_gracefully() {
+        // Walker on a path with no directory entry returns empty, not an
+        // error. Consistent with `list_directory`'s Option semantics.
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-g", test_dek(), 16);
+        forest
+            .upsert_file(file_entry("/a.txt", 1), &backend)
+            .await
+            .unwrap();
+
+        let (files, dirs) = forest
+            .list_subtree("/does/not/exist", &backend)
+            .await
+            .unwrap();
+        assert!(files.is_empty());
+        assert!(dirs.is_empty());
+    }
+
+    #[tokio::test]
     async fn entry_count_tracks_upsert_and_remove() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut forest = ShardedHamtPrivateForest::new("bucket-a", test_dek(), 16);
@@ -1540,8 +1892,7 @@ mod tests {
         // `/shared/*` files plus `D:/shared` (21 entries), and the shard
         // owning `D:/` which the ancestor chain pinned (1 entry).
         let populated: Vec<&crate::private_forest::ShardV7> = manifest
-            .shards
-            .iter()
+            .shards_iter()
             .filter(|s| s.root.is_some())
             .collect();
         assert_eq!(populated.len(), 2, "leaf shard + root-dir shard");
@@ -1586,10 +1937,10 @@ mod tests {
         // indices are stable across calls since routing is deterministic.
         let ga_leaf_idx = forest.shard_for_file("/ga/a.txt");
         let root_dir_idx = forest.shard_for_dir("/");
-        assert!(m1.shards[ga_leaf_idx].root.is_some());
-        assert_eq!(m1.shards[ga_leaf_idx].seq, 1);
-        assert!(m1.shards[root_dir_idx].root.is_some());
-        assert_eq!(m1.shards[root_dir_idx].seq, 1);
+        assert!(m1.shard(ga_leaf_idx).root.is_some());
+        assert_eq!(m1.shard(ga_leaf_idx).seq, 1);
+        assert!(m1.shard(root_dir_idx).root.is_some());
+        assert_eq!(m1.shard(root_dir_idx).seq, 1);
 
         // A second write under a *different* top-level directory dirties
         // its own leaf shard AND the root-dir shard (because `D:/` now
@@ -1608,15 +1959,15 @@ mod tests {
         // shards but harmless to skip when it happens.
         if ga_leaf_idx != gb_leaf_idx && ga_leaf_idx != root_dir_idx {
             assert_eq!(
-                m2.shards[ga_leaf_idx].seq, 1,
+                m2.shard(ga_leaf_idx).seq, 1,
                 "first-flush leaf shard must keep seq=1 when not re-dirtied"
             );
         }
         if gb_leaf_idx != ga_leaf_idx && gb_leaf_idx != root_dir_idx {
-            assert_eq!(m2.shards[gb_leaf_idx].seq, 1);
+            assert_eq!(m2.shard(gb_leaf_idx).seq, 1);
         }
         assert_eq!(
-            m2.shards[root_dir_idx].seq, 2,
+            m2.shard(root_dir_idx).seq, 2,
             "root-dir shard must re-bump when a new top-level dir joins D:/'s subdirs"
         );
     }
@@ -1627,7 +1978,7 @@ mod tests {
         // it there would strand untouched subtree ciphertexts after the next
         // path-of-change flush (see the design note on `hamt_node_v7_aad`).
         // Replay protection for shard root *swaps* lives at the manifest
-        // layer (ETag + `manifest.shards[i].seq`), not per-node.
+        // layer (ETag + `manifest.shard(i).seq`), not per-node.
         //
         // What we can still exercise at the node layer: tamper a manifest
         // root pointer and confirm load fails. Either the backend has no
@@ -1641,9 +1992,9 @@ mod tests {
             .unwrap();
         let mut manifest = forest.flush_dirty(&backend).await.unwrap().clone();
         let leaf_idx = forest.shard_for_file("/seq/x.txt");
-        let mut tampered_root = manifest.shards[leaf_idx].root.expect("populated shard");
+        let mut tampered_root = manifest.shard(leaf_idx).root.expect("populated shard");
         tampered_root[0] ^= 0xFF;
-        manifest.shards[leaf_idx].root = Some(tampered_root);
+        manifest.shard_mut(leaf_idx).root = Some(tampered_root);
 
         let mut reopened =
             ShardedHamtPrivateForest::from_manifest(manifest, "bucket-a", test_dek());
@@ -1806,7 +2157,7 @@ mod tests {
         // ─── Migration ──────────────────────────────────────────────────────
         let backend = Arc::new(InMemoryBackend::new());
         let mut manifest = ShardManifestV7::new(16);
-        manifest.created_at = v1.created_at; // mirror the client-side carryover
+        manifest.root.created_at = v1.created_at; // mirror the client-side carryover
 
         let mut v7 = ShardedHamtPrivateForest::from_manifest(
             manifest,
@@ -1825,7 +2176,7 @@ mod tests {
 
         v7.flush_dirty(&backend).await.unwrap();
         let snapshot = v7.manifest().clone();
-        assert_eq!(snapshot.created_at, 1_700_000_000, "created_at carried forward");
+        assert_eq!(snapshot.root.created_at, 1_700_000_000, "created_at carried forward");
 
         // ─── Reload a fresh forest from the persisted manifest ──────────────
         let mut reopened = ShardedHamtPrivateForest::from_manifest(
@@ -1914,7 +2265,7 @@ mod tests {
         // groups across shards). Total entry_count across the manifest
         // covers every file plus every directory ancestor that was
         // materialized along the way.
-        let total_entries: u64 = manifest.shards.iter().map(|s| s.entry_count as u64).sum();
+        let total_entries: u64 = manifest.shards_iter().map(|s| s.entry_count as u64).sum();
         assert!(
             total_entries >= total as u64,
             "manifest entry_count sum {} must cover all {} files plus ancestor dirs",
@@ -1922,8 +2273,7 @@ mod tests {
             total
         );
         let populated: Vec<&crate::private_forest::ShardV7> = manifest
-            .shards
-            .iter()
+            .shards_iter()
             .filter(|s| s.root.is_some())
             .collect();
         assert!(

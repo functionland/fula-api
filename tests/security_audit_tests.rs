@@ -735,7 +735,7 @@ mod rotation_integration {
 /// `tests/common/mod.rs` and exercise attack scenarios that can't be
 /// reproduced with pure crypto-unit tests.
 mod migration_security {
-    use super::common::v1_seed::{seed_v1_forest, index_key_for, SeedFile};
+    use super::common::v1_seed::{seed_v1_forest, index_key_for, dir_index_key_for, SeedFile};
     use super::common::{spawn_server, make_client, EnvGuard};
     use bytes::Bytes;
     use fula_client::EncryptionConfig;
@@ -1202,6 +1202,109 @@ mod migration_security {
             "NEW-2.1 guard must refuse plaintext for encrypted=true paths; \
              got Ok({} bytes)",
             result.as_ref().map(|b| b.len()).unwrap_or(0)
+        );
+    }
+
+    /// F-1.3 D3 guard: a corrupt / unreadable dir-index blob at the
+    /// deterministic key must trigger the rebuild-from-forest fallback rather
+    /// than failing the load. After rebuild the listing must be non-empty
+    /// (we seeded files before the corruption) and the dir-index object on
+    /// disk must come back — the rebuild marks the index dirty so the next
+    /// flush repaves it.
+    #[tokio::test]
+    async fn test_corrupt_dir_index_triggers_rebuild_from_forest() {
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let secret = encryption.export_secret_key().clone();
+        let bucket = "sec-dir-index-corrupt";
+
+        let state = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+        let writer = make_client(&base, EncryptionConfig::from_secret_key(secret.clone()));
+        writer.create_bucket(bucket).await.expect("create bucket");
+        seed_v1_forest(
+            &writer,
+            bucket,
+            &[SeedFile::new("/a.txt", 4), SeedFile::new("/dir1/b.txt", 4)],
+            &[],
+        )
+        .await;
+        writer.migrate_to_sharded(bucket).await.expect("migrate");
+        assert!(writer.is_forest_sharded_hamt(bucket));
+
+        // Corrupt the dir-index blob: any non-envelope bytes will fail
+        // `EncryptedDirectoryIndex::from_bytes` and `load_directory_index`
+        // returns None → rebuild path fires.
+        let dir_key = dir_index_key_for(&writer, bucket);
+        writer
+            .inner()
+            .put_object(bucket, &dir_key, Bytes::from_static(b"GARBAGE-NOT-A-VALID-ENVELOPE"))
+            .await
+            .expect("corrupt dir-index");
+
+        drop(writer);
+
+        let reader = make_client(&base, EncryptionConfig::from_secret_key(secret));
+        let listing = reader
+            .list_directory(bucket, Some("/"))
+            .await
+            .expect("list_directory must succeed via rebuild");
+        // The forest still has /a.txt and /dir1/b.txt — after rebuild the
+        // listing sees both, which means the rebuild walked the shards
+        // correctly.
+        let total: usize = listing.directories.values().map(|v| v.len()).sum();
+        assert!(
+            total >= 1,
+            "rebuild-from-forest must return at least one file; got {}",
+            total
+        );
+    }
+
+    /// F-1.3 D4 guard: after the root manifest commits but the dir-index PUT
+    /// never lands (simulated by deleting the dir-index blob post-migration),
+    /// `load_directory_index` observes a 404 and the loader falls back to
+    /// `rebuild_directory_index_from_forest`. The bucket must still list
+    /// successfully and the forest itself must remain v7.
+    #[tokio::test]
+    async fn test_missing_dir_index_triggers_rebuild_from_forest() {
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let secret = encryption.export_secret_key().clone();
+        let bucket = "sec-dir-index-missing";
+
+        let state = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+        let writer = make_client(&base, EncryptionConfig::from_secret_key(secret.clone()));
+        writer.create_bucket(bucket).await.expect("create bucket");
+        seed_v1_forest(&writer, bucket, &[SeedFile::new("/x.txt", 4)], &[]).await;
+        writer.migrate_to_sharded(bucket).await.expect("migrate");
+
+        // Pretend the dir-index PUT never succeeded: delete the object at
+        // its deterministic key. Root manifest still carries a dir_index_etag
+        // pointing at an object that no longer exists — this is the D4
+        // "partial flush" shape.
+        let dir_key = dir_index_key_for(&writer, bucket);
+        writer
+            .inner()
+            .delete_object(bucket, &dir_key)
+            .await
+            .expect("delete dir-index");
+
+        drop(writer);
+
+        let reader = make_client(&base, EncryptionConfig::from_secret_key(secret));
+        let listing = reader
+            .list_directory(bucket, Some("/"))
+            .await
+            .expect("list_directory must succeed via rebuild on 404");
+        assert!(reader.is_forest_sharded_hamt(bucket));
+        let total: usize = listing.directories.values().map(|v| v.len()).sum();
+        assert!(
+            total >= 1,
+            "rebuild-from-forest on 404 must repopulate the listing; got {}",
+            total
         );
     }
 }

@@ -57,6 +57,10 @@ struct Args {
     /// Enable admin API endpoints
     #[arg(long, env = "FULA_ADMIN_API")]
     admin_api: bool,
+
+    /// LRU block cache size in MB (0 disables the cache)
+    #[arg(long, default_value = "256", env = "FULA_BLOCK_CACHE_MB")]
+    block_cache_mb: usize,
 }
 
 #[tokio::main]
@@ -121,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
         auth_enabled: !args.no_auth,
         admin_jwt_secret: args.admin_jwt_secret,
         admin_api_enabled: args.admin_api,
+        block_cache_mb: args.block_cache_mb,
         ..Default::default()
     };
 
