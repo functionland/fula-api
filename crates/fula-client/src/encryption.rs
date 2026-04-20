@@ -474,8 +474,15 @@ impl ForestCacheEntry {
             // When contended (a writer is in flight), fall back to `true` —
             // the cache entry is in active use, so callers should not treat
             // it as stale and evict while we're mid-flush.
+            //
+            // v7 has two independent dirtiness signals: shards (tracked by
+            // `ShardedHamtPrivateForest::is_dirty`) and the directory index
+            // (F-1.3). A rebuild-from-forest after a dir-index soft-fail
+            // dirties only the latter — we must still report dirty here so
+            // `flush_forest_inner` actually runs Phase 1.6 + Phase 2 and
+            // persists the rebuilt index under a fresh seq.
             ForestCacheEntry::ShardedHamt { forest, .. } => match forest.try_read() {
-                Ok(guard) => guard.is_dirty(),
+                Ok(guard) => guard.is_dirty() || guard.dir_index_dirty(),
                 Err(_) => true,
             },
         }
@@ -2373,16 +2380,23 @@ impl EncryptedClient {
 
                         let now = chrono::Utc::now().timestamp();
                         let dir_index_etag = manifest.root.dir_index_etag.clone();
+                        let dir_index_seq_pin = manifest.root.dir_index_seq;
                         let mut forest = ShardedHamtPrivateForest::from_manifest(
                             manifest,
                             bucket.to_string(),
                             forest_dek.clone(),
                         );
-                        // F-1.3: try to load the dir-index blob; if absent or
-                        // corrupt, rebuild from the forest contents and mark
-                        // dirty so the next flush persists the rebuilt blob.
+                        // F-1.3: try to load the dir-index blob; if absent,
+                        // corrupt, or not pinned to the seq this root committed
+                        // to, rebuild from the forest contents and mark dirty
+                        // so the next flush persists the rebuilt blob.
                         match self
-                            .load_directory_index(bucket, &forest_dek, dir_index_etag.as_deref())
+                            .load_directory_index(
+                                bucket,
+                                &forest_dek,
+                                dir_index_etag.as_deref(),
+                                dir_index_seq_pin,
+                            )
                             .await?
                         {
                             Some((idx, seq)) => {
@@ -2399,6 +2413,13 @@ impl EncryptedClient {
                                     .map_err(ClientError::Encryption)?;
                                 forest.install_dir_index(rebuilt, 0);
                                 forest.mark_dir_index_dirty();
+                                // The S3 dir-index blob at `dir_index_etag` is
+                                // the one we just proved untrustworthy (missing,
+                                // corrupt, or failed the seq pin). Drop the
+                                // stale etag so Phase 1.6 overwrites
+                                // unconditionally; the committing root PUT
+                                // still enforces `If-Match` on the root etag.
+                                forest.clear_dir_index_etag();
                             }
                         }
                         let forest_arc = Arc::new(tokio::sync::RwLock::new(forest));
@@ -2460,6 +2481,21 @@ impl EncryptedClient {
         self.forest_cache.get(bucket)
             .map(|entry| matches!(entry.value(), ForestCacheEntry::ShardedHamt { .. }))
             .unwrap_or(false)
+    }
+
+    /// Test-only accessor: returns `(num_shards, page_count)` for a loaded
+    /// sharded bucket. Gated on `test-fault-injection` so it never leaks
+    /// into production builds.
+    #[cfg(feature = "test-fault-injection")]
+    pub fn sharded_forest_layout(&self, bucket: &str) -> Option<(usize, usize)> {
+        let entry = self.forest_cache.get(bucket)?;
+        if let ForestCacheEntry::ShardedHamt { forest, .. } = entry.value() {
+            let guard = forest.try_read().ok()?;
+            let manifest = guard.manifest();
+            Some((manifest.num_shards(), manifest.page_count()))
+        } else {
+            None
+        }
     }
 
 
@@ -2974,6 +3010,25 @@ impl EncryptedClient {
                 Err(e) => return Err(e),
             };
             let etag = if put.etag.is_empty() { None } else { Some(put.etag) };
+            // Post-PUT WAL record: pin the real etag S3 now serves so a
+            // crash between here and the Phase-2 root PUT can be recovered
+            // by replay (`reconcile_page_etag`) without re-polling S3 for
+            // each page's current etag. The pre-PUT entry above is
+            // sufficient for idempotent-PUT replay at the same key, but
+            // only this post-PUT entry lets the next flush's `If-Match`
+            // match S3's actual state.
+            if let Err(e) = wal::append(
+                bucket,
+                &wal_mac,
+                WalEntry::PageWrote {
+                    page_id,
+                    old_etag: old_etag.clone(),
+                    new_etag: etag.clone(),
+                    seq: page.seq,
+                },
+            ) {
+                tracing::warn!(%bucket, page_id, error = %e, "WAL append post-PUT PageWrote failed");
+            }
             manifest_snapshot.root.page_index.insert(page_id, PageRef {
                 etag,
                 seq: page.seq,
@@ -3035,7 +3090,23 @@ impl EncryptedClient {
                 Err(e) => return Err(e),
             };
             let new_dir_etag = if put.etag.is_empty() { None } else { Some(put.etag) };
+            // Post-PUT WAL record: pin the real dir-index etag so a
+            // crash between here and the Phase-2 root PUT can be recovered
+            // without re-reading the dir-index object. Mirrors the
+            // post-PUT PageWrote above.
+            if let Err(e) = wal::append(
+                bucket,
+                &wal_mac,
+                WalEntry::DirIndexWrote {
+                    old_etag: old_dir_etag.clone(),
+                    new_etag: new_dir_etag.clone(),
+                    seq: next_dir_seq,
+                },
+            ) {
+                tracing::warn!(%bucket, error = %e, "WAL append post-PUT DirIndexWrote failed");
+            }
             manifest_snapshot.root.dir_index_etag = new_dir_etag;
+            manifest_snapshot.root.dir_index_seq = Some(next_dir_seq);
             Some(next_dir_seq)
         } else {
             None
@@ -3238,6 +3309,11 @@ impl EncryptedClient {
                     format!("manifest page envelope id {} != expected {}", envelope.page_id, page_id)
                 )));
             }
+            // Plan §3.1 M2: reject pages whose `seq < root.page_index[.].seq`
+            // (rollback / stale-shard-cache). Newer pages (`envelope.seq >
+            // page_ref.seq`) are legitimate after a Phase-1.5-landed-but-
+            // Phase-2-crashed write — accept them so fresh readers can keep
+            // reading while the writer's next flush re-drives the root PUT.
             if envelope.seq < page_ref.seq {
                 return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
                     format!("stale manifest page {}: envelope seq {} < root-expected seq {}",
@@ -3266,6 +3342,7 @@ impl EncryptedClient {
         bucket: &str,
         forest_dek: &fula_crypto::keys::DekKey,
         expected_etag: Option<&str>,
+        expected_seq: Option<u64>,
     ) -> std::result::Result<Option<(DirectoryIndex, u64)>, ClientError> {
         let key = derive_dir_index_key(forest_dek, bucket);
         let blob = match self.inner.get_object(bucket, &key).await {
@@ -3273,12 +3350,14 @@ impl EncryptedClient {
             Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e),
         };
-        // NOTE: get_object discards the HEAD ETag. An ETag cross-check is
-        // defense-in-depth but not safety-critical: the AAD binds (bucket, seq)
-        // and the manifest root's seq isn't currently pinned alongside the
-        // etag, so AEAD verification + seq check below catch rollback and
-        // tamper regardless. If `expected_etag` is provided, and a future
-        // refactor exposes the PUT ETag on the read path, wire it through.
+        // `get_object` discards the HEAD ETag so we cannot cross-check
+        // `expected_etag` here directly; it stays threaded for future refactors
+        // that expose the GET ETag on the read path. `expected_seq` is the
+        // authoritative pin instead: the dir-index envelope's `seq` is
+        // AEAD-bound (AAD ties plaintext to `(bucket, seq)`), and the root we
+        // just loaded commits to exactly one value of it. A mismatch means
+        // we raced a concurrent migrator (or the key holds an overwrite we
+        // never committed to): treat as stale and trigger rebuild-from-forest.
         let _ = expected_etag;
         let envelope = match EncryptedDirectoryIndex::from_bytes(&blob) {
             Ok(e) => e,
@@ -3288,7 +3367,20 @@ impl EncryptedClient {
             }
         };
         match envelope.decrypt(forest_dek, bucket) {
-            Ok((index, seq)) => Ok(Some((index, seq))),
+            Ok((index, seq)) => {
+                if let Some(pinned) = expected_seq {
+                    if seq != pinned {
+                        tracing::warn!(
+                            %bucket,
+                            loaded_seq = seq,
+                            pinned_seq = pinned,
+                            "dir-index seq mismatch with root pin; will rebuild"
+                        );
+                        return Ok(None);
+                    }
+                }
+                Ok(Some((index, seq)))
+            }
             Err(e) => {
                 tracing::warn!(%bucket, error = %e, "dir-index decrypt failed; will rebuild");
                 Ok(None)
@@ -3458,6 +3550,30 @@ impl EncryptedClient {
             }
         };
 
+        // After Step 7 begins, this migration owns the WAL (Step 0 verified it
+        // was empty, and Phase B writes only our own PageWrote/DirIndexWrote
+        // entries). On any post-Step-7 failure, clear the WAL so Step 0's
+        // defer-guard on the NEXT attempt doesn't spin forever on orphaned
+        // entries that no regular flush would drain (monolithic replay ignores
+        // PageWrote/DirIndexWrote by design — see replay_wal_entries).
+        let phase_b_fail = |token: String| {
+            let client = self.inner.clone();
+            let bucket_owned = bucket.to_string();
+            async move {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if let Err(e) = wal::clear(&bucket_owned) {
+                        tracing::warn!(bucket = %bucket_owned, error = %e,
+                            "migration WAL clear after Phase B failure failed");
+                    }
+                }
+                if let Err(e) = client.release_migration_lock(&bucket_owned, &token).await {
+                    tracing::warn!(bucket = %bucket_owned, error = %e,
+                        "migration lock release failed (TTL will expire)");
+                }
+            }
+        };
+
         // ── Step 3: Resolve the v1 ETag (for If-Match) ─────────────────────
         let v1_etag: String = match v1_etag_hint {
             Some(e) if !e.is_empty() => e.to_string(),
@@ -3562,7 +3678,7 @@ impl EncryptedClient {
             let page = match manifest_snapshot.pages.get_mut(&page_id) {
                 Some(p) => p,
                 None => {
-                    release_best_effort(lock_token.clone()).await;
+                    phase_b_fail(lock_token.clone()).await;
                     return Ok(MigrationOutcome::DeferredTransientError {
                         reason: format!("dirty page {} not loaded in migration", page_id),
                     });
@@ -3588,28 +3704,53 @@ impl EncryptedClient {
             {
                 Ok(b) => b,
                 Err(e) => {
-                    release_best_effort(lock_token.clone()).await;
+                    phase_b_fail(lock_token.clone()).await;
                     return Ok(MigrationOutcome::DeferredTransientError {
                         reason: format!("encrypt manifest page {} failed: {}", page_id, e),
                     });
                 }
             };
             let page_key = derive_manifest_page_key(forest_dek, bucket, &shard_salt, page_id);
-            let put = match self.inner.put_object_with_metadata(
+            // If-None-Match=*: migration uses a fresh random shard_salt, so each
+            // page key is first-ever on this bucket. Any 412 here means another
+            // concurrent migrator beat us (lease-expiry race) and their terminal
+            // If-Match on v1_etag will arbitrate the winner. Defer & let the
+            // winner's state settle.
+            let put = match self.inner.put_object_with_metadata_conditional(
                 bucket,
                 &page_key,
                 Bytes::from(blob),
                 Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
+                None,
+                Some("*"),
             ).await {
                 Ok(r) => r,
+                Err(e) if e.is_concurrent_modification() => {
+                    phase_b_fail(lock_token.clone()).await;
+                    return Ok(MigrationOutcome::DeferredTransientError {
+                        reason: format!("412 on migration page {} PUT — concurrent migrator raced", page_id),
+                    });
+                }
                 Err(e) => {
-                    release_best_effort(lock_token.clone()).await;
+                    phase_b_fail(lock_token.clone()).await;
                     return Ok(MigrationOutcome::DeferredTransientError {
                         reason: format!("PUT manifest page {} failed: {}", page_id, e),
                     });
                 }
             };
             let etag = if put.etag.is_empty() { None } else { Some(put.etag) };
+            if let Err(e) = wal::append(
+                bucket,
+                &wal_mac_pages,
+                WalEntry::PageWrote {
+                    page_id,
+                    old_etag: old_etag.clone(),
+                    new_etag: etag.clone(),
+                    seq: page.seq,
+                },
+            ) {
+                tracing::warn!(%bucket, page_id, error = %e, "migration: WAL append post-PUT PageWrote failed");
+            }
             manifest_snapshot.root.page_index.insert(page_id, PageRef {
                 etag,
                 seq: page.seq,
@@ -3641,13 +3782,22 @@ impl EncryptedClient {
         ).and_then(|e| e.to_bytes()) {
             Ok(b) => b,
             Err(e) => {
-                release_best_effort(lock_token.clone()).await;
+                phase_b_fail(lock_token.clone()).await;
                 return Ok(MigrationOutcome::DeferredTransientError {
                     reason: format!("encrypt migration dir-index failed: {}", e),
                 });
             }
         };
         let dir_index_key = derive_dir_index_key(forest_dek, bucket);
+        // Unconditional overwrite is required: the dir-index key is stable
+        // across migrations (no shard_salt in its derivation), so a legitimate
+        // re-migration (e.g. after a rollback-attack recovery at
+        // test_version_downgrade_blocked_after_v7_pin) finds a pre-existing
+        // dir-index from the earlier migration and must replace it. The
+        // advisory lock + terminal If-Match on v1_etag together arbitrate
+        // concurrent migrators; the narrow race where two migrators holding
+        // stale v1 ETags both clobber this key is contained by the terminal
+        // v1_etag gate (only one commits v7).
         let dir_index_put = match self.inner.put_object_with_metadata(
             bucket,
             &dir_index_key,
@@ -3656,14 +3806,27 @@ impl EncryptedClient {
         ).await {
             Ok(r) => r,
             Err(e) => {
-                release_best_effort(lock_token.clone()).await;
+                phase_b_fail(lock_token.clone()).await;
                 return Ok(MigrationOutcome::DeferredTransientError {
                     reason: format!("PUT migration dir-index failed: {}", e),
                 });
             }
         };
-        manifest_snapshot.root.dir_index_etag =
+        let new_dir_index_etag =
             if dir_index_put.etag.is_empty() { None } else { Some(dir_index_put.etag) };
+        if let Err(e) = wal::append(
+            bucket,
+            &wal_mac_pages,
+            WalEntry::DirIndexWrote {
+                old_etag: None,
+                new_etag: new_dir_index_etag.clone(),
+                seq: dir_index_seq,
+            },
+        ) {
+            tracing::warn!(%bucket, error = %e, "migration: WAL append post-PUT DirIndexWrote failed");
+        }
+        manifest_snapshot.root.dir_index_etag = new_dir_index_etag;
+        manifest_snapshot.root.dir_index_seq = Some(dir_index_seq);
 
         let manifest_seq: u64 = 1;
         let manifest_data = match EncryptedShardManifestV7::encrypt_v7(
@@ -3674,7 +3837,7 @@ impl EncryptedClient {
         ).and_then(|em| em.to_bytes()) {
             Ok(bytes) => bytes,
             Err(e) => {
-                release_best_effort(lock_token.clone()).await;
+                phase_b_fail(lock_token.clone()).await;
                 return Ok(MigrationOutcome::DeferredTransientError {
                     reason: format!("encrypt v7 manifest failed: {}", e),
                 });
@@ -3695,13 +3858,13 @@ impl EncryptedClient {
         ).await {
             Ok(r) => r,
             Err(e) if e.is_concurrent_modification() => {
-                release_best_effort(lock_token.clone()).await;
+                phase_b_fail(lock_token.clone()).await;
                 return Ok(MigrationOutcome::DeferredTransientError {
                     reason: "412 on v7 manifest PUT — another writer rewrote v1".to_string(),
                 });
             }
             Err(e) => {
-                release_best_effort(lock_token.clone()).await;
+                phase_b_fail(lock_token.clone()).await;
                 return Ok(MigrationOutcome::DeferredTransientError {
                     reason: format!("v7 manifest PUT failed: {}", e),
                 });
@@ -4881,6 +5044,41 @@ impl EncryptedClient {
                 }
             }
 
+            // Fold PageWrote entries by `page_id`, keeping the highest-seq
+            // record whose `new_etag` is `Some` — i.e. a post-PUT record
+            // proving the etag S3 actually serves. Pre-PUT records
+            // (`new_etag: None`) are skipped here: they guarantee PUT
+            // idempotency at the same key but don't authoritatively pin
+            // the root-side etag. On a Phase-1.5-landed-but-Phase-2-crashed
+            // write, the reloaded `manifest.root.page_index[page_id]`
+            // carries the pre-crash (stale) etag; applying the folded
+            // post-PUT record patches it so the next flush's `If-Match`
+            // succeeds instead of looping on 412.
+            let mut page_writes: std::collections::HashMap<
+                PageId,
+                (u64, Option<String>),
+            > = std::collections::HashMap::new();
+            for wentry in &entries {
+                if let WalEntry::PageWrote { page_id, new_etag: Some(et), seq, .. } = wentry {
+                    let slot = page_writes.entry(*page_id).or_insert((0u64, None));
+                    if *seq >= slot.0 {
+                        *slot = (*seq, Some(et.clone()));
+                    }
+                }
+            }
+
+            // Fold DirIndexWrote entries the same way: highest-seq post-PUT
+            // record wins. Applied to `root.dir_index_etag` +
+            // `root.dir_index_seq` via `reconcile_dir_index_etag`.
+            let mut dir_index_write: Option<(u64, Option<String>)> = None;
+            for wentry in &entries {
+                if let WalEntry::DirIndexWrote { new_etag: Some(et), seq, .. } = wentry {
+                    if dir_index_write.as_ref().map_or(true, |(s, _)| *seq >= *s) {
+                        dir_index_write = Some((*seq, Some(et.clone())));
+                    }
+                }
+            }
+
             {
                 let mut guard = forest_arc.write().await;
                 if !shard_writes.is_empty() {
@@ -4890,6 +5088,12 @@ impl EncryptedClient {
                             guard.reconcile_shard_write(idx, seq, etag);
                         }
                     }
+                }
+                for (page_id, (seq, etag)) in page_writes {
+                    guard.reconcile_page_etag(page_id, seq, etag);
+                }
+                if let Some((seq, etag)) = dir_index_write {
+                    guard.reconcile_dir_index_etag(seq, etag);
                 }
 
                 // Phase 2 (v7): replay Insert/Remove in the same order they
@@ -4910,17 +5114,10 @@ impl EncryptedClient {
                             let _ = guard.remove_file(&key, &backend).await
                                 .map_err(ClientError::Encryption)?;
                         }
-                        WalEntry::ShardWrote { .. } => {
-                            // Handled above in Phase 1.
-                        }
-                        WalEntry::PageWrote { .. } | WalEntry::DirIndexWrote { .. } => {
-                            // Meta-HAMT page + dir-index write records are
-                            // for post-flush reconciliation only. Pages are
-                            // index-addressed and idempotent under replay,
-                            // so a naive replay would bump page seq
-                            // unnecessarily; the next `save_sharded_hamt_forest`
-                            // will re-PUT any page that's still dirty under a
-                            // fresh seq computed from the reloaded manifest.
+                        WalEntry::ShardWrote { .. }
+                        | WalEntry::PageWrote { .. }
+                        | WalEntry::DirIndexWrote { .. } => {
+                            // Handled above in the fold/reconcile phase.
                         }
                     }
                 }

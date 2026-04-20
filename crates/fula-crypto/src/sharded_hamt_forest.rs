@@ -450,6 +450,52 @@ impl ShardedHamtPrivateForest {
         self.dir_index_dirty = true;
     }
 
+    /// Clear the in-memory root's `dir_index_etag` so the next flush's
+    /// conditional PUT targets a fresh write rather than gating on a stale
+    /// ETag. Used by the rebuild-from-forest path (F-1.3 soft-fail) because
+    /// the prior etag on `root.dir_index_etag` points at whatever S3 is
+    /// currently holding — which by definition is *not* the plaintext we
+    /// just rebuilt from forest shards. Clearing lets us overwrite
+    /// unconditionally; the committing root PUT retains its `If-Match` on
+    /// the root ETag, so a legitimate concurrent writer's root commit still
+    /// wins the race and our flush converges on retry. Must only be called
+    /// after `install_dir_index` / `mark_dir_index_dirty` from the
+    /// rebuild path; normal mutation flows keep the etag so Phase 1.6's
+    /// optimistic lock still catches concurrent dir-index writers.
+    pub fn clear_dir_index_etag(&mut self) {
+        self.manifest.root.dir_index_etag = None;
+    }
+
+    /// Reconcile a single page's root-side etag/seq pin from a post-PUT WAL
+    /// record. Invoked on crash-recovery replay: the committing root PUT
+    /// didn't fire, so the reloaded `manifest.root.page_index[page_id]`
+    /// still carries the pre-crash etag. The post-PUT WAL record supplies
+    /// the real etag S3 now serves, letting the next flush's Phase 1.5
+    /// `If-Match` succeed instead of looping on 412.
+    pub fn reconcile_page_etag(
+        &mut self,
+        page_id: crate::private_forest::PageId,
+        seq: u64,
+        etag: Option<String>,
+    ) {
+        self.manifest.root.page_index.insert(
+            page_id,
+            crate::private_forest::PageRef { etag, seq },
+        );
+    }
+
+    /// Reconcile the dir-index root-side etag/seq pin from a post-PUT WAL
+    /// record. Counterpart to [`reconcile_page_etag`] for the F-1.3 blob:
+    /// after a Phase-1.6-landed-but-Phase-2-crashed write, the reloaded
+    /// root's `dir_index_etag` is stale. `self.dir_index_seq` was already
+    /// installed from the envelope's seq by the load path; this method
+    /// only patches the root-side pins so the next flush's conditional
+    /// PUT matches S3.
+    pub fn reconcile_dir_index_etag(&mut self, seq: u64, etag: Option<String>) {
+        self.manifest.root.dir_index_etag = etag;
+        self.manifest.root.dir_index_seq = Some(seq);
+    }
+
     /// O(1) list of immediate subdirectories beneath `dir_path`, answered
     /// from the in-memory [`crate::private_forest::DirectoryIndex`]. Falls
     /// back to an empty list if the path isn't recorded — callers that need

@@ -67,4 +67,5 @@ encryption = []
 wasm = []
 # Exposes crash-injection atomics in encryption.rs so integration tests can
 # simulate abort between migration phases. Off in production builds.
-test-fault-injection = []
+# Pulls through to fula-crypto to enable the FORCE_INITIAL_SHARD_COUNT override.
+test-fault-injection = ["fula-crypto/test-fault-injection"]

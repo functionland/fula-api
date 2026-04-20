@@ -914,10 +914,26 @@ pub fn shard_for_path_v6(path: &str, dek: &DekKey, shard_salt: &[u8], num_shards
 ///
 /// `max(16, next_power_of_two(file_count / 5000))`
 pub fn compute_initial_shard_count(file_count: usize) -> usize {
+    #[cfg(feature = "test-fault-injection")]
+    {
+        let forced = FORCE_INITIAL_SHARD_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        if forced > 0 {
+            return forced.min(MAX_SHARDS);
+        }
+    }
     let target = file_count / 5000;
     let pow2 = target.next_power_of_two().max(1);
     pow2.max(16).min(MAX_SHARDS)
 }
+
+/// Test-only override for `compute_initial_shard_count`. Non-zero values
+/// (clamped to `MAX_SHARDS`) short-circuit the file-count heuristic so
+/// integration tests can force multi-page manifests without populating
+/// millions of files. Off by default; only compiled when the crate's
+/// `test-fault-injection` feature is on.
+#[cfg(feature = "test-fault-injection")]
+pub static FORCE_INITIAL_SHARD_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Events emitted during v1 → v7 migration for app-level notifications
 #[derive(Clone, Debug)]
@@ -1093,6 +1109,16 @@ pub struct ManifestRoot {
     /// buckets that have not yet flushed the dir-index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir_index_etag: Option<String>,
+    /// Sequence number of the [`DirectoryIndex`] blob this root commits to.
+    /// AEAD-bound inside the dir-index envelope — a reader that fetches the
+    /// dir-index under this root MUST reject any plaintext whose `seq` does
+    /// not equal this value. Pins both rollback (serving an older dir-index
+    /// for this root) and forward-drift (serving a newer dir-index written
+    /// by a concurrent migrator under a different root), closing the race
+    /// where `dir_index_etag` alone is insufficient because `load_object`
+    /// discards S3's HEAD ETag. `None` before the first successful flush.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir_index_seq: Option<u64>,
 }
 
 impl ManifestRoot {
@@ -1117,6 +1143,7 @@ impl ManifestRoot {
             modified_at: now,
             page_index: BTreeMap::new(),
             dir_index_etag: None,
+            dir_index_seq: None,
         }
     }
 
@@ -2260,6 +2287,7 @@ mod tests {
             );
         }
         manifest.root.dir_index_etag = Some("\"etag-dir-index\"".to_string());
+        manifest.root.dir_index_seq = Some(42);
 
         // Encrypt each page and the root, assert each stays under the cap.
         for (page_id, page) in manifest.pages.iter() {
@@ -2291,6 +2319,7 @@ mod tests {
         assert_eq!(decoded_root.num_shards, MAX_SHARDS);
         assert_eq!(decoded_root.page_index.len(), MAX_PAGES);
         assert_eq!(decoded_root.dir_index_etag.as_deref(), Some("\"etag-dir-index\""));
+        assert_eq!(decoded_root.dir_index_seq, Some(42));
     }
 
     #[test]

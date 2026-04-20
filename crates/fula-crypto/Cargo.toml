@@ -15,6 +15,9 @@ default = ["tokio-runtime"]
 wasm = ["getrandom/js"]
 # Enable tokio-based async streaming (not WASM compatible)
 tokio-runtime = ["tokio"]
+# Test-only fault injection knobs (e.g. FORCE_INITIAL_SHARD_COUNT).
+# Off by default so production builds never carry the override atomics.
+test-fault-injection = []
 
 [dependencies]
 # Core crypto

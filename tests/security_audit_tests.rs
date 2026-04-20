@@ -1378,6 +1378,142 @@ mod migration_security {
             total
         );
     }
+
+    /// F-1.3 seq-pin guard: forge a valid seq-B ciphertext at the dir-index
+    /// key (AEAD-valid under the same DEK + bucket but a different `seq` than
+    /// the root pins). `get_object` in the load path discards the S3 HEAD ETag,
+    /// so the ETag-only check can't see the substitution. The `dir_index_seq`
+    /// pin committed by `ManifestRoot` is the authoritative defense — reader
+    /// compares the decrypted `seq` against the pinned value and returns
+    /// `Ok(None)` on any mismatch, falling back to
+    /// `rebuild_directory_index_from_forest`.
+    ///
+    /// Complements `test_missing_dir_index_triggers_rebuild_from_forest`
+    /// (D4 / 404 path) and `test_version_downgrade_blocked_after_v7_pin`:
+    /// here the adversary produces a *decryptable* ciphertext under
+    /// legitimate keys, so the only anchor that catches the swap is the seq
+    /// pin.
+    #[tokio::test]
+    async fn test_dir_index_seq_mismatch_triggers_rebuild() {
+        use fula_crypto::{DirectoryIndex, EncryptedDirectoryIndex};
+
+        let base = spawn_server().await;
+        let encryption = EncryptionConfig::new();
+        let secret = encryption.export_secret_key().clone();
+        let bucket = "sec-dir-index-seq-mismatch";
+
+        let state = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("FULA_STATE_DIR", state.path());
+
+        let writer = make_client(&base, EncryptionConfig::from_secret_key(secret.clone()));
+        writer.create_bucket(bucket).await.expect("create bucket");
+        seed_v1_forest(&writer, bucket, &[SeedFile::new("/real/a.txt", 4)], &[]).await;
+        writer.migrate_to_sharded(bucket).await.expect("migrate");
+
+        // Forge a DirectoryIndex whose entries would not match the real
+        // forest, encrypted under the bucket's forest DEK at an
+        // attacker-chosen sequence far from the migration's seq=1. The
+        // ciphertext is AEAD-valid — only the seq pin in the manifest root
+        // can reject it.
+        let km = writer.encryption_config().key_manager();
+        let forest_dek = km.derive_path_key(&format!("forest:{}", bucket));
+        let mut forged = DirectoryIndex::new();
+        forged.ensure_dir("/forged");
+
+        let forged_seq: u64 = 99;
+        let forged_envelope =
+            EncryptedDirectoryIndex::encrypt(&forged, &forest_dek, bucket, forged_seq)
+                .expect("forged envelope must encrypt");
+
+        // Sanity: absent the seq pin, the reader would install the forged
+        // blob — it is valid under the same DEK + bucket. The seq check is
+        // the sole anchor being exercised here.
+        let (_, sealed_seq) = forged_envelope
+            .decrypt(&forest_dek, bucket)
+            .expect("forged envelope must decrypt under the real DEK");
+        assert_eq!(sealed_seq, forged_seq, "forged seq must survive roundtrip");
+
+        let forged_bytes = forged_envelope.to_bytes().expect("serialize forged envelope");
+        let dir_key = dir_index_key_for(&writer, bucket);
+        writer
+            .inner()
+            .put_object(bucket, &dir_key, Bytes::from(forged_bytes))
+            .await
+            .expect("overwrite dir-index with forged blob");
+
+        drop(writer);
+
+        // Fresh reader: loads the manifest root (with `dir_index_seq` pinned
+        // to the migration's value), fetches the forged blob, sees
+        // `seq=99 != pin`, discards, and rebuilds from the forest. The
+        // listing must surface the real file — rebuild-from-forest is the
+        // only path that produces it.
+        let reader = make_client(&base, EncryptionConfig::from_secret_key(secret));
+        let listing = reader
+            .list_directory(bucket, Some("/"))
+            .await
+            .expect("list_directory must succeed via rebuild on seq mismatch");
+        assert!(reader.is_forest_sharded_hamt(bucket));
+        let total: usize = listing.directories.values().map(|v| v.len()).sum();
+        assert!(
+            total >= 1,
+            "rebuild-from-forest on seq mismatch must repopulate the listing; got {}",
+            total
+        );
+        assert!(
+            listing
+                .directories
+                .values()
+                .flat_map(|v| v.iter())
+                .any(|f| f.original_key == "/real/a.txt"),
+            "real forest file must appear after rebuild from forest"
+        );
+
+        // Discriminating post-conditions (otherwise the test passes even if
+        // the seq check is removed, because `list_directory` walks forest
+        // shards, not the dir-index). The rebuild path installs at seq=0
+        // and marks dirty — a flush then PUTs a fresh seq=1 envelope whose
+        // plaintext was constructed from `rebuild_directory_index_from_forest`.
+        //
+        // A regression that accepted the forged blob would instead install at
+        // seq=99 and *not* mark dirty; the flush would be a no-op for the
+        // dir-index, leaving the forged seq=99 contents (with `/forged` and
+        // without `/real`) visible on S3.
+        reader
+            .flush_forest(bucket)
+            .await
+            .expect("flush_forest after rebuild must succeed");
+
+        let blob = reader
+            .inner()
+            .get_object(bucket, &dir_index_key_for(&reader, bucket))
+            .await
+            .expect("dir-index blob must exist after flush");
+        let flushed = EncryptedDirectoryIndex::from_bytes(&blob)
+            .expect("flushed dir-index envelope must parse");
+        assert_eq!(
+            flushed.sequence, 1,
+            "rebuild writes seq = prior_pinned_seq(0 after reject) + 1; \
+             seeing {} would indicate the forged seq=99 envelope was accepted \
+             and the next flush bumped from there",
+            flushed.sequence
+        );
+        let (decoded, sealed_seq) = flushed
+            .decrypt(&forest_dek, bucket)
+            .expect("flushed dir-index must decrypt under the forest DEK");
+        assert_eq!(sealed_seq, 1, "AAD-bound seq must match envelope.sequence");
+        assert!(
+            decoded.entries.contains_key("/real"),
+            "rebuild-from-forest must reproduce /real from the migrated \
+             forest; entries = {:?}",
+            decoded.entries.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !decoded.entries.contains_key("/forged"),
+            "forged directory must not survive the rebuild; entries = {:?}",
+            decoded.entries.keys().collect::<Vec<_>>()
+        );
+    }
 }
 
 /// H-1 / H-2 download-side verification tests.
