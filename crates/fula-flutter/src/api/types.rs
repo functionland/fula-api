@@ -9,12 +9,12 @@ use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::RwLock;
 #[cfg(not(target_arch = "wasm32"))]
-use tokio::sync::Mutex;
+pub(crate) use tokio::sync::Semaphore;
 
 #[cfg(target_arch = "wasm32")]
 use async_lock::RwLock;
 #[cfg(target_arch = "wasm32")]
-use async_lock::Mutex;
+pub(crate) use async_lock::Semaphore;
 
 // ============================================================================
 // Configuration Types
@@ -421,9 +421,16 @@ pub struct RotationManagerHandle {
 }
 
 /// Handle to an ongoing multipart upload
+///
+/// The inner [`MultipartUpload`](fula_client::MultipartUpload) uses interior
+/// mutability, so parallel `upload_part` calls can run their HTTP I/O without
+/// serialising. The `semaphore` bounds how many parts are in flight at once
+/// to avoid saturating the mobile radio, file handles, or the pinning
+/// service with a burst of concurrent POSTs.
 #[derive(Clone)]
 pub struct MultipartHandle {
-    pub(crate) inner: Arc<Mutex<fula_client::MultipartUpload>>,
+    pub(crate) inner: Arc<fula_client::MultipartUpload>,
+    pub(crate) semaphore: Arc<Semaphore>,
     #[allow(dead_code)]
     pub(crate) client: Arc<fula_client::FulaClient>,
 }

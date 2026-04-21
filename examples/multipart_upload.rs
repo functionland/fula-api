@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     println!("\n📤 Manual multipart upload (with resume capability)...");
     
     // Start upload
-    let mut upload = MultipartUpload::start(
+    let upload = MultipartUpload::start(
         Arc::clone(&client),
         "large-files",
         "chunked-file.bin",
