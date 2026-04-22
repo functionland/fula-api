@@ -31,10 +31,7 @@ class BucketInfo {
   /// Creation timestamp (Unix epoch seconds)
   final PlatformInt64 createdAt;
 
-  const BucketInfo({
-    required this.name,
-    required this.createdAt,
-  });
+  const BucketInfo({required this.name, required this.createdAt});
 
   @override
   int get hashCode => name.hashCode ^ createdAt.hashCode;
@@ -56,10 +53,7 @@ class CopyResult {
   /// Last modified timestamp (Unix epoch seconds)
   final PlatformInt64 lastModified;
 
-  const CopyResult({
-    required this.etag,
-    required this.lastModified,
-  });
+  const CopyResult({required this.etag, required this.lastModified});
 
   @override
   int get hashCode => etag.hashCode ^ lastModified.hashCode;
@@ -276,9 +270,7 @@ class ForestSubtree {
   /// Serialized subtree data
   final Uint8List serialized;
 
-  const ForestSubtree({
-    required this.serialized,
-  });
+  const ForestSubtree({required this.serialized});
 
   @override
   int get hashCode => serialized.hashCode;
@@ -305,11 +297,29 @@ class FulaConfig {
   /// Maximum retry attempts (default: 3)
   final int maxRetries;
 
+  /// F10: per-chunk download timeout in seconds.
+  ///
+  /// Applied to every individual chunk fetched by the windowed chunked-download
+  /// engine. Guards against a slow server trickling bytes below the global
+  /// dead-connection threshold. Only active on native targets; wasm inherits
+  /// the browser fetch default. Default: 300 (5 minutes).
+  final BigInt perChunkDownloadTimeoutSeconds;
+
+  /// F8: maximum plaintext size a buffered download will accept.
+  ///
+  /// Applied *before* any network I/O by the buffered download path. If the
+  /// chunked metadata declares a `total_size` larger than this ceiling, the
+  /// buffered path returns an error instead of allocating the buffer.
+  /// Default: 256 MiB.
+  final BigInt bufferedDownloadMaxBytes;
+
   const FulaConfig({
     required this.endpoint,
     this.accessToken,
     required this.timeoutSeconds,
     required this.maxRetries,
+    required this.perChunkDownloadTimeoutSeconds,
+    required this.bufferedDownloadMaxBytes,
   });
 
   static Future<FulaConfig> default_() =>
@@ -320,7 +330,9 @@ class FulaConfig {
       endpoint.hashCode ^
       accessToken.hashCode ^
       timeoutSeconds.hashCode ^
-      maxRetries.hashCode;
+      maxRetries.hashCode ^
+      perChunkDownloadTimeoutSeconds.hashCode ^
+      bufferedDownloadMaxBytes.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -330,7 +342,10 @@ class FulaConfig {
           endpoint == other.endpoint &&
           accessToken == other.accessToken &&
           timeoutSeconds == other.timeoutSeconds &&
-          maxRetries == other.maxRetries;
+          maxRetries == other.maxRetries &&
+          perChunkDownloadTimeoutSeconds ==
+              other.perChunkDownloadTimeoutSeconds &&
+          bufferedDownloadMaxBytes == other.bufferedDownloadMaxBytes;
 }
 
 /// Result of a get operation with metadata
@@ -518,10 +533,7 @@ class MetadataEntry {
   /// Metadata value
   final String value;
 
-  const MetadataEntry({
-    required this.key,
-    required this.value,
-  });
+  const MetadataEntry({required this.key, required this.value});
 
   @override
   int get hashCode => key.hashCode ^ value.hashCode;
@@ -565,8 +577,7 @@ enum ObfuscationMode {
   /// e.g., "/photos/vacation/" + hash(filename)
   /// Allows folder-like organization while hiding filenames.
   /// Server sees: `/photos/vacation/e_a7c3f9b2`
-  preserveStructure,
-  ;
+  preserveStructure;
 
   static Future<ObfuscationMode> default_() =>
       RustLib.instance.api.crateApiTypesObfuscationModeDefault();
@@ -659,10 +670,7 @@ class PinningConfig {
   /// Authentication token
   final String token;
 
-  const PinningConfig({
-    required this.endpoint,
-    required this.token,
-  });
+  const PinningConfig({required this.endpoint, required this.token});
 
   @override
   int get hashCode => endpoint.hashCode ^ token.hashCode;
@@ -684,10 +692,7 @@ class PutResult {
   /// Version ID (if versioning enabled)
   final String? versionId;
 
-  const PutResult({
-    required this.etag,
-    this.versionId,
-  });
+  const PutResult({required this.etag, this.versionId});
 
   @override
   int get hashCode => etag.hashCode ^ versionId.hashCode;
@@ -709,10 +714,7 @@ class RotationFailure {
   /// Error message
   final String error;
 
-  const RotationFailure({
-    required this.storageKey,
-    required this.error,
-  });
+  const RotationFailure({required this.storageKey, required this.error});
 
   @override
   int get hashCode => storageKey.hashCode ^ error.hashCode;
@@ -753,15 +755,11 @@ class RotationReport {
 
   /// Check if all rotations succeeded
   Future<bool> isSuccess() =>
-      RustLib.instance.api.crateApiTypesRotationReportIsSuccess(
-        that: this,
-      );
+      RustLib.instance.api.crateApiTypesRotationReportIsSuccess(that: this);
 
   /// Get success rate as percentage
   Future<double> successRate() =>
-      RustLib.instance.api.crateApiTypesRotationReportSuccessRate(
-        that: this,
-      );
+      RustLib.instance.api.crateApiTypesRotationReportSuccessRate(that: this);
 
   @override
   int get hashCode =>
@@ -796,7 +794,6 @@ enum ShareMode {
 
   /// Snapshot (point-in-time) access
   snapshot,
-  ;
 }
 
 /// Permissions granted by a share
@@ -856,16 +853,17 @@ class UploadProgress {
 
   // HINT: Make it `#[frb(sync)]` to let it become the default constructor of Dart class.
   /// Create a new progress struct
-  static Future<UploadProgress> newInstance(
-          {required BigInt bytesUploaded,
-          required BigInt totalBytes,
-          required int currentPart,
-          required int totalParts}) =>
-      RustLib.instance.api.crateApiTypesUploadProgressNew(
-          bytesUploaded: bytesUploaded,
-          totalBytes: totalBytes,
-          currentPart: currentPart,
-          totalParts: totalParts);
+  static Future<UploadProgress> newInstance({
+    required BigInt bytesUploaded,
+    required BigInt totalBytes,
+    required int currentPart,
+    required int totalParts,
+  }) => RustLib.instance.api.crateApiTypesUploadProgressNew(
+    bytesUploaded: bytesUploaded,
+    totalBytes: totalBytes,
+    currentPart: currentPart,
+    totalParts: totalParts,
+  );
 
   @override
   int get hashCode =>

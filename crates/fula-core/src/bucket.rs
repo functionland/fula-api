@@ -172,23 +172,24 @@ impl<S: BlockStore> Bucket<S> {
         let max = max_keys.unwrap_or(self.config.max_keys);
         let prefix_str = prefix.unwrap_or("");
         
-        // Get all matching entries
-        let all_entries = self.index.list_prefix(prefix_str.as_bytes()).await?;
-        
+        // Get matching entries using bounded traversal (avoids loading entire tree).
+        // When a delimiter is present, some entries become common_prefixes and don't
+        // count toward `max`, so we request extra to avoid under-fetching.
+        let fetch_limit = if delimiter.is_some() { max * 3 } else { max };
+        let start_key = start_after.map(|s| s.to_string());
+        let all_entries = self.index.list_prefix_bounded(
+            prefix_str.as_bytes(),
+            start_key.as_ref(),
+            fetch_limit,
+        ).await?;
+
         let mut objects = Vec::new();
         let mut common_prefixes = std::collections::BTreeSet::new();
         let mut is_truncated = false;
         let mut next_marker = None;
 
         for (key, metadata) in all_entries {
-            // Apply start_after filter
-            if let Some(start) = start_after {
-                if key.as_str() <= start {
-                    continue;
-                }
-            }
-
-            // Check max keys
+            // Check max keys (authoritative truncation)
             if objects.len() >= max {
                 is_truncated = true;
                 next_marker = Some(key.clone());
@@ -286,25 +287,86 @@ pub struct ListedObject {
     pub metadata: ObjectMetadata,
 }
 
-/// Serializable bucket registry for persistence
+/// Serializable bucket registry for persistence (v1: monolithic)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BucketRegistry {
     /// Version for future migrations
     pub version: u32,
-    /// All bucket metadata
+    /// All bucket metadata (v1 only — v2 uses shard_cids instead)
+    #[serde(default)]
     pub buckets: Vec<BucketMetadata>,
 }
 
 impl BucketRegistry {
-    /// Current registry version
+    /// Current registry version (still write v1 when under threshold)
     pub const CURRENT_VERSION: u32 = 1;
 
-    /// Create a new registry from bucket metadata
+    /// Create a new v1 registry from bucket metadata
     pub fn new(buckets: Vec<BucketMetadata>) -> Self {
         Self {
             version: Self::CURRENT_VERSION,
             buckets,
         }
+    }
+}
+
+/// V2 sharded registry root (stored at the registry CID).
+/// Small manifest — just shard pointers. Each shard is a separate IPLD block.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BucketRegistryV2 {
+    /// Always 2 for v2 format
+    pub version: u32,
+    /// Number of shards
+    pub num_shards: usize,
+    /// One CID per shard
+    #[serde(with = "cid_vec_serde")]
+    pub shard_cids: Vec<Cid>,
+}
+
+/// A single shard of the v2 registry (stored separately in IPFS)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RegistryShard {
+    /// Shard index (for verification)
+    pub shard_index: usize,
+    /// Buckets in this shard
+    pub buckets: Vec<BucketMetadata>,
+}
+
+/// Threshold: switch to v2 sharded format when bucket count exceeds this.
+/// Below this, v1 monolithic is fine (well under 1MB).
+const SHARDED_REGISTRY_THRESHOLD: usize = 500;
+
+/// Default number of registry shards when migrating to v2
+const DEFAULT_REGISTRY_SHARDS: usize = 16;
+
+/// Minimal struct to probe the `version` field from a DAG-CBOR registry block
+/// without requiring the full schema to match.
+#[derive(Deserialize)]
+struct VersionProbe {
+    #[serde(default = "version_probe_default")]
+    version: u32,
+}
+
+fn version_probe_default() -> u32 {
+    1
+}
+
+/// serde helper for Vec<Cid>
+mod cid_vec_serde {
+    use cid::Cid;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(cids: &[Cid], s: S) -> Result<S::Ok, S::Error> {
+        let strings: Vec<String> = cids.iter().map(|c| c.to_string()).collect();
+        strings.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Cid>, D::Error> {
+        let strings = Vec::<String>::deserialize(d)?;
+        strings
+            .into_iter()
+            .map(|s| s.parse().map_err(serde::de::Error::custom))
+            .collect()
     }
 }
 
@@ -314,10 +376,16 @@ pub struct BucketManager<S: BlockStore + PinStore> {
     store: Arc<S>,
     /// Bucket metadata cache
     buckets: Arc<DashMap<String, BucketMetadata>>,
+    /// Secondary index: display name → list of internal keys.
+    /// Enables O(1) admin lookup by display name instead of scanning all buckets.
+    name_index: Arc<DashMap<String, Vec<String>>>,
     /// Default configuration
     default_config: BucketConfig,
     /// Path to store the registry CID (for persistence)
     registry_cid_path: Option<std::path::PathBuf>,
+    /// Dirty flag: true if buckets have been modified since last persist.
+    /// Avoids redundant serialization + IPFS writes on every object put.
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 impl<S: BlockStore + PinStore> BucketManager<S> {
@@ -326,8 +394,10 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
         Self {
             store,
             buckets: Arc::new(DashMap::new()),
+            name_index: Arc::new(DashMap::new()),
             default_config: BucketConfig::default(),
             registry_cid_path: None,
+            dirty: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -336,8 +406,42 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
         Self {
             store,
             buckets: Arc::new(DashMap::new()),
+            name_index: Arc::new(DashMap::new()),
             default_config: BucketConfig::default(),
             registry_cid_path: Some(registry_cid_path.as_ref().to_path_buf()),
+            dirty: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Rebuild the name_index from the current buckets DashMap
+    fn rebuild_name_index(&self) {
+        self.name_index.clear();
+        for entry in self.buckets.iter() {
+            let internal_key = entry.key().clone();
+            let display_name = entry.value().name.clone();
+            self.name_index
+                .entry(display_name)
+                .or_insert_with(Vec::new)
+                .push(internal_key);
+        }
+    }
+
+    /// Add a single entry to the name index
+    fn index_add(&self, display_name: &str, internal_key: &str) {
+        self.name_index
+            .entry(display_name.to_string())
+            .or_insert_with(Vec::new)
+            .push(internal_key.to_string());
+    }
+
+    /// Remove a single entry from the name index
+    fn index_remove(&self, display_name: &str, internal_key: &str) {
+        if let Some(mut keys) = self.name_index.get_mut(display_name) {
+            keys.retain(|k| k != internal_key);
+            if keys.is_empty() {
+                drop(keys);
+                self.name_index.remove(display_name);
+            }
         }
     }
 
@@ -380,14 +484,16 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
 
         info!(cid = %cid, "Loading bucket registry from IPFS");
 
-        // Fetch registry from IPFS with retry logic and exponential backoff
+        // Fetch raw block from IPFS with retry logic and exponential backoff.
+        // We fetch bytes instead of get_ipld<BucketRegistry> so we can probe the
+        // version field first and then deserialize as v1 or v2.
         let max_attempts = 5;
         let mut attempts = 0;
         let mut delay = std::time::Duration::from_secs(1);
 
-        let registry: BucketRegistry = loop {
-            match self.store.get_ipld(&cid).await {
-                Ok(reg) => break reg,
+        let raw_bytes = loop {
+            match self.store.get_block(&cid).await {
+                Ok(bytes) => break bytes,
                 Err(e) if attempts < max_attempts - 1 => {
                     attempts += 1;
                     warn!(
@@ -416,20 +522,53 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
             }
         };
 
-        // Validate version
-        if registry.version > BucketRegistry::CURRENT_VERSION {
-            warn!(
-                stored_version = registry.version,
-                current_version = BucketRegistry::CURRENT_VERSION,
-                "Registry version is newer than supported, some features may not work"
-            );
-        }
+        // Probe the version field to determine format
+        let probe: VersionProbe = serde_ipld_dagcbor::from_slice(&raw_bytes).map_err(|e| {
+            CoreError::StorageError(format!("Failed to probe registry version: {}", e))
+        })?;
+
+        let all_buckets: Vec<BucketMetadata> = if probe.version >= 2 {
+            // V2 sharded format: manifest + per-shard blocks
+            info!(version = probe.version, "Loading v2 sharded registry");
+            let manifest: BucketRegistryV2 =
+                serde_ipld_dagcbor::from_slice(&raw_bytes).map_err(|e| {
+                    CoreError::StorageError(format!("Failed to deserialize v2 manifest: {}", e))
+                })?;
+
+            let mut buckets = Vec::new();
+            for (i, shard_cid) in manifest.shard_cids.iter().enumerate() {
+                let shard: RegistryShard = self.store.get_ipld(shard_cid).await.map_err(|e| {
+                    CoreError::StorageError(format!(
+                        "Failed to load registry shard {} ({}): {}",
+                        i, shard_cid, e
+                    ))
+                })?;
+                buckets.extend(shard.buckets);
+            }
+            buckets
+        } else {
+            // V1 monolithic format
+            let registry: BucketRegistry =
+                serde_ipld_dagcbor::from_slice(&raw_bytes).map_err(|e| {
+                    CoreError::StorageError(format!("Failed to deserialize v1 registry: {}", e))
+                })?;
+
+            if registry.version > BucketRegistry::CURRENT_VERSION {
+                warn!(
+                    stored_version = registry.version,
+                    current_version = BucketRegistry::CURRENT_VERSION,
+                    "Registry version is newer than supported, some features may not work"
+                );
+            }
+
+            registry.buckets
+        };
 
         // Populate the in-memory cache
         // IMPORTANT: Use the same key format as create_bucket_for_user: {owner_id}:{name}
         // This ensures buckets from different users with the same name don't collide
-        let count = registry.buckets.len();
-        for bucket_meta in registry.buckets {
+        let count = all_buckets.len();
+        for bucket_meta in all_buckets {
             let internal_key = Self::scoped_bucket_key(&bucket_meta.owner_id, &bucket_meta.name);
             info!(
                 bucket = %bucket_meta.name,
@@ -439,6 +578,9 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
             );
             self.buckets.insert(internal_key, bucket_meta);
         }
+
+        // Build the secondary name index for O(1) admin lookups
+        self.rebuild_name_index();
 
         info!(bucket_count = count, "Bucket registry loaded successfully");
         Ok(count)
@@ -455,18 +597,27 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
         self.persist_registry_internal(Some(token)).await
     }
 
-    /// Internal implementation for registry persistence
+    /// Internal implementation for registry persistence.
+    ///
+    /// Uses v1 monolithic format when bucket count <= SHARDED_REGISTRY_THRESHOLD,
+    /// auto-upgrades to v2 sharded format when it exceeds the threshold.
     async fn persist_registry_internal(&self, token: Option<&str>) -> Result<Cid> {
         // Collect all bucket metadata
         let buckets: Vec<BucketMetadata> = self.buckets.iter().map(|r| r.value().clone()).collect();
-        let registry = BucketRegistry::new(buckets);
+        let bucket_count = buckets.len();
 
-        info!(bucket_count = registry.buckets.len(), "Persisting bucket registry to IPFS");
+        info!(bucket_count = bucket_count, "Persisting bucket registry to IPFS");
 
-        // Store as IPLD (DAG-CBOR)
-        let cid = self.store.put_ipld(&registry).await.map_err(|e| {
-            CoreError::StorageError(format!("Failed to store registry in IPFS: {}", e))
-        })?;
+        let cid = if bucket_count > SHARDED_REGISTRY_THRESHOLD {
+            // V2 sharded format: partition buckets into shards
+            self.persist_registry_v2(buckets, token).await?
+        } else {
+            // V1 monolithic: all buckets in one block
+            let registry = BucketRegistry::new(buckets);
+            self.store.put_ipld(&registry).await.map_err(|e| {
+                CoreError::StorageError(format!("Failed to store registry in IPFS: {}", e))
+            })?
+        };
 
         // Pin the registry for persistence (with or without user token)
         if let Some(t) = token {
@@ -522,6 +673,66 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
             info!(cid = %cid, path = %path.display(), "Registry CID saved to file");
         }
 
+        self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(cid)
+    }
+
+    /// Persist bucket registry in v2 sharded format.
+    /// Partitions buckets into shards, stores each shard separately, then
+    /// stores a small manifest with shard CIDs as the root block.
+    async fn persist_registry_v2(
+        &self,
+        buckets: Vec<BucketMetadata>,
+        token: Option<&str>,
+    ) -> Result<Cid> {
+        let num_shards = DEFAULT_REGISTRY_SHARDS;
+        let mut shards: Vec<Vec<BucketMetadata>> = (0..num_shards).map(|_| Vec::new()).collect();
+
+        // Partition by hash(owner_id) % num_shards
+        for bucket in buckets {
+            let hash = {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&bucket.owner_id, &mut hasher);
+                std::hash::Hasher::finish(&hasher) as usize
+            };
+            shards[hash % num_shards].push(bucket);
+        }
+
+        // Store each shard as a separate IPLD block
+        let mut shard_cids = Vec::with_capacity(num_shards);
+        for (i, shard_buckets) in shards.into_iter().enumerate() {
+            let shard = RegistryShard {
+                shard_index: i,
+                buckets: shard_buckets,
+            };
+            let shard_cid = self.store.put_ipld(&shard).await.map_err(|e| {
+                CoreError::StorageError(format!("Failed to store registry shard {}: {}", i, e))
+            })?;
+            shard_cids.push(shard_cid);
+        }
+
+        // Store the v2 manifest (small — just CID pointers)
+        let manifest = BucketRegistryV2 {
+            version: 2,
+            num_shards,
+            shard_cids,
+        };
+        let cid = self.store.put_ipld(&manifest).await.map_err(|e| {
+            CoreError::StorageError(format!("Failed to store v2 registry manifest: {}", e))
+        })?;
+
+        // Pin the root manifest
+        if let Some(t) = token {
+            self.store.pin_with_token(&cid, Some("fula-bucket-registry-v2"), t).await.map_err(|e| {
+                CoreError::StorageError(format!("Failed to pin v2 registry: {}", e))
+            })?;
+        } else {
+            self.store.pin(&cid, Some("fula-bucket-registry-v2")).await.map_err(|e| {
+                CoreError::StorageError(format!("Failed to pin v2 registry: {}", e))
+            })?;
+        }
+
+        info!(cid = %cid, num_shards = num_shards, "Persisted v2 sharded registry");
         Ok(cid)
     }
 
@@ -550,15 +761,17 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
         tracing::debug!(bucket_name = %name, root_cid = %metadata.root_cid, "Bucket created in IPFS, adding to registry");
         
         self.buckets.insert(name.clone(), metadata.clone());
-        
+        self.index_add(&metadata.name, &name);
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+
         // Persist the registry after adding a bucket
         if let Err(e) = self.persist_registry().await {
             warn!(error = %e, "Failed to persist registry after bucket creation");
             // Don't fail the operation, bucket is still created in memory
         }
-        
+
         tracing::info!(bucket_name = %name, total_buckets = %self.buckets.len(), "Bucket registered successfully");
-        
+
         Ok(metadata)
     }
 
@@ -589,21 +802,25 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
     /// Delete a bucket
     pub async fn delete_bucket(&self, name: &str) -> Result<()> {
         let bucket = self.open_bucket(name).await?;
-        
+
         if bucket.object_count() > 0 {
             return Err(CoreError::PreconditionFailed(
                 "Bucket is not empty".to_string(),
             ));
         }
 
+        // Remove from name index before removing from buckets
+        let display_name = bucket.metadata().name.clone();
+        self.index_remove(&display_name, name);
         self.buckets.remove(name);
-        
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+
         // Persist the registry after removing a bucket
         if let Err(e) = self.persist_registry().await {
             warn!(error = %e, "Failed to persist registry after bucket deletion");
             // Don't fail the operation, bucket is still deleted from memory
         }
-        
+
         Ok(())
     }
 
@@ -665,6 +882,8 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
 
         // Store with internal key, but metadata contains display name
         self.buckets.insert(internal_key.clone(), metadata.clone());
+        self.index_add(&metadata.name, &internal_key);
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Persist the registry after adding a bucket
         if let Err(e) = self.persist_registry().await {
@@ -710,7 +929,9 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
             ));
         }
 
+        self.index_remove(name, &internal_key);
         self.buckets.remove(&internal_key);
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Persist the registry after removing a bucket
         if let Err(e) = self.persist_registry().await {
@@ -739,92 +960,85 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
 
     /// Find a bucket by display name that contains a specific object key
     ///
-    /// Searches all users' buckets for one with matching display name that contains the key.
-    /// This is used by admin endpoints where the user context is not known.
+    /// Uses the secondary name index for O(1) lookup of matching buckets
+    /// instead of scanning all buckets. This is used by admin endpoints
+    /// where the user context is not known.
     ///
     /// Returns the object metadata if found.
     pub async fn find_object_in_bucket(&self, display_name: &str, key: &str) -> Option<crate::metadata::ObjectMetadata> {
-        let bucket_count = self.buckets.len();
-        let bucket_names: Vec<String> = self.buckets.iter()
-            .map(|r| format!("{} (key={})", r.value().name.clone(), r.key().clone()))
-            .collect();
         tracing::debug!(
             target_bucket = %display_name,
             target_key = %key,
-            total_buckets = bucket_count,
-            available_buckets = ?bucket_names,
-            "Searching for object in bucket"
+            "Searching for object in bucket via name index"
         );
 
-        // Iterate through all buckets
-        let mut matching_buckets = 0;
-        for entry in self.buckets.iter() {
-            let metadata = entry.value();
-            if metadata.name == display_name {
-                matching_buckets += 1;
+        // Use name index for O(1) lookup of internal keys with this display name
+        let internal_keys: Vec<String> = match self.name_index.get(display_name) {
+            Some(keys) => keys.clone(),
+            None => {
                 tracing::debug!(
-                    internal_key = %entry.key(),
-                    bucket_name = %metadata.name,
-                    root_cid = %metadata.root_cid,
-                    object_count = metadata.object_count,
-                    "Found matching bucket, attempting to load"
+                    target_bucket = %display_name,
+                    "No buckets found with this display name"
                 );
+                return None;
+            }
+        };
 
-                // Try to load this bucket and find the object
-                match Bucket::load(
-                    metadata.clone(),
-                    Arc::clone(&self.store),
-                    self.default_config.clone(),
-                    None, // Don't need cache updates for read-only
-                ).await {
-                    Ok(bucket) => {
-                        // List first few objects for debugging
-                        if let Ok(list_result) = bucket.list_objects(None, None, None, Some(10)).await {
-                            let object_keys: Vec<&str> = list_result.objects.iter()
-                                .map(|o| o.key.as_str())
-                                .collect();
+        for internal_key in &internal_keys {
+            let metadata = match self.buckets.get(internal_key) {
+                Some(m) => m.clone(),
+                None => continue,
+            };
+
+            tracing::debug!(
+                internal_key = %internal_key,
+                bucket_name = %metadata.name,
+                root_cid = %metadata.root_cid,
+                object_count = metadata.object_count,
+                "Found matching bucket, attempting to load"
+            );
+
+            match Bucket::load(
+                metadata,
+                Arc::clone(&self.store),
+                self.default_config.clone(),
+                None,
+            ).await {
+                Ok(bucket) => {
+                    match bucket.get_object(key).await {
+                        Ok(Some(obj_meta)) => {
                             tracing::debug!(
                                 bucket = %display_name,
-                                object_keys = ?object_keys,
-                                "Sample of objects in bucket"
+                                key = %key,
+                                cid = %obj_meta.cid,
+                                "Found object"
+                            );
+                            return Some(obj_meta);
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                bucket = %display_name,
+                                key = %key,
+                                "Object not found in this bucket"
                             );
                         }
-
-                        match bucket.get_object(key).await {
-                            Ok(Some(obj_meta)) => {
-                                tracing::debug!(
-                                    bucket = %display_name,
-                                    key = %key,
-                                    cid = %obj_meta.cid,
-                                    "Found object"
-                                );
-                                return Some(obj_meta);
-                            }
-                            Ok(None) => {
-                                tracing::debug!(
-                                    bucket = %display_name,
-                                    key = %key,
-                                    "Object not found in this bucket"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    bucket = %display_name,
-                                    key = %key,
-                                    error = %e,
-                                    "Error getting object from bucket"
-                                );
-                            }
+                        Err(e) => {
+                            tracing::warn!(
+                                bucket = %display_name,
+                                key = %key,
+                                error = %e,
+                                "Error getting object from bucket"
+                            );
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            bucket = %display_name,
-                            internal_key = %entry.key(),
-                            error = %e,
-                            "Failed to load bucket"
-                        );
-                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        bucket = %display_name,
+                        internal_key = %internal_key,
+                        error = %e,
+                        "Failed to load bucket"
+                    );
                 }
             }
         }
@@ -832,7 +1046,7 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
         tracing::debug!(
             target_bucket = %display_name,
             target_key = %key,
-            matching_buckets = matching_buckets,
+            matching_buckets = internal_keys.len(),
             "Object not found in any matching bucket"
         );
         None
@@ -1017,15 +1231,105 @@ mod tests {
     #[tokio::test]
     async fn test_bucket_manager_persistence_empty_start() {
         use tempfile::tempdir;
-        
+
         let temp_dir = tempdir().unwrap();
         let cid_path = temp_dir.path().join("nonexistent.cid");
-        
+
         let store = Arc::new(MemoryBlockStore::new());
         let manager = BucketManager::with_persistence(store, &cid_path);
-        
+
         // Should gracefully handle missing CID file
         let loaded_count = manager.load_registry().await.unwrap();
         assert_eq!(loaded_count, 0, "Should start with 0 buckets when CID file doesn't exist");
+    }
+
+    #[tokio::test]
+    async fn test_registry_v2_sharded_roundtrip() {
+        use crate::metadata::BucketMetadata;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let cid_path = temp_dir.path().join("registry.cid");
+        let store = Arc::new(MemoryBlockStore::new());
+
+        // Build a bucket list larger than the sharding threshold so
+        // persist_registry_internal writes v2 format.
+        let manager = BucketManager::with_persistence(Arc::clone(&store), &cid_path);
+        let root_cid = fula_blockstore::cid_utils::create_cid(
+            b"root",
+            fula_blockstore::cid_utils::CidCodec::DagCbor,
+        );
+
+        let bucket_count = SHARDED_REGISTRY_THRESHOLD + 10;
+        for i in 0..bucket_count {
+            let owner_id = format!("owner_{}", i % 50); // 50 distinct owners
+            let name = format!("bucket_{}", i);
+            let meta = BucketMetadata::new(name.clone(), owner_id.clone(), root_cid);
+            let key = BucketManager::<MemoryBlockStore>::scoped_bucket_key(&owner_id, &name);
+            manager.buckets.insert(key, meta);
+        }
+
+        // Persist — should choose v2 because count > threshold
+        manager.persist_registry().await.unwrap();
+        assert!(cid_path.exists());
+
+        // Verify root block is v2 format
+        let cid_str = std::fs::read_to_string(&cid_path).unwrap();
+        let cid: Cid = cid_str.parse().unwrap();
+        let raw = store.get_block(&cid).await.unwrap();
+        let probe: VersionProbe =
+            serde_ipld_dagcbor::from_slice(&raw).unwrap();
+        assert_eq!(probe.version, 2, "Root block should be v2 after sharded persist");
+
+        // Load into a fresh manager — exercises v2 load path
+        let manager2 = BucketManager::with_persistence(Arc::clone(&store), &cid_path);
+        let loaded = manager2.load_registry().await.unwrap();
+        assert_eq!(loaded, bucket_count, "Should reload all buckets from v2 shards");
+
+        // Spot-check a few buckets
+        assert!(manager2.buckets.contains_key(
+            &BucketManager::<MemoryBlockStore>::scoped_bucket_key("owner_0", "bucket_0")
+        ));
+        // bucket_count-1 = 509, owner = 509 % 50 = 9
+        let last_idx = bucket_count - 1;
+        let last_owner = format!("owner_{}", last_idx % 50);
+        assert!(manager2.buckets.contains_key(
+            &BucketManager::<MemoryBlockStore>::scoped_bucket_key(&last_owner, &format!("bucket_{}", last_idx))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_registry_v1_loaded_by_new_code() {
+        // Ensure the v2-aware load_registry can still read v1 format
+        use crate::metadata::BucketMetadata;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let cid_path = temp_dir.path().join("registry.cid");
+        let store = Arc::new(MemoryBlockStore::new());
+
+        // Manually store a v1 registry
+        let root_cid = fula_blockstore::cid_utils::create_cid(
+            b"root",
+            fula_blockstore::cid_utils::CidCodec::DagCbor,
+        );
+        let buckets = vec![
+            BucketMetadata::new("alpha".to_string(), "user_a".to_string(), root_cid),
+            BucketMetadata::new("beta".to_string(), "user_b".to_string(), root_cid),
+        ];
+        let registry = BucketRegistry::new(buckets);
+        let cid = store.put_ipld(&registry).await.unwrap();
+        std::fs::write(&cid_path, cid.to_string()).unwrap();
+
+        // Load with the new version-aware code
+        let manager = BucketManager::with_persistence(Arc::clone(&store), &cid_path);
+        let loaded = manager.load_registry().await.unwrap();
+        assert_eq!(loaded, 2);
+        assert!(manager.buckets.contains_key(
+            &BucketManager::<MemoryBlockStore>::scoped_bucket_key("user_a", "alpha")
+        ));
+        assert!(manager.buckets.contains_key(
+            &BucketManager::<MemoryBlockStore>::scoped_bucket_key("user_b", "beta")
+        ));
     }
 }

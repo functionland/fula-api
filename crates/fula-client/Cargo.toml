@@ -28,8 +28,11 @@ tracing = { workspace = true }
 url = "2.5"
 base64 = { workspace = true }
 hex = { workspace = true }
+blake3 = { workspace = true }
 mime_guess = "2.0"
 tokio = { version = "1.42", default-features = false, features = ["sync"] }
+dashmap = { workspace = true }
+async-trait = { workspace = true }
 
 # Platform-specific dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -37,6 +40,8 @@ tokio = { version = "1.42", default-features = false, features = ["sync"] }
 fula-crypto = { path = "../fula-crypto" }
 reqwest = { workspace = true }
 uuid = { workspace = true }
+fs2 = "0.4"
+dirs = "5"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # WASM: disable default features (no tokio), enable wasm feature
@@ -45,6 +50,8 @@ fula-crypto = { path = "../fula-crypto", default-features = false, features = ["
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 # uuid needs js feature for WASM randomness
 uuid = { version = "1.11", features = ["v4", "serde", "js"] }
+# MultipartAbortGuard Drop impl spawns the abort future on wasm
+wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -58,3 +65,7 @@ default = []
 encryption = []
 # Enable WASM support for web browsers (automatic via target config)
 wasm = []
+# Exposes crash-injection atomics in encryption.rs so integration tests can
+# simulate abort between migration phases. Off in production builds.
+# Pulls through to fula-crypto to enable the FORCE_INITIAL_SHARD_COUNT override.
+test-fault-injection = ["fula-crypto/test-fault-injection"]

@@ -42,6 +42,13 @@ pub struct GatewayConfig {
     pub admin_jwt_secret: Option<String>,
     /// Enable admin API endpoints
     pub admin_api_enabled: bool,
+    /// LRU block cache capacity in MB. 0 disables the cache.
+    #[serde(default = "default_block_cache_mb")]
+    pub block_cache_mb: usize,
+}
+
+fn default_block_cache_mb() -> usize {
+    256
 }
 
 impl Default for GatewayConfig {
@@ -65,6 +72,7 @@ impl Default for GatewayConfig {
             storage_api_url: None,
             admin_jwt_secret: None,
             admin_api_enabled: false,
+            block_cache_mb: default_block_cache_mb(),
         }
     }
 }

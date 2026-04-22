@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use tracing::{debug, instrument};
 
 /// Fula storage client
+#[derive(Clone)]
 pub struct FulaClient {
     config: Config,
     http: Client,
@@ -49,6 +50,14 @@ impl FulaClient {
     /// Get the configuration
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Access the pooled HTTP client for internal modules (e.g. multipart
+    /// helpers) that need to issue raw requests. Exposing this keeps
+    /// connection pooling and configured timeouts intact instead of minting
+    /// a fresh `reqwest::Client` per call. (NEW-F3.)
+    pub(crate) fn http_client(&self) -> &Client {
+        &self.http
     }
 
     // ==================== Bucket Operations ====================
@@ -168,6 +177,53 @@ impl FulaClient {
             etag,
             version_id: None,
         })
+    }
+
+    /// Put an object with metadata and optional If-Match / If-None-Match guards.
+    ///
+    /// Used by conditional-write paths (e.g. forest flush) to detect concurrent
+    /// modification. On ETag mismatch the server returns 412, which surfaces as
+    /// `ClientError::ConcurrentModification`.
+    #[instrument(skip(self, data))]
+    pub async fn put_object_with_metadata_conditional(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        metadata: Option<ObjectMetadata>,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<PutObjectResult> {
+        let path = format!("/{}/{}", bucket, key);
+        let data = data.into();
+
+        let mut headers = HashMap::new();
+        if let Some(meta) = metadata {
+            if let Some(ct) = meta.content_type {
+                headers.insert("Content-Type".to_string(), ct);
+            }
+            for (k, v) in meta.user_metadata {
+                headers.insert(format!("x-amz-meta-{}", k), v);
+            }
+        }
+        if let Some(etag) = if_match {
+            headers.insert("If-Match".to_string(), format!("\"{}\"", etag.trim_matches('"')));
+        }
+        if let Some(etag) = if_none_match {
+            let val = if etag == "*" { "*".to_string() } else { format!("\"{}\"", etag.trim_matches('"')) };
+            headers.insert("If-None-Match".to_string(), val);
+        }
+
+        let response = self.request("PUT", &path, None, Some(headers), Some(data)).await?;
+
+        let etag = response
+            .headers()
+            .get("ETag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_matches('"').to_string())
+            .unwrap_or_default();
+
+        Ok(PutObjectResult { etag, version_id: None })
     }
 
     /// Put an object with pinning credentials
@@ -443,6 +499,35 @@ impl FulaClient {
         // Check for errors
         let status = response.status();
         if !status.is_success() {
+            // 412 Precondition Failed surfaces as ConcurrentModification so
+            // callers using If-Match / If-None-Match can retry distinctly.
+            if status.as_u16() == 412 {
+                let _ = response.text().await;
+                return Err(ClientError::ConcurrentModification(
+                    "precondition failed (ETag mismatch)".to_string()
+                ));
+            }
+
+            // 409 on a /locks/ endpoint means the migration lock is held.
+            // We narrowly gate on the path so non-lock 409s (e.g. S3
+            // BucketAlreadyExists) continue to surface as S3 errors.
+            if status.as_u16() == 409 && path.starts_with("/locks/") {
+                let body = response.text().await.unwrap_or_default();
+                let expires_at = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("expires_at").and_then(|e| e.as_i64()))
+                    .unwrap_or(0);
+                // Strip the "/locks/" prefix to recover the bucket name, and
+                // drop any trailing "/heartbeat" segment.
+                let bucket = path
+                    .trim_start_matches("/locks/")
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                return Err(ClientError::MigrationLockHeld { bucket, expires_at });
+            }
+
             // For HEAD requests, S3 returns error code in x-amz-error-code header
             // since there's no response body
             let error_code = response
@@ -450,9 +535,9 @@ impl FulaClient {
                 .get("x-amz-error-code")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            
+
             let text = response.text().await.unwrap_or_default();
-            
+
             // If we have an error code header, use it; otherwise parse XML or use status
             if let Some(code) = error_code {
                 return Err(ClientError::S3Error {
@@ -461,11 +546,73 @@ impl FulaClient {
                     request_id: None,
                 });
             }
-            
+
             return Err(ClientError::from_s3_xml(&text, status.as_u16()));
         }
 
         Ok(response)
+    }
+}
+
+/// Handle returned from `acquire_migration_lock`. Carries the token needed
+/// to release the lock or refresh its TTL.
+#[derive(Debug, Clone)]
+pub struct MigrationLockHandle {
+    pub token: String,
+    pub expires_at_ms: i64,
+}
+
+impl FulaClient {
+    /// Acquire the server-side migration advisory lock for `bucket`.
+    ///
+    /// Returns the holder's token on success. On 409, returns
+    /// `ClientError::MigrationLockHeld { bucket, expires_at }` — the caller
+    /// should interpret this as "another device is migrating" and fall back
+    /// to a read-only path.
+    #[instrument(skip(self))]
+    pub async fn acquire_migration_lock(&self, bucket: &str) -> Result<MigrationLockHandle> {
+        let path = format!("/locks/{}", bucket);
+        let response = self.request("POST", &path, None, None, None).await?;
+        let text = response.text().await?;
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| ClientError::InvalidResponse(format!("lock acquire: {}", e)))?;
+        let token = v.get("token").and_then(|t| t.as_str())
+            .ok_or_else(|| ClientError::InvalidResponse("lock acquire: missing token".into()))?
+            .to_string();
+        let expires_at_ms = v.get("expires_at").and_then(|e| e.as_i64())
+            .ok_or_else(|| ClientError::InvalidResponse("lock acquire: missing expires_at".into()))?;
+        Ok(MigrationLockHandle { token, expires_at_ms })
+    }
+
+    /// Release the migration lock for `bucket`. Requires the token returned
+    /// from `acquire_migration_lock`. Idempotent: a 404 (already released)
+    /// is treated as success.
+    #[instrument(skip(self, token))]
+    pub async fn release_migration_lock(&self, bucket: &str, token: &str) -> Result<()> {
+        let path = format!("/locks/{}", bucket);
+        let mut headers = HashMap::new();
+        headers.insert("x-fula-lock-token".to_string(), token.to_string());
+        match self.request("DELETE", &path, None, Some(headers), None).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.is_not_found() => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Refresh the TTL on the migration lock for `bucket`. Returns the new
+    /// `expires_at_ms`. Callers should run this on a ~30s cadence so the
+    /// 60s server TTL never lapses mid-migration.
+    #[instrument(skip(self, token))]
+    pub async fn heartbeat_migration_lock(&self, bucket: &str, token: &str) -> Result<i64> {
+        let path = format!("/locks/{}/heartbeat", bucket);
+        let mut headers = HashMap::new();
+        headers.insert("x-fula-lock-token".to_string(), token.to_string());
+        let response = self.request("POST", &path, None, Some(headers), None).await?;
+        let text = response.text().await?;
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| ClientError::InvalidResponse(format!("lock heartbeat: {}", e)))?;
+        v.get("expires_at").and_then(|e| e.as_i64())
+            .ok_or_else(|| ClientError::InvalidResponse("lock heartbeat: missing expires_at".into()))
     }
 }
 

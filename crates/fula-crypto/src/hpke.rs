@@ -27,49 +27,84 @@ use hpke::{
 use serde::{Deserialize as SerdeDeserialize, Serialize};
 
 /// Adapter to bridge getrandom to hpke's rand_core 0.9
+///
+/// # Panics
+///
+/// All methods on this adapter call `getrandom::getrandom()` and panic if the
+/// OS entropy source is unavailable. This can happen in degraded environments
+/// (early boot, certain sandboxed WASM runtimes without Web Crypto API).
+///
+/// The `hpke` crate's `RngCore` trait requires infallible `fill_bytes`, so
+/// errors cannot be propagated through this adapter. Callers that need
+/// fallible HPKE operations should call [`check_entropy`] before invoking
+/// [`Encryptor`] or [`Decryptor`] methods.
 struct HpkeRng;
 
 impl RngCore for HpkeRng {
     fn next_u32(&mut self) -> u32 {
         let mut buf = [0u8; 4];
-        getrandom::getrandom(&mut buf).expect("getrandom failed");
+        getrandom::getrandom(&mut buf).expect("getrandom failed: OS entropy source unavailable");
         u32::from_le_bytes(buf)
     }
 
     fn next_u64(&mut self) -> u64 {
         let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).expect("getrandom failed");
+        getrandom::getrandom(&mut buf).expect("getrandom failed: OS entropy source unavailable");
         u64::from_le_bytes(buf)
     }
 
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        getrandom::getrandom(dest).expect("getrandom failed");
+        getrandom::getrandom(dest).expect("getrandom failed: OS entropy source unavailable");
     }
 }
 
 impl CryptoRng for HpkeRng {}
 
+/// Check whether the OS entropy source is available.
+///
+/// Returns `Ok(())` if `getrandom` succeeds, or an error describing the
+/// failure. Call this before HPKE operations in contexts where entropy may
+/// be unavailable (early boot, sandboxed WASM) to get a recoverable error
+/// instead of a panic from [`HpkeRng`].
+pub fn check_entropy() -> crate::Result<()> {
+    let mut buf = [0u8; 1];
+    getrandom::getrandom(&mut buf)
+        .map_err(|e| crate::CryptoError::KeyGeneration(format!("entropy unavailable: {}", e)))
+}
+
 /// Size of encapsulated key
 pub const ENCAPSULATED_KEY_SIZE: usize = 32;
 
 /// HPKE configuration
+///
+/// # Fixed cipher suite
+///
+/// The HPKE implementation is hardcoded to the RFC 9180 suite
+/// `X25519HkdfSha256 + HkdfSha256 + ChaCha20Poly1305`. The [`HpkeConfig::aead`]
+/// field is **ignored** by `HpkeEncryption` and is retained only for
+/// forward-compatibility and diagnostics. Setting it to anything other than
+/// [`AeadCipher::ChaCha20Poly1305`] does not change behavior.
 #[derive(Clone, Debug, Serialize, SerdeDeserialize)]
 pub struct HpkeConfig {
-    /// The AEAD cipher preference.
+    /// Nominal AEAD cipher — **ignored by the current implementation**.
     ///
-    /// **Note:** This field is currently ignored by the HPKE encryption logic.
-    /// The actual AEAD algorithm is hardcoded to ChaCha20Poly1305 as part of the
-    /// RFC 9180 cipher suite (X25519HkdfSha256 + HkdfSha256 + ChaCha20Poly1305).
-    /// This field is retained for forward compatibility and configuration display.
+    /// The RFC 9180 suite is fixed to ChaCha20Poly1305. This field exists so
+    /// that future cipher-suite negotiation can be wired in without a schema
+    /// break. Use [`AeadCipher::ChaCha20Poly1305`] for any config that is
+    /// serialized and later inspected, to avoid misleading readers.
+    #[deprecated(
+        note = "ignored; the RFC 9180 suite is fixed to ChaCha20Poly1305 — kept for forward-compat only"
+    )]
     pub aead: AeadCipher,
     /// Key derivation context
     pub context: String,
 }
 
 impl Default for HpkeConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
-            aead: AeadCipher::Aes256Gcm,
+            aead: AeadCipher::ChaCha20Poly1305,
             context: "fula-hpke-v1".to_string(),
         }
     }
@@ -261,6 +296,88 @@ impl Encryptor {
     pub fn encrypt_dek(&self, dek: &DekKey) -> Result<EncryptedData> {
         self.encrypt_with_aad(dek.as_bytes(), b"fula:v2:dek-wrap")
     }
+
+    /// Encrypt a DEK, binding additional `context` bytes into the AAD.
+    ///
+    /// The full AAD is `b"fula:v2:dek-wrap|" ++ context`. `context` is expected
+    /// to be a canonical, length-prefixed encoding of the surrounding metadata
+    /// (e.g. share-token fields) so any post-wrap mutation of that metadata
+    /// breaks unwrap authenticity. Callers own domain separation inside
+    /// `context` (e.g. `b"fula:v4:share-token|..."`).
+    pub fn encrypt_dek_with_context(
+        &self,
+        dek: &DekKey,
+        context: &[u8],
+    ) -> Result<EncryptedData> {
+        let mut aad = Vec::with_capacity(b"fula:v2:dek-wrap|".len() + context.len());
+        aad.extend_from_slice(b"fula:v2:dek-wrap|");
+        aad.extend_from_slice(context);
+        self.encrypt_with_aad(dek.as_bytes(), &aad)
+    }
+
+    /// Encrypt for the recipient with HPKE Auth mode, binding the sender's
+    /// long-term X25519 keypair into the HPKE key schedule (RFC 9180 §5 mode
+    /// `auth`). Unlike Base mode, this authenticates that `sender` possessed
+    /// their secret key at encrypt time — an attacker who knows the recipient
+    /// pk (public) cannot forge an Auth-mode ciphertext claiming a given
+    /// sender pk without the matching secret.
+    ///
+    /// `aad` is authenticated but not encrypted. Callers should bind the
+    /// recipient pk (or its hash) into `aad` so captures cannot be replayed
+    /// to a different recipient of the same sender.
+    ///
+    /// Returns `EncryptedData` with `version = 2` (same envelope format as
+    /// Base mode — the Auth binding lives inside the HPKE context, not the
+    /// on-wire header).
+    pub fn encrypt_for_recipient_auth(
+        &self,
+        sender: &KekKeyPair,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<EncryptedData> {
+        let pk_recip = <X25519HkdfSha256 as Kem>::PublicKey::from_bytes(
+            self.recipient_public.as_bytes(),
+        )
+        .map_err(|e| CryptoError::Encryption(format!("Invalid recipient public key: {:?}", e)))?;
+
+        let sk_sender = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(
+            sender.secret_key().as_bytes(),
+        )
+        .map_err(|e| CryptoError::Encryption(format!("Invalid sender secret key: {:?}", e)))?;
+        let pk_sender = <X25519HkdfSha256 as Kem>::PublicKey::from_bytes(
+            sender.public_key().as_bytes(),
+        )
+        .map_err(|e| CryptoError::Encryption(format!("Invalid sender public key: {:?}", e)))?;
+
+        let mut csprng = HpkeRng;
+        let (encapped_key, ciphertext) = hpke::single_shot_seal::<
+            ChaCha20Poly1305,
+            HkdfSha256,
+            X25519HkdfSha256,
+            _,
+        >(
+            &OpModeS::Auth((sk_sender, pk_sender)),
+            &pk_recip,
+            HPKE_INFO,
+            plaintext,
+            aad,
+            &mut csprng,
+        )
+        .map_err(|e| CryptoError::Encryption(format!("HPKE auth encryption failed: {:?}", e)))?;
+
+        let enc_bytes = encapped_key.to_bytes();
+        let mut enc_array = [0u8; 32];
+        enc_array.copy_from_slice(&enc_bytes);
+
+        Ok(EncryptedData {
+            version: 2,
+            encapsulated_key: EncapsulatedKey {
+                ephemeral_public: enc_array,
+            },
+            cipher: AeadCipher::ChaCha20Poly1305,
+            ciphertext,
+        })
+    }
 }
 
 /// Decryptor for RFC 9180 HPKE-based decryption
@@ -303,18 +420,26 @@ impl Decryptor {
 
     /// Decrypt data with custom AAD (must match the AAD used during encryption)
     /// Security audit fix #5: AAD binding verification
+    ///
+    /// Attacker-controllable failure modes (malformed encapsulated key, tag
+    /// mismatch, AAD mismatch) collapse to a single generic error so an
+    /// attacker with a decryption oracle can't distinguish reasons.
     pub fn decrypt_with_aad(&self, encrypted: &EncryptedData, aad: &[u8]) -> Result<Vec<u8>> {
-        // Parse secret key into HPKE format
+        // Parse secret key into HPKE format.
+        // This failure is NOT attacker-controllable — it reflects a corrupted
+        // local keystore, so keep the specific error to aid operators.
         let sk_recip = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(
             self.secret.as_bytes()
         ).map_err(|e| CryptoError::Decryption(format!("Invalid secret key: {:?}", e)))?;
 
-        // Parse encapsulated key
+        // Parse encapsulated key. This IS attacker-controllable (comes from the
+        // ciphertext envelope), so map to the generic failure below.
         let enc_key = <X25519HkdfSha256 as Kem>::EncappedKey::from_bytes(
             encrypted.encapsulated_key.as_bytes()
-        ).map_err(|e| CryptoError::Decryption(format!("Invalid encapsulated key: {:?}", e)))?;
+        ).map_err(|_| CryptoError::Decryption("authentication failed".to_string()))?;
 
-        // Use RFC 9180 single-shot open (Base mode)
+        // Use RFC 9180 single-shot open (Base mode). Tag/AAD failure is also
+        // attacker-controllable and must share the same error string.
         let plaintext = hpke::single_shot_open::<
             ChaCha20Poly1305,
             HkdfSha256,
@@ -326,7 +451,7 @@ impl Decryptor {
             HPKE_INFO,
             &encrypted.ciphertext,
             aad,  // Security audit fix #5: AAD binding verification
-        ).map_err(|e| CryptoError::Decryption(format!("HPKE decryption failed: {:?}", e)))?;
+        ).map_err(|_| CryptoError::Decryption("authentication failed".to_string()))?;
 
         Ok(plaintext)
     }
@@ -337,17 +462,82 @@ impl Decryptor {
         let bytes = Zeroizing::new(self.decrypt_with_aad(encrypted, b"fula:v2:dek-wrap")?);
         DekKey::from_bytes(&bytes)
     }
+
+    /// Decrypt a wrapped DEK whose AAD binds additional `context` bytes.
+    ///
+    /// Mirror of [`Encryptor::encrypt_dek_with_context`]. The AAD is
+    /// `b"fula:v2:dek-wrap|" ++ context` and `context` must byte-for-byte match
+    /// what the producer bound. Any mutation of the caller-bound metadata
+    /// collapses to the generic `authentication failed` error.
+    pub fn decrypt_dek_with_context(
+        &self,
+        encrypted: &EncryptedData,
+        context: &[u8],
+    ) -> Result<DekKey> {
+        let mut aad = Vec::with_capacity(b"fula:v2:dek-wrap|".len() + context.len());
+        aad.extend_from_slice(b"fula:v2:dek-wrap|");
+        aad.extend_from_slice(context);
+        let bytes = Zeroizing::new(self.decrypt_with_aad(encrypted, &aad)?);
+        DekKey::from_bytes(&bytes)
+    }
+
+    /// Decrypt a ciphertext produced by [`Encryptor::encrypt_for_recipient_auth`].
+    ///
+    /// Verifies that the sender possessed the secret key matching
+    /// `sender_public_key` at encrypt time. A mismatch (tampered claim,
+    /// forged ciphertext, or a captured Base-mode envelope replayed with a
+    /// fabricated sender pk) surfaces as a generic `authentication failed`
+    /// error — mode-ID, KEM, and AEAD checks are indistinguishable from the
+    /// caller's perspective.
+    pub fn decrypt_for_recipient_auth(
+        &self,
+        sender_public_key: &PublicKey,
+        encrypted: &EncryptedData,
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
+        let sk_recip = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(
+            self.secret.as_bytes(),
+        )
+        .map_err(|e| CryptoError::Decryption(format!("Invalid secret key: {:?}", e)))?;
+
+        let pk_sender = <X25519HkdfSha256 as Kem>::PublicKey::from_bytes(
+            sender_public_key.as_bytes(),
+        )
+        .map_err(|_| CryptoError::Decryption("authentication failed".to_string()))?;
+
+        let enc_key = <X25519HkdfSha256 as Kem>::EncappedKey::from_bytes(
+            encrypted.encapsulated_key.as_bytes(),
+        )
+        .map_err(|_| CryptoError::Decryption("authentication failed".to_string()))?;
+
+        let plaintext = hpke::single_shot_open::<
+            ChaCha20Poly1305,
+            HkdfSha256,
+            X25519HkdfSha256,
+        >(
+            &OpModeR::Auth(pk_sender),
+            &sk_recip,
+            &enc_key,
+            HPKE_INFO,
+            &encrypted.ciphertext,
+            aad,
+        )
+        .map_err(|_| CryptoError::Decryption("authentication failed".to_string()))?;
+
+        Ok(plaintext)
+    }
 }
 
-/// Encrypt data for multiple recipients
-pub fn encrypt_for_multiple(
-    _plaintext: &[u8],
+/// Generate a random DEK and wrap it for multiple recipients.
+///
+/// Returns the plaintext DEK (for content encryption) and one HPKE-wrapped
+/// copy per recipient. Each recipient can unwrap the DEK independently using
+/// their own secret key.
+pub fn wrap_dek_for_multiple(
     recipients: &[PublicKey],
 ) -> Result<(DekKey, Vec<EncryptedData>)> {
-    // Generate a random DEK
     let dek = DekKey::generate();
 
-    // Encrypt the DEK for each recipient
     let mut wrapped_keys = Vec::with_capacity(recipients.len());
     for recipient in recipients {
         let encryptor = Encryptor::new(recipient);
@@ -356,6 +546,15 @@ pub fn encrypt_for_multiple(
     }
 
     Ok((dek, wrapped_keys))
+}
+
+/// Deprecated alias for [`wrap_dek_for_multiple`].
+#[deprecated(since = "0.6.0", note = "renamed to wrap_dek_for_multiple; the _plaintext parameter was unused")]
+pub fn encrypt_for_multiple(
+    _plaintext: &[u8],
+    recipients: &[PublicKey],
+) -> Result<(DekKey, Vec<EncryptedData>)> {
+    wrap_dek_for_multiple(recipients)
 }
 
 /// Create a time-limited sharing link
@@ -451,12 +650,11 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_for_multiple() {
+    fn test_wrap_dek_for_multiple() {
         let recipients: Vec<_> = (0..3).map(|_| KekKeyPair::generate()).collect();
         let public_keys: Vec<_> = recipients.iter().map(|kp| kp.public_key().clone()).collect();
-        let plaintext = b"shared secret";
 
-        let (dek, wrapped_keys) = encrypt_for_multiple(plaintext, &public_keys).unwrap();
+        let (dek, wrapped_keys) = wrap_dek_for_multiple(&public_keys).unwrap();
 
         // Each recipient should be able to decrypt their wrapped key
         for (i, wrapped) in wrapped_keys.iter().enumerate() {

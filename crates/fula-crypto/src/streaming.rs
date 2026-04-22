@@ -48,6 +48,24 @@ impl BaoOutboard {
         self.content_length
     }
 
+    /// Get the number of leaf (block) hashes stored in the outboard
+    pub fn num_leaves(&self) -> usize {
+        self.data.len() / 32
+    }
+
+    /// Get the hash of a specific block by index
+    ///
+    /// Returns `None` if the index is out of range.
+    pub fn leaf_hash(&self, index: usize) -> Option<Blake3Hash> {
+        let offset = index * 32;
+        if offset + 32 > self.data.len() {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&self.data[offset..offset + 32]);
+        Some(Blake3Hash::new(bytes))
+    }
+
     /// Serialize to bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut result = Vec::with_capacity(8 + 32 + self.data.len());
@@ -151,19 +169,81 @@ impl BaoDecoder {
 
     /// Track a chunk of data at the given offset for deferred full-file verification.
     ///
-    /// **Important:** This method does NOT verify the chunk against the Merkle tree.
-    /// The current implementation uses a simplified linear hash list rather than a
-    /// full binary Merkle tree. Only [`verify_all()`](Self::verify_all) performs actual
-    /// integrity verification (by comparing the full-file BLAKE3 hash against the
-    /// expected root hash). This method simply tracks the byte count for progress.
+    /// **Deprecated:** Use [`verify_chunk()`](Self::verify_chunk) instead, which
+    /// actually verifies each block against the stored leaf hashes. This method
+    /// only tracks the byte count for progress without performing any verification.
+    #[deprecated(since = "0.6.0", note = "use verify_chunk() which performs actual per-block verification")]
     pub fn track_chunk(&mut self, offset: u64, data: &[u8]) -> Result<()> {
         let _chunk_index = (offset / BAO_BLOCK_SIZE as u64) as usize;
-
-        // Compute chunk hash for future Merkle verification (not yet implemented)
         let _chunk_hash: Blake3Hash = blake3::hash(data).into();
+        self.verified_bytes += data.len() as u64;
+        Ok(())
+    }
+
+    /// Verify a chunk of data at the given byte offset against stored block hashes.
+    ///
+    /// Verifies all complete BAO blocks (1 KiB each) covered by the data range.
+    /// Each block's BLAKE3 hash is compared against the leaf hash stored in the outboard.
+    /// The outboard is authenticated via AES-GCM (stored as encrypted metadata),
+    /// so the leaf hashes are trustworthy.
+    ///
+    /// Returns an error if any block's hash does not match.
+    pub fn verify_chunk(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let block_size = BAO_BLOCK_SIZE as u64;
+        let start_block = (offset / block_size) as usize;
+        let start_offset_in_block = (offset % block_size) as usize;
+        let num_leaves = self.outboard.num_leaves();
+
+        let mut data_offset = 0usize;
+        let mut block_index = start_block;
+
+        // If we start mid-block, skip to the next full block
+        if start_offset_in_block > 0 {
+            let skip = (BAO_BLOCK_SIZE - start_offset_in_block).min(data.len());
+            data_offset += skip;
+            block_index += 1;
+        }
+
+        // Verify each complete block
+        while data_offset + BAO_BLOCK_SIZE <= data.len() && block_index < num_leaves {
+            let block_data = &data[data_offset..data_offset + BAO_BLOCK_SIZE];
+            let computed: Blake3Hash = blake3::hash(block_data).into();
+
+            if let Some(expected) = self.outboard.leaf_hash(block_index) {
+                if computed != expected {
+                    return Err(CryptoError::BaoVerification(format!(
+                        "block {} hash mismatch at offset {}",
+                        block_index,
+                        offset + data_offset as u64
+                    )));
+                }
+            }
+
+            data_offset += BAO_BLOCK_SIZE;
+            block_index += 1;
+        }
+
+        // Verify the final partial block (only valid for the last block of the file)
+        if data_offset < data.len() && block_index < num_leaves {
+            let is_last_block = block_index == num_leaves - 1;
+            if is_last_block {
+                let block_data = &data[data_offset..];
+                let computed: Blake3Hash = blake3::hash(block_data).into();
+                if let Some(expected) = self.outboard.leaf_hash(block_index) {
+                    if computed != expected {
+                        return Err(CryptoError::BaoVerification(format!(
+                            "final block {} hash mismatch", block_index
+                        )));
+                    }
+                }
+            }
+        }
 
         self.verified_bytes += data.len() as u64;
-
         Ok(())
     }
 
@@ -205,16 +285,19 @@ impl<R: Read> VerifiedStream<R> {
     }
 
     /// Read and verify a chunk
+    ///
+    /// Reads from the underlying reader and verifies each BAO block against
+    /// the stored leaf hashes. Returns `None` at end of stream.
     pub fn read_verified(&mut self) -> Result<Option<Vec<u8>>> {
         let bytes_read = self.reader.read(&mut self.buffer)?;
         if bytes_read == 0 {
             return Ok(None);
         }
-        
+
         let chunk = self.buffer[..bytes_read].to_vec();
-        self.decoder.track_chunk(self.position, &chunk)?;
+        self.decoder.verify_chunk(self.position, &chunk)?;
         self.position += bytes_read as u64;
-        
+
         Ok(Some(chunk))
     }
 
@@ -329,15 +412,101 @@ mod tests {
     fn test_verified_stream() {
         let data = b"Test data for verified streaming";
         let outboard = encode(data);
-        
+
         let reader = std::io::Cursor::new(data.to_vec());
         let mut stream = VerifiedStream::new(reader, outboard);
-        
+
         let mut collected = Vec::new();
         while let Some(chunk) = stream.read_verified().unwrap() {
             collected.extend(chunk);
         }
-        
+
         assert_eq!(data.as_slice(), collected.as_slice());
+    }
+
+    #[test]
+    fn test_verify_chunk_single_block() {
+        // Data smaller than BAO_BLOCK_SIZE (1 KiB)
+        let data = b"Hello, Bao verification!";
+        let outboard = encode(data);
+
+        let mut decoder = BaoDecoder::new(outboard);
+        // Single block = last block, verified via the final-block path
+        decoder.verify_chunk(0, data).unwrap();
+    }
+
+    #[test]
+    fn test_verify_chunk_multiple_blocks() {
+        // Data spanning multiple BAO blocks (each 1 KiB)
+        let data: Vec<u8> = (0..3 * BAO_BLOCK_SIZE).map(|i| (i % 256) as u8).collect();
+        let outboard = encode(&data);
+
+        let mut decoder = BaoDecoder::new(outboard);
+
+        // Verify each block individually
+        for i in 0..3 {
+            let offset = i * BAO_BLOCK_SIZE;
+            let block = &data[offset..offset + BAO_BLOCK_SIZE];
+            decoder.verify_chunk(offset as u64, block).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_verify_chunk_detects_corruption() {
+        let data: Vec<u8> = (0..2 * BAO_BLOCK_SIZE).map(|i| (i % 256) as u8).collect();
+        let outboard = encode(&data);
+
+        let mut decoder = BaoDecoder::new(outboard);
+
+        // Corrupt the first byte
+        let mut corrupted = data[..BAO_BLOCK_SIZE].to_vec();
+        corrupted[0] ^= 0xFF;
+        let result = decoder.verify_chunk(0, &corrupted);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_chunk_large_contiguous_range() {
+        // Verify a multi-block range in a single call
+        let data: Vec<u8> = (0..4 * BAO_BLOCK_SIZE).map(|i| (i % 256) as u8).collect();
+        let outboard = encode(&data);
+
+        let mut decoder = BaoDecoder::new(outboard);
+        // Pass the entire data — should verify all 4 blocks
+        decoder.verify_chunk(0, &data).unwrap();
+    }
+
+    #[test]
+    fn test_verify_chunk_with_trailing_partial_block() {
+        // Data that doesn't evenly divide into BAO blocks
+        let size = 2 * BAO_BLOCK_SIZE + 500;
+        let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+        let outboard = encode(&data);
+
+        let mut decoder = BaoDecoder::new(outboard.clone());
+        // Verify all at once — 2 full blocks + 1 partial (last block)
+        decoder.verify_chunk(0, &data).unwrap();
+
+        // Verify corruption in the partial final block is detected
+        let mut corrupted = data.clone();
+        corrupted[2 * BAO_BLOCK_SIZE + 10] ^= 0xFF;
+        let mut decoder2 = BaoDecoder::new(outboard);
+        let result = decoder2.verify_chunk(0, &corrupted);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_outboard_leaf_hash_access() {
+        let data: Vec<u8> = (0..3 * BAO_BLOCK_SIZE).map(|i| (i % 256) as u8).collect();
+        let outboard = encode(&data);
+
+        assert_eq!(outboard.num_leaves(), 3);
+        // Each leaf hash should match BLAKE3 of its block
+        for i in 0..3 {
+            let block = &data[i * BAO_BLOCK_SIZE..(i + 1) * BAO_BLOCK_SIZE];
+            let expected: Blake3Hash = blake3::hash(block).into();
+            assert_eq!(outboard.leaf_hash(i).unwrap(), expected);
+        }
+        assert!(outboard.leaf_hash(3).is_none());
     }
 }

@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueNom,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.11.1";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1984564384;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1451949050;
 
 // Section: executor
 
@@ -830,6 +830,57 @@ fn wire__crate__api__client__delete_object_impl(
         },
     )
 }
+fn wire__crate__api__encrypted__derive_key_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    context: impl CstDecode<String>,
+    input: impl CstDecode<Vec<u8>>,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::DcoCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "derive_key",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_context = context.cst_decode();
+            let api_input = input.cst_decode();
+            move |context| {
+                transform_result_dco::<_, _, ()>((move || {
+                    let output_ok = Result::<_, ()>::Ok(crate::api::encrypted::derive_key(
+                        api_context,
+                        api_input,
+                    ))?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__encrypted__derive_public_key_from_secret_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    secret_key_bytes: impl CstDecode<Vec<u8>>,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::DcoCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "derive_public_key_from_secret",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_secret_key_bytes = secret_key_bytes.cst_decode();
+            move |context| {
+                transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok = crate::api::encrypted::derive_public_key_from_secret(
+                            api_secret_key_bytes,
+                        )?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__encrypted__enc_create_bucket_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     client: impl CstDecode<
@@ -1384,6 +1435,119 @@ fn wire__crate__api__encrypted__get_decrypted_impl(
                             api_key,
                         )
                         .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__encrypted__get_decrypted_buffered_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    client: impl CstDecode<
+        RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EncryptedClientHandle>,
+        >,
+    >,
+    bucket: impl CstDecode<String>,
+    key: impl CstDecode<String>,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "get_decrypted_buffered",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_client = client.cst_decode();
+            let api_bucket = bucket.cst_decode();
+            let api_key = key.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let mut api_client_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_client,
+                                    0,
+                                    false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_client_guard =
+                                        Some(api_client.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_client_guard = api_client_guard.unwrap();
+                        let output_ok = crate::api::encrypted::get_decrypted_buffered(
+                            &*api_client_guard,
+                            api_bucket,
+                            api_key,
+                        )
+                        .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__encrypted__get_decrypted_buffered_by_storage_key_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    client: impl CstDecode<
+        RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EncryptedClientHandle>,
+        >,
+    >,
+    bucket: impl CstDecode<String>,
+    storage_key: impl CstDecode<String>,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "get_decrypted_buffered_by_storage_key",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_client = client.cst_decode();
+            let api_bucket = bucket.cst_decode();
+            let api_storage_key = storage_key.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let mut api_client_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_client,
+                                    0,
+                                    false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_client_guard =
+                                        Some(api_client.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_client_guard = api_client_guard.unwrap();
+                        let output_ok =
+                            crate::api::encrypted::get_decrypted_buffered_by_storage_key(
+                                &*api_client_guard,
+                                api_bucket,
+                                api_storage_key,
+                            )
+                            .await?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -1980,6 +2144,7 @@ fn wire__crate__api__sharing__get_with_share_impl(
     >,
     bucket: impl CstDecode<String>,
     storage_key: impl CstDecode<String>,
+    original_key: impl CstDecode<String>,
     share: impl CstDecode<
         RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<AcceptedShareHandle>>,
     >,
@@ -1994,6 +2159,7 @@ fn wire__crate__api__sharing__get_with_share_impl(
             let api_client = client.cst_decode();
             let api_bucket = bucket.cst_decode();
             let api_storage_key = storage_key.cst_decode();
+            let api_original_key = original_key.cst_decode();
             let api_share = share.cst_decode();
             move |context| async move {
                 transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
@@ -2032,6 +2198,7 @@ fn wire__crate__api__sharing__get_with_share_impl(
                             &*api_client_guard,
                             api_bucket,
                             api_storage_key,
+                            api_original_key,
                             &*api_share_guard,
                         )
                         .await?;
@@ -2052,6 +2219,7 @@ fn wire__crate__api__sharing__get_with_token_impl(
     >,
     bucket: impl CstDecode<String>,
     storage_key: impl CstDecode<String>,
+    original_key: impl CstDecode<String>,
     token_json: impl CstDecode<String>,
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
@@ -2064,6 +2232,7 @@ fn wire__crate__api__sharing__get_with_token_impl(
             let api_client = client.cst_decode();
             let api_bucket = bucket.cst_decode();
             let api_storage_key = storage_key.cst_decode();
+            let api_original_key = original_key.cst_decode();
             let api_token_json = token_json.cst_decode();
             move |context| async move {
                 transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
@@ -2091,6 +2260,7 @@ fn wire__crate__api__sharing__get_with_token_impl(
                             &*api_client_guard,
                             api_bucket,
                             api_storage_key,
+                            api_original_key,
                             api_token_json,
                         )
                         .await?;
@@ -3669,6 +3839,26 @@ fn wire__crate__api__types__upload_progress_new_impl(
         },
     )
 }
+fn wire__crate__api__metrics__wal_append_failure_count_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::DcoCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "wal_append_failure_count",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            move |context| {
+                transform_result_dco::<_, _, ()>((move || {
+                    let output_ok =
+                        Result::<_, ()>::Ok(crate::api::metrics::wal_append_failure_count())?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 
 // Section: dart2rust
 
@@ -4002,11 +4192,15 @@ impl SseDecode for crate::api::types::FulaConfig {
         let mut var_accessToken = <Option<String>>::sse_decode(deserializer);
         let mut var_timeoutSeconds = <u64>::sse_decode(deserializer);
         let mut var_maxRetries = <u32>::sse_decode(deserializer);
+        let mut var_perChunkDownloadTimeoutSeconds = <u64>::sse_decode(deserializer);
+        let mut var_bufferedDownloadMaxBytes = <u64>::sse_decode(deserializer);
         return crate::api::types::FulaConfig {
             endpoint: var_endpoint,
             access_token: var_accessToken,
             timeout_seconds: var_timeoutSeconds,
             max_retries: var_maxRetries,
+            per_chunk_download_timeout_seconds: var_perChunkDownloadTimeoutSeconds,
+            buffered_download_max_bytes: var_bufferedDownloadMaxBytes,
         };
     }
 }
@@ -4795,6 +4989,12 @@ impl flutter_rust_bridge::IntoDart for crate::api::types::FulaConfig {
             self.access_token.into_into_dart().into_dart(),
             self.timeout_seconds.into_into_dart().into_dart(),
             self.max_retries.into_into_dart().into_dart(),
+            self.per_chunk_download_timeout_seconds
+                .into_into_dart()
+                .into_dart(),
+            self.buffered_download_max_bytes
+                .into_into_dart()
+                .into_dart(),
         ]
         .into_dart()
     }
@@ -5413,6 +5613,8 @@ impl SseEncode for crate::api::types::FulaConfig {
         <Option<String>>::sse_encode(self.access_token, serializer);
         <u64>::sse_encode(self.timeout_seconds, serializer);
         <u32>::sse_encode(self.max_retries, serializer);
+        <u64>::sse_encode(self.per_chunk_download_timeout_seconds, serializer);
+        <u64>::sse_encode(self.buffered_download_max_bytes, serializer);
     }
 }
 
@@ -6139,6 +6341,10 @@ mod io {
                 access_token: self.access_token.cst_decode(),
                 timeout_seconds: self.timeout_seconds.cst_decode(),
                 max_retries: self.max_retries.cst_decode(),
+                per_chunk_download_timeout_seconds: self
+                    .per_chunk_download_timeout_seconds
+                    .cst_decode(),
+                buffered_download_max_bytes: self.buffered_download_max_bytes.cst_decode(),
             }
         }
     }
@@ -6557,6 +6763,8 @@ mod io {
                 access_token: core::ptr::null_mut(),
                 timeout_seconds: Default::default(),
                 max_retries: Default::default(),
+                per_chunk_download_timeout_seconds: Default::default(),
+                buffered_download_max_bytes: Default::default(),
             }
         }
     }
@@ -6954,6 +7162,23 @@ mod io {
     }
 
     #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__encrypted__derive_key(
+        port_: i64,
+        context: *mut wire_cst_list_prim_u_8_strict,
+        input: *mut wire_cst_list_prim_u_8_loose,
+    ) {
+        wire__crate__api__encrypted__derive_key_impl(port_, context, input)
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__encrypted__derive_public_key_from_secret(
+        port_: i64,
+        secret_key_bytes: *mut wire_cst_list_prim_u_8_loose,
+    ) {
+        wire__crate__api__encrypted__derive_public_key_from_secret_impl(port_, secret_key_bytes)
+    }
+
+    #[unsafe(no_mangle)]
     pub extern "C" fn frbgen_fula_client_wire__crate__api__encrypted__enc_create_bucket(
         port_: i64,
         client: usize,
@@ -7074,6 +7299,31 @@ mod io {
         key: *mut wire_cst_list_prim_u_8_strict,
     ) {
         wire__crate__api__encrypted__get_decrypted_impl(port_, client, bucket, key)
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__encrypted__get_decrypted_buffered(
+        port_: i64,
+        client: usize,
+        bucket: *mut wire_cst_list_prim_u_8_strict,
+        key: *mut wire_cst_list_prim_u_8_strict,
+    ) {
+        wire__crate__api__encrypted__get_decrypted_buffered_impl(port_, client, bucket, key)
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__encrypted__get_decrypted_buffered_by_storage_key(
+        port_: i64,
+        client: usize,
+        bucket: *mut wire_cst_list_prim_u_8_strict,
+        storage_key: *mut wire_cst_list_prim_u_8_strict,
+    ) {
+        wire__crate__api__encrypted__get_decrypted_buffered_by_storage_key_impl(
+            port_,
+            client,
+            bucket,
+            storage_key,
+        )
     }
 
     #[unsafe(no_mangle)]
@@ -7198,9 +7448,17 @@ mod io {
         client: usize,
         bucket: *mut wire_cst_list_prim_u_8_strict,
         storage_key: *mut wire_cst_list_prim_u_8_strict,
+        original_key: *mut wire_cst_list_prim_u_8_strict,
         share: usize,
     ) {
-        wire__crate__api__sharing__get_with_share_impl(port_, client, bucket, storage_key, share)
+        wire__crate__api__sharing__get_with_share_impl(
+            port_,
+            client,
+            bucket,
+            storage_key,
+            original_key,
+            share,
+        )
     }
 
     #[unsafe(no_mangle)]
@@ -7209,6 +7467,7 @@ mod io {
         client: usize,
         bucket: *mut wire_cst_list_prim_u_8_strict,
         storage_key: *mut wire_cst_list_prim_u_8_strict,
+        original_key: *mut wire_cst_list_prim_u_8_strict,
         token_json: *mut wire_cst_list_prim_u_8_strict,
     ) {
         wire__crate__api__sharing__get_with_token_impl(
@@ -7216,6 +7475,7 @@ mod io {
             client,
             bucket,
             storage_key,
+            original_key,
             token_json,
         )
     }
@@ -7551,6 +7811,13 @@ mod io {
             current_part,
             total_parts,
         )
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__metrics__wal_append_failure_count(
+        port_: i64,
+    ) {
+        wire__crate__api__metrics__wal_append_failure_count_impl(port_)
     }
 
     #[unsafe(no_mangle)]
@@ -7894,6 +8161,8 @@ mod io {
         access_token: *mut wire_cst_list_prim_u_8_strict,
         timeout_seconds: u64,
         max_retries: u32,
+        per_chunk_download_timeout_seconds: u64,
+        buffered_download_max_bytes: u64,
     }
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -8365,8 +8634,8 @@ mod web {
                 .unwrap();
             assert_eq!(
                 self_.length(),
-                4,
-                "Expected 4 elements, got {}",
+                6,
+                "Expected 6 elements, got {}",
                 self_.length()
             );
             crate::api::types::FulaConfig {
@@ -8374,6 +8643,8 @@ mod web {
                 access_token: self_.get(1).cst_decode(),
                 timeout_seconds: self_.get(2).cst_decode(),
                 max_retries: self_.get(3).cst_decode(),
+                per_chunk_download_timeout_seconds: self_.get(4).cst_decode(),
+                buffered_download_max_bytes: self_.get(5).cst_decode(),
             }
         }
     }
@@ -9218,6 +9489,23 @@ mod web {
     }
 
     #[wasm_bindgen]
+    pub fn wire__crate__api__encrypted__derive_key(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        context: String,
+        input: Box<[u8]>,
+    ) {
+        wire__crate__api__encrypted__derive_key_impl(port_, context, input)
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__encrypted__derive_public_key_from_secret(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        secret_key_bytes: Box<[u8]>,
+    ) {
+        wire__crate__api__encrypted__derive_public_key_from_secret_impl(port_, secret_key_bytes)
+    }
+
+    #[wasm_bindgen]
     pub fn wire__crate__api__encrypted__enc_create_bucket(
         port_: flutter_rust_bridge::for_generated::MessagePort,
         client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
@@ -9343,6 +9631,31 @@ mod web {
     }
 
     #[wasm_bindgen]
+    pub fn wire__crate__api__encrypted__get_decrypted_buffered(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        bucket: String,
+        key: String,
+    ) {
+        wire__crate__api__encrypted__get_decrypted_buffered_impl(port_, client, bucket, key)
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__encrypted__get_decrypted_buffered_by_storage_key(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        bucket: String,
+        storage_key: String,
+    ) {
+        wire__crate__api__encrypted__get_decrypted_buffered_by_storage_key_impl(
+            port_,
+            client,
+            bucket,
+            storage_key,
+        )
+    }
+
+    #[wasm_bindgen]
     pub fn wire__crate__api__encrypted__get_decrypted_by_storage_key(
         port_: flutter_rust_bridge::for_generated::MessagePort,
         client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
@@ -9464,9 +9777,17 @@ mod web {
         client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
         bucket: String,
         storage_key: String,
+        original_key: String,
         share: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
     ) {
-        wire__crate__api__sharing__get_with_share_impl(port_, client, bucket, storage_key, share)
+        wire__crate__api__sharing__get_with_share_impl(
+            port_,
+            client,
+            bucket,
+            storage_key,
+            original_key,
+            share,
+        )
     }
 
     #[wasm_bindgen]
@@ -9475,6 +9796,7 @@ mod web {
         client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
         bucket: String,
         storage_key: String,
+        original_key: String,
         token_json: String,
     ) {
         wire__crate__api__sharing__get_with_token_impl(
@@ -9482,6 +9804,7 @@ mod web {
             client,
             bucket,
             storage_key,
+            original_key,
             token_json,
         )
     }
@@ -9819,6 +10142,13 @@ mod web {
             current_part,
             total_parts,
         )
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__metrics__wal_append_failure_count(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+    ) {
+        wire__crate__api__metrics__wal_append_failure_count_impl(port_)
     }
 
     #[wasm_bindgen]

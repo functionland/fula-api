@@ -13,6 +13,27 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::instrument;
 
+/// Outcome classification for a single pinning-service attempt. `Transient`
+/// errors (429, 5xx, network) are retried; `Permanent` (4xx other than 429,
+/// deserialisation) bubble up immediately. (R1.)
+enum PinAttempt {
+    Transient(BlockStoreError),
+    Permanent(BlockStoreError),
+}
+
+/// Exponential backoff with a 5s cap, starting at 200ms.
+///
+/// attempt=0 → 200ms, 1 → 400, 2 → 800, 3 → 1600, 4+ → 3200/5000 cap.
+fn backoff_delay(attempt: usize) -> Duration {
+    let base_ms: u64 = 200;
+    let cap_ms: u64 = 5000;
+    let shift = attempt.min(5) as u32;
+    let ms = base_ms
+        .saturating_mul(1u64 << shift)
+        .min(cap_ms);
+    Duration::from_millis(ms)
+}
+
 /// Configuration for IPFS Pinning Service
 #[derive(Clone, Debug)]
 pub struct PinningServiceConfig {
@@ -205,33 +226,66 @@ impl PinningServiceClient {
         format!("Bearer {}", self.config.access_token)
     }
 
-    /// Add a new pin
+    /// Add a new pin.
+    ///
+    /// Retries transient failures (429, 5xx, and network errors) with
+    /// exponential backoff up to `config.max_retries` attempts. Permanent
+    /// errors (4xx other than 429) fail fast. (R1.)
     #[instrument(skip(self, pin), fields(cid = %pin.cid))]
     pub async fn add_pin(&self, pin: Pin) -> Result<PinStatusResponse> {
         let url = format!("{}/pins", self.config.endpoint);
+        let max_attempts = self.config.max_retries.max(1) as usize;
 
+        let mut last_err: Option<BlockStoreError> = None;
+        for attempt in 0..max_attempts {
+            match self.try_add_pin(&url, &pin).await {
+                Ok(resp) => return Ok(resp),
+                Err(PinAttempt::Permanent(e)) => return Err(e),
+                Err(PinAttempt::Transient(e)) => {
+                    last_err = Some(e);
+                    if attempt + 1 < max_attempts {
+                        let delay = backoff_delay(attempt);
+                        tracing::warn!(
+                            cid = %pin.cid,
+                            attempt = attempt + 1,
+                            max_attempts,
+                            delay_ms = delay.as_millis() as u64,
+                            "add_pin transient error, backing off"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.expect("retry loop entered at least once"))
+    }
+
+    async fn try_add_pin(&self, url: &str, pin: &Pin) -> std::result::Result<PinStatusResponse, PinAttempt> {
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .header("Authorization", self.auth_header())
             .header("Content-Type", "application/json")
-            .json(&pin)
+            .json(pin)
             .send()
-            .await?;
+            .await
+            .map_err(|e| PinAttempt::Transient(BlockStoreError::Connection(e.to_string())))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error = response.text().await.unwrap_or_default();
-            return Err(BlockStoreError::PinFailed(format!(
-                "Failed to add pin ({}): {}",
-                status, error
-            )));
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json()
+                .await
+                .map_err(|e| PinAttempt::Permanent(BlockStoreError::Deserialization(e.to_string())));
         }
 
-        response
-            .json()
-            .await
-            .map_err(|e| BlockStoreError::Deserialization(e.to_string()))
+        let body = response.text().await.unwrap_or_default();
+        let err = BlockStoreError::PinFailed(format!("Failed to add pin ({}): {}", status, body));
+        if status.as_u16() == 429 || status.is_server_error() {
+            Err(PinAttempt::Transient(err))
+        } else {
+            Err(PinAttempt::Permanent(err))
+        }
     }
 
     /// Get pin status by request ID
@@ -478,5 +532,88 @@ mod tests {
 
         let deserialized: PinningStatus = serde_json::from_str("\"queued\"").unwrap();
         assert_eq!(deserialized, PinningStatus::Queued);
+    }
+
+    #[test]
+    fn backoff_delay_grows_and_caps() {
+        assert_eq!(backoff_delay(0), Duration::from_millis(200));
+        assert_eq!(backoff_delay(1), Duration::from_millis(400));
+        assert_eq!(backoff_delay(2), Duration::from_millis(800));
+        assert_eq!(backoff_delay(3), Duration::from_millis(1600));
+        assert_eq!(backoff_delay(4), Duration::from_millis(3200));
+        assert_eq!(backoff_delay(5), Duration::from_millis(5000));
+        // caps
+        assert_eq!(backoff_delay(10), Duration::from_millis(5000));
+        assert_eq!(backoff_delay(100), Duration::from_millis(5000));
+    }
+
+    // R1 regression: add_pin must retry transient 5xx responses up to
+    // `max_retries` attempts and succeed once the server returns 2xx.
+    #[tokio::test]
+    async fn add_pin_retries_transient_5xx_and_succeeds() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // First two calls: 503 (transient). Third: 200 with a valid pin status.
+        Mock::given(method("POST"))
+            .and(path("/pins"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/pins"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "requestid": "req-xyz",
+                "status": "queued",
+                "created": "2026-04-20T00:00:00Z",
+                "pin": { "cid": "QmTest" },
+                "delegates": []
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = PinningServiceConfig::new(server.uri(), "token");
+        config.max_retries = 3;
+        let client = PinningServiceClient::new(config).unwrap();
+
+        let resp = client.add_pin(Pin::new("QmTest")).await.expect("should succeed after retry");
+        assert_eq!(resp.request_id, "req-xyz");
+    }
+
+    // R1 regression: permanent 4xx (e.g. 400 bad request) must NOT retry.
+    #[tokio::test]
+    async fn add_pin_does_not_retry_permanent_4xx() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // All calls return 400 (permanent).
+        Mock::given(method("POST"))
+            .and(path("/pins"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad cid"))
+            .mount(&server)
+            .await;
+
+        let mut config = PinningServiceConfig::new(server.uri(), "token");
+        config.max_retries = 5;
+        let client = PinningServiceClient::new(config).unwrap();
+
+        let start = std::time::Instant::now();
+        let err = client.add_pin(Pin::new("QmTest")).await.expect_err("should fail");
+        // A single attempt — no backoff sleep — should finish fast.
+        assert!(start.elapsed() < Duration::from_millis(300),
+            "permanent error retried (took {:?})", start.elapsed());
+        assert!(matches!(err, BlockStoreError::PinFailed(_)));
+        // Probe the recorded requests count as a final check the retry didn't happen.
+        let attempts_made = server.received_requests().await.unwrap().len();
+        let _ = AtomicUsize::new(0); // silence unused-import on platforms where Ordering isn't used elsewhere
+        let _ = Ordering::SeqCst;
+        assert_eq!(attempts_made, 1, "permanent 4xx must not retry");
     }
 }

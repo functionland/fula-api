@@ -8,91 +8,152 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'types.dart';
 
 /// Upload an encrypted object
-Future<PutResult> putEncrypted(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String key,
-        required List<int> data}) =>
-    RustLib.instance.api.crateApiEncryptedPutEncrypted(
-        client: client, bucket: bucket, key: key, data: data);
+Future<PutResult> putEncrypted({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String key,
+  required List<int> data,
+}) => RustLib.instance.api.crateApiEncryptedPutEncrypted(
+  client: client,
+  bucket: bucket,
+  key: key,
+  data: data,
+);
 
 /// Upload an encrypted object with specific content type
-Future<PutResult> putEncryptedWithType(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String key,
-        required List<int> data,
-        required String contentType}) =>
-    RustLib.instance.api.crateApiEncryptedPutEncryptedWithType(
-        client: client,
-        bucket: bucket,
-        key: key,
-        data: data,
-        contentType: contentType);
+Future<PutResult> putEncryptedWithType({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String key,
+  required List<int> data,
+  required String contentType,
+}) => RustLib.instance.api.crateApiEncryptedPutEncryptedWithType(
+  client: client,
+  bucket: bucket,
+  key: key,
+  data: data,
+  contentType: contentType,
+);
 
 /// Download and decrypt an object by original key
-Future<Uint8List> getDecrypted(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String key}) =>
-    RustLib.instance.api.crateApiEncryptedGetDecrypted(
-        client: client, bucket: bucket, key: key);
+Future<Uint8List> getDecrypted({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String key,
+}) => RustLib.instance.api.crateApiEncryptedGetDecrypted(
+  client: client,
+  bucket: bucket,
+  key: key,
+);
 
 /// Download and decrypt an object by storage key
-Future<Uint8List> getDecryptedByStorageKey(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String storageKey}) =>
-    RustLib.instance.api.crateApiEncryptedGetDecryptedByStorageKey(
-        client: client, bucket: bucket, storageKey: storageKey);
+Future<Uint8List> getDecryptedByStorageKey({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String storageKey,
+}) => RustLib.instance.api.crateApiEncryptedGetDecryptedByStorageKey(
+  client: client,
+  bucket: bucket,
+  storageKey: storageKey,
+);
+
+/// F8: Buffered, root-hash-verified download by original key.
+///
+/// Holds the full plaintext in RAM and only returns after the BAO root-hash
+/// check passes, closing the mid-stream truncation / chunk-reorder window
+/// that the streaming variant accepts. Rejects files larger than
+/// `FulaConfig::buffered_download_max_bytes` before any network I/O.
+///
+/// Prefer this over `get_decrypted` for disaster-recovery consumers that
+/// must not observe any plaintext until the whole file has been verified.
+Future<Uint8List> getDecryptedBuffered({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String key,
+}) => RustLib.instance.api.crateApiEncryptedGetDecryptedBuffered(
+  client: client,
+  bucket: bucket,
+  key: key,
+);
+
+/// F8: Buffered, root-hash-verified download by storage key.
+///
+/// See `get_decrypted_buffered` for semantics.
+Future<Uint8List> getDecryptedBufferedByStorageKey({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String storageKey,
+}) => RustLib.instance.api.crateApiEncryptedGetDecryptedBufferedByStorageKey(
+  client: client,
+  bucket: bucket,
+  storageKey: storageKey,
+);
 
 /// Download and decrypt with full metadata
-Future<DecryptedObjectInfo> getWithPrivateMetadata(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String storageKey}) =>
-    RustLib.instance.api.crateApiEncryptedGetWithPrivateMetadata(
-        client: client, bucket: bucket, storageKey: storageKey);
+Future<DecryptedObjectInfo> getWithPrivateMetadata({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String storageKey,
+}) => RustLib.instance.api.crateApiEncryptedGetWithPrivateMetadata(
+  client: client,
+  bucket: bucket,
+  storageKey: storageKey,
+);
 
 /// Delete an encrypted object by original key
-Future<void> deleteEncrypted(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String key}) =>
-    RustLib.instance.api.crateApiEncryptedDeleteEncrypted(
-        client: client, bucket: bucket, key: key);
+Future<void> deleteEncrypted({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String key,
+}) => RustLib.instance.api.crateApiEncryptedDeleteEncrypted(
+  client: client,
+  bucket: bucket,
+  key: key,
+);
 
 /// Delete an encrypted object by storage key
-Future<void> deleteByStorageKey(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String storageKey}) =>
-    RustLib.instance.api.crateApiEncryptedDeleteByStorageKey(
-        client: client, bucket: bucket, storageKey: storageKey);
+Future<void> deleteByStorageKey({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String storageKey,
+}) => RustLib.instance.api.crateApiEncryptedDeleteByStorageKey(
+  client: client,
+  bucket: bucket,
+  storageKey: storageKey,
+);
 
 /// Get decrypted metadata without downloading content
-Future<FileMetadata> headDecrypted(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String storageKey}) =>
-    RustLib.instance.api.crateApiEncryptedHeadDecrypted(
-        client: client, bucket: bucket, storageKey: storageKey);
+Future<FileMetadata> headDecrypted({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String storageKey,
+}) => RustLib.instance.api.crateApiEncryptedHeadDecrypted(
+  client: client,
+  bucket: bucket,
+  storageKey: storageKey,
+);
 
 /// List objects with decrypted metadata
-Future<List<FileMetadata>> listDecrypted(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required ListOptions options}) =>
-    RustLib.instance.api.crateApiEncryptedListDecrypted(
-        client: client, bucket: bucket, options: options);
+Future<List<FileMetadata>> listDecrypted({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required ListOptions options,
+}) => RustLib.instance.api.crateApiEncryptedListDecrypted(
+  client: client,
+  bucket: bucket,
+  options: options,
+);
 
 /// List directory structure
-Future<DirectoryListing> listDirectory(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        String? prefix}) =>
-    RustLib.instance.api.crateApiEncryptedListDirectory(
-        client: client, bucket: bucket, prefix: prefix);
+Future<DirectoryListing> listDirectory({
+  required EncryptedClientHandle client,
+  required String bucket,
+  String? prefix,
+}) => RustLib.instance.api.crateApiEncryptedListDirectory(
+  client: client,
+  bucket: bucket,
+  prefix: prefix,
+);
 
 /// Export the secret key for backup
 Future<Uint8List> exportSecretKey({required EncryptedClientHandle client}) =>
@@ -102,23 +163,98 @@ Future<Uint8List> exportSecretKey({required EncryptedClientHandle client}) =>
 Future<Uint8List> getPublicKey({required EncryptedClientHandle client}) =>
     RustLib.instance.api.crateApiEncryptedGetPublicKey(client: client);
 
+/// Derive X25519 public key from private key bytes
+///
+/// **IMPORTANT**: Use this function instead of Dart's X25519 public key derivation
+/// to ensure compatibility between Flutter and Web/WASM clients.
+///
+/// This ensures that both FxFiles and Web UI derive the exact same public key
+/// from the same private key bytes, avoiding cryptographic mismatches.
+///
+/// # Arguments
+/// * `secret_key_bytes` - 32-byte X25519 private key (raw bytes, not clamped)
+///
+/// # Returns
+/// * `Ok(Vec<u8>)` - 32-byte X25519 public key
+/// * `Err` - If secret_key_bytes is not exactly 32 bytes
+///
+/// # Example
+/// ```dart
+/// // In Flutter/Dart, generate random 32 bytes:
+/// final secretKeyBytes = Uint8List(32);
+/// Random.secure().nextBytes(secretKeyBytes);
+///
+/// // Derive public key using Rust (ensures cross-platform compatibility):
+/// final publicKeyBytes = await derivePublicKeyFromSecret(secretKeyBytes);
+///
+/// // Now use publicKeyBytes for createShareToken
+/// // and secretKeyBytes in the share URL
+/// ```
+Future<Uint8List> derivePublicKeyFromSecret({
+  required List<int> secretKeyBytes,
+}) => RustLib.instance.api.crateApiEncryptedDerivePublicKeyFromSecret(
+  secretKeyBytes: secretKeyBytes,
+);
+
+/// Derive a 32-byte key using Argon2id (memory-hard KDF)
+///
+/// **IMPORTANT**: Use this function to derive encryption keys from user credentials
+/// instead of platform-specific PBKDF2 implementations.
+///
+/// This ensures both FxFiles (Flutter) and WebUI (WASM) derive the exact same key
+/// from the same inputs, with brute-force resistance from Argon2id's memory-hardness.
+///
+/// Parameters:
+/// - Memory: 64 MiB
+/// - Iterations: 3
+/// - Parallelism: 1 (for cross-platform consistency)
+///
+/// # Arguments
+/// * `context` - A context string used as salt (e.g., "fula-files-v1")
+/// * `input` - The input bytes (e.g., UTF-8 encoded "google:{userId}:{email}")
+///
+/// # Returns
+/// * 32-byte derived key
+///
+/// # Example
+/// ```dart
+/// // Derive encryption key from Google credentials (same as WebUI):
+/// final input = utf8.encode('google:${userId}:${email}');
+/// final secretKey = await deriveKey(context: 'fula-files-v1', input: input);
+///
+/// // Use secretKey for createEncryptedClient
+/// ```
+Future<Uint8List> deriveKey({
+  required String context,
+  required List<int> input,
+}) => RustLib.instance.api.crateApiEncryptedDeriveKey(
+  context: context,
+  input: input,
+);
+
 /// Check if client uses FlatNamespace mode
 Future<bool> isFlatNamespace({required EncryptedClientHandle client}) =>
     RustLib.instance.api.crateApiEncryptedIsFlatNamespace(client: client);
 
 /// List buckets (delegated to inner client)
-Future<List<BucketInfo>> encListBuckets(
-        {required EncryptedClientHandle client}) =>
-    RustLib.instance.api.crateApiEncryptedEncListBuckets(client: client);
+Future<List<BucketInfo>> encListBuckets({
+  required EncryptedClientHandle client,
+}) => RustLib.instance.api.crateApiEncryptedEncListBuckets(client: client);
 
 /// Create bucket (delegated to inner client)
-Future<void> encCreateBucket(
-        {required EncryptedClientHandle client, required String name}) =>
-    RustLib.instance.api
-        .crateApiEncryptedEncCreateBucket(client: client, name: name);
+Future<void> encCreateBucket({
+  required EncryptedClientHandle client,
+  required String name,
+}) => RustLib.instance.api.crateApiEncryptedEncCreateBucket(
+  client: client,
+  name: name,
+);
 
 /// Delete bucket (delegated to inner client)
-Future<void> encDeleteBucket(
-        {required EncryptedClientHandle client, required String name}) =>
-    RustLib.instance.api
-        .crateApiEncryptedEncDeleteBucket(client: client, name: name);
+Future<void> encDeleteBucket({
+  required EncryptedClientHandle client,
+  required String name,
+}) => RustLib.instance.api.crateApiEncryptedEncDeleteBucket(
+  client: client,
+  name: name,
+);

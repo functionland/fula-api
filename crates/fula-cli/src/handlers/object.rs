@@ -1,6 +1,6 @@
 //! Object operation handlers
 
-use crate::pinning::{check_can_upload, pin_for_user};
+use crate::pinning::{check_can_upload, pin_for_user, unpin_for_user};
 use crate::{AppState, ApiError, S3ErrorCode};
 use crate::state::UserSession;
 use crate::xml;
@@ -51,6 +51,44 @@ pub async fn put_object(
         None => body,
     };
 
+    // Open bucket first so conditional-write guards can consult the current
+    // stored ETag without doing extra I/O later. (Moved ahead of put_block.)
+    tracing::debug!(bucket = %bucket_name, "Opening user-scoped bucket");
+    let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await
+        .map_err(|e| {
+            tracing::error!(error = %e, bucket = %bucket_name, "Failed to open bucket");
+            e
+        })?;
+
+    // RFC 7232 conditional-write preconditions. Used by fula-client forest
+    // flush to catch concurrent writers (surfaces as ClientError::Concurrent
+    // Modification on 412). Checked before put_block to avoid an orphan
+    // block when the precondition fails.
+    //
+    // NOTE: This is a best-effort check — get_object + put_object are not
+    // atomic under concurrent PUTs on the same key (each request opens its
+    // own bucket snapshot). The client's retry-on-412 loop handles the
+    // residual commit-window race.
+    let existing = bucket.get_object(&key).await?;
+    let current_etag: Option<&str> = existing.as_ref().map(|m| m.etag.as_str());
+
+    if let Some(h) = headers.get("If-Match").and_then(|v| v.to_str().ok()) {
+        if !match_if_match(h, current_etag) {
+            return Err(ApiError::s3(
+                S3ErrorCode::PreconditionFailed,
+                "If-Match precondition failed",
+            ));
+        }
+    }
+    if let Some(h) = headers.get("If-None-Match").and_then(|v| v.to_str().ok()) {
+        if !match_if_none_match(h, current_etag) {
+            return Err(ApiError::s3(
+                S3ErrorCode::PreconditionFailed,
+                "If-None-Match precondition failed",
+            ));
+        }
+    }
+
     // Store the data
     let cid = state.block_store.put_block(&body).await?;
 
@@ -93,14 +131,6 @@ pub async fn put_object(
         }
     }
 
-    // Store in bucket (user-scoped)
-    tracing::debug!(bucket = %bucket_name, "Opening user-scoped bucket");
-    let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await
-        .map_err(|e| {
-            tracing::error!(error = %e, bucket = %bucket_name, "Failed to open bucket");
-            e
-        })?;
-
     tracing::debug!(key = %key, "Storing object metadata");
     bucket.put_object(key.clone(), metadata).await
         .map_err(|e| {
@@ -115,11 +145,14 @@ pub async fn put_object(
             e
         })?;
 
-    // Persist the bucket registry so the new root CID survives restarts
-    // Use the user's JWT for pinning service authentication
-    if let Err(e) = state.bucket_manager.persist_registry_with_token(&session.jwt_token).await {
-        tracing::warn!(error = %e, "Failed to persist bucket registry after put_object");
-    }
+    // Persist the bucket registry so the new root CID survives restarts.
+    // This MUST succeed — otherwise the new tree root is lost on restart.
+    // Use the user's JWT for pinning service authentication.
+    state.bucket_manager.persist_registry_with_token(&session.jwt_token).await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to persist bucket registry after put_object — data may be lost on restart");
+            ApiError::s3(S3ErrorCode::InternalError, "Failed to persist storage index. Please retry.")
+        })?;
 
     // Pin the BUCKET ROOT CID to ensure tree structure survives GC.
     // This recursively pins all tree nodes AND all referenced object data.
@@ -456,6 +489,7 @@ pub async fn delete_object(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<UserSession>,
     Path((bucket_name, key)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
@@ -464,13 +498,70 @@ pub async fn delete_object(
     // User-scoped bucket access
     let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
 
-    bucket.delete_object(&key).await?;
+    // Capture the removed metadata so we can unpin the CID after the index
+    // is successfully updated. Must unpin AFTER persist — if persist fails
+    // and we've already unpinned, the data is gone but the index still
+    // references it on next start (recoverable on re-upload, but bad UX).
+    let removed = bucket.delete_object(&key).await?;
     bucket.flush().await?;
 
-    // Persist the bucket registry so the updated root CID survives restarts
-    // Use the user's JWT for pinning service authentication
-    if let Err(e) = state.bucket_manager.persist_registry_with_token(&session.jwt_token).await {
-        tracing::warn!(error = %e, "Failed to persist bucket registry after delete_object");
+    // Persist the bucket registry so the updated root CID survives restarts.
+    // This MUST succeed — otherwise the delete is lost on restart.
+    state.bucket_manager.persist_registry_with_token(&session.jwt_token).await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to persist bucket registry after delete_object — change may be lost on restart");
+            ApiError::s3(S3ErrorCode::InternalError, "Failed to persist storage index. Please retry.")
+        })?;
+
+    // Best-effort IPFS unpin (F-NEW). Must be refcount-safe: if any other key
+    // in this bucket still references the same CID (client-side dedup, or two
+    // keys coincidentally mapped to the same content), skip the unpin to avoid
+    // losing pins for still-referenced data.
+    //
+    // Cross-bucket refcount is not checked here: each bucket's pinning is
+    // scoped to its own index, and the pinning service tracks pins by
+    // request_id — unpinning one bucket's pin does not affect other buckets'
+    // pins of the same CID, since each was added as a separate pin.
+    if let Some(removed_meta) = removed {
+        let cid = removed_meta.cid;
+        let still_referenced = match bucket
+            .list_objects(None, None, None, None)
+            .await
+        {
+            Ok(result) => result.objects.iter().any(|o| o.metadata.cid == cid),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    cid = %cid,
+                    "Could not enumerate bucket to refcount-check CID; skipping unpin conservatively"
+                );
+                true
+            }
+        };
+
+        if !still_referenced {
+            if let Err(e) = state.block_store.unpin(&cid).await {
+                tracing::warn!(
+                    cid = %cid,
+                    error = %e,
+                    "Failed to unpin from local IPFS (best-effort)"
+                );
+            }
+
+            unpin_for_user(
+                &headers,
+                &cid,
+                state.config.pinning_service_endpoint.as_deref(),
+                Some(&session.jwt_token),
+            )
+            .await;
+        } else {
+            tracing::debug!(
+                cid = %cid,
+                bucket = %bucket_name,
+                "Skipping unpin — CID still referenced by another key in the bucket"
+            );
+        }
     }
 
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -525,11 +616,13 @@ pub async fn copy_object(
     dest_bucket_handle.put_object(dest_key, dest_metadata.clone()).await?;
     dest_bucket_handle.flush().await?;
 
-    // Persist the bucket registry so the updated root CID survives restarts
-    // Use the user's JWT for pinning service authentication
-    if let Err(e) = state.bucket_manager.persist_registry_with_token(&session.jwt_token).await {
-        tracing::warn!(error = %e, "Failed to persist bucket registry after copy_object");
-    }
+    // Persist the bucket registry so the updated root CID survives restarts.
+    // This MUST succeed — otherwise the copy is lost on restart.
+    state.bucket_manager.persist_registry_with_token(&session.jwt_token).await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to persist bucket registry after copy_object — change may be lost on restart");
+            ApiError::s3(S3ErrorCode::InternalError, "Failed to persist storage index. Please retry.")
+        })?;
 
     let xml_response = xml::copy_object_result(
         dest_metadata.last_modified,
@@ -541,4 +634,105 @@ pub async fn copy_object(
         [("Content-Type", "application/xml")],
         xml_response,
     ).into_response())
+}
+
+// ============================================================================
+// RFC 7232 conditional-write helpers (If-Match / If-None-Match)
+// ============================================================================
+//
+// S3 subset: strong ETags only. Weak validators (`W/"..."`) are rejected.
+// Stored ETags are un-quoted CID strings (see ObjectMetadata::new); client
+// sends quoted values, so parse_etag_list strips quotes before comparison.
+
+/// RFC 7232 §3.1. True iff the If-Match precondition is satisfied.
+pub(crate) fn match_if_match(header: &str, current: Option<&str>) -> bool {
+    let h = header.trim();
+    if h == "*" {
+        return current.is_some();
+    }
+    let Some(cur) = current else { return false; };
+    parse_etag_list(h).any(|t| t == cur)
+}
+
+/// RFC 7232 §3.2. True iff the If-None-Match precondition is satisfied.
+pub(crate) fn match_if_none_match(header: &str, current: Option<&str>) -> bool {
+    let h = header.trim();
+    if h == "*" {
+        return current.is_none();
+    }
+    let Some(cur) = current else { return true; };
+    !parse_etag_list(h).any(|t| t == cur)
+}
+
+/// Parse a comma-separated list of strong quoted ETags. Weak validators
+/// (`W/"..."`) and unquoted tokens are silently skipped.
+fn parse_etag_list(s: &str) -> impl Iterator<Item = String> + '_ {
+    s.split(',').filter_map(|tok| {
+        let t = tok.trim();
+        if t.starts_with("W/") || t.starts_with("w/") {
+            return None;
+        }
+        let t = t.strip_prefix('"')?.strip_suffix('"')?;
+        Some(t.to_string())
+    })
+}
+
+#[cfg(test)]
+mod conditional_tests {
+    use super::{match_if_match, match_if_none_match};
+
+    #[test]
+    fn if_match_star_requires_existing() {
+        assert!(match_if_match("*", Some("abc")));
+        assert!(!match_if_match("*", None));
+    }
+
+    #[test]
+    fn if_none_match_star_requires_absent() {
+        assert!(!match_if_none_match("*", Some("abc")));
+        assert!(match_if_none_match("*", None));
+    }
+
+    #[test]
+    fn if_match_single_tag() {
+        assert!(match_if_match("\"abc\"", Some("abc")));
+        assert!(!match_if_match("\"abc\"", Some("xyz")));
+        assert!(!match_if_match("\"abc\"", None));
+    }
+
+    #[test]
+    fn if_none_match_single_tag() {
+        assert!(!match_if_none_match("\"abc\"", Some("abc")));
+        assert!(match_if_none_match("\"abc\"", Some("xyz")));
+        assert!(match_if_none_match("\"abc\"", None));
+    }
+
+    #[test]
+    fn etag_list_any_matches() {
+        assert!(match_if_match("\"a\", \"b\"", Some("b")));
+        assert!(!match_if_match("\"a\", \"b\"", Some("c")));
+        assert!(!match_if_none_match("\"a\", \"b\"", Some("a")));
+    }
+
+    #[test]
+    fn weak_etag_rejected() {
+        // Weak validators are filtered out — neither If-Match nor If-None-Match
+        // can satisfy against them.
+        assert!(!match_if_match("W/\"abc\"", Some("abc")));
+        // If-None-Match with no valid tags in list vs an existing etag:
+        // parse_etag_list returns empty, so .any() is false, so !false = true.
+        assert!(match_if_none_match("W/\"abc\"", Some("abc")));
+    }
+
+    #[test]
+    fn empty_or_whitespace_header() {
+        assert!(!match_if_match("", Some("abc")));
+        assert!(match_if_none_match("", Some("abc")));
+        assert!(!match_if_match("   ", Some("abc")));
+    }
+
+    #[test]
+    fn handles_surrounding_whitespace_in_list() {
+        assert!(match_if_match("  \"x\"  ,  \"y\"  ", Some("y")));
+    }
 }

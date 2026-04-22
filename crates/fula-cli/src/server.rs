@@ -1,5 +1,6 @@
 //! Server startup and lifecycle
 
+use crate::handlers::locks;
 use crate::{AppState, GatewayConfig, routes};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -10,6 +11,10 @@ use tracing::info;
 pub async fn run_server(config: GatewayConfig) -> anyhow::Result<()> {
     // Create application state
     let state = Arc::new(AppState::new(config.clone()).await?);
+
+    // Spawn the migration-lock TTL sweeper. Holds a cheap clone of the store;
+    // lives for the lifetime of the process.
+    locks::start_sweeper(state.lock_store.clone());
 
     // Create router
     let app = routes::create_router(state);
@@ -33,6 +38,9 @@ pub async fn run_server_with_shutdown(
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let state = Arc::new(AppState::new(config.clone()).await?);
+
+    locks::start_sweeper(state.lock_store.clone());
+
     let app = routes::create_router(state);
 
     let addr = config.bind_addr();

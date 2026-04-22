@@ -7,99 +7,127 @@ import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'types.dart';
 
+// These functions are ignored (category: IgnoreBecauseExplicitAttribute): `get_file_size`, `put_flat_from_path_deferred`, `put_flat_from_path`
+
 /// Load the forest index from storage
-Future<void> loadForest(
-        {required EncryptedClientHandle client, required String bucket}) =>
-    RustLib.instance.api
-        .crateApiForestLoadForest(client: client, bucket: bucket);
+Future<void> loadForest({
+  required EncryptedClientHandle client,
+  required String bucket,
+}) => RustLib.instance.api.crateApiForestLoadForest(
+  client: client,
+  bucket: bucket,
+);
 
 /// Save the forest index to storage
 ///
 /// This is an alias for flush_forest. It saves any pending changes
 /// in the forest cache to storage.
-Future<void> saveForest(
-        {required EncryptedClientHandle client, required String bucket}) =>
-    RustLib.instance.api
-        .crateApiForestSaveForest(client: client, bucket: bucket);
+Future<void> saveForest({
+  required EncryptedClientHandle client,
+  required String bucket,
+}) => RustLib.instance.api.crateApiForestSaveForest(
+  client: client,
+  bucket: bucket,
+);
 
 /// Flush any pending forest changes to storage
-Future<void> flushForest(
-        {required EncryptedClientHandle client, required String bucket}) =>
-    RustLib.instance.api
-        .crateApiForestFlushForest(client: client, bucket: bucket);
+Future<void> flushForest({
+  required EncryptedClientHandle client,
+  required String bucket,
+}) => RustLib.instance.api.crateApiForestFlushForest(
+  client: client,
+  bucket: bucket,
+);
 
 /// Check if there are pending (unsaved) forest changes
-Future<bool> hasPendingChanges(
-        {required EncryptedClientHandle client, required String bucket}) =>
-    RustLib.instance.api
-        .crateApiForestHasPendingChanges(client: client, bucket: bucket);
+Future<bool> hasPendingChanges({
+  required EncryptedClientHandle client,
+  required String bucket,
+}) => RustLib.instance.api.crateApiForestHasPendingChanges(
+  client: client,
+  bucket: bucket,
+);
 
 /// Upload a file with immediate forest save
 ///
 /// This is the recommended method for most use cases.
 /// The file path is preserved in the encrypted forest index.
-Future<PutResult> putFlat(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String path,
-        required List<int> data,
-        String? contentType}) =>
-    RustLib.instance.api.crateApiForestPutFlat(
-        client: client,
-        bucket: bucket,
-        path: path,
-        data: data,
-        contentType: contentType);
+Future<PutResult> putFlat({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String path,
+  required List<int> data,
+  String? contentType,
+}) => RustLib.instance.api.crateApiForestPutFlat(
+  client: client,
+  bucket: bucket,
+  path: path,
+  data: data,
+  contentType: contentType,
+);
 
 /// Upload a file without immediate forest save (deferred)
 ///
 /// Use this for batch uploads, then call `flush_forest` when done.
 /// More efficient for uploading many files at once.
-Future<PutResult> putFlatDeferred(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String path,
-        required List<int> data,
-        String? contentType}) =>
-    RustLib.instance.api.crateApiForestPutFlatDeferred(
-        client: client,
-        bucket: bucket,
-        path: path,
-        data: data,
-        contentType: contentType);
+Future<PutResult> putFlatDeferred({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String path,
+  required List<int> data,
+  String? contentType,
+}) => RustLib.instance.api.crateApiForestPutFlatDeferred(
+  client: client,
+  bucket: bucket,
+  path: path,
+  data: data,
+  contentType: contentType,
+);
 
 /// Download a file by its path
-Future<Uint8List> getFlat(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String path}) =>
-    RustLib.instance.api
-        .crateApiForestGetFlat(client: client, bucket: bucket, path: path);
+Future<Uint8List> getFlat({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String path,
+}) => RustLib.instance.api.crateApiForestGetFlat(
+  client: client,
+  bucket: bucket,
+  path: path,
+);
 
 /// Delete a file by its path
-Future<void> deleteFlat(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String path}) =>
-    RustLib.instance.api
-        .crateApiForestDeleteFlat(client: client, bucket: bucket, path: path);
+Future<void> deleteFlat({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String path,
+}) => RustLib.instance.api.crateApiForestDeleteFlat(
+  client: client,
+  bucket: bucket,
+  path: path,
+);
 
 /// List all files from the forest index (no network calls)
 ///
 /// This reads from the local forest index, which is faster
 /// than listing from the server.
-Future<List<FileMetadata>> listFromForest(
-        {required EncryptedClientHandle client, required String bucket}) =>
-    RustLib.instance.api
-        .crateApiForestListFromForest(client: client, bucket: bucket);
+Future<List<FileMetadata>> listFromForest({
+  required EncryptedClientHandle client,
+  required String bucket,
+}) => RustLib.instance.api.crateApiForestListFromForest(
+  client: client,
+  bucket: bucket,
+);
 
 /// Extract a subtree from the forest for sharing
 ///
 /// This creates a serialized subtree that can be shared with others.
 /// The subtree includes all files under the given prefix.
-Future<ForestSubtree> getForestSubtree(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String prefix}) =>
-    RustLib.instance.api.crateApiForestGetForestSubtree(
-        client: client, bucket: bucket, prefix: prefix);
+Future<ForestSubtree> getForestSubtree({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String prefix,
+}) => RustLib.instance.api.crateApiForestGetForestSubtree(
+  client: client,
+  bucket: bucket,
+  prefix: prefix,
+);

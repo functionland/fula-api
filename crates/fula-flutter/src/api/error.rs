@@ -108,6 +108,21 @@ impl From<fula_client::ClientError> for FulaError {
             ClientError::AccessDenied(msg) => FulaError::AccessDenied(msg),
             ClientError::UploadFailed(msg) => FulaError::UploadFailed(msg),
             ClientError::DownloadFailed(msg) => FulaError::DownloadFailed(msg),
+            ClientError::ConcurrentModification(msg) => FulaError::InvalidResponse(
+                format!("concurrent modification: {}", msg),
+            ),
+            ClientError::ConcurrentModificationExhausted { bucket, retries, unresolved_ops, wal_path } => {
+                FulaError::InvalidResponse(format!(
+                    "concurrent modification unresolved after {} retries: bucket={}, pending ops={}, wal={}",
+                    retries, bucket, unresolved_ops, wal_path
+                ))
+            }
+            ClientError::RotationInProgress { bucket } => FulaError::InvalidResponse(
+                format!("rotation already in progress for bucket: {}", bucket),
+            ),
+            ClientError::MigrationLockHeld { bucket, expires_at } => FulaError::InvalidResponse(
+                format!("migration lock held for bucket {} (expires at {} ms)", bucket, expires_at),
+            ),
         }
     }
 }

@@ -12,119 +12,155 @@ Future<FulaClientHandle> createClient({required FulaConfig config}) =>
     RustLib.instance.api.crateApiClientCreateClient(config: config);
 
 /// Create a new encrypted client with the given configuration
-Future<EncryptedClientHandle> createEncryptedClient(
-        {required FulaConfig config, required EncryptionConfig encryption}) =>
-    RustLib.instance.api.crateApiClientCreateEncryptedClient(
-        config: config, encryption: encryption);
+Future<EncryptedClientHandle> createEncryptedClient({
+  required FulaConfig config,
+  required EncryptionConfig encryption,
+}) => RustLib.instance.api.crateApiClientCreateEncryptedClient(
+  config: config,
+  encryption: encryption,
+);
 
 /// Create encrypted client with pinning support
-Future<EncryptedClientHandle> createEncryptedClientWithPinning(
-        {required FulaConfig config,
-        required EncryptionConfig encryption,
-        required PinningConfig pinning}) =>
-    RustLib.instance.api.crateApiClientCreateEncryptedClientWithPinning(
-        config: config, encryption: encryption, pinning: pinning);
+Future<EncryptedClientHandle> createEncryptedClientWithPinning({
+  required FulaConfig config,
+  required EncryptionConfig encryption,
+  required PinningConfig pinning,
+}) => RustLib.instance.api.crateApiClientCreateEncryptedClientWithPinning(
+  config: config,
+  encryption: encryption,
+  pinning: pinning,
+);
 
 /// List all buckets
 Future<List<BucketInfo>> listBuckets({required FulaClientHandle client}) =>
     RustLib.instance.api.crateApiClientListBuckets(client: client);
 
 /// Create a new bucket
-Future<void> createBucket(
-        {required FulaClientHandle client, required String name}) =>
+Future<void> createBucket({
+  required FulaClientHandle client,
+  required String name,
+}) =>
     RustLib.instance.api.crateApiClientCreateBucket(client: client, name: name);
 
 /// Delete a bucket
-Future<void> deleteBucket(
-        {required FulaClientHandle client, required String name}) =>
+Future<void> deleteBucket({
+  required FulaClientHandle client,
+  required String name,
+}) =>
     RustLib.instance.api.crateApiClientDeleteBucket(client: client, name: name);
 
 /// Check if a bucket exists
-Future<bool> bucketExists(
-        {required FulaClientHandle client, required String name}) =>
+Future<bool> bucketExists({
+  required FulaClientHandle client,
+  required String name,
+}) =>
     RustLib.instance.api.crateApiClientBucketExists(client: client, name: name);
 
 /// Upload an object
-Future<PutResult> putObject(
-        {required FulaClientHandle client,
-        required String bucket,
-        required String key,
-        required List<int> data}) =>
-    RustLib.instance.api.crateApiClientPutObject(
-        client: client, bucket: bucket, key: key, data: data);
+Future<PutResult> putObject({
+  required FulaClientHandle client,
+  required String bucket,
+  required String key,
+  required List<int> data,
+}) => RustLib.instance.api.crateApiClientPutObject(
+  client: client,
+  bucket: bucket,
+  key: key,
+  data: data,
+);
 
 /// Upload an object with metadata
-Future<PutResult> putObjectWithMetadata(
-        {required FulaClientHandle client,
-        required String bucket,
-        required String key,
-        required List<int> data,
-        required ObjectMetadata metadata}) =>
-    RustLib.instance.api.crateApiClientPutObjectWithMetadata(
-        client: client,
-        bucket: bucket,
-        key: key,
-        data: data,
-        metadata: metadata);
+Future<PutResult> putObjectWithMetadata({
+  required FulaClientHandle client,
+  required String bucket,
+  required String key,
+  required List<int> data,
+  required ObjectMetadata metadata,
+}) => RustLib.instance.api.crateApiClientPutObjectWithMetadata(
+  client: client,
+  bucket: bucket,
+  key: key,
+  data: data,
+  metadata: metadata,
+);
 
 /// Download an object
-Future<Uint8List> getObject(
-        {required FulaClientHandle client,
-        required String bucket,
-        required String key}) =>
-    RustLib.instance.api
-        .crateApiClientGetObject(client: client, bucket: bucket, key: key);
+Future<Uint8List> getObject({
+  required FulaClientHandle client,
+  required String bucket,
+  required String key,
+}) => RustLib.instance.api.crateApiClientGetObject(
+  client: client,
+  bucket: bucket,
+  key: key,
+);
 
 /// Download an object with metadata
-Future<GetObjectResult> getObjectWithMetadata(
-        {required FulaClientHandle client,
-        required String bucket,
-        required String key}) =>
-    RustLib.instance.api.crateApiClientGetObjectWithMetadata(
-        client: client, bucket: bucket, key: key);
+Future<GetObjectResult> getObjectWithMetadata({
+  required FulaClientHandle client,
+  required String bucket,
+  required String key,
+}) => RustLib.instance.api.crateApiClientGetObjectWithMetadata(
+  client: client,
+  bucket: bucket,
+  key: key,
+);
 
 /// Get object metadata without downloading content
-Future<HeadResult> headObject(
-        {required FulaClientHandle client,
-        required String bucket,
-        required String key}) =>
-    RustLib.instance.api
-        .crateApiClientHeadObject(client: client, bucket: bucket, key: key);
+Future<HeadResult> headObject({
+  required FulaClientHandle client,
+  required String bucket,
+  required String key,
+}) => RustLib.instance.api.crateApiClientHeadObject(
+  client: client,
+  bucket: bucket,
+  key: key,
+);
 
 /// Delete an object
-Future<void> deleteObject(
-        {required FulaClientHandle client,
-        required String bucket,
-        required String key}) =>
-    RustLib.instance.api
-        .crateApiClientDeleteObject(client: client, bucket: bucket, key: key);
+Future<void> deleteObject({
+  required FulaClientHandle client,
+  required String bucket,
+  required String key,
+}) => RustLib.instance.api.crateApiClientDeleteObject(
+  client: client,
+  bucket: bucket,
+  key: key,
+);
 
 /// Check if an object exists
-Future<bool> objectExists(
-        {required FulaClientHandle client,
-        required String bucket,
-        required String key}) =>
-    RustLib.instance.api
-        .crateApiClientObjectExists(client: client, bucket: bucket, key: key);
+Future<bool> objectExists({
+  required FulaClientHandle client,
+  required String bucket,
+  required String key,
+}) => RustLib.instance.api.crateApiClientObjectExists(
+  client: client,
+  bucket: bucket,
+  key: key,
+);
 
 /// Copy an object
-Future<CopyResult> copyObject(
-        {required FulaClientHandle client,
-        required String srcBucket,
-        required String srcKey,
-        required String dstBucket,
-        required String dstKey}) =>
-    RustLib.instance.api.crateApiClientCopyObject(
-        client: client,
-        srcBucket: srcBucket,
-        srcKey: srcKey,
-        dstBucket: dstBucket,
-        dstKey: dstKey);
+Future<CopyResult> copyObject({
+  required FulaClientHandle client,
+  required String srcBucket,
+  required String srcKey,
+  required String dstBucket,
+  required String dstKey,
+}) => RustLib.instance.api.crateApiClientCopyObject(
+  client: client,
+  srcBucket: srcBucket,
+  srcKey: srcKey,
+  dstBucket: dstBucket,
+  dstKey: dstKey,
+);
 
 /// List objects in a bucket
-Future<ListObjectsResult> listObjects(
-        {required FulaClientHandle client,
-        required String bucket,
-        required ListOptions options}) =>
-    RustLib.instance.api.crateApiClientListObjects(
-        client: client, bucket: bucket, options: options);
+Future<ListObjectsResult> listObjects({
+  required FulaClientHandle client,
+  required String bucket,
+  required ListOptions options,
+}) => RustLib.instance.api.crateApiClientListObjects(
+  client: client,
+  bucket: bucket,
+  options: options,
+);

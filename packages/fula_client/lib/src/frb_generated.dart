@@ -8,6 +8,7 @@ import 'api/client.dart';
 import 'api/encrypted.dart';
 import 'api/error.dart';
 import 'api/forest.dart';
+import 'api/metrics.dart';
 import 'api/multipart.dart';
 import 'api/rotation.dart';
 import 'api/sharing.dart';
@@ -43,12 +44,8 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 
   /// Initialize flutter_rust_bridge in mock mode.
   /// No libraries for FFI are loaded.
-  static void initMock({
-    required RustLibApi api,
-  }) {
-    instance.initMockImpl(
-      api: api,
-    );
+  static void initMock({required RustLibApi api}) {
+    instance.initMockImpl(api: api);
   }
 
   /// Dispose flutter_rust_bridge
@@ -76,107 +73,146 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => -1984564384;
+  int get rustContentHash => 1451949050;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
-    stem: 'fula_flutter',
-    ioDirectory: '../../crates/fula-flutter/target/release/',
-    webPrefix: 'pkg/',
-  );
+        stem: 'fula_flutter',
+        ioDirectory: '../../crates/fula-flutter/target/release/',
+        webPrefix: 'pkg/',
+      );
 }
 
 abstract class RustLibApi extends BaseApi {
-  Future<void> crateApiMultipartAbortMultipart(
-      {required MultipartHandle handle});
+  Future<void> crateApiMultipartAbortMultipart({
+    required MultipartHandle handle,
+  });
 
-  Future<AcceptedShareHandle> crateApiSharingAcceptShare(
-      {required EncryptedClientHandle client, required String tokenJson});
+  Future<AcceptedShareHandle> crateApiSharingAcceptShare({
+    required EncryptedClientHandle client,
+    required String tokenJson,
+  });
 
-  Future<bool> crateApiClientBucketExists(
-      {required FulaClientHandle client, required String name});
+  Future<bool> crateApiClientBucketExists({
+    required FulaClientHandle client,
+    required String name,
+  });
 
-  Future<String> crateApiMultipartCompleteMultipart(
-      {required MultipartHandle handle});
+  Future<String> crateApiMultipartCompleteMultipart({
+    required MultipartHandle handle,
+  });
 
-  Future<CopyResult> crateApiClientCopyObject(
-      {required FulaClientHandle client,
-      required String srcBucket,
-      required String srcKey,
-      required String dstBucket,
-      required String dstKey});
+  Future<CopyResult> crateApiClientCopyObject({
+    required FulaClientHandle client,
+    required String srcBucket,
+    required String srcKey,
+    required String dstBucket,
+    required String dstKey,
+  });
 
-  Future<void> crateApiClientCreateBucket(
-      {required FulaClientHandle client, required String name});
+  Future<void> crateApiClientCreateBucket({
+    required FulaClientHandle client,
+    required String name,
+  });
 
-  Future<FulaClientHandle> crateApiClientCreateClient(
-      {required FulaConfig config});
+  Future<FulaClientHandle> crateApiClientCreateClient({
+    required FulaConfig config,
+  });
 
-  Future<EncryptedClientHandle> crateApiClientCreateEncryptedClient(
-      {required FulaConfig config, required EncryptionConfig encryption});
+  Future<EncryptedClientHandle> crateApiClientCreateEncryptedClient({
+    required FulaConfig config,
+    required EncryptionConfig encryption,
+  });
 
-  Future<EncryptedClientHandle> crateApiClientCreateEncryptedClientWithPinning(
-      {required FulaConfig config,
-      required EncryptionConfig encryption,
-      required PinningConfig pinning});
+  Future<EncryptedClientHandle> crateApiClientCreateEncryptedClientWithPinning({
+    required FulaConfig config,
+    required EncryptionConfig encryption,
+    required PinningConfig pinning,
+  });
 
-  Future<RotationManagerHandle> crateApiRotationCreateRotationManager(
-      {required EncryptedClientHandle client});
+  Future<RotationManagerHandle> crateApiRotationCreateRotationManager({
+    required EncryptedClientHandle client,
+  });
 
-  Future<String> crateApiSharingCreateShareToken(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey,
-      required List<int> recipientPublicKey,
-      PlatformInt64? expiresAt});
+  Future<String> crateApiSharingCreateShareToken({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+    required List<int> recipientPublicKey,
+    PlatformInt64? expiresAt,
+  });
 
-  Future<String> crateApiSharingCreateShareTokenWithMode(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey,
-      required List<int> recipientPublicKey,
-      required ShareMode mode,
-      PlatformInt64? expiresAt});
+  Future<String> crateApiSharingCreateShareTokenWithMode({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+    required List<int> recipientPublicKey,
+    required ShareMode mode,
+    PlatformInt64? expiresAt,
+  });
 
-  Future<void> crateApiClientDeleteBucket(
-      {required FulaClientHandle client, required String name});
+  Future<void> crateApiClientDeleteBucket({
+    required FulaClientHandle client,
+    required String name,
+  });
 
-  Future<void> crateApiEncryptedDeleteByStorageKey(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey});
+  Future<void> crateApiEncryptedDeleteByStorageKey({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+  });
 
-  Future<void> crateApiEncryptedDeleteEncrypted(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key});
+  Future<void> crateApiEncryptedDeleteEncrypted({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+  });
 
-  Future<void> crateApiForestDeleteFlat(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String path});
+  Future<void> crateApiForestDeleteFlat({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+  });
 
-  Future<void> crateApiClientDeleteObject(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key});
+  Future<void> crateApiClientDeleteObject({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  });
 
-  Future<void> crateApiEncryptedEncCreateBucket(
-      {required EncryptedClientHandle client, required String name});
+  Future<Uint8List> crateApiEncryptedDeriveKey({
+    required String context,
+    required List<int> input,
+  });
 
-  Future<void> crateApiEncryptedEncDeleteBucket(
-      {required EncryptedClientHandle client, required String name});
+  Future<Uint8List> crateApiEncryptedDerivePublicKeyFromSecret({
+    required List<int> secretKeyBytes,
+  });
 
-  Future<List<BucketInfo>> crateApiEncryptedEncListBuckets(
-      {required EncryptedClientHandle client});
+  Future<void> crateApiEncryptedEncCreateBucket({
+    required EncryptedClientHandle client,
+    required String name,
+  });
+
+  Future<void> crateApiEncryptedEncDeleteBucket({
+    required EncryptedClientHandle client,
+    required String name,
+  });
+
+  Future<List<BucketInfo>> crateApiEncryptedEncListBuckets({
+    required EncryptedClientHandle client,
+  });
 
   Future<EncryptionConfig> crateApiTypesEncryptionConfigDefault();
 
-  Future<Uint8List> crateApiEncryptedExportSecretKey(
-      {required EncryptedClientHandle client});
+  Future<Uint8List> crateApiEncryptedExportSecretKey({
+    required EncryptedClientHandle client,
+  });
 
-  Future<void> crateApiForestFlushForest(
-      {required EncryptedClientHandle client, required String bucket});
+  Future<void> crateApiForestFlushForest({
+    required EncryptedClientHandle client,
+    required String bucket,
+  });
 
   Future<FulaConfig> crateApiTypesFulaConfigDefault();
 
@@ -184,279 +220,344 @@ abstract class RustLibApi extends BaseApi {
 
   Future<bool> crateApiErrorFulaErrorIsAccessDenied({required FulaError that});
 
-  Future<bool> crateApiErrorFulaErrorIsEncryptionError(
-      {required FulaError that});
+  Future<bool> crateApiErrorFulaErrorIsEncryptionError({
+    required FulaError that,
+  });
 
   Future<bool> crateApiErrorFulaErrorIsNetworkError({required FulaError that});
 
   Future<bool> crateApiErrorFulaErrorIsNotFound({required FulaError that});
 
-  Future<Uint8List> crateApiChunkedGetChunked(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key});
+  Future<Uint8List> crateApiChunkedGetChunked({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+  });
 
-  Future<int> crateApiMultipartGetCompletedParts(
-      {required MultipartHandle handle});
+  Future<int> crateApiMultipartGetCompletedParts({
+    required MultipartHandle handle,
+  });
 
-  Future<Uint8List> crateApiEncryptedGetDecrypted(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key});
+  Future<Uint8List> crateApiEncryptedGetDecrypted({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+  });
 
-  Future<Uint8List> crateApiEncryptedGetDecryptedByStorageKey(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey});
+  Future<Uint8List> crateApiEncryptedGetDecryptedBuffered({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+  });
 
-  Future<Uint8List> crateApiForestGetFlat(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String path});
+  Future<Uint8List> crateApiEncryptedGetDecryptedBufferedByStorageKey({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+  });
 
-  Future<ForestSubtree> crateApiForestGetForestSubtree(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String prefix});
+  Future<Uint8List> crateApiEncryptedGetDecryptedByStorageKey({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+  });
 
-  Future<int?> crateApiRotationGetKekVersion(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey});
+  Future<Uint8List> crateApiForestGetFlat({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+  });
 
-  Future<Uint8List> crateApiClientGetObject(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key});
+  Future<ForestSubtree> crateApiForestGetForestSubtree({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String prefix,
+  });
 
-  Future<GetObjectResult> crateApiClientGetObjectWithMetadata(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key});
+  Future<int?> crateApiRotationGetKekVersion({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+  });
 
-  Future<Uint8List> crateApiEncryptedGetPublicKey(
-      {required EncryptedClientHandle client});
+  Future<Uint8List> crateApiClientGetObject({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  });
 
-  Future<Uint8List> crateApiChunkedGetRange(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key,
-      required BigInt offset,
-      required BigInt length});
+  Future<GetObjectResult> crateApiClientGetObjectWithMetadata({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  });
 
-  Future<SharePermissions> crateApiSharingGetSharePermissions(
-      {required AcceptedShareHandle share});
+  Future<Uint8List> crateApiEncryptedGetPublicKey({
+    required EncryptedClientHandle client,
+  });
 
-  Future<String> crateApiMultipartGetUploadId(
-      {required MultipartHandle handle});
+  Future<Uint8List> crateApiChunkedGetRange({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+    required BigInt offset,
+    required BigInt length,
+  });
 
-  Future<DecryptedObjectInfo> crateApiEncryptedGetWithPrivateMetadata(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey});
+  Future<SharePermissions> crateApiSharingGetSharePermissions({
+    required AcceptedShareHandle share,
+  });
 
-  Future<Uint8List> crateApiSharingGetWithShare(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey,
-      required AcceptedShareHandle share});
+  Future<String> crateApiMultipartGetUploadId({
+    required MultipartHandle handle,
+  });
 
-  Future<Uint8List> crateApiSharingGetWithToken(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey,
-      required String tokenJson});
+  Future<DecryptedObjectInfo> crateApiEncryptedGetWithPrivateMetadata({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+  });
 
-  Future<bool> crateApiForestHasPendingChanges(
-      {required EncryptedClientHandle client, required String bucket});
+  Future<Uint8List> crateApiSharingGetWithShare({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+    required String originalKey,
+    required AcceptedShareHandle share,
+  });
 
-  Future<FileMetadata> crateApiEncryptedHeadDecrypted(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey});
+  Future<Uint8List> crateApiSharingGetWithToken({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+    required String originalKey,
+    required String tokenJson,
+  });
 
-  Future<HeadResult> crateApiClientHeadObject(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key});
+  Future<bool> crateApiForestHasPendingChanges({
+    required EncryptedClientHandle client,
+    required String bucket,
+  });
 
-  Future<bool> crateApiEncryptedIsFlatNamespace(
-      {required EncryptedClientHandle client});
+  Future<FileMetadata> crateApiEncryptedHeadDecrypted({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+  });
 
-  Future<bool> crateApiSharingIsShareExpired(
-      {required AcceptedShareHandle share});
+  Future<HeadResult> crateApiClientHeadObject({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  });
 
-  Future<List<BucketInfo>> crateApiClientListBuckets(
-      {required FulaClientHandle client});
+  Future<bool> crateApiEncryptedIsFlatNamespace({
+    required EncryptedClientHandle client,
+  });
 
-  Future<List<FileMetadata>> crateApiEncryptedListDecrypted(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required ListOptions options});
+  Future<bool> crateApiSharingIsShareExpired({
+    required AcceptedShareHandle share,
+  });
 
-  Future<DirectoryListing> crateApiEncryptedListDirectory(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      String? prefix});
+  Future<List<BucketInfo>> crateApiClientListBuckets({
+    required FulaClientHandle client,
+  });
 
-  Future<List<FileMetadata>> crateApiForestListFromForest(
-      {required EncryptedClientHandle client, required String bucket});
+  Future<List<FileMetadata>> crateApiEncryptedListDecrypted({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required ListOptions options,
+  });
 
-  Future<ListObjectsResult> crateApiClientListObjects(
-      {required FulaClientHandle client,
-      required String bucket,
-      required ListOptions options});
+  Future<DirectoryListing> crateApiEncryptedListDirectory({
+    required EncryptedClientHandle client,
+    required String bucket,
+    String? prefix,
+  });
+
+  Future<List<FileMetadata>> crateApiForestListFromForest({
+    required EncryptedClientHandle client,
+    required String bucket,
+  });
+
+  Future<ListObjectsResult> crateApiClientListObjects({
+    required FulaClientHandle client,
+    required String bucket,
+    required ListOptions options,
+  });
 
   Future<ListOptions> crateApiTypesListOptionsDefault();
 
-  Future<void> crateApiForestLoadForest(
-      {required EncryptedClientHandle client, required String bucket});
+  Future<void> crateApiForestLoadForest({
+    required EncryptedClientHandle client,
+    required String bucket,
+  });
 
   Future<ObfuscationMode> crateApiTypesObfuscationModeDefault();
 
-  Future<bool> crateApiClientObjectExists(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key});
+  Future<bool> crateApiClientObjectExists({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  });
 
   Future<ObjectMetadata> crateApiTypesObjectMetadataDefault();
 
-  Future<PutResult> crateApiChunkedPutChunked(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key,
-      required List<int> data,
-      int? chunkSize});
+  Future<PutResult> crateApiChunkedPutChunked({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+    required List<int> data,
+    int? chunkSize,
+  });
 
-  Future<PutResult> crateApiEncryptedPutEncrypted(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key,
-      required List<int> data});
+  Future<PutResult> crateApiEncryptedPutEncrypted({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+    required List<int> data,
+  });
 
-  Future<PutResult> crateApiEncryptedPutEncryptedWithType(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key,
-      required List<int> data,
-      required String contentType});
+  Future<PutResult> crateApiEncryptedPutEncryptedWithType({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+    required List<int> data,
+    required String contentType,
+  });
 
-  Future<PutResult> crateApiForestPutFlat(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String path,
-      required List<int> data,
-      String? contentType});
+  Future<PutResult> crateApiForestPutFlat({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required List<int> data,
+    String? contentType,
+  });
 
-  Future<PutResult> crateApiForestPutFlatDeferred(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String path,
-      required List<int> data,
-      String? contentType});
+  Future<PutResult> crateApiForestPutFlatDeferred({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required List<int> data,
+    String? contentType,
+  });
 
-  Future<PutResult> crateApiClientPutObject(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key,
-      required List<int> data});
+  Future<PutResult> crateApiClientPutObject({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+    required List<int> data,
+  });
 
-  Future<PutResult> crateApiClientPutObjectWithMetadata(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key,
-      required List<int> data,
-      required ObjectMetadata metadata});
+  Future<PutResult> crateApiClientPutObjectWithMetadata({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+    required List<int> data,
+    required ObjectMetadata metadata,
+  });
 
-  Future<int> crateApiRotationRewrapObject(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey,
-      required RotationManagerHandle manager});
+  Future<int> crateApiRotationRewrapObject({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+    required RotationManagerHandle manager,
+  });
 
-  Future<RotationReport> crateApiRotationRotateBucket(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required RotationManagerHandle manager});
+  Future<RotationReport> crateApiRotationRotateBucket({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required RotationManagerHandle manager,
+  });
 
-  Future<bool> crateApiTypesRotationReportIsSuccess(
-      {required RotationReport that});
+  Future<bool> crateApiTypesRotationReportIsSuccess({
+    required RotationReport that,
+  });
 
-  Future<double> crateApiTypesRotationReportSuccessRate(
-      {required RotationReport that});
+  Future<double> crateApiTypesRotationReportSuccessRate({
+    required RotationReport that,
+  });
 
-  Future<void> crateApiForestSaveForest(
-      {required EncryptedClientHandle client, required String bucket});
+  Future<void> crateApiForestSaveForest({
+    required EncryptedClientHandle client,
+    required String bucket,
+  });
 
   Future<bool> crateApiChunkedShouldUseChunked({required BigInt size});
 
-  Future<MultipartHandle> crateApiMultipartStartMultipart(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key});
+  Future<MultipartHandle> crateApiMultipartStartMultipart({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  });
 
-  Future<String> crateApiMultipartUploadLargeFileSimple(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key,
-      required List<int> data,
-      int? chunkSize});
+  Future<String> crateApiMultipartUploadLargeFileSimple({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+    required List<int> data,
+    int? chunkSize,
+  });
 
-  Future<void> crateApiMultipartUploadPart(
-      {required MultipartHandle handle,
-      required int partNumber,
-      required List<int> data});
+  Future<void> crateApiMultipartUploadPart({
+    required MultipartHandle handle,
+    required int partNumber,
+    required List<int> data,
+  });
 
-  Future<UploadProgress> crateApiTypesUploadProgressNew(
-      {required BigInt bytesUploaded,
-      required BigInt totalBytes,
-      required int currentPart,
-      required int totalParts});
+  Future<UploadProgress> crateApiTypesUploadProgressNew({
+    required BigInt bytesUploaded,
+    required BigInt totalBytes,
+    required int currentPart,
+    required int totalParts,
+  });
 
-  RustArcIncrementStrongCountFnType
-      get rust_arc_increment_strong_count_AcceptedShareHandle;
-
-  RustArcDecrementStrongCountFnType
-      get rust_arc_decrement_strong_count_AcceptedShareHandle;
-
-  CrossPlatformFinalizerArg
-      get rust_arc_decrement_strong_count_AcceptedShareHandlePtr;
+  Future<BigInt> crateApiMetricsWalAppendFailureCount();
 
   RustArcIncrementStrongCountFnType
-      get rust_arc_increment_strong_count_EncryptedClientHandle;
+  get rust_arc_increment_strong_count_AcceptedShareHandle;
 
   RustArcDecrementStrongCountFnType
-      get rust_arc_decrement_strong_count_EncryptedClientHandle;
+  get rust_arc_decrement_strong_count_AcceptedShareHandle;
 
   CrossPlatformFinalizerArg
-      get rust_arc_decrement_strong_count_EncryptedClientHandlePtr;
+  get rust_arc_decrement_strong_count_AcceptedShareHandlePtr;
 
   RustArcIncrementStrongCountFnType
-      get rust_arc_increment_strong_count_FulaClientHandle;
+  get rust_arc_increment_strong_count_EncryptedClientHandle;
 
   RustArcDecrementStrongCountFnType
-      get rust_arc_decrement_strong_count_FulaClientHandle;
+  get rust_arc_decrement_strong_count_EncryptedClientHandle;
 
   CrossPlatformFinalizerArg
-      get rust_arc_decrement_strong_count_FulaClientHandlePtr;
+  get rust_arc_decrement_strong_count_EncryptedClientHandlePtr;
 
   RustArcIncrementStrongCountFnType
-      get rust_arc_increment_strong_count_MultipartHandle;
+  get rust_arc_increment_strong_count_FulaClientHandle;
 
   RustArcDecrementStrongCountFnType
-      get rust_arc_decrement_strong_count_MultipartHandle;
+  get rust_arc_decrement_strong_count_FulaClientHandle;
 
   CrossPlatformFinalizerArg
-      get rust_arc_decrement_strong_count_MultipartHandlePtr;
+  get rust_arc_decrement_strong_count_FulaClientHandlePtr;
 
   RustArcIncrementStrongCountFnType
-      get rust_arc_increment_strong_count_RotationManagerHandle;
+  get rust_arc_increment_strong_count_MultipartHandle;
 
   RustArcDecrementStrongCountFnType
-      get rust_arc_decrement_strong_count_RotationManagerHandle;
+  get rust_arc_decrement_strong_count_MultipartHandle;
 
   CrossPlatformFinalizerArg
-      get rust_arc_decrement_strong_count_RotationManagerHandlePtr;
+  get rust_arc_decrement_strong_count_MultipartHandlePtr;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_RotationManagerHandle;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_RotationManagerHandle;
+
+  CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_RotationManagerHandlePtr;
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -468,103 +569,128 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   });
 
   @override
-  Future<void> crateApiMultipartAbortMultipart(
-      {required MultipartHandle handle}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-                handle);
-        return wire.wire__crate__api__multipart__abort_multipart(port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<void> crateApiMultipartAbortMultipart({
+    required MultipartHandle handle,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+                handle,
+              );
+          return wire.wire__crate__api__multipart__abort_multipart(port_, arg0);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiMultipartAbortMultipartConstMeta,
+        argValues: [handle],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiMultipartAbortMultipartConstMeta,
-      argValues: [handle],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiMultipartAbortMultipartConstMeta =>
-      const TaskConstMeta(
-        debugName: "abort_multipart",
-        argNames: ["handle"],
-      );
+      const TaskConstMeta(debugName: "abort_multipart", argNames: ["handle"]);
 
   @override
-  Future<AcceptedShareHandle> crateApiSharingAcceptShare(
-      {required EncryptedClientHandle client, required String tokenJson}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(tokenJson);
-        return wire.wire__crate__api__sharing__accept_share(port_, arg0, arg1);
-      },
-      codec: DcoCodec(
-        decodeSuccessData:
-            dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<AcceptedShareHandle> crateApiSharingAcceptShare({
+    required EncryptedClientHandle client,
+    required String tokenJson,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(tokenJson);
+          return wire.wire__crate__api__sharing__accept_share(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData:
+              dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiSharingAcceptShareConstMeta,
+        argValues: [client, tokenJson],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiSharingAcceptShareConstMeta,
-      argValues: [client, tokenJson],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiSharingAcceptShareConstMeta => const TaskConstMeta(
-        debugName: "accept_share",
-        argNames: ["client", "tokenJson"],
-      );
+    debugName: "accept_share",
+    argNames: ["client", "tokenJson"],
+  );
 
   @override
-  Future<bool> crateApiClientBucketExists(
-      {required FulaClientHandle client, required String name}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(name);
-        return wire.wire__crate__api__client__bucket_exists(port_, arg0, arg1);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_bool,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<bool> crateApiClientBucketExists({
+    required FulaClientHandle client,
+    required String name,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(name);
+          return wire.wire__crate__api__client__bucket_exists(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientBucketExistsConstMeta,
+        argValues: [client, name],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientBucketExistsConstMeta,
-      argValues: [client, name],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientBucketExistsConstMeta => const TaskConstMeta(
-        debugName: "bucket_exists",
-        argNames: ["client", "name"],
-      );
+    debugName: "bucket_exists",
+    argNames: ["client", "name"],
+  );
 
   @override
-  Future<String> crateApiMultipartCompleteMultipart(
-      {required MultipartHandle handle}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-                handle);
-        return wire.wire__crate__api__multipart__complete_multipart(
-            port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_String,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<String> crateApiMultipartCompleteMultipart({
+    required MultipartHandle handle,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+                handle,
+              );
+          return wire.wire__crate__api__multipart__complete_multipart(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_String,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiMultipartCompleteMultipartConstMeta,
+        argValues: [handle],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiMultipartCompleteMultipartConstMeta,
-      argValues: [handle],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiMultipartCompleteMultipartConstMeta =>
@@ -574,108 +700,135 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<CopyResult> crateApiClientCopyObject(
-      {required FulaClientHandle client,
-      required String srcBucket,
-      required String srcKey,
-      required String dstBucket,
-      required String dstKey}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(srcBucket);
-        var arg2 = cst_encode_String(srcKey);
-        var arg3 = cst_encode_String(dstBucket);
-        var arg4 = cst_encode_String(dstKey);
-        return wire.wire__crate__api__client__copy_object(
-            port_, arg0, arg1, arg2, arg3, arg4);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_copy_result,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<CopyResult> crateApiClientCopyObject({
+    required FulaClientHandle client,
+    required String srcBucket,
+    required String srcKey,
+    required String dstBucket,
+    required String dstKey,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(srcBucket);
+          var arg2 = cst_encode_String(srcKey);
+          var arg3 = cst_encode_String(dstBucket);
+          var arg4 = cst_encode_String(dstKey);
+          return wire.wire__crate__api__client__copy_object(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_copy_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientCopyObjectConstMeta,
+        argValues: [client, srcBucket, srcKey, dstBucket, dstKey],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientCopyObjectConstMeta,
-      argValues: [client, srcBucket, srcKey, dstBucket, dstKey],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientCopyObjectConstMeta => const TaskConstMeta(
-        debugName: "copy_object",
-        argNames: ["client", "srcBucket", "srcKey", "dstBucket", "dstKey"],
-      );
+    debugName: "copy_object",
+    argNames: ["client", "srcBucket", "srcKey", "dstBucket", "dstKey"],
+  );
 
   @override
-  Future<void> crateApiClientCreateBucket(
-      {required FulaClientHandle client, required String name}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(name);
-        return wire.wire__crate__api__client__create_bucket(port_, arg0, arg1);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<void> crateApiClientCreateBucket({
+    required FulaClientHandle client,
+    required String name,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(name);
+          return wire.wire__crate__api__client__create_bucket(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientCreateBucketConstMeta,
+        argValues: [client, name],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientCreateBucketConstMeta,
-      argValues: [client, name],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientCreateBucketConstMeta => const TaskConstMeta(
-        debugName: "create_bucket",
-        argNames: ["client", "name"],
-      );
+    debugName: "create_bucket",
+    argNames: ["client", "name"],
+  );
 
   @override
-  Future<FulaClientHandle> crateApiClientCreateClient(
-      {required FulaConfig config}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 = cst_encode_box_autoadd_fula_config(config);
-        return wire.wire__crate__api__client__create_client(port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData:
-            dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<FulaClientHandle> crateApiClientCreateClient({
+    required FulaConfig config,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_box_autoadd_fula_config(config);
+          return wire.wire__crate__api__client__create_client(port_, arg0);
+        },
+        codec: DcoCodec(
+          decodeSuccessData:
+              dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientCreateClientConstMeta,
+        argValues: [config],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientCreateClientConstMeta,
-      argValues: [config],
-      apiImpl: this,
-    ));
+    );
   }
 
-  TaskConstMeta get kCrateApiClientCreateClientConstMeta => const TaskConstMeta(
-        debugName: "create_client",
-        argNames: ["config"],
-      );
+  TaskConstMeta get kCrateApiClientCreateClientConstMeta =>
+      const TaskConstMeta(debugName: "create_client", argNames: ["config"]);
 
   @override
-  Future<EncryptedClientHandle> crateApiClientCreateEncryptedClient(
-      {required FulaConfig config, required EncryptionConfig encryption}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 = cst_encode_box_autoadd_fula_config(config);
-        var arg1 = cst_encode_box_autoadd_encryption_config(encryption);
-        return wire.wire__crate__api__client__create_encrypted_client(
-            port_, arg0, arg1);
-      },
-      codec: DcoCodec(
-        decodeSuccessData:
-            dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<EncryptedClientHandle> crateApiClientCreateEncryptedClient({
+    required FulaConfig config,
+    required EncryptionConfig encryption,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_box_autoadd_fula_config(config);
+          var arg1 = cst_encode_box_autoadd_encryption_config(encryption);
+          return wire.wire__crate__api__client__create_encrypted_client(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData:
+              dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientCreateEncryptedClientConstMeta,
+        argValues: [config, encryption],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientCreateEncryptedClientConstMeta,
-      argValues: [config, encryption],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientCreateEncryptedClientConstMeta =>
@@ -685,28 +838,35 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<EncryptedClientHandle> crateApiClientCreateEncryptedClientWithPinning(
-      {required FulaConfig config,
-      required EncryptionConfig encryption,
-      required PinningConfig pinning}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 = cst_encode_box_autoadd_fula_config(config);
-        var arg1 = cst_encode_box_autoadd_encryption_config(encryption);
-        var arg2 = cst_encode_box_autoadd_pinning_config(pinning);
-        return wire
-            .wire__crate__api__client__create_encrypted_client_with_pinning(
-                port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData:
-            dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<EncryptedClientHandle> crateApiClientCreateEncryptedClientWithPinning({
+    required FulaConfig config,
+    required EncryptionConfig encryption,
+    required PinningConfig pinning,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_box_autoadd_fula_config(config);
+          var arg1 = cst_encode_box_autoadd_encryption_config(encryption);
+          var arg2 = cst_encode_box_autoadd_pinning_config(pinning);
+          return wire
+              .wire__crate__api__client__create_encrypted_client_with_pinning(
+                port_,
+                arg0,
+                arg1,
+                arg2,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData:
+              dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientCreateEncryptedClientWithPinningConstMeta,
+        argValues: [config, encryption, pinning],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientCreateEncryptedClientWithPinningConstMeta,
-      argValues: [config, encryption, pinning],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientCreateEncryptedClientWithPinningConstMeta =>
@@ -716,25 +876,31 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<RotationManagerHandle> crateApiRotationCreateRotationManager(
-      {required EncryptedClientHandle client}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        return wire.wire__crate__api__rotation__create_rotation_manager(
-            port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData:
-            dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle,
-        decodeErrorData: null,
+  Future<RotationManagerHandle> crateApiRotationCreateRotationManager({
+    required EncryptedClientHandle client,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          return wire.wire__crate__api__rotation__create_rotation_manager(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData:
+              dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiRotationCreateRotationManagerConstMeta,
+        argValues: [client],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiRotationCreateRotationManagerConstMeta,
-      argValues: [client],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiRotationCreateRotationManagerConstMeta =>
@@ -744,69 +910,103 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<String> crateApiSharingCreateShareToken(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey,
-      required List<int> recipientPublicKey,
-      PlatformInt64? expiresAt}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(storageKey);
-        var arg3 = cst_encode_list_prim_u_8_loose(recipientPublicKey);
-        var arg4 = cst_encode_opt_box_autoadd_i_64(expiresAt);
-        return wire.wire__crate__api__sharing__create_share_token(
-            port_, arg0, arg1, arg2, arg3, arg4);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_String,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<String> crateApiSharingCreateShareToken({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+    required List<int> recipientPublicKey,
+    PlatformInt64? expiresAt,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(storageKey);
+          var arg3 = cst_encode_list_prim_u_8_loose(recipientPublicKey);
+          var arg4 = cst_encode_opt_box_autoadd_i_64(expiresAt);
+          return wire.wire__crate__api__sharing__create_share_token(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_String,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiSharingCreateShareTokenConstMeta,
+        argValues: [client, bucket, storageKey, recipientPublicKey, expiresAt],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiSharingCreateShareTokenConstMeta,
-      argValues: [client, bucket, storageKey, recipientPublicKey, expiresAt],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiSharingCreateShareTokenConstMeta =>
       const TaskConstMeta(
         debugName: "create_share_token",
-        argNames: ["client", "bucket", "storageKey", "recipientPublicKey", "expiresAt"],
+        argNames: [
+          "client",
+          "bucket",
+          "storageKey",
+          "recipientPublicKey",
+          "expiresAt",
+        ],
       );
 
   @override
-  Future<String> crateApiSharingCreateShareTokenWithMode(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey,
-      required List<int> recipientPublicKey,
-      required ShareMode mode,
-      PlatformInt64? expiresAt}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(storageKey);
-        var arg3 = cst_encode_list_prim_u_8_loose(recipientPublicKey);
-        var arg4 = cst_encode_share_mode(mode);
-        var arg5 = cst_encode_opt_box_autoadd_i_64(expiresAt);
-        return wire.wire__crate__api__sharing__create_share_token_with_mode(
-            port_, arg0, arg1, arg2, arg3, arg4, arg5);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_String,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<String> crateApiSharingCreateShareTokenWithMode({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+    required List<int> recipientPublicKey,
+    required ShareMode mode,
+    PlatformInt64? expiresAt,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(storageKey);
+          var arg3 = cst_encode_list_prim_u_8_loose(recipientPublicKey);
+          var arg4 = cst_encode_share_mode(mode);
+          var arg5 = cst_encode_opt_box_autoadd_i_64(expiresAt);
+          return wire.wire__crate__api__sharing__create_share_token_with_mode(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+            arg5,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_String,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiSharingCreateShareTokenWithModeConstMeta,
+        argValues: [
+          client,
+          bucket,
+          storageKey,
+          recipientPublicKey,
+          mode,
+          expiresAt,
+        ],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiSharingCreateShareTokenWithModeConstMeta,
-      argValues: [client, bucket, storageKey, recipientPublicKey, mode, expiresAt],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiSharingCreateShareTokenWithModeConstMeta =>
@@ -818,59 +1018,76 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           "storageKey",
           "recipientPublicKey",
           "mode",
-          "expiresAt"
+          "expiresAt",
         ],
       );
 
   @override
-  Future<void> crateApiClientDeleteBucket(
-      {required FulaClientHandle client, required String name}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(name);
-        return wire.wire__crate__api__client__delete_bucket(port_, arg0, arg1);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<void> crateApiClientDeleteBucket({
+    required FulaClientHandle client,
+    required String name,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(name);
+          return wire.wire__crate__api__client__delete_bucket(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientDeleteBucketConstMeta,
+        argValues: [client, name],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientDeleteBucketConstMeta,
-      argValues: [client, name],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientDeleteBucketConstMeta => const TaskConstMeta(
-        debugName: "delete_bucket",
-        argNames: ["client", "name"],
-      );
+    debugName: "delete_bucket",
+    argNames: ["client", "name"],
+  );
 
   @override
-  Future<void> crateApiEncryptedDeleteByStorageKey(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(storageKey);
-        return wire.wire__crate__api__encrypted__delete_by_storage_key(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<void> crateApiEncryptedDeleteByStorageKey({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(storageKey);
+          return wire.wire__crate__api__encrypted__delete_by_storage_key(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedDeleteByStorageKeyConstMeta,
+        argValues: [client, bucket, storageKey],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedDeleteByStorageKeyConstMeta,
-      argValues: [client, bucket, storageKey],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedDeleteByStorageKeyConstMeta =>
@@ -880,28 +1097,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<void> crateApiEncryptedDeleteEncrypted(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        return wire.wire__crate__api__encrypted__delete_encrypted(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<void> crateApiEncryptedDeleteEncrypted({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          return wire.wire__crate__api__encrypted__delete_encrypted(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedDeleteEncryptedConstMeta,
+        argValues: [client, bucket, key],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedDeleteEncryptedConstMeta,
-      argValues: [client, bucket, key],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedDeleteEncryptedConstMeta =>
@@ -911,85 +1136,172 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<void> crateApiForestDeleteFlat(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String path}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(path);
-        return wire.wire__crate__api__forest__delete_flat(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<void> crateApiForestDeleteFlat({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(path);
+          return wire.wire__crate__api__forest__delete_flat(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestDeleteFlatConstMeta,
+        argValues: [client, bucket, path],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiForestDeleteFlatConstMeta,
-      argValues: [client, bucket, path],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiForestDeleteFlatConstMeta => const TaskConstMeta(
-        debugName: "delete_flat",
-        argNames: ["client", "bucket", "path"],
-      );
+    debugName: "delete_flat",
+    argNames: ["client", "bucket", "path"],
+  );
 
   @override
-  Future<void> crateApiClientDeleteObject(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        return wire.wire__crate__api__client__delete_object(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<void> crateApiClientDeleteObject({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          return wire.wire__crate__api__client__delete_object(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientDeleteObjectConstMeta,
+        argValues: [client, bucket, key],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientDeleteObjectConstMeta,
-      argValues: [client, bucket, key],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientDeleteObjectConstMeta => const TaskConstMeta(
-        debugName: "delete_object",
-        argNames: ["client", "bucket", "key"],
+    debugName: "delete_object",
+    argNames: ["client", "bucket", "key"],
+  );
+
+  @override
+  Future<Uint8List> crateApiEncryptedDeriveKey({
+    required String context,
+    required List<int> input,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_String(context);
+          var arg1 = cst_encode_list_prim_u_8_loose(input);
+          return wire.wire__crate__api__encrypted__derive_key(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiEncryptedDeriveKeyConstMeta,
+        argValues: [context, input],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiEncryptedDeriveKeyConstMeta => const TaskConstMeta(
+    debugName: "derive_key",
+    argNames: ["context", "input"],
+  );
+
+  @override
+  Future<Uint8List> crateApiEncryptedDerivePublicKeyFromSecret({
+    required List<int> secretKeyBytes,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_list_prim_u_8_loose(secretKeyBytes);
+          return wire
+              .wire__crate__api__encrypted__derive_public_key_from_secret(
+                port_,
+                arg0,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedDerivePublicKeyFromSecretConstMeta,
+        argValues: [secretKeyBytes],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiEncryptedDerivePublicKeyFromSecretConstMeta =>
+      const TaskConstMeta(
+        debugName: "derive_public_key_from_secret",
+        argNames: ["secretKeyBytes"],
       );
 
   @override
-  Future<void> crateApiEncryptedEncCreateBucket(
-      {required EncryptedClientHandle client, required String name}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(name);
-        return wire.wire__crate__api__encrypted__enc_create_bucket(
-            port_, arg0, arg1);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<void> crateApiEncryptedEncCreateBucket({
+    required EncryptedClientHandle client,
+    required String name,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(name);
+          return wire.wire__crate__api__encrypted__enc_create_bucket(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedEncCreateBucketConstMeta,
+        argValues: [client, name],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedEncCreateBucketConstMeta,
-      argValues: [client, name],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedEncCreateBucketConstMeta =>
@@ -999,25 +1311,33 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<void> crateApiEncryptedEncDeleteBucket(
-      {required EncryptedClientHandle client, required String name}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(name);
-        return wire.wire__crate__api__encrypted__enc_delete_bucket(
-            port_, arg0, arg1);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<void> crateApiEncryptedEncDeleteBucket({
+    required EncryptedClientHandle client,
+    required String name,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(name);
+          return wire.wire__crate__api__encrypted__enc_delete_bucket(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedEncDeleteBucketConstMeta,
+        argValues: [client, name],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedEncDeleteBucketConstMeta,
-      argValues: [client, name],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedEncDeleteBucketConstMeta =>
@@ -1027,142 +1347,158 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<List<BucketInfo>> crateApiEncryptedEncListBuckets(
-      {required EncryptedClientHandle client}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        return wire.wire__crate__api__encrypted__enc_list_buckets(port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_bucket_info,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<List<BucketInfo>> crateApiEncryptedEncListBuckets({
+    required EncryptedClientHandle client,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          return wire.wire__crate__api__encrypted__enc_list_buckets(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_bucket_info,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedEncListBucketsConstMeta,
+        argValues: [client],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedEncListBucketsConstMeta,
-      argValues: [client],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedEncListBucketsConstMeta =>
-      const TaskConstMeta(
-        debugName: "enc_list_buckets",
-        argNames: ["client"],
-      );
+      const TaskConstMeta(debugName: "enc_list_buckets", argNames: ["client"]);
 
   @override
   Future<EncryptionConfig> crateApiTypesEncryptionConfigDefault() {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        return wire.wire__crate__api__types__encryption_config_default(port_);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_encryption_config,
-        decodeErrorData: null,
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          return wire.wire__crate__api__types__encryption_config_default(port_);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_encryption_config,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiTypesEncryptionConfigDefaultConstMeta,
+        argValues: [],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiTypesEncryptionConfigDefaultConstMeta,
-      argValues: [],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiTypesEncryptionConfigDefaultConstMeta =>
-      const TaskConstMeta(
-        debugName: "encryption_config_default",
-        argNames: [],
-      );
+      const TaskConstMeta(debugName: "encryption_config_default", argNames: []);
 
   @override
-  Future<Uint8List> crateApiEncryptedExportSecretKey(
-      {required EncryptedClientHandle client}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        return wire.wire__crate__api__encrypted__export_secret_key(port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_prim_u_8_strict,
-        decodeErrorData: null,
+  Future<Uint8List> crateApiEncryptedExportSecretKey({
+    required EncryptedClientHandle client,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          return wire.wire__crate__api__encrypted__export_secret_key(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiEncryptedExportSecretKeyConstMeta,
+        argValues: [client],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedExportSecretKeyConstMeta,
-      argValues: [client],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedExportSecretKeyConstMeta =>
-      const TaskConstMeta(
-        debugName: "export_secret_key",
-        argNames: ["client"],
-      );
+      const TaskConstMeta(debugName: "export_secret_key", argNames: ["client"]);
 
   @override
-  Future<void> crateApiForestFlushForest(
-      {required EncryptedClientHandle client, required String bucket}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        return wire.wire__crate__api__forest__flush_forest(port_, arg0, arg1);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<void> crateApiForestFlushForest({
+    required EncryptedClientHandle client,
+    required String bucket,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          return wire.wire__crate__api__forest__flush_forest(port_, arg0, arg1);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestFlushForestConstMeta,
+        argValues: [client, bucket],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiForestFlushForestConstMeta,
-      argValues: [client, bucket],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiForestFlushForestConstMeta => const TaskConstMeta(
-        debugName: "flush_forest",
-        argNames: ["client", "bucket"],
-      );
+    debugName: "flush_forest",
+    argNames: ["client", "bucket"],
+  );
 
   @override
   Future<FulaConfig> crateApiTypesFulaConfigDefault() {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        return wire.wire__crate__api__types__fula_config_default(port_);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_fula_config,
-        decodeErrorData: null,
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          return wire.wire__crate__api__types__fula_config_default(port_);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_fula_config,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiTypesFulaConfigDefaultConstMeta,
+        argValues: [],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiTypesFulaConfigDefaultConstMeta,
-      argValues: [],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiTypesFulaConfigDefaultConstMeta =>
-      const TaskConstMeta(
-        debugName: "fula_config_default",
-        argNames: [],
-      );
+      const TaskConstMeta(debugName: "fula_config_default", argNames: []);
 
   @override
   Future<void> crateApiErrorFulaErrorErrorCode({required FulaError that}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 = cst_encode_box_autoadd_fula_error(that);
-        return wire.wire__crate__api__error__fula_error_error_code(port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: null,
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_box_autoadd_fula_error(that);
+          return wire.wire__crate__api__error__fula_error_error_code(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiErrorFulaErrorErrorCodeConstMeta,
+        argValues: [that],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiErrorFulaErrorErrorCodeConstMeta,
-      argValues: [that],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiErrorFulaErrorErrorCodeConstMeta =>
@@ -1173,20 +1509,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @override
   Future<bool> crateApiErrorFulaErrorIsAccessDenied({required FulaError that}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 = cst_encode_box_autoadd_fula_error(that);
-        return wire.wire__crate__api__error__fula_error_is_access_denied(
-            port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_bool,
-        decodeErrorData: null,
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_box_autoadd_fula_error(that);
+          return wire.wire__crate__api__error__fula_error_is_access_denied(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiErrorFulaErrorIsAccessDeniedConstMeta,
+        argValues: [that],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiErrorFulaErrorIsAccessDeniedConstMeta,
-      argValues: [that],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiErrorFulaErrorIsAccessDeniedConstMeta =>
@@ -1196,22 +1536,27 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<bool> crateApiErrorFulaErrorIsEncryptionError(
-      {required FulaError that}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 = cst_encode_box_autoadd_fula_error(that);
-        return wire.wire__crate__api__error__fula_error_is_encryption_error(
-            port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_bool,
-        decodeErrorData: null,
+  Future<bool> crateApiErrorFulaErrorIsEncryptionError({
+    required FulaError that,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_box_autoadd_fula_error(that);
+          return wire.wire__crate__api__error__fula_error_is_encryption_error(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiErrorFulaErrorIsEncryptionErrorConstMeta,
+        argValues: [that],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiErrorFulaErrorIsEncryptionErrorConstMeta,
-      argValues: [that],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiErrorFulaErrorIsEncryptionErrorConstMeta =>
@@ -1222,20 +1567,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @override
   Future<bool> crateApiErrorFulaErrorIsNetworkError({required FulaError that}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 = cst_encode_box_autoadd_fula_error(that);
-        return wire.wire__crate__api__error__fula_error_is_network_error(
-            port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_bool,
-        decodeErrorData: null,
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_box_autoadd_fula_error(that);
+          return wire.wire__crate__api__error__fula_error_is_network_error(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiErrorFulaErrorIsNetworkErrorConstMeta,
+        argValues: [that],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiErrorFulaErrorIsNetworkErrorConstMeta,
-      argValues: [that],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiErrorFulaErrorIsNetworkErrorConstMeta =>
@@ -1246,20 +1595,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @override
   Future<bool> crateApiErrorFulaErrorIsNotFound({required FulaError that}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 = cst_encode_box_autoadd_fula_error(that);
-        return wire.wire__crate__api__error__fula_error_is_not_found(
-            port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_bool,
-        decodeErrorData: null,
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_box_autoadd_fula_error(that);
+          return wire.wire__crate__api__error__fula_error_is_not_found(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiErrorFulaErrorIsNotFoundConstMeta,
+        argValues: [that],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiErrorFulaErrorIsNotFoundConstMeta,
-      argValues: [that],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiErrorFulaErrorIsNotFoundConstMeta =>
@@ -1269,54 +1622,68 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<Uint8List> crateApiChunkedGetChunked(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        return wire.wire__crate__api__chunked__get_chunked(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_prim_u_8_strict,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<Uint8List> crateApiChunkedGetChunked({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          return wire.wire__crate__api__chunked__get_chunked(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiChunkedGetChunkedConstMeta,
+        argValues: [client, bucket, key],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiChunkedGetChunkedConstMeta,
-      argValues: [client, bucket, key],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiChunkedGetChunkedConstMeta => const TaskConstMeta(
-        debugName: "get_chunked",
-        argNames: ["client", "bucket", "key"],
-      );
+    debugName: "get_chunked",
+    argNames: ["client", "bucket", "key"],
+  );
 
   @override
-  Future<int> crateApiMultipartGetCompletedParts(
-      {required MultipartHandle handle}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-                handle);
-        return wire.wire__crate__api__multipart__get_completed_parts(
-            port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_u_32,
-        decodeErrorData: null,
+  Future<int> crateApiMultipartGetCompletedParts({
+    required MultipartHandle handle,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+                handle,
+              );
+          return wire.wire__crate__api__multipart__get_completed_parts(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_u_32,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiMultipartGetCompletedPartsConstMeta,
+        argValues: [handle],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiMultipartGetCompletedPartsConstMeta,
-      argValues: [handle],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiMultipartGetCompletedPartsConstMeta =>
@@ -1326,28 +1693,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<Uint8List> crateApiEncryptedGetDecrypted(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        return wire.wire__crate__api__encrypted__get_decrypted(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_prim_u_8_strict,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<Uint8List> crateApiEncryptedGetDecrypted({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          return wire.wire__crate__api__encrypted__get_decrypted(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedGetDecryptedConstMeta,
+        argValues: [client, bucket, key],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedGetDecryptedConstMeta,
-      argValues: [client, bucket, key],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedGetDecryptedConstMeta =>
@@ -1357,28 +1732,116 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<Uint8List> crateApiEncryptedGetDecryptedByStorageKey(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(storageKey);
-        return wire.wire__crate__api__encrypted__get_decrypted_by_storage_key(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_prim_u_8_strict,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<Uint8List> crateApiEncryptedGetDecryptedBuffered({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          return wire.wire__crate__api__encrypted__get_decrypted_buffered(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedGetDecryptedBufferedConstMeta,
+        argValues: [client, bucket, key],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedGetDecryptedByStorageKeyConstMeta,
-      argValues: [client, bucket, storageKey],
-      apiImpl: this,
-    ));
+    );
+  }
+
+  TaskConstMeta get kCrateApiEncryptedGetDecryptedBufferedConstMeta =>
+      const TaskConstMeta(
+        debugName: "get_decrypted_buffered",
+        argNames: ["client", "bucket", "key"],
+      );
+
+  @override
+  Future<Uint8List> crateApiEncryptedGetDecryptedBufferedByStorageKey({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(storageKey);
+          return wire
+              .wire__crate__api__encrypted__get_decrypted_buffered_by_storage_key(
+                port_,
+                arg0,
+                arg1,
+                arg2,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedGetDecryptedBufferedByStorageKeyConstMeta,
+        argValues: [client, bucket, storageKey],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta
+  get kCrateApiEncryptedGetDecryptedBufferedByStorageKeyConstMeta =>
+      const TaskConstMeta(
+        debugName: "get_decrypted_buffered_by_storage_key",
+        argNames: ["client", "bucket", "storageKey"],
+      );
+
+  @override
+  Future<Uint8List> crateApiEncryptedGetDecryptedByStorageKey({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(storageKey);
+          return wire.wire__crate__api__encrypted__get_decrypted_by_storage_key(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedGetDecryptedByStorageKeyConstMeta,
+        argValues: [client, bucket, storageKey],
+        apiImpl: this,
+      ),
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedGetDecryptedByStorageKeyConstMeta =>
@@ -1388,57 +1851,74 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<Uint8List> crateApiForestGetFlat(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String path}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(path);
-        return wire.wire__crate__api__forest__get_flat(port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_prim_u_8_strict,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<Uint8List> crateApiForestGetFlat({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(path);
+          return wire.wire__crate__api__forest__get_flat(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestGetFlatConstMeta,
+        argValues: [client, bucket, path],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiForestGetFlatConstMeta,
-      argValues: [client, bucket, path],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiForestGetFlatConstMeta => const TaskConstMeta(
-        debugName: "get_flat",
-        argNames: ["client", "bucket", "path"],
-      );
+    debugName: "get_flat",
+    argNames: ["client", "bucket", "path"],
+  );
 
   @override
-  Future<ForestSubtree> crateApiForestGetForestSubtree(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String prefix}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(prefix);
-        return wire.wire__crate__api__forest__get_forest_subtree(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_forest_subtree,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<ForestSubtree> crateApiForestGetForestSubtree({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String prefix,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(prefix);
+          return wire.wire__crate__api__forest__get_forest_subtree(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_forest_subtree,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestGetForestSubtreeConstMeta,
+        argValues: [client, bucket, prefix],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiForestGetForestSubtreeConstMeta,
-      argValues: [client, bucket, prefix],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiForestGetForestSubtreeConstMeta =>
@@ -1448,28 +1928,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<int?> crateApiRotationGetKekVersion(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(storageKey);
-        return wire.wire__crate__api__rotation__get_kek_version(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_opt_box_autoadd_u_32,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<int?> crateApiRotationGetKekVersion({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(storageKey);
+          return wire.wire__crate__api__rotation__get_kek_version(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_opt_box_autoadd_u_32,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiRotationGetKekVersionConstMeta,
+        argValues: [client, bucket, storageKey],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiRotationGetKekVersionConstMeta,
-      argValues: [client, bucket, storageKey],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiRotationGetKekVersionConstMeta =>
@@ -1479,58 +1967,74 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<Uint8List> crateApiClientGetObject(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        return wire.wire__crate__api__client__get_object(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_prim_u_8_strict,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<Uint8List> crateApiClientGetObject({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          return wire.wire__crate__api__client__get_object(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientGetObjectConstMeta,
+        argValues: [client, bucket, key],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientGetObjectConstMeta,
-      argValues: [client, bucket, key],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientGetObjectConstMeta => const TaskConstMeta(
-        debugName: "get_object",
-        argNames: ["client", "bucket", "key"],
-      );
+    debugName: "get_object",
+    argNames: ["client", "bucket", "key"],
+  );
 
   @override
-  Future<GetObjectResult> crateApiClientGetObjectWithMetadata(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        return wire.wire__crate__api__client__get_object_with_metadata(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_get_object_result,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<GetObjectResult> crateApiClientGetObjectWithMetadata({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          return wire.wire__crate__api__client__get_object_with_metadata(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_get_object_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientGetObjectWithMetadataConstMeta,
+        argValues: [client, bucket, key],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientGetObjectWithMetadataConstMeta,
-      argValues: [client, bucket, key],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientGetObjectWithMetadataConstMeta =>
@@ -1540,84 +2044,101 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<Uint8List> crateApiEncryptedGetPublicKey(
-      {required EncryptedClientHandle client}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        return wire.wire__crate__api__encrypted__get_public_key(port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_prim_u_8_strict,
-        decodeErrorData: null,
+  Future<Uint8List> crateApiEncryptedGetPublicKey({
+    required EncryptedClientHandle client,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          return wire.wire__crate__api__encrypted__get_public_key(port_, arg0);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiEncryptedGetPublicKeyConstMeta,
+        argValues: [client],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedGetPublicKeyConstMeta,
-      argValues: [client],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedGetPublicKeyConstMeta =>
-      const TaskConstMeta(
-        debugName: "get_public_key",
-        argNames: ["client"],
-      );
+      const TaskConstMeta(debugName: "get_public_key", argNames: ["client"]);
 
   @override
-  Future<Uint8List> crateApiChunkedGetRange(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key,
-      required BigInt offset,
-      required BigInt length}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        var arg3 = cst_encode_u_64(offset);
-        var arg4 = cst_encode_u_64(length);
-        return wire.wire__crate__api__chunked__get_range(
-            port_, arg0, arg1, arg2, arg3, arg4);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_prim_u_8_strict,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<Uint8List> crateApiChunkedGetRange({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+    required BigInt offset,
+    required BigInt length,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          var arg3 = cst_encode_u_64(offset);
+          var arg4 = cst_encode_u_64(length);
+          return wire.wire__crate__api__chunked__get_range(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiChunkedGetRangeConstMeta,
+        argValues: [client, bucket, key, offset, length],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiChunkedGetRangeConstMeta,
-      argValues: [client, bucket, key, offset, length],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiChunkedGetRangeConstMeta => const TaskConstMeta(
-        debugName: "get_range",
-        argNames: ["client", "bucket", "key", "offset", "length"],
-      );
+    debugName: "get_range",
+    argNames: ["client", "bucket", "key", "offset", "length"],
+  );
 
   @override
-  Future<SharePermissions> crateApiSharingGetSharePermissions(
-      {required AcceptedShareHandle share}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-                share);
-        return wire.wire__crate__api__sharing__get_share_permissions(
-            port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_share_permissions,
-        decodeErrorData: null,
+  Future<SharePermissions> crateApiSharingGetSharePermissions({
+    required AcceptedShareHandle share,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+                share,
+              );
+          return wire.wire__crate__api__sharing__get_share_permissions(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_share_permissions,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiSharingGetSharePermissionsConstMeta,
+        argValues: [share],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiSharingGetSharePermissionsConstMeta,
-      argValues: [share],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiSharingGetSharePermissionsConstMeta =>
@@ -1627,54 +2148,63 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<String> crateApiMultipartGetUploadId(
-      {required MultipartHandle handle}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-                handle);
-        return wire.wire__crate__api__multipart__get_upload_id(port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_String,
-        decodeErrorData: null,
+  Future<String> crateApiMultipartGetUploadId({
+    required MultipartHandle handle,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+                handle,
+              );
+          return wire.wire__crate__api__multipart__get_upload_id(port_, arg0);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_String,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiMultipartGetUploadIdConstMeta,
+        argValues: [handle],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiMultipartGetUploadIdConstMeta,
-      argValues: [handle],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiMultipartGetUploadIdConstMeta =>
-      const TaskConstMeta(
-        debugName: "get_upload_id",
-        argNames: ["handle"],
-      );
+      const TaskConstMeta(debugName: "get_upload_id", argNames: ["handle"]);
 
   @override
-  Future<DecryptedObjectInfo> crateApiEncryptedGetWithPrivateMetadata(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(storageKey);
-        return wire.wire__crate__api__encrypted__get_with_private_metadata(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_decrypted_object_info,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<DecryptedObjectInfo> crateApiEncryptedGetWithPrivateMetadata({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(storageKey);
+          return wire.wire__crate__api__encrypted__get_with_private_metadata(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_decrypted_object_info,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedGetWithPrivateMetadataConstMeta,
+        argValues: [client, bucket, storageKey],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedGetWithPrivateMetadataConstMeta,
-      argValues: [client, bucket, storageKey],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedGetWithPrivateMetadataConstMeta =>
@@ -1684,93 +2214,132 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<Uint8List> crateApiSharingGetWithShare(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey,
-      required AcceptedShareHandle share}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(storageKey);
-        var arg3 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-                share);
-        return wire.wire__crate__api__sharing__get_with_share(
-            port_, arg0, arg1, arg2, arg3);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_prim_u_8_strict,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<Uint8List> crateApiSharingGetWithShare({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+    required String originalKey,
+    required AcceptedShareHandle share,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(storageKey);
+          var arg3 = cst_encode_String(originalKey);
+          var arg4 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+                share,
+              );
+          return wire.wire__crate__api__sharing__get_with_share(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiSharingGetWithShareConstMeta,
+        argValues: [client, bucket, storageKey, originalKey, share],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiSharingGetWithShareConstMeta,
-      argValues: [client, bucket, storageKey, share],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiSharingGetWithShareConstMeta =>
       const TaskConstMeta(
         debugName: "get_with_share",
-        argNames: ["client", "bucket", "storageKey", "share"],
+        argNames: ["client", "bucket", "storageKey", "originalKey", "share"],
       );
 
   @override
-  Future<Uint8List> crateApiSharingGetWithToken(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey,
-      required String tokenJson}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(storageKey);
-        var arg3 = cst_encode_String(tokenJson);
-        return wire.wire__crate__api__sharing__get_with_token(
-            port_, arg0, arg1, arg2, arg3);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_prim_u_8_strict,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<Uint8List> crateApiSharingGetWithToken({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+    required String originalKey,
+    required String tokenJson,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(storageKey);
+          var arg3 = cst_encode_String(originalKey);
+          var arg4 = cst_encode_String(tokenJson);
+          return wire.wire__crate__api__sharing__get_with_token(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiSharingGetWithTokenConstMeta,
+        argValues: [client, bucket, storageKey, originalKey, tokenJson],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiSharingGetWithTokenConstMeta,
-      argValues: [client, bucket, storageKey, tokenJson],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiSharingGetWithTokenConstMeta =>
       const TaskConstMeta(
         debugName: "get_with_token",
-        argNames: ["client", "bucket", "storageKey", "tokenJson"],
+        argNames: [
+          "client",
+          "bucket",
+          "storageKey",
+          "originalKey",
+          "tokenJson",
+        ],
       );
 
   @override
-  Future<bool> crateApiForestHasPendingChanges(
-      {required EncryptedClientHandle client, required String bucket}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        return wire.wire__crate__api__forest__has_pending_changes(
-            port_, arg0, arg1);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_bool,
-        decodeErrorData: null,
+  Future<bool> crateApiForestHasPendingChanges({
+    required EncryptedClientHandle client,
+    required String bucket,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          return wire.wire__crate__api__forest__has_pending_changes(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiForestHasPendingChangesConstMeta,
+        argValues: [client, bucket],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiForestHasPendingChangesConstMeta,
-      argValues: [client, bucket],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiForestHasPendingChangesConstMeta =>
@@ -1780,28 +2349,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<FileMetadata> crateApiEncryptedHeadDecrypted(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(storageKey);
-        return wire.wire__crate__api__encrypted__head_decrypted(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_file_metadata,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<FileMetadata> crateApiEncryptedHeadDecrypted({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(storageKey);
+          return wire.wire__crate__api__encrypted__head_decrypted(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_file_metadata,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedHeadDecryptedConstMeta,
+        argValues: [client, bucket, storageKey],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedHeadDecryptedConstMeta,
-      argValues: [client, bucket, storageKey],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedHeadDecryptedConstMeta =>
@@ -1811,135 +2388,158 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<HeadResult> crateApiClientHeadObject(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        return wire.wire__crate__api__client__head_object(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_head_result,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<HeadResult> crateApiClientHeadObject({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          return wire.wire__crate__api__client__head_object(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_head_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientHeadObjectConstMeta,
+        argValues: [client, bucket, key],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientHeadObjectConstMeta,
-      argValues: [client, bucket, key],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientHeadObjectConstMeta => const TaskConstMeta(
-        debugName: "head_object",
-        argNames: ["client", "bucket", "key"],
-      );
+    debugName: "head_object",
+    argNames: ["client", "bucket", "key"],
+  );
 
   @override
-  Future<bool> crateApiEncryptedIsFlatNamespace(
-      {required EncryptedClientHandle client}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        return wire.wire__crate__api__encrypted__is_flat_namespace(port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_bool,
-        decodeErrorData: null,
+  Future<bool> crateApiEncryptedIsFlatNamespace({
+    required EncryptedClientHandle client,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          return wire.wire__crate__api__encrypted__is_flat_namespace(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiEncryptedIsFlatNamespaceConstMeta,
+        argValues: [client],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedIsFlatNamespaceConstMeta,
-      argValues: [client],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedIsFlatNamespaceConstMeta =>
-      const TaskConstMeta(
-        debugName: "is_flat_namespace",
-        argNames: ["client"],
-      );
+      const TaskConstMeta(debugName: "is_flat_namespace", argNames: ["client"]);
 
   @override
-  Future<bool> crateApiSharingIsShareExpired(
-      {required AcceptedShareHandle share}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-                share);
-        return wire.wire__crate__api__sharing__is_share_expired(port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_bool,
-        decodeErrorData: null,
+  Future<bool> crateApiSharingIsShareExpired({
+    required AcceptedShareHandle share,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+                share,
+              );
+          return wire.wire__crate__api__sharing__is_share_expired(port_, arg0);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiSharingIsShareExpiredConstMeta,
+        argValues: [share],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiSharingIsShareExpiredConstMeta,
-      argValues: [share],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiSharingIsShareExpiredConstMeta =>
-      const TaskConstMeta(
-        debugName: "is_share_expired",
-        argNames: ["share"],
-      );
+      const TaskConstMeta(debugName: "is_share_expired", argNames: ["share"]);
 
   @override
-  Future<List<BucketInfo>> crateApiClientListBuckets(
-      {required FulaClientHandle client}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        return wire.wire__crate__api__client__list_buckets(port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_bucket_info,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<List<BucketInfo>> crateApiClientListBuckets({
+    required FulaClientHandle client,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          return wire.wire__crate__api__client__list_buckets(port_, arg0);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_bucket_info,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientListBucketsConstMeta,
+        argValues: [client],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientListBucketsConstMeta,
-      argValues: [client],
-      apiImpl: this,
-    ));
+    );
   }
 
-  TaskConstMeta get kCrateApiClientListBucketsConstMeta => const TaskConstMeta(
-        debugName: "list_buckets",
-        argNames: ["client"],
-      );
+  TaskConstMeta get kCrateApiClientListBucketsConstMeta =>
+      const TaskConstMeta(debugName: "list_buckets", argNames: ["client"]);
 
   @override
-  Future<List<FileMetadata>> crateApiEncryptedListDecrypted(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required ListOptions options}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_box_autoadd_list_options(options);
-        return wire.wire__crate__api__encrypted__list_decrypted(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_file_metadata,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<List<FileMetadata>> crateApiEncryptedListDecrypted({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required ListOptions options,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_box_autoadd_list_options(options);
+          return wire.wire__crate__api__encrypted__list_decrypted(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_file_metadata,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedListDecryptedConstMeta,
+        argValues: [client, bucket, options],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedListDecryptedConstMeta,
-      argValues: [client, bucket, options],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedListDecryptedConstMeta =>
@@ -1949,28 +2549,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<DirectoryListing> crateApiEncryptedListDirectory(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      String? prefix}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_opt_String(prefix);
-        return wire.wire__crate__api__encrypted__list_directory(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_directory_listing,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<DirectoryListing> crateApiEncryptedListDirectory({
+    required EncryptedClientHandle client,
+    required String bucket,
+    String? prefix,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_opt_String(prefix);
+          return wire.wire__crate__api__encrypted__list_directory(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_directory_listing,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedListDirectoryConstMeta,
+        argValues: [client, bucket, prefix],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedListDirectoryConstMeta,
-      argValues: [client, bucket, prefix],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedListDirectoryConstMeta =>
@@ -1980,25 +2588,33 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<List<FileMetadata>> crateApiForestListFromForest(
-      {required EncryptedClientHandle client, required String bucket}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        return wire.wire__crate__api__forest__list_from_forest(
-            port_, arg0, arg1);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_file_metadata,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<List<FileMetadata>> crateApiForestListFromForest({
+    required EncryptedClientHandle client,
+    required String bucket,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          return wire.wire__crate__api__forest__list_from_forest(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_file_metadata,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestListFromForestConstMeta,
+        argValues: [client, bucket],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiForestListFromForestConstMeta,
-      argValues: [client, bucket],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiForestListFromForestConstMeta =>
@@ -2008,216 +2624,253 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<ListObjectsResult> crateApiClientListObjects(
-      {required FulaClientHandle client,
-      required String bucket,
-      required ListOptions options}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_box_autoadd_list_options(options);
-        return wire.wire__crate__api__client__list_objects(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_objects_result,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<ListObjectsResult> crateApiClientListObjects({
+    required FulaClientHandle client,
+    required String bucket,
+    required ListOptions options,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_box_autoadd_list_options(options);
+          return wire.wire__crate__api__client__list_objects(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_objects_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientListObjectsConstMeta,
+        argValues: [client, bucket, options],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientListObjectsConstMeta,
-      argValues: [client, bucket, options],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientListObjectsConstMeta => const TaskConstMeta(
-        debugName: "list_objects",
-        argNames: ["client", "bucket", "options"],
-      );
+    debugName: "list_objects",
+    argNames: ["client", "bucket", "options"],
+  );
 
   @override
   Future<ListOptions> crateApiTypesListOptionsDefault() {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        return wire.wire__crate__api__types__list_options_default(port_);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_list_options,
-        decodeErrorData: null,
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          return wire.wire__crate__api__types__list_options_default(port_);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_options,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiTypesListOptionsDefaultConstMeta,
+        argValues: [],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiTypesListOptionsDefaultConstMeta,
-      argValues: [],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiTypesListOptionsDefaultConstMeta =>
-      const TaskConstMeta(
-        debugName: "list_options_default",
-        argNames: [],
-      );
+      const TaskConstMeta(debugName: "list_options_default", argNames: []);
 
   @override
-  Future<void> crateApiForestLoadForest(
-      {required EncryptedClientHandle client, required String bucket}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        return wire.wire__crate__api__forest__load_forest(port_, arg0, arg1);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<void> crateApiForestLoadForest({
+    required EncryptedClientHandle client,
+    required String bucket,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          return wire.wire__crate__api__forest__load_forest(port_, arg0, arg1);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestLoadForestConstMeta,
+        argValues: [client, bucket],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiForestLoadForestConstMeta,
-      argValues: [client, bucket],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiForestLoadForestConstMeta => const TaskConstMeta(
-        debugName: "load_forest",
-        argNames: ["client", "bucket"],
-      );
+    debugName: "load_forest",
+    argNames: ["client", "bucket"],
+  );
 
   @override
   Future<ObfuscationMode> crateApiTypesObfuscationModeDefault() {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        return wire.wire__crate__api__types__obfuscation_mode_default(port_);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_obfuscation_mode,
-        decodeErrorData: null,
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          return wire.wire__crate__api__types__obfuscation_mode_default(port_);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_obfuscation_mode,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiTypesObfuscationModeDefaultConstMeta,
+        argValues: [],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiTypesObfuscationModeDefaultConstMeta,
-      argValues: [],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiTypesObfuscationModeDefaultConstMeta =>
-      const TaskConstMeta(
-        debugName: "obfuscation_mode_default",
-        argNames: [],
-      );
+      const TaskConstMeta(debugName: "obfuscation_mode_default", argNames: []);
 
   @override
-  Future<bool> crateApiClientObjectExists(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        return wire.wire__crate__api__client__object_exists(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_bool,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<bool> crateApiClientObjectExists({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          return wire.wire__crate__api__client__object_exists(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientObjectExistsConstMeta,
+        argValues: [client, bucket, key],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientObjectExistsConstMeta,
-      argValues: [client, bucket, key],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientObjectExistsConstMeta => const TaskConstMeta(
-        debugName: "object_exists",
-        argNames: ["client", "bucket", "key"],
-      );
+    debugName: "object_exists",
+    argNames: ["client", "bucket", "key"],
+  );
 
   @override
   Future<ObjectMetadata> crateApiTypesObjectMetadataDefault() {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        return wire.wire__crate__api__types__object_metadata_default(port_);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_object_metadata,
-        decodeErrorData: null,
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          return wire.wire__crate__api__types__object_metadata_default(port_);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_object_metadata,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiTypesObjectMetadataDefaultConstMeta,
+        argValues: [],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiTypesObjectMetadataDefaultConstMeta,
-      argValues: [],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiTypesObjectMetadataDefaultConstMeta =>
-      const TaskConstMeta(
-        debugName: "object_metadata_default",
-        argNames: [],
-      );
+      const TaskConstMeta(debugName: "object_metadata_default", argNames: []);
 
   @override
-  Future<PutResult> crateApiChunkedPutChunked(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key,
-      required List<int> data,
-      int? chunkSize}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        var arg3 = cst_encode_list_prim_u_8_loose(data);
-        var arg4 = cst_encode_opt_box_autoadd_u_32(chunkSize);
-        return wire.wire__crate__api__chunked__put_chunked(
-            port_, arg0, arg1, arg2, arg3, arg4);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_put_result,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<PutResult> crateApiChunkedPutChunked({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+    required List<int> data,
+    int? chunkSize,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          var arg3 = cst_encode_list_prim_u_8_loose(data);
+          var arg4 = cst_encode_opt_box_autoadd_u_32(chunkSize);
+          return wire.wire__crate__api__chunked__put_chunked(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiChunkedPutChunkedConstMeta,
+        argValues: [client, bucket, key, data, chunkSize],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiChunkedPutChunkedConstMeta,
-      argValues: [client, bucket, key, data, chunkSize],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiChunkedPutChunkedConstMeta => const TaskConstMeta(
-        debugName: "put_chunked",
-        argNames: ["client", "bucket", "key", "data", "chunkSize"],
-      );
+    debugName: "put_chunked",
+    argNames: ["client", "bucket", "key", "data", "chunkSize"],
+  );
 
   @override
-  Future<PutResult> crateApiEncryptedPutEncrypted(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key,
-      required List<int> data}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        var arg3 = cst_encode_list_prim_u_8_loose(data);
-        return wire.wire__crate__api__encrypted__put_encrypted(
-            port_, arg0, arg1, arg2, arg3);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_put_result,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<PutResult> crateApiEncryptedPutEncrypted({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+    required List<int> data,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          var arg3 = cst_encode_list_prim_u_8_loose(data);
+          return wire.wire__crate__api__encrypted__put_encrypted(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedPutEncryptedConstMeta,
+        argValues: [client, bucket, key, data],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedPutEncryptedConstMeta,
-      argValues: [client, bucket, key, data],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedPutEncryptedConstMeta =>
@@ -2227,32 +2880,42 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<PutResult> crateApiEncryptedPutEncryptedWithType(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String key,
-      required List<int> data,
-      required String contentType}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        var arg3 = cst_encode_list_prim_u_8_loose(data);
-        var arg4 = cst_encode_String(contentType);
-        return wire.wire__crate__api__encrypted__put_encrypted_with_type(
-            port_, arg0, arg1, arg2, arg3, arg4);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_put_result,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<PutResult> crateApiEncryptedPutEncryptedWithType({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+    required List<int> data,
+    required String contentType,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          var arg3 = cst_encode_list_prim_u_8_loose(data);
+          var arg4 = cst_encode_String(contentType);
+          return wire.wire__crate__api__encrypted__put_encrypted_with_type(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiEncryptedPutEncryptedWithTypeConstMeta,
+        argValues: [client, bucket, key, data, contentType],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiEncryptedPutEncryptedWithTypeConstMeta,
-      argValues: [client, bucket, key, data, contentType],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiEncryptedPutEncryptedWithTypeConstMeta =>
@@ -2262,66 +2925,86 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<PutResult> crateApiForestPutFlat(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String path,
-      required List<int> data,
-      String? contentType}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(path);
-        var arg3 = cst_encode_list_prim_u_8_loose(data);
-        var arg4 = cst_encode_opt_String(contentType);
-        return wire.wire__crate__api__forest__put_flat(
-            port_, arg0, arg1, arg2, arg3, arg4);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_put_result,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<PutResult> crateApiForestPutFlat({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required List<int> data,
+    String? contentType,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(path);
+          var arg3 = cst_encode_list_prim_u_8_loose(data);
+          var arg4 = cst_encode_opt_String(contentType);
+          return wire.wire__crate__api__forest__put_flat(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestPutFlatConstMeta,
+        argValues: [client, bucket, path, data, contentType],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiForestPutFlatConstMeta,
-      argValues: [client, bucket, path, data, contentType],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiForestPutFlatConstMeta => const TaskConstMeta(
-        debugName: "put_flat",
-        argNames: ["client", "bucket", "path", "data", "contentType"],
-      );
+    debugName: "put_flat",
+    argNames: ["client", "bucket", "path", "data", "contentType"],
+  );
 
   @override
-  Future<PutResult> crateApiForestPutFlatDeferred(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String path,
-      required List<int> data,
-      String? contentType}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(path);
-        var arg3 = cst_encode_list_prim_u_8_loose(data);
-        var arg4 = cst_encode_opt_String(contentType);
-        return wire.wire__crate__api__forest__put_flat_deferred(
-            port_, arg0, arg1, arg2, arg3, arg4);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_put_result,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<PutResult> crateApiForestPutFlatDeferred({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required List<int> data,
+    String? contentType,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(path);
+          var arg3 = cst_encode_list_prim_u_8_loose(data);
+          var arg4 = cst_encode_opt_String(contentType);
+          return wire.wire__crate__api__forest__put_flat_deferred(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestPutFlatDeferredConstMeta,
+        argValues: [client, bucket, path, data, contentType],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiForestPutFlatDeferredConstMeta,
-      argValues: [client, bucket, path, data, contentType],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiForestPutFlatDeferredConstMeta =>
@@ -2331,64 +3014,83 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<PutResult> crateApiClientPutObject(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key,
-      required List<int> data}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        var arg3 = cst_encode_list_prim_u_8_loose(data);
-        return wire.wire__crate__api__client__put_object(
-            port_, arg0, arg1, arg2, arg3);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_put_result,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<PutResult> crateApiClientPutObject({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+    required List<int> data,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          var arg3 = cst_encode_list_prim_u_8_loose(data);
+          return wire.wire__crate__api__client__put_object(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientPutObjectConstMeta,
+        argValues: [client, bucket, key, data],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientPutObjectConstMeta,
-      argValues: [client, bucket, key, data],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientPutObjectConstMeta => const TaskConstMeta(
-        debugName: "put_object",
-        argNames: ["client", "bucket", "key", "data"],
-      );
+    debugName: "put_object",
+    argNames: ["client", "bucket", "key", "data"],
+  );
 
   @override
-  Future<PutResult> crateApiClientPutObjectWithMetadata(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key,
-      required List<int> data,
-      required ObjectMetadata metadata}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        var arg3 = cst_encode_list_prim_u_8_loose(data);
-        var arg4 = cst_encode_box_autoadd_object_metadata(metadata);
-        return wire.wire__crate__api__client__put_object_with_metadata(
-            port_, arg0, arg1, arg2, arg3, arg4);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_put_result,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<PutResult> crateApiClientPutObjectWithMetadata({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+    required List<int> data,
+    required ObjectMetadata metadata,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          var arg3 = cst_encode_list_prim_u_8_loose(data);
+          var arg4 = cst_encode_box_autoadd_object_metadata(metadata);
+          return wire.wire__crate__api__client__put_object_with_metadata(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientPutObjectWithMetadataConstMeta,
+        argValues: [client, bucket, key, data, metadata],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiClientPutObjectWithMetadataConstMeta,
-      argValues: [client, bucket, key, data, metadata],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiClientPutObjectWithMetadataConstMeta =>
@@ -2398,32 +3100,42 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<int> crateApiRotationRewrapObject(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required String storageKey,
-      required RotationManagerHandle manager}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(storageKey);
-        var arg3 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-                manager);
-        return wire.wire__crate__api__rotation__rewrap_object(
-            port_, arg0, arg1, arg2, arg3);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_u_32,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<int> crateApiRotationRewrapObject({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String storageKey,
+    required RotationManagerHandle manager,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(storageKey);
+          var arg3 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+                manager,
+              );
+          return wire.wire__crate__api__rotation__rewrap_object(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_u_32,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiRotationRewrapObjectConstMeta,
+        argValues: [client, bucket, storageKey, manager],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiRotationRewrapObjectConstMeta,
-      argValues: [client, bucket, storageKey, manager],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiRotationRewrapObjectConstMeta =>
@@ -2433,30 +3145,39 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<RotationReport> crateApiRotationRotateBucket(
-      {required EncryptedClientHandle client,
-      required String bucket,
-      required RotationManagerHandle manager}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-                manager);
-        return wire.wire__crate__api__rotation__rotate_bucket(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_rotation_report,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<RotationReport> crateApiRotationRotateBucket({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required RotationManagerHandle manager,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+                manager,
+              );
+          return wire.wire__crate__api__rotation__rotate_bucket(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_rotation_report,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiRotationRotateBucketConstMeta,
+        argValues: [client, bucket, manager],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiRotationRotateBucketConstMeta,
-      argValues: [client, bucket, manager],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiRotationRotateBucketConstMeta =>
@@ -2466,22 +3187,27 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<bool> crateApiTypesRotationReportIsSuccess(
-      {required RotationReport that}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 = cst_encode_box_autoadd_rotation_report(that);
-        return wire.wire__crate__api__types__rotation_report_is_success(
-            port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_bool,
-        decodeErrorData: null,
+  Future<bool> crateApiTypesRotationReportIsSuccess({
+    required RotationReport that,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_box_autoadd_rotation_report(that);
+          return wire.wire__crate__api__types__rotation_report_is_success(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiTypesRotationReportIsSuccessConstMeta,
+        argValues: [that],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiTypesRotationReportIsSuccessConstMeta,
-      argValues: [that],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiTypesRotationReportIsSuccessConstMeta =>
@@ -2491,22 +3217,27 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<double> crateApiTypesRotationReportSuccessRate(
-      {required RotationReport that}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 = cst_encode_box_autoadd_rotation_report(that);
-        return wire.wire__crate__api__types__rotation_report_success_rate(
-            port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_f_64,
-        decodeErrorData: null,
+  Future<double> crateApiTypesRotationReportSuccessRate({
+    required RotationReport that,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_box_autoadd_rotation_report(that);
+          return wire.wire__crate__api__types__rotation_report_success_rate(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_f_64,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiTypesRotationReportSuccessRateConstMeta,
+        argValues: [that],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiTypesRotationReportSuccessRateConstMeta,
-      argValues: [that],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiTypesRotationReportSuccessRateConstMeta =>
@@ -2516,78 +3247,93 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<void> crateApiForestSaveForest(
-      {required EncryptedClientHandle client, required String bucket}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        return wire.wire__crate__api__forest__save_forest(port_, arg0, arg1);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<void> crateApiForestSaveForest({
+    required EncryptedClientHandle client,
+    required String bucket,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          return wire.wire__crate__api__forest__save_forest(port_, arg0, arg1);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestSaveForestConstMeta,
+        argValues: [client, bucket],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiForestSaveForestConstMeta,
-      argValues: [client, bucket],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiForestSaveForestConstMeta => const TaskConstMeta(
-        debugName: "save_forest",
-        argNames: ["client", "bucket"],
-      );
+    debugName: "save_forest",
+    argNames: ["client", "bucket"],
+  );
 
   @override
   Future<bool> crateApiChunkedShouldUseChunked({required BigInt size}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 = cst_encode_u_64(size);
-        return wire.wire__crate__api__chunked__should_use_chunked(port_, arg0);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_bool,
-        decodeErrorData: null,
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_u_64(size);
+          return wire.wire__crate__api__chunked__should_use_chunked(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiChunkedShouldUseChunkedConstMeta,
+        argValues: [size],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiChunkedShouldUseChunkedConstMeta,
-      argValues: [size],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiChunkedShouldUseChunkedConstMeta =>
-      const TaskConstMeta(
-        debugName: "should_use_chunked",
-        argNames: ["size"],
-      );
+      const TaskConstMeta(debugName: "should_use_chunked", argNames: ["size"]);
 
   @override
-  Future<MultipartHandle> crateApiMultipartStartMultipart(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        return wire.wire__crate__api__multipart__start_multipart(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData:
-            dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<MultipartHandle> crateApiMultipartStartMultipart({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          return wire.wire__crate__api__multipart__start_multipart(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData:
+              dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiMultipartStartMultipartConstMeta,
+        argValues: [client, bucket, key],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiMultipartStartMultipartConstMeta,
-      argValues: [client, bucket, key],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiMultipartStartMultipartConstMeta =>
@@ -2597,32 +3343,42 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<String> crateApiMultipartUploadLargeFileSimple(
-      {required FulaClientHandle client,
-      required String bucket,
-      required String key,
-      required List<int> data,
-      int? chunkSize}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-                client);
-        var arg1 = cst_encode_String(bucket);
-        var arg2 = cst_encode_String(key);
-        var arg3 = cst_encode_list_prim_u_8_loose(data);
-        var arg4 = cst_encode_opt_box_autoadd_u_32(chunkSize);
-        return wire.wire__crate__api__multipart__upload_large_file_simple(
-            port_, arg0, arg1, arg2, arg3, arg4);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_String,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<String> crateApiMultipartUploadLargeFileSimple({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+    required List<int> data,
+    int? chunkSize,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          var arg3 = cst_encode_list_prim_u_8_loose(data);
+          var arg4 = cst_encode_opt_box_autoadd_u_32(chunkSize);
+          return wire.wire__crate__api__multipart__upload_large_file_simple(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_String,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiMultipartUploadLargeFileSimpleConstMeta,
+        argValues: [client, bucket, key, data, chunkSize],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiMultipartUploadLargeFileSimpleConstMeta,
-      argValues: [client, bucket, key, data, chunkSize],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiMultipartUploadLargeFileSimpleConstMeta =>
@@ -2632,28 +3388,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<void> crateApiMultipartUploadPart(
-      {required MultipartHandle handle,
-      required int partNumber,
-      required List<int> data}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 =
-            cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-                handle);
-        var arg1 = cst_encode_u_32(partNumber);
-        var arg2 = cst_encode_list_prim_u_8_loose(data);
-        return wire.wire__crate__api__multipart__upload_part(
-            port_, arg0, arg1, arg2);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_unit,
-        decodeErrorData: dco_decode_AnyhowException,
+  Future<void> crateApiMultipartUploadPart({
+    required MultipartHandle handle,
+    required int partNumber,
+    required List<int> data,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+                handle,
+              );
+          var arg1 = cst_encode_u_32(partNumber);
+          var arg2 = cst_encode_list_prim_u_8_loose(data);
+          return wire.wire__crate__api__multipart__upload_part(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiMultipartUploadPartConstMeta,
+        argValues: [handle, partNumber, data],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiMultipartUploadPartConstMeta,
-      argValues: [handle, partNumber, data],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiMultipartUploadPartConstMeta =>
@@ -2663,28 +3427,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
-  Future<UploadProgress> crateApiTypesUploadProgressNew(
-      {required BigInt bytesUploaded,
-      required BigInt totalBytes,
-      required int currentPart,
-      required int totalParts}) {
-    return handler.executeNormal(NormalTask(
-      callFfi: (port_) {
-        var arg0 = cst_encode_u_64(bytesUploaded);
-        var arg1 = cst_encode_u_64(totalBytes);
-        var arg2 = cst_encode_u_32(currentPart);
-        var arg3 = cst_encode_u_32(totalParts);
-        return wire.wire__crate__api__types__upload_progress_new(
-            port_, arg0, arg1, arg2, arg3);
-      },
-      codec: DcoCodec(
-        decodeSuccessData: dco_decode_upload_progress,
-        decodeErrorData: null,
+  Future<UploadProgress> crateApiTypesUploadProgressNew({
+    required BigInt bytesUploaded,
+    required BigInt totalBytes,
+    required int currentPart,
+    required int totalParts,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_u_64(bytesUploaded);
+          var arg1 = cst_encode_u_64(totalBytes);
+          var arg2 = cst_encode_u_32(currentPart);
+          var arg3 = cst_encode_u_32(totalParts);
+          return wire.wire__crate__api__types__upload_progress_new(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_upload_progress,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiTypesUploadProgressNewConstMeta,
+        argValues: [bytesUploaded, totalBytes, currentPart, totalParts],
+        apiImpl: this,
       ),
-      constMeta: kCrateApiTypesUploadProgressNewConstMeta,
-      argValues: [bytesUploaded, totalBytes, currentPart, totalParts],
-      apiImpl: this,
-    ));
+    );
   }
 
   TaskConstMeta get kCrateApiTypesUploadProgressNewConstMeta =>
@@ -2693,45 +3465,68 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         argNames: ["bytesUploaded", "totalBytes", "currentPart", "totalParts"],
       );
 
-  RustArcIncrementStrongCountFnType
-      get rust_arc_increment_strong_count_AcceptedShareHandle => wire
-          .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle;
+  @override
+  Future<BigInt> crateApiMetricsWalAppendFailureCount() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          return wire.wire__crate__api__metrics__wal_append_failure_count(
+            port_,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_u_64,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiMetricsWalAppendFailureCountConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
 
-  RustArcDecrementStrongCountFnType
-      get rust_arc_decrement_strong_count_AcceptedShareHandle => wire
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle;
-
-  RustArcIncrementStrongCountFnType
-      get rust_arc_increment_strong_count_EncryptedClientHandle => wire
-          .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle;
-
-  RustArcDecrementStrongCountFnType
-      get rust_arc_decrement_strong_count_EncryptedClientHandle => wire
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle;
-
-  RustArcIncrementStrongCountFnType
-      get rust_arc_increment_strong_count_FulaClientHandle => wire
-          .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle;
-
-  RustArcDecrementStrongCountFnType
-      get rust_arc_decrement_strong_count_FulaClientHandle => wire
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle;
-
-  RustArcIncrementStrongCountFnType
-      get rust_arc_increment_strong_count_MultipartHandle => wire
-          .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle;
-
-  RustArcDecrementStrongCountFnType
-      get rust_arc_decrement_strong_count_MultipartHandle => wire
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle;
+  TaskConstMeta get kCrateApiMetricsWalAppendFailureCountConstMeta =>
+      const TaskConstMeta(debugName: "wal_append_failure_count", argNames: []);
 
   RustArcIncrementStrongCountFnType
-      get rust_arc_increment_strong_count_RotationManagerHandle => wire
-          .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle;
+  get rust_arc_increment_strong_count_AcceptedShareHandle => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle;
 
   RustArcDecrementStrongCountFnType
-      get rust_arc_decrement_strong_count_RotationManagerHandle => wire
-          .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle;
+  get rust_arc_decrement_strong_count_AcceptedShareHandle => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_EncryptedClientHandle => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_EncryptedClientHandle => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_FulaClientHandle => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_FulaClientHandle => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_MultipartHandle => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_MultipartHandle => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_RotationManagerHandle => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_RotationManagerHandle => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle;
 
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw) {
@@ -2741,120 +3536,135 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   AcceptedShareHandle
-      dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          dynamic raw) {
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return AcceptedShareHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   EncryptedClientHandle
-      dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          dynamic raw) {
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return EncryptedClientHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   FulaClientHandle
-      dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          dynamic raw) {
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return FulaClientHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   MultipartHandle
-      dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          dynamic raw) {
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return MultipartHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   RotationManagerHandle
-      dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          dynamic raw) {
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return RotationManagerHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   AcceptedShareHandle
-      dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          dynamic raw) {
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return AcceptedShareHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   EncryptedClientHandle
-      dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          dynamic raw) {
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return EncryptedClientHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   FulaClientHandle
-      dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          dynamic raw) {
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return FulaClientHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   MultipartHandle
-      dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          dynamic raw) {
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return MultipartHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   RotationManagerHandle
-      dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          dynamic raw) {
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return RotationManagerHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   AcceptedShareHandle
-      dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          dynamic raw) {
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return AcceptedShareHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   EncryptedClientHandle
-      dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          dynamic raw) {
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return EncryptedClientHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   FulaClientHandle
-      dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          dynamic raw) {
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return FulaClientHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   MultipartHandle
-      dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          dynamic raw) {
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return MultipartHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
   RotationManagerHandle
-      dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          dynamic raw) {
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    dynamic raw,
+  ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return RotationManagerHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
@@ -3032,22 +3842,22 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     final arr = raw as List<dynamic>;
     if (arr.length != 1)
       throw Exception('unexpected arr length: expect 1 but see ${arr.length}');
-    return ForestSubtree(
-      serialized: dco_decode_list_prim_u_8_strict(arr[0]),
-    );
+    return ForestSubtree(serialized: dco_decode_list_prim_u_8_strict(arr[0]));
   }
 
   @protected
   FulaConfig dco_decode_fula_config(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 4)
-      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
     return FulaConfig(
       endpoint: dco_decode_String(arr[0]),
       accessToken: dco_decode_opt_String(arr[1]),
       timeoutSeconds: dco_decode_u_64(arr[2]),
       maxRetries: dco_decode_u_32(arr[3]),
+      perChunkDownloadTimeoutSeconds: dco_decode_u_64(arr[4]),
+      bufferedDownloadMaxBytes: dco_decode_u_64(arr[5]),
     );
   }
 
@@ -3056,62 +3866,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     switch (raw[0]) {
       case 0:
-        return FulaError_Network(
-          dco_decode_String(raw[1]),
-        );
+        return FulaError_Network(dco_decode_String(raw[1]));
       case 1:
         return FulaError_NotFound(
           bucket: dco_decode_String(raw[1]),
           key: dco_decode_String(raw[2]),
         );
       case 2:
-        return FulaError_BucketNotFound(
-          dco_decode_String(raw[1]),
-        );
+        return FulaError_BucketNotFound(dco_decode_String(raw[1]));
       case 3:
-        return FulaError_AccessDenied(
-          dco_decode_String(raw[1]),
-        );
+        return FulaError_AccessDenied(dco_decode_String(raw[1]));
       case 4:
-        return FulaError_Encryption(
-          dco_decode_String(raw[1]),
-        );
+        return FulaError_Encryption(dco_decode_String(raw[1]));
       case 5:
-        return FulaError_InvalidConfig(
-          dco_decode_String(raw[1]),
-        );
+        return FulaError_InvalidConfig(dco_decode_String(raw[1]));
       case 6:
-        return FulaError_UploadFailed(
-          dco_decode_String(raw[1]),
-        );
+        return FulaError_UploadFailed(dco_decode_String(raw[1]));
       case 7:
-        return FulaError_DownloadFailed(
-          dco_decode_String(raw[1]),
-        );
+        return FulaError_DownloadFailed(dco_decode_String(raw[1]));
       case 8:
-        return FulaError_XmlParse(
-          dco_decode_String(raw[1]),
-        );
+        return FulaError_XmlParse(dco_decode_String(raw[1]));
       case 9:
-        return FulaError_InvalidResponse(
-          dco_decode_String(raw[1]),
-        );
+        return FulaError_InvalidResponse(dco_decode_String(raw[1]));
       case 10:
-        return FulaError_ShareError(
-          dco_decode_String(raw[1]),
-        );
+        return FulaError_ShareError(dco_decode_String(raw[1]));
       case 11:
-        return FulaError_RotationError(
-          dco_decode_String(raw[1]),
-        );
+        return FulaError_RotationError(dco_decode_String(raw[1]));
       case 12:
-        return FulaError_ForestError(
-          dco_decode_String(raw[1]),
-        );
+        return FulaError_ForestError(dco_decode_String(raw[1]));
       case 13:
-        return FulaError_Internal(
-          dco_decode_String(raw[1]),
-        );
+        return FulaError_Internal(dco_decode_String(raw[1]));
       default:
         throw Exception("unreachable");
     }
@@ -3436,137 +4220,182 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   AcceptedShareHandle
-      sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          SseDeserializer deserializer) {
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return AcceptedShareHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   EncryptedClientHandle
-      sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          SseDeserializer deserializer) {
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return EncryptedClientHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   FulaClientHandle
-      sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          SseDeserializer deserializer) {
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return FulaClientHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   MultipartHandle
-      sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          SseDeserializer deserializer) {
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return MultipartHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   RotationManagerHandle
-      sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          SseDeserializer deserializer) {
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return RotationManagerHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   AcceptedShareHandle
-      sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          SseDeserializer deserializer) {
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return AcceptedShareHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   EncryptedClientHandle
-      sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          SseDeserializer deserializer) {
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return EncryptedClientHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   FulaClientHandle
-      sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          SseDeserializer deserializer) {
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return FulaClientHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   MultipartHandle
-      sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          SseDeserializer deserializer) {
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return MultipartHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   RotationManagerHandle
-      sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          SseDeserializer deserializer) {
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return RotationManagerHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   AcceptedShareHandle
-      sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          SseDeserializer deserializer) {
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return AcceptedShareHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   EncryptedClientHandle
-      sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          SseDeserializer deserializer) {
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return EncryptedClientHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   FulaClientHandle
-      sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          SseDeserializer deserializer) {
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return FulaClientHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   MultipartHandle
-      sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          SseDeserializer deserializer) {
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return MultipartHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
   RotationManagerHandle
-      sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          SseDeserializer deserializer) {
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return RotationManagerHandleImpl.frbInternalSseDecode(
-        sse_decode_usize(deserializer), sse_decode_i_32(deserializer));
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
   }
 
   @protected
@@ -3584,7 +4413,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   EncryptionConfig sse_decode_box_autoadd_encryption_config(
-      SseDeserializer deserializer) {
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_encryption_config(deserializer));
   }
@@ -3609,28 +4439,32 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   ListOptions sse_decode_box_autoadd_list_options(
-      SseDeserializer deserializer) {
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_list_options(deserializer));
   }
 
   @protected
   ObjectMetadata sse_decode_box_autoadd_object_metadata(
-      SseDeserializer deserializer) {
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_object_metadata(deserializer));
   }
 
   @protected
   PinningConfig sse_decode_box_autoadd_pinning_config(
-      SseDeserializer deserializer) {
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_pinning_config(deserializer));
   }
 
   @protected
   RotationReport sse_decode_box_autoadd_rotation_report(
-      SseDeserializer deserializer) {
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_rotation_report(deserializer));
   }
@@ -3659,7 +4493,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   DecryptedObjectInfo sse_decode_decrypted_object_info(
-      SseDeserializer deserializer) {
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_data = sse_decode_list_prim_u_8_strict(deserializer);
     var var_originalKey = sse_decode_String(deserializer);
@@ -3667,11 +4502,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_contentType = sse_decode_opt_String(deserializer);
     var var_metadata = sse_decode_list_metadata_entry(deserializer);
     return DecryptedObjectInfo(
-        data: var_data,
-        originalKey: var_originalKey,
-        size: var_size,
-        contentType: var_contentType,
-        metadata: var_metadata);
+      data: var_data,
+      originalKey: var_originalKey,
+      size: var_size,
+      contentType: var_contentType,
+      metadata: var_metadata,
+    );
   }
 
   @protected
@@ -3681,7 +4517,10 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_isDirectory = sse_decode_bool(deserializer);
     var var_files = sse_decode_list_file_metadata(deserializer);
     return DirectoryEntry(
-        name: var_name, isDirectory: var_isDirectory, files: var_files);
+      name: var_name,
+      isDirectory: var_isDirectory,
+      files: var_files,
+    );
   }
 
   @protected
@@ -3691,7 +4530,10 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_prefix = sse_decode_opt_String(deserializer);
     var var_entries = sse_decode_list_directory_entry(deserializer);
     return DirectoryListing(
-        bucket: var_bucket, prefix: var_prefix, entries: var_entries);
+      bucket: var_bucket,
+      prefix: var_prefix,
+      entries: var_entries,
+    );
   }
 
   @protected
@@ -3701,9 +4543,10 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_enableMetadataPrivacy = sse_decode_bool(deserializer);
     var var_obfuscationMode = sse_decode_obfuscation_mode(deserializer);
     return EncryptionConfig(
-        secretKey: var_secretKey,
-        enableMetadataPrivacy: var_enableMetadataPrivacy,
-        obfuscationMode: var_obfuscationMode);
+      secretKey: var_secretKey,
+      enableMetadataPrivacy: var_enableMetadataPrivacy,
+      obfuscationMode: var_obfuscationMode,
+    );
   }
 
   @protected
@@ -3723,13 +4566,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_modifiedAt = sse_decode_opt_box_autoadd_i_64(deserializer);
     var var_isEncrypted = sse_decode_bool(deserializer);
     return FileMetadata(
-        storageKey: var_storageKey,
-        originalKey: var_originalKey,
-        size: var_size,
-        contentType: var_contentType,
-        createdAt: var_createdAt,
-        modifiedAt: var_modifiedAt,
-        isEncrypted: var_isEncrypted);
+      storageKey: var_storageKey,
+      originalKey: var_originalKey,
+      size: var_size,
+      contentType: var_contentType,
+      createdAt: var_createdAt,
+      modifiedAt: var_modifiedAt,
+      isEncrypted: var_isEncrypted,
+    );
   }
 
   @protected
@@ -3746,11 +4590,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_accessToken = sse_decode_opt_String(deserializer);
     var var_timeoutSeconds = sse_decode_u_64(deserializer);
     var var_maxRetries = sse_decode_u_32(deserializer);
+    var var_perChunkDownloadTimeoutSeconds = sse_decode_u_64(deserializer);
+    var var_bufferedDownloadMaxBytes = sse_decode_u_64(deserializer);
     return FulaConfig(
-        endpoint: var_endpoint,
-        accessToken: var_accessToken,
-        timeoutSeconds: var_timeoutSeconds,
-        maxRetries: var_maxRetries);
+      endpoint: var_endpoint,
+      accessToken: var_accessToken,
+      timeoutSeconds: var_timeoutSeconds,
+      maxRetries: var_maxRetries,
+      perChunkDownloadTimeoutSeconds: var_perChunkDownloadTimeoutSeconds,
+      bufferedDownloadMaxBytes: var_bufferedDownloadMaxBytes,
+    );
   }
 
   @protected
@@ -3817,12 +4666,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_lastModified = sse_decode_i_64(deserializer);
     var var_metadata = sse_decode_list_metadata_entry(deserializer);
     return GetObjectResult(
-        data: var_data,
-        etag: var_etag,
-        contentType: var_contentType,
-        size: var_size,
-        lastModified: var_lastModified,
-        metadata: var_metadata);
+      data: var_data,
+      etag: var_etag,
+      contentType: var_contentType,
+      size: var_size,
+      lastModified: var_lastModified,
+      metadata: var_metadata,
+    );
   }
 
   @protected
@@ -3834,11 +4684,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_lastModified = sse_decode_i_64(deserializer);
     var var_metadata = sse_decode_list_metadata_entry(deserializer);
     return HeadResult(
-        etag: var_etag,
-        contentType: var_contentType,
-        size: var_size,
-        lastModified: var_lastModified,
-        metadata: var_metadata);
+      etag: var_etag,
+      contentType: var_contentType,
+      size: var_size,
+      lastModified: var_lastModified,
+      metadata: var_metadata,
+    );
   }
 
   @protected
@@ -3879,7 +4730,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   List<DirectoryEntry> sse_decode_list_directory_entry(
-      SseDeserializer deserializer) {
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
     var len_ = sse_decode_i_32(deserializer);
@@ -3892,7 +4744,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   List<FileMetadata> sse_decode_list_file_metadata(
-      SseDeserializer deserializer) {
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
     var len_ = sse_decode_i_32(deserializer);
@@ -3905,7 +4758,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   List<MetadataEntry> sse_decode_list_metadata_entry(
-      SseDeserializer deserializer) {
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
     var len_ = sse_decode_i_32(deserializer);
@@ -3930,17 +4784,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   ListObjectsResult sse_decode_list_objects_result(
-      SseDeserializer deserializer) {
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_objects = sse_decode_list_object_info(deserializer);
     var var_commonPrefixes = sse_decode_list_String(deserializer);
     var var_isTruncated = sse_decode_bool(deserializer);
     var var_nextToken = sse_decode_opt_String(deserializer);
     return ListObjectsResult(
-        objects: var_objects,
-        commonPrefixes: var_commonPrefixes,
-        isTruncated: var_isTruncated,
-        nextToken: var_nextToken);
+      objects: var_objects,
+      commonPrefixes: var_commonPrefixes,
+      isTruncated: var_isTruncated,
+      nextToken: var_nextToken,
+    );
   }
 
   @protected
@@ -3951,10 +4807,11 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_maxKeys = sse_decode_opt_box_autoadd_u_32(deserializer);
     var var_continuationToken = sse_decode_opt_String(deserializer);
     return ListOptions(
-        prefix: var_prefix,
-        delimiter: var_delimiter,
-        maxKeys: var_maxKeys,
-        continuationToken: var_continuationToken);
+      prefix: var_prefix,
+      delimiter: var_delimiter,
+      maxKeys: var_maxKeys,
+      continuationToken: var_continuationToken,
+    );
   }
 
   @protected
@@ -3973,7 +4830,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   List<RotationFailure> sse_decode_list_rotation_failure(
-      SseDeserializer deserializer) {
+    SseDeserializer deserializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
     var len_ = sse_decode_i_32(deserializer);
@@ -4008,11 +4866,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_etag = sse_decode_String(deserializer);
     var var_storageClass = sse_decode_String(deserializer);
     return ObjectInfo(
-        key: var_key,
-        size: var_size,
-        lastModified: var_lastModified,
-        etag: var_etag,
-        storageClass: var_storageClass);
+      key: var_key,
+      size: var_size,
+      lastModified: var_lastModified,
+      etag: var_etag,
+      storageClass: var_storageClass,
+    );
   }
 
   @protected
@@ -4022,9 +4881,10 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_cacheControl = sse_decode_opt_String(deserializer);
     var var_userMetadata = sse_decode_list_metadata_entry(deserializer);
     return ObjectMetadata(
-        contentType: var_contentType,
-        cacheControl: var_cacheControl,
-        userMetadata: var_userMetadata);
+      contentType: var_contentType,
+      cacheControl: var_cacheControl,
+      userMetadata: var_userMetadata,
+    );
   }
 
   @protected
@@ -4104,11 +4964,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_failed = sse_decode_u_32(deserializer);
     var var_failures = sse_decode_list_rotation_failure(deserializer);
     return RotationReport(
-        total: var_total,
-        rotated: var_rotated,
-        skipped: var_skipped,
-        failed: var_failed,
-        failures: var_failures);
+      total: var_total,
+      rotated: var_rotated,
+      skipped: var_skipped,
+      failed: var_failed,
+      failures: var_failures,
+    );
   }
 
   @protected
@@ -4125,7 +4986,10 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_canWrite = sse_decode_bool(deserializer);
     var var_expiresAt = sse_decode_opt_box_autoadd_i_64(deserializer);
     return SharePermissions(
-        canRead: var_canRead, canWrite: var_canWrite, expiresAt: var_expiresAt);
+      canRead: var_canRead,
+      canWrite: var_canWrite,
+      expiresAt: var_expiresAt,
+    );
   }
 
   @protected
@@ -4160,11 +5024,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_totalParts = sse_decode_u_32(deserializer);
     var var_percentage = sse_decode_f_64(deserializer);
     return UploadProgress(
-        bytesUploaded: var_bytesUploaded,
-        totalBytes: var_totalBytes,
-        currentPart: var_currentPart,
-        totalParts: var_totalParts,
-        percentage: var_percentage);
+      bytesUploaded: var_bytesUploaded,
+      totalBytes: var_totalBytes,
+      currentPart: var_currentPart,
+      totalParts: var_totalParts,
+      percentage: var_percentage,
+    );
   }
 
   @protected
@@ -4174,122 +5039,152 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  int cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-      AcceptedShareHandle raw) {
+  int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    AcceptedShareHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as AcceptedShareHandleImpl).frbInternalCstEncode(move: true);
   }
 
   @protected
-  int cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-      EncryptedClientHandle raw) {
+  int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    EncryptedClientHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as EncryptedClientHandleImpl).frbInternalCstEncode(move: true);
   }
 
   @protected
-  int cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-      FulaClientHandle raw) {
+  int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    FulaClientHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as FulaClientHandleImpl).frbInternalCstEncode(move: true);
   }
 
   @protected
-  int cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-      MultipartHandle raw) {
+  int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    MultipartHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as MultipartHandleImpl).frbInternalCstEncode(move: true);
   }
 
   @protected
-  int cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-      RotationManagerHandle raw) {
+  int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    RotationManagerHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as RotationManagerHandleImpl).frbInternalCstEncode(move: true);
   }
 
   @protected
-  int cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-      AcceptedShareHandle raw) {
+  int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    AcceptedShareHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as AcceptedShareHandleImpl).frbInternalCstEncode(move: false);
   }
 
   @protected
-  int cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-      EncryptedClientHandle raw) {
+  int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    EncryptedClientHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as EncryptedClientHandleImpl).frbInternalCstEncode(move: false);
   }
 
   @protected
-  int cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-      FulaClientHandle raw) {
+  int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    FulaClientHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as FulaClientHandleImpl).frbInternalCstEncode(move: false);
   }
 
   @protected
-  int cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-      MultipartHandle raw) {
+  int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    MultipartHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as MultipartHandleImpl).frbInternalCstEncode(move: false);
   }
 
   @protected
-  int cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-      RotationManagerHandle raw) {
+  int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    RotationManagerHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as RotationManagerHandleImpl).frbInternalCstEncode(move: false);
   }
 
   @protected
-  int cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-      AcceptedShareHandle raw) {
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    AcceptedShareHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as AcceptedShareHandleImpl).frbInternalCstEncode();
   }
 
   @protected
-  int cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-      EncryptedClientHandle raw) {
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    EncryptedClientHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as EncryptedClientHandleImpl).frbInternalCstEncode();
   }
 
   @protected
-  int cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-      FulaClientHandle raw) {
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    FulaClientHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as FulaClientHandleImpl).frbInternalCstEncode();
   }
 
   @protected
-  int cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-      MultipartHandle raw) {
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    MultipartHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as MultipartHandleImpl).frbInternalCstEncode();
   }
 
   @protected
-  int cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-      RotationManagerHandle raw) {
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    RotationManagerHandle raw,
+  ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
-// ignore: invalid_use_of_internal_member
+    // ignore: invalid_use_of_internal_member
     return (raw as RotationManagerHandleImpl).frbInternalCstEncode();
   }
 
@@ -4343,159 +5238,206 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_AnyhowException(
-      AnyhowException self, SseSerializer serializer) {
+    AnyhowException self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.message, serializer);
   }
 
   @protected
   void
-      sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          AcceptedShareHandle self, SseSerializer serializer) {
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    AcceptedShareHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as AcceptedShareHandleImpl).frbInternalSseEncode(move: true),
-        serializer);
+      (self as AcceptedShareHandleImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          EncryptedClientHandle self, SseSerializer serializer) {
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    EncryptedClientHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as EncryptedClientHandleImpl).frbInternalSseEncode(move: true),
-        serializer);
+      (self as EncryptedClientHandleImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          FulaClientHandle self, SseSerializer serializer) {
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    FulaClientHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as FulaClientHandleImpl).frbInternalSseEncode(move: true),
-        serializer);
+      (self as FulaClientHandleImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          MultipartHandle self, SseSerializer serializer) {
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    MultipartHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as MultipartHandleImpl).frbInternalSseEncode(move: true),
-        serializer);
+      (self as MultipartHandleImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          RotationManagerHandle self, SseSerializer serializer) {
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    RotationManagerHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as RotationManagerHandleImpl).frbInternalSseEncode(move: true),
-        serializer);
+      (self as RotationManagerHandleImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          AcceptedShareHandle self, SseSerializer serializer) {
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    AcceptedShareHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as AcceptedShareHandleImpl).frbInternalSseEncode(move: false),
-        serializer);
+      (self as AcceptedShareHandleImpl).frbInternalSseEncode(move: false),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          EncryptedClientHandle self, SseSerializer serializer) {
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    EncryptedClientHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as EncryptedClientHandleImpl).frbInternalSseEncode(move: false),
-        serializer);
+      (self as EncryptedClientHandleImpl).frbInternalSseEncode(move: false),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          FulaClientHandle self, SseSerializer serializer) {
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    FulaClientHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as FulaClientHandleImpl).frbInternalSseEncode(move: false),
-        serializer);
+      (self as FulaClientHandleImpl).frbInternalSseEncode(move: false),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          MultipartHandle self, SseSerializer serializer) {
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    MultipartHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as MultipartHandleImpl).frbInternalSseEncode(move: false),
-        serializer);
+      (self as MultipartHandleImpl).frbInternalSseEncode(move: false),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          RotationManagerHandle self, SseSerializer serializer) {
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    RotationManagerHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as RotationManagerHandleImpl).frbInternalSseEncode(move: false),
-        serializer);
+      (self as RotationManagerHandleImpl).frbInternalSseEncode(move: false),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
-          AcceptedShareHandle self, SseSerializer serializer) {
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    AcceptedShareHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as AcceptedShareHandleImpl).frbInternalSseEncode(move: null),
-        serializer);
+      (self as AcceptedShareHandleImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
-          EncryptedClientHandle self, SseSerializer serializer) {
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+    EncryptedClientHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as EncryptedClientHandleImpl).frbInternalSseEncode(move: null),
-        serializer);
+      (self as EncryptedClientHandleImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
-          FulaClientHandle self, SseSerializer serializer) {
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+    FulaClientHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as FulaClientHandleImpl).frbInternalSseEncode(move: null),
-        serializer);
+      (self as FulaClientHandleImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
-          MultipartHandle self, SseSerializer serializer) {
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+    MultipartHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as MultipartHandleImpl).frbInternalSseEncode(move: null),
-        serializer);
+      (self as MultipartHandleImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
   }
 
   @protected
   void
-      sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
-          RotationManagerHandle self, SseSerializer serializer) {
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    RotationManagerHandle self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
-        (self as RotationManagerHandleImpl).frbInternalSseEncode(move: null),
-        serializer);
+      (self as RotationManagerHandleImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
   }
 
   @protected
@@ -4512,56 +5454,72 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_box_autoadd_encryption_config(
-      EncryptionConfig self, SseSerializer serializer) {
+    EncryptionConfig self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_encryption_config(self, serializer);
   }
 
   @protected
   void sse_encode_box_autoadd_fula_config(
-      FulaConfig self, SseSerializer serializer) {
+    FulaConfig self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_fula_config(self, serializer);
   }
 
   @protected
   void sse_encode_box_autoadd_fula_error(
-      FulaError self, SseSerializer serializer) {
+    FulaError self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_fula_error(self, serializer);
   }
 
   @protected
   void sse_encode_box_autoadd_i_64(
-      PlatformInt64 self, SseSerializer serializer) {
+    PlatformInt64 self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_64(self, serializer);
   }
 
   @protected
   void sse_encode_box_autoadd_list_options(
-      ListOptions self, SseSerializer serializer) {
+    ListOptions self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_list_options(self, serializer);
   }
 
   @protected
   void sse_encode_box_autoadd_object_metadata(
-      ObjectMetadata self, SseSerializer serializer) {
+    ObjectMetadata self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_object_metadata(self, serializer);
   }
 
   @protected
   void sse_encode_box_autoadd_pinning_config(
-      PinningConfig self, SseSerializer serializer) {
+    PinningConfig self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_pinning_config(self, serializer);
   }
 
   @protected
   void sse_encode_box_autoadd_rotation_report(
-      RotationReport self, SseSerializer serializer) {
+    RotationReport self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_rotation_report(self, serializer);
   }
@@ -4588,7 +5546,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_decrypted_object_info(
-      DecryptedObjectInfo self, SseSerializer serializer) {
+    DecryptedObjectInfo self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_list_prim_u_8_strict(self.data, serializer);
     sse_encode_String(self.originalKey, serializer);
@@ -4599,7 +5559,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_directory_entry(
-      DirectoryEntry self, SseSerializer serializer) {
+    DirectoryEntry self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.name, serializer);
     sse_encode_bool(self.isDirectory, serializer);
@@ -4608,7 +5570,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_directory_listing(
-      DirectoryListing self, SseSerializer serializer) {
+    DirectoryListing self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.bucket, serializer);
     sse_encode_opt_String(self.prefix, serializer);
@@ -4617,7 +5581,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_encryption_config(
-      EncryptionConfig self, SseSerializer serializer) {
+    EncryptionConfig self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_opt_list_prim_u_8_strict(self.secretKey, serializer);
     sse_encode_bool(self.enableMetadataPrivacy, serializer);
@@ -4655,6 +5621,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_opt_String(self.accessToken, serializer);
     sse_encode_u_64(self.timeoutSeconds, serializer);
     sse_encode_u_32(self.maxRetries, serializer);
+    sse_encode_u_64(self.perChunkDownloadTimeoutSeconds, serializer);
+    sse_encode_u_64(self.bufferedDownloadMaxBytes, serializer);
   }
 
   @protected
@@ -4709,7 +5677,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_get_object_result(
-      GetObjectResult self, SseSerializer serializer) {
+    GetObjectResult self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_list_prim_u_8_strict(self.data, serializer);
     sse_encode_String(self.etag, serializer);
@@ -4752,7 +5722,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_list_bucket_info(
-      List<BucketInfo> self, SseSerializer serializer) {
+    List<BucketInfo> self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     for (final item in self) {
@@ -4762,7 +5734,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_list_directory_entry(
-      List<DirectoryEntry> self, SseSerializer serializer) {
+    List<DirectoryEntry> self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     for (final item in self) {
@@ -4772,7 +5746,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_list_file_metadata(
-      List<FileMetadata> self, SseSerializer serializer) {
+    List<FileMetadata> self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     for (final item in self) {
@@ -4782,7 +5758,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_list_metadata_entry(
-      List<MetadataEntry> self, SseSerializer serializer) {
+    List<MetadataEntry> self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     for (final item in self) {
@@ -4792,7 +5770,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_list_object_info(
-      List<ObjectInfo> self, SseSerializer serializer) {
+    List<ObjectInfo> self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     for (final item in self) {
@@ -4802,7 +5782,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_list_objects_result(
-      ListObjectsResult self, SseSerializer serializer) {
+    ListObjectsResult self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_list_object_info(self.objects, serializer);
     sse_encode_list_String(self.commonPrefixes, serializer);
@@ -4821,16 +5803,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_list_prim_u_8_loose(
-      List<int> self, SseSerializer serializer) {
+    List<int> self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
-    serializer.buffer
-        .putUint8List(self is Uint8List ? self : Uint8List.fromList(self));
+    serializer.buffer.putUint8List(
+      self is Uint8List ? self : Uint8List.fromList(self),
+    );
   }
 
   @protected
   void sse_encode_list_prim_u_8_strict(
-      Uint8List self, SseSerializer serializer) {
+    Uint8List self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     serializer.buffer.putUint8List(self);
@@ -4838,7 +5825,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_list_rotation_failure(
-      List<RotationFailure> self, SseSerializer serializer) {
+    List<RotationFailure> self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     for (final item in self) {
@@ -4855,7 +5844,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_obfuscation_mode(
-      ObfuscationMode self, SseSerializer serializer) {
+    ObfuscationMode self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.index, serializer);
   }
@@ -4872,7 +5863,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_object_metadata(
-      ObjectMetadata self, SseSerializer serializer) {
+    ObjectMetadata self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_opt_String(self.contentType, serializer);
     sse_encode_opt_String(self.cacheControl, serializer);
@@ -4891,7 +5884,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_opt_box_autoadd_i_64(
-      PlatformInt64? self, SseSerializer serializer) {
+    PlatformInt64? self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
     sse_encode_bool(self != null, serializer);
@@ -4912,7 +5907,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_opt_list_prim_u_8_strict(
-      Uint8List? self, SseSerializer serializer) {
+    Uint8List? self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
     sse_encode_bool(self != null, serializer);
@@ -4937,7 +5934,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_rotation_failure(
-      RotationFailure self, SseSerializer serializer) {
+    RotationFailure self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.storageKey, serializer);
     sse_encode_String(self.error, serializer);
@@ -4945,7 +5944,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_rotation_report(
-      RotationReport self, SseSerializer serializer) {
+    RotationReport self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_u_32(self.total, serializer);
     sse_encode_u_32(self.rotated, serializer);
@@ -4962,7 +5963,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_share_permissions(
-      SharePermissions self, SseSerializer serializer) {
+    SharePermissions self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_bool(self.canRead, serializer);
     sse_encode_bool(self.canWrite, serializer);
@@ -4994,7 +5997,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void sse_encode_upload_progress(
-      UploadProgress self, SseSerializer serializer) {
+    UploadProgress self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_u_64(self.bytesUploaded, serializer);
     sse_encode_u_64(self.totalBytes, serializer);
@@ -5015,20 +6020,27 @@ class AcceptedShareHandleImpl extends RustOpaque
     implements AcceptedShareHandle {
   // Not to be used by end users
   AcceptedShareHandleImpl.frbInternalDcoDecode(List<dynamic> wire)
-      : super.frbInternalDcoDecode(wire, _kStaticData);
+    : super.frbInternalDcoDecode(wire, _kStaticData);
 
   // Not to be used by end users
   AcceptedShareHandleImpl.frbInternalSseDecode(
-      BigInt ptr, int externalSizeOnNative)
-      : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+    BigInt ptr,
+    int externalSizeOnNative,
+  ) : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
 
   static final _kStaticData = RustArcStaticData(
     rustArcIncrementStrongCount: RustLib
-        .instance.api.rust_arc_increment_strong_count_AcceptedShareHandle,
+        .instance
+        .api
+        .rust_arc_increment_strong_count_AcceptedShareHandle,
     rustArcDecrementStrongCount: RustLib
-        .instance.api.rust_arc_decrement_strong_count_AcceptedShareHandle,
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_AcceptedShareHandle,
     rustArcDecrementStrongCountPtr: RustLib
-        .instance.api.rust_arc_decrement_strong_count_AcceptedShareHandlePtr,
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_AcceptedShareHandlePtr,
   );
 }
 
@@ -5037,20 +6049,27 @@ class EncryptedClientHandleImpl extends RustOpaque
     implements EncryptedClientHandle {
   // Not to be used by end users
   EncryptedClientHandleImpl.frbInternalDcoDecode(List<dynamic> wire)
-      : super.frbInternalDcoDecode(wire, _kStaticData);
+    : super.frbInternalDcoDecode(wire, _kStaticData);
 
   // Not to be used by end users
   EncryptedClientHandleImpl.frbInternalSseDecode(
-      BigInt ptr, int externalSizeOnNative)
-      : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+    BigInt ptr,
+    int externalSizeOnNative,
+  ) : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
 
   static final _kStaticData = RustArcStaticData(
     rustArcIncrementStrongCount: RustLib
-        .instance.api.rust_arc_increment_strong_count_EncryptedClientHandle,
+        .instance
+        .api
+        .rust_arc_increment_strong_count_EncryptedClientHandle,
     rustArcDecrementStrongCount: RustLib
-        .instance.api.rust_arc_decrement_strong_count_EncryptedClientHandle,
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_EncryptedClientHandle,
     rustArcDecrementStrongCountPtr: RustLib
-        .instance.api.rust_arc_decrement_strong_count_EncryptedClientHandlePtr,
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_EncryptedClientHandlePtr,
   );
 }
 
@@ -5058,12 +6077,13 @@ class EncryptedClientHandleImpl extends RustOpaque
 class FulaClientHandleImpl extends RustOpaque implements FulaClientHandle {
   // Not to be used by end users
   FulaClientHandleImpl.frbInternalDcoDecode(List<dynamic> wire)
-      : super.frbInternalDcoDecode(wire, _kStaticData);
+    : super.frbInternalDcoDecode(wire, _kStaticData);
 
   // Not to be used by end users
   FulaClientHandleImpl.frbInternalSseDecode(
-      BigInt ptr, int externalSizeOnNative)
-      : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+    BigInt ptr,
+    int externalSizeOnNative,
+  ) : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
 
   static final _kStaticData = RustArcStaticData(
     rustArcIncrementStrongCount:
@@ -5071,7 +6091,9 @@ class FulaClientHandleImpl extends RustOpaque implements FulaClientHandle {
     rustArcDecrementStrongCount:
         RustLib.instance.api.rust_arc_decrement_strong_count_FulaClientHandle,
     rustArcDecrementStrongCountPtr: RustLib
-        .instance.api.rust_arc_decrement_strong_count_FulaClientHandlePtr,
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_FulaClientHandlePtr,
   );
 }
 
@@ -5079,11 +6101,11 @@ class FulaClientHandleImpl extends RustOpaque implements FulaClientHandle {
 class MultipartHandleImpl extends RustOpaque implements MultipartHandle {
   // Not to be used by end users
   MultipartHandleImpl.frbInternalDcoDecode(List<dynamic> wire)
-      : super.frbInternalDcoDecode(wire, _kStaticData);
+    : super.frbInternalDcoDecode(wire, _kStaticData);
 
   // Not to be used by end users
   MultipartHandleImpl.frbInternalSseDecode(BigInt ptr, int externalSizeOnNative)
-      : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+    : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
 
   static final _kStaticData = RustArcStaticData(
     rustArcIncrementStrongCount:
@@ -5100,19 +6122,26 @@ class RotationManagerHandleImpl extends RustOpaque
     implements RotationManagerHandle {
   // Not to be used by end users
   RotationManagerHandleImpl.frbInternalDcoDecode(List<dynamic> wire)
-      : super.frbInternalDcoDecode(wire, _kStaticData);
+    : super.frbInternalDcoDecode(wire, _kStaticData);
 
   // Not to be used by end users
   RotationManagerHandleImpl.frbInternalSseDecode(
-      BigInt ptr, int externalSizeOnNative)
-      : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+    BigInt ptr,
+    int externalSizeOnNative,
+  ) : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
 
   static final _kStaticData = RustArcStaticData(
     rustArcIncrementStrongCount: RustLib
-        .instance.api.rust_arc_increment_strong_count_RotationManagerHandle,
+        .instance
+        .api
+        .rust_arc_increment_strong_count_RotationManagerHandle,
     rustArcDecrementStrongCount: RustLib
-        .instance.api.rust_arc_decrement_strong_count_RotationManagerHandle,
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_RotationManagerHandle,
     rustArcDecrementStrongCountPtr: RustLib
-        .instance.api.rust_arc_decrement_strong_count_RotationManagerHandlePtr,
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_RotationManagerHandlePtr,
   );
 }

@@ -91,6 +91,31 @@ pub trait BlockStore: Send + Sync {
     async fn get_ipld<T: serde::de::DeserializeOwned>(&self, cid: &Cid) -> Result<T>;
 }
 
+#[async_trait]
+impl<T: BlockStore> BlockStore for Box<T> {
+    async fn put_block(&self, data: &[u8]) -> Result<Cid> {
+        (**self).put_block(data).await
+    }
+    async fn get_block(&self, cid: &Cid) -> Result<Bytes> {
+        (**self).get_block(cid).await
+    }
+    async fn has_block(&self, cid: &Cid) -> Result<bool> {
+        (**self).has_block(cid).await
+    }
+    async fn delete_block(&self, cid: &Cid) -> Result<()> {
+        (**self).delete_block(cid).await
+    }
+    async fn block_size(&self, cid: &Cid) -> Result<u64> {
+        (**self).block_size(cid).await
+    }
+    async fn put_ipld<U: serde::Serialize + Send + Sync>(&self, data: &U) -> Result<Cid> {
+        (**self).put_ipld(data).await
+    }
+    async fn get_ipld<U: serde::de::DeserializeOwned>(&self, cid: &Cid) -> Result<U> {
+        (**self).get_ipld(cid).await
+    }
+}
+
 /// Trait for pinning operations (IPFS Cluster)
 #[async_trait]
 pub trait PinStore: BlockStore {

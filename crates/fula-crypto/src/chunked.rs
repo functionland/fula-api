@@ -151,9 +151,17 @@ pub struct ChunkedEncoder {
     dek: DekKey,
     chunk_size: usize,
     bao_encoder: BaoEncoder,
+    /// H-1: unkeyed BLAKE3 hasher fed the same plaintext as `bao_encoder`.
+    /// Emits a content hash that can be bound to the forest entry (outside
+    /// the attacker-forgeable HPKE envelope) so whole-file substitution is
+    /// detectable on download. The Bao root hash is not enough because it
+    /// lives inside the AEAD-encrypted `ChunkedFileMetadata` blob, whose
+    /// DEK is attacker-chosen under an HPKE-to-self forgery.
+    content_hasher: blake3::Hasher,
     chunks: Vec<EncryptedChunk>,
     current_chunk: Vec<u8>,
     bytes_processed: u64,
+    aad_prefix: Option<Vec<u8>>,
 }
 
 /// An encrypted chunk ready for upload
@@ -180,9 +188,30 @@ impl ChunkedEncoder {
             dek,
             chunk_size,
             bao_encoder: BaoEncoder::new(),
+            content_hasher: blake3::Hasher::new(),
             chunks: Vec::new(),
             current_chunk: Vec::with_capacity(chunk_size),
             bytes_processed: 0,
+            aad_prefix: None,
+        }
+    }
+
+    /// Create a new chunked encoder with AAD prefix for chunk binding
+    ///
+    /// Each chunk will be encrypted with AAD = `"{aad_prefix}:{chunk_index}"`,
+    /// binding ciphertext to both the parent file and the chunk position.
+    pub fn with_aad(dek: DekKey, aad_prefix: impl Into<Vec<u8>>) -> Self {
+        Self {
+            aad_prefix: Some(aad_prefix.into()),
+            ..Self::new(dek)
+        }
+    }
+
+    /// Create a new chunked encoder with AAD prefix and a specific chunk size
+    pub fn with_aad_and_chunk_size(dek: DekKey, aad_prefix: impl Into<Vec<u8>>, chunk_size: usize) -> Self {
+        Self {
+            aad_prefix: Some(aad_prefix.into()),
+            ..Self::with_chunk_size(dek, chunk_size)
         }
     }
 
@@ -192,9 +221,12 @@ impl ChunkedEncoder {
     pub fn update(&mut self, data: &[u8]) -> Result<Vec<EncryptedChunk>> {
         let mut ready_chunks = Vec::new();
         
-        for byte in data {
-            self.current_chunk.push(*byte);
-            
+        let mut offset = 0;
+        while offset < data.len() {
+            let remaining = self.chunk_size - self.current_chunk.len();
+            let to_copy = remaining.min(data.len() - offset);
+            self.current_chunk.extend_from_slice(&data[offset..offset + to_copy]);
+            offset += to_copy;
             if self.current_chunk.len() >= self.chunk_size {
                 let chunk = self.encrypt_current_chunk()?;
                 ready_chunks.push(chunk);
@@ -203,9 +235,18 @@ impl ChunkedEncoder {
         
         // Update Bao encoder with original plaintext for integrity
         self.bao_encoder.update(data);
+        // H-1: feed the same plaintext into the unkeyed BLAKE3 hasher so
+        // `content_hash_hex()` can be bound to the forest entry.
+        self.content_hasher.update(data);
         self.bytes_processed += data.len() as u64;
-        
+
         Ok(ready_chunks)
+    }
+
+    /// H-1: return the BLAKE3 hex digest of all plaintext fed via `update`.
+    /// Must be called before `finalize` consumes `self`.
+    pub fn content_hash_hex(&self) -> String {
+        self.content_hasher.finalize().to_hex().to_string()
     }
 
     /// Finalize the encoder and get the last chunk (if any) and metadata
@@ -223,7 +264,7 @@ impl ChunkedEncoder {
         // Collect all nonces
         let nonces: Vec<Nonce> = self.chunks.iter().map(|c| c.nonce.clone()).collect();
         
-        let metadata = ChunkedFileMetadata::new(
+        let mut metadata = ChunkedFileMetadata::new(
             self.chunk_size as u32,
             self.chunks.len() as u32,
             self.bytes_processed,
@@ -232,20 +273,29 @@ impl ChunkedEncoder {
             None,
         );
 
+        // Mark as v2 if AAD was used
+        if self.aad_prefix.is_some() {
+            metadata.format = "streaming-v2".to_string();
+        }
+
         Ok((final_chunk, metadata, outboard))
     }
 
     /// Encrypt the current chunk buffer
     fn encrypt_current_chunk(&mut self) -> Result<EncryptedChunk> {
         let chunk_index = self.chunks.len() as u32;
-        
+
         // Generate a unique nonce for this chunk
-        // We derive it from the chunk index to be deterministic for the same DEK
         let nonce = Nonce::generate();
-        
-        // Encrypt the chunk
+
+        // Encrypt the chunk, with AAD if prefix is set
         let aead = Aead::new_default(&self.dek);
-        let ciphertext = aead.encrypt(&nonce, &self.current_chunk)?;
+        let ciphertext = if let Some(ref prefix) = self.aad_prefix {
+            let aad = format!("{}:{}", String::from_utf8_lossy(prefix), chunk_index).into_bytes();
+            aead.encrypt_with_aad(&nonce, &self.current_chunk, &aad)?
+        } else {
+            aead.encrypt(&nonce, &self.current_chunk)?
+        };
         
         let chunk = EncryptedChunk {
             index: chunk_index,
@@ -278,6 +328,7 @@ pub struct ChunkedDecoder {
     metadata: ChunkedFileMetadata,
     /// Collected plaintext chunks
     chunks: Vec<(u32, Vec<u8>)>,
+    aad_prefix: Option<Vec<u8>>,
 }
 
 impl ChunkedDecoder {
@@ -287,6 +338,17 @@ impl ChunkedDecoder {
             dek,
             metadata,
             chunks: Vec::new(),
+            aad_prefix: None,
+        }
+    }
+
+    /// Create a new decoder with AAD prefix for chunk binding verification
+    pub fn with_aad(dek: DekKey, metadata: ChunkedFileMetadata, aad_prefix: impl Into<Vec<u8>>) -> Self {
+        Self {
+            dek,
+            metadata,
+            chunks: Vec::new(),
+            aad_prefix: Some(aad_prefix.into()),
         }
     }
 
@@ -294,7 +356,12 @@ impl ChunkedDecoder {
     pub fn decrypt_chunk(&mut self, index: u32, ciphertext: &[u8]) -> Result<Bytes> {
         let nonce = self.metadata.get_chunk_nonce(index)?;
         let aead = Aead::new_default(&self.dek);
-        let plaintext = aead.decrypt(&nonce, ciphertext)?;
+        let plaintext = if let Some(ref prefix) = self.aad_prefix {
+            let aad = format!("{}:{}", String::from_utf8_lossy(prefix), index).into_bytes();
+            aead.decrypt_with_aad(&nonce, ciphertext, &aad)?
+        } else {
+            aead.decrypt(&nonce, ciphertext)?
+        };
         
         self.chunks.push((index, plaintext.clone()));
         
@@ -390,9 +457,13 @@ pub struct AsyncStreamingEncoder {
     dek: DekKey,
     chunk_size: usize,
     bao_encoder: BaoEncoder,
+    /// H-1: unkeyed BLAKE3 hasher fed in parallel with `bao_encoder`.
+    /// See `ChunkedEncoder::content_hasher` for rationale.
+    content_hasher: blake3::Hasher,
     chunk_index: u32,
     nonces: Vec<Nonce>,
     bytes_processed: u64,
+    aad_prefix: Option<Vec<u8>>,
 }
 
 #[cfg(feature = "tokio-runtime")]
@@ -409,9 +480,19 @@ impl AsyncStreamingEncoder {
             dek,
             chunk_size,
             bao_encoder: BaoEncoder::new(),
+            content_hasher: blake3::Hasher::new(),
             chunk_index: 0,
             nonces: Vec::new(),
             bytes_processed: 0,
+            aad_prefix: None,
+        }
+    }
+
+    /// Create with AAD prefix for chunk binding
+    pub fn with_aad(dek: DekKey, aad_prefix: impl Into<Vec<u8>>) -> Self {
+        Self {
+            aad_prefix: Some(aad_prefix.into()),
+            ..Self::new(dek)
         }
     }
 
@@ -444,21 +525,35 @@ impl AsyncStreamingEncoder {
             
             // Update Bao encoder for integrity
             self.bao_encoder.update(&buffer[..bytes_read]);
+            // H-1: feed the same plaintext slice into the unkeyed BLAKE3
+            // hasher so `content_hash_hex()` covers the full stream.
+            self.content_hasher.update(&buffer[..bytes_read]);
             self.bytes_processed += bytes_read as u64;
-            
+
             // Encrypt this chunk
             let chunk = self.encrypt_chunk(&buffer[..bytes_read])?;
             chunks.push(chunk);
         }
-        
+
         Ok(chunks)
+    }
+
+    /// H-1: return the BLAKE3 hex digest of all plaintext streamed through
+    /// `process_reader`. Call before `finalize` consumes `self`.
+    pub fn content_hash_hex(&self) -> String {
+        self.content_hasher.finalize().to_hex().to_string()
     }
 
     /// Encrypt a single chunk of data
     fn encrypt_chunk(&mut self, data: &[u8]) -> Result<EncryptedChunk> {
         let nonce = Nonce::generate();
         let aead = Aead::new_default(&self.dek);
-        let ciphertext = aead.encrypt(&nonce, data)?;
+        let ciphertext = if let Some(ref prefix) = self.aad_prefix {
+            let aad = format!("{}:{}", String::from_utf8_lossy(prefix), self.chunk_index).into_bytes();
+            aead.encrypt_with_aad(&nonce, data, &aad)?
+        } else {
+            aead.encrypt(&nonce, data)?
+        };
         
         let chunk = EncryptedChunk {
             index: self.chunk_index,
@@ -475,8 +570,8 @@ impl AsyncStreamingEncoder {
     /// Finalize and get metadata
     pub fn finalize(self) -> (ChunkedFileMetadata, BaoOutboard) {
         let outboard = self.bao_encoder.finalize();
-        
-        let metadata = ChunkedFileMetadata::new(
+
+        let mut metadata = ChunkedFileMetadata::new(
             self.chunk_size as u32,
             self.chunk_index,
             self.bytes_processed,
@@ -484,7 +579,11 @@ impl AsyncStreamingEncoder {
             self.nonces,
             None,
         );
-        
+
+        if self.aad_prefix.is_some() {
+            metadata.format = "streaming-v2".to_string();
+        }
+
         (metadata, outboard)
     }
 
@@ -509,6 +608,7 @@ pub struct VerifiedStreamingDecoder {
     expected_hash: Blake3Hash,
     bao_encoder: BaoEncoder,
     verified_bytes: u64,
+    aad_prefix: Option<Vec<u8>>,
 }
 
 impl VerifiedStreamingDecoder {
@@ -521,18 +621,37 @@ impl VerifiedStreamingDecoder {
             expected_hash,
             bao_encoder: BaoEncoder::new(),
             verified_bytes: 0,
+            aad_prefix: None,
+        })
+    }
+
+    /// Create a new verified streaming decoder with AAD prefix
+    pub fn with_aad(dek: DekKey, metadata: ChunkedFileMetadata, aad_prefix: impl Into<Vec<u8>>) -> Result<Self> {
+        let expected_hash = metadata.get_root_hash()?;
+        Ok(Self {
+            dek,
+            metadata,
+            expected_hash,
+            bao_encoder: BaoEncoder::new(),
+            verified_bytes: 0,
+            aad_prefix: Some(aad_prefix.into()),
         })
     }
 
     /// Decrypt and verify a single chunk
-    /// 
+    ///
     /// Returns the plaintext if decryption and verification succeed.
     /// Verification is progressive - each chunk updates the hash state.
     pub fn decrypt_and_verify(&mut self, index: u32, ciphertext: &[u8]) -> Result<Bytes> {
         // Decrypt
         let nonce = self.metadata.get_chunk_nonce(index)?;
         let aead = Aead::new_default(&self.dek);
-        let plaintext = aead.decrypt(&nonce, ciphertext)?;
+        let plaintext = if let Some(ref prefix) = self.aad_prefix {
+            let aad = format!("{}:{}", String::from_utf8_lossy(prefix), index).into_bytes();
+            aead.decrypt_with_aad(&nonce, ciphertext, &aad)?
+        } else {
+            aead.decrypt(&nonce, ciphertext)?
+        };
         
         // Update Bao encoder for verification
         self.bao_encoder.update(&plaintext);
@@ -728,5 +847,245 @@ mod tests {
         // But final verification should fail because hash doesn't match
         let result = decoder.finalize_and_verify();
         assert!(result.is_err());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Audit2 v3/v4 tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_with_aad_and_chunk_size_produces_streaming_v2() {
+        let dek = DekKey::generate();
+        let data = b"test data for AAD chunk size combo".repeat(100);
+        let aad_prefix = b"fula:v4:chunk:QmTestKey123";
+
+        let mut encoder = ChunkedEncoder::with_aad_and_chunk_size(
+            dek.clone(), aad_prefix.to_vec(), MIN_CHUNK_SIZE,
+        );
+        let chunks = encoder.update(&data).unwrap();
+        let (final_chunk, metadata, _outboard) = encoder.finalize().unwrap();
+
+        assert_eq!(metadata.format, "streaming-v2", "AAD encoder must produce streaming-v2 format");
+        assert!(metadata.num_chunks > 0);
+
+        // Verify roundtrip with AAD decoder
+        let mut decoder = ChunkedDecoder::with_aad(dek, metadata, aad_prefix.to_vec());
+        for chunk in &chunks {
+            decoder.decrypt_chunk(chunk.index, &chunk.ciphertext).unwrap();
+        }
+        if let Some(c) = final_chunk {
+            decoder.decrypt_chunk(c.index, &c.ciphertext).unwrap();
+        }
+        let recovered = decoder.finalize().unwrap();
+        assert_eq!(recovered.as_ref(), data.as_slice());
+    }
+
+    #[test]
+    fn test_without_aad_produces_streaming_v1() {
+        let dek = DekKey::generate();
+        let data = b"test data without AAD".repeat(100);
+
+        let mut encoder = ChunkedEncoder::with_chunk_size(dek.clone(), MIN_CHUNK_SIZE);
+        let _chunks = encoder.update(&data).unwrap();
+        let (_final_chunk, metadata, _) = encoder.finalize().unwrap();
+
+        assert_eq!(metadata.format, "streaming-v1", "Non-AAD encoder must produce streaming-v1");
+    }
+
+    #[test]
+    fn test_streaming_v1_backward_compat_decode() {
+        // Simulate old v3 upload: encode without AAD (streaming-v1)
+        let dek = DekKey::generate();
+        let original = b"legacy v3 file content".repeat(100);
+
+        let mut encoder = ChunkedEncoder::with_chunk_size(dek.clone(), MIN_CHUNK_SIZE);
+        let chunks = encoder.update(&original).unwrap();
+        let (final_chunk, metadata, _) = encoder.finalize().unwrap();
+        assert_eq!(metadata.format, "streaming-v1");
+
+        // Decode with NON-AAD decoder (as old client would)
+        let mut decoder = ChunkedDecoder::new(dek.clone(), metadata.clone());
+        for c in &chunks { decoder.decrypt_chunk(c.index, &c.ciphertext).unwrap(); }
+        if let Some(c) = &final_chunk { decoder.decrypt_chunk(c.index, &c.ciphertext).unwrap(); }
+        let recovered = decoder.finalize().unwrap();
+        assert_eq!(recovered.as_ref(), original.as_slice());
+
+        // NEW client should also handle streaming-v1 by checking format field
+        // and NOT using AAD (the branching logic in encryption.rs)
+        let mut decoder2 = ChunkedDecoder::new(dek, metadata);
+        for c in &chunks { decoder2.decrypt_chunk(c.index, &c.ciphertext).unwrap(); }
+        if let Some(c) = &final_chunk { decoder2.decrypt_chunk(c.index, &c.ciphertext).unwrap(); }
+        let recovered2 = decoder2.finalize().unwrap();
+        assert_eq!(recovered2.as_ref(), original.as_slice());
+    }
+
+    #[test]
+    fn test_streaming_v2_chunks_cannot_be_swapped_between_files() {
+        let dek = DekKey::generate();
+        // Data must be > MIN_CHUNK_SIZE to produce chunks from update()
+        let data_a = vec![0xAAu8; MIN_CHUNK_SIZE * 2 + 1000];
+        let data_b = vec![0xBBu8; MIN_CHUNK_SIZE * 2 + 1000];
+
+        // Encode file A with AAD bound to storage key A
+        let mut enc_a = ChunkedEncoder::with_aad_and_chunk_size(
+            dek.clone(), b"fula:v4:chunk:QmFileA".to_vec(), MIN_CHUNK_SIZE,
+        );
+        let mut chunks_a = enc_a.update(&data_a).unwrap();
+        let (final_a, meta_a, _) = enc_a.finalize().unwrap();
+        if let Some(c) = final_a { chunks_a.push(c); }
+        assert!(chunks_a.len() >= 2, "File A must have >=2 chunks, got {}", chunks_a.len());
+
+        // Encode file B with AAD bound to storage key B
+        let mut enc_b = ChunkedEncoder::with_aad_and_chunk_size(
+            dek.clone(), b"fula:v4:chunk:QmFileB".to_vec(), MIN_CHUNK_SIZE,
+        );
+        let mut chunks_b = enc_b.update(&data_b).unwrap();
+        let (final_b, _meta_b, _) = enc_b.finalize().unwrap();
+        if let Some(c) = final_b { chunks_b.push(c); }
+        assert!(!chunks_b.is_empty(), "File B must have chunks");
+
+        // Try to decode file A's metadata with file B's chunk 0 ciphertext
+        // This should fail because the AAD won't match
+        let mut decoder_a = ChunkedDecoder::with_aad(dek.clone(), meta_a.clone(), b"fula:v4:chunk:QmFileA".to_vec());
+        let result = decoder_a.decrypt_chunk(0, &chunks_b[0].ciphertext);
+        assert!(result.is_err(), "Chunk from file B must not decrypt under file A's AAD");
+
+        // But file A's own chunks work fine
+        let mut decoder_a2 = ChunkedDecoder::with_aad(dek, meta_a, b"fula:v4:chunk:QmFileA".to_vec());
+        for c in &chunks_a { decoder_a2.decrypt_chunk(c.index, &c.ciphertext).unwrap(); }
+        let recovered = decoder_a2.finalize().unwrap();
+        assert_eq!(recovered.as_ref(), data_a.as_slice());
+    }
+
+    #[test]
+    fn test_streaming_v2_chunks_cannot_be_reordered() {
+        let dek = DekKey::generate();
+        // Data must span multiple chunks
+        let data = vec![0xCCu8; MIN_CHUNK_SIZE * 3 + 500];
+
+        let mut encoder = ChunkedEncoder::with_aad_and_chunk_size(
+            dek.clone(), b"fula:v4:chunk:QmReorderTest".to_vec(), MIN_CHUNK_SIZE,
+        );
+        let mut all_chunks = encoder.update(&data).unwrap();
+        let (final_chunk, metadata, _) = encoder.finalize().unwrap();
+        if let Some(c) = final_chunk { all_chunks.push(c); }
+        assert!(all_chunks.len() >= 2, "Need at least 2 chunks to test reorder, got {}", all_chunks.len());
+
+        // Try decrypting chunk 1's ciphertext at index 0 — AAD includes index
+        let mut decoder = ChunkedDecoder::with_aad(
+            dek, metadata, b"fula:v4:chunk:QmReorderTest".to_vec(),
+        );
+        let result = decoder.decrypt_chunk(0, &all_chunks[1].ciphertext);
+        assert!(result.is_err(), "Swapping chunk indices must fail AAD verification");
+    }
+
+    #[test]
+    fn test_streaming_v2_wrong_aad_prefix_fails() {
+        let dek = DekKey::generate();
+        // Data must be > MIN_CHUNK_SIZE so update() emits chunks
+        let data = vec![0xDDu8; MIN_CHUNK_SIZE * 2 + 500];
+
+        let mut encoder = ChunkedEncoder::with_aad_and_chunk_size(
+            dek.clone(), b"fula:v4:chunk:QmCorrectKey".to_vec(), MIN_CHUNK_SIZE,
+        );
+        let mut chunks = encoder.update(&data).unwrap();
+        let (final_chunk, metadata, _) = encoder.finalize().unwrap();
+        if let Some(c) = final_chunk { chunks.push(c); }
+        assert!(!chunks.is_empty(), "Must have at least 1 chunk");
+
+        // Attempt to decode with wrong AAD prefix
+        let mut decoder = ChunkedDecoder::with_aad(
+            dek, metadata, b"fula:v4:chunk:QmWrongKey".to_vec(),
+        );
+        let result = decoder.decrypt_chunk(0, &chunks[0].ciphertext);
+        assert!(result.is_err(), "Wrong AAD prefix must cause decryption failure");
+    }
+
+    #[test]
+    fn test_content_type_not_set_by_default() {
+        let dek = DekKey::generate();
+        let data = b"content type test".repeat(50);
+
+        let mut encoder = ChunkedEncoder::with_chunk_size(dek.clone(), MIN_CHUNK_SIZE);
+        let _chunks = encoder.update(&data).unwrap();
+        let (_, metadata, _) = encoder.finalize().unwrap();
+
+        assert!(metadata.content_type.is_none(),
+            "content_type must not be set by encoder — it leaks file type to server");
+    }
+
+    #[test]
+    fn test_content_type_absent_deserializes_as_none() {
+        // Simulate JSON from a new upload that omits content_type
+        let json = r#"{
+            "format": "streaming-v2",
+            "chunk_size": 262144,
+            "num_chunks": 5,
+            "total_size": 1310720,
+            "root_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "chunk_nonces": []
+        }"#;
+        let meta: ChunkedFileMetadata = serde_json::from_str(json).unwrap();
+        assert!(meta.content_type.is_none());
+    }
+
+    #[test]
+    fn test_content_type_present_deserializes_as_some() {
+        // Simulate JSON from an OLD upload that includes content_type
+        let json = r#"{
+            "format": "streaming-v1",
+            "chunk_size": 262144,
+            "num_chunks": 5,
+            "total_size": 1310720,
+            "root_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "chunk_nonces": [],
+            "content_type": "image/jpeg"
+        }"#;
+        let meta: ChunkedFileMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.content_type, Some("image/jpeg".to_string()),
+            "Old metadata with content_type must still deserialize correctly");
+    }
+
+    #[test]
+    fn test_v1_v2_cross_decode_fails() {
+        // streaming-v2 ciphertext cannot be decoded by streaming-v1 decoder
+        let dek = DekKey::generate();
+        // Data must be > MIN_CHUNK_SIZE so update() emits chunks
+        let data = vec![0xEEu8; MIN_CHUNK_SIZE * 2 + 500];
+
+        let mut encoder = ChunkedEncoder::with_aad_and_chunk_size(
+            dek.clone(), b"fula:v4:chunk:QmCross".to_vec(), MIN_CHUNK_SIZE,
+        );
+        let mut chunks = encoder.update(&data).unwrap();
+        let (final_chunk, metadata, _) = encoder.finalize().unwrap();
+        if let Some(c) = final_chunk { chunks.push(c); }
+        assert!(!chunks.is_empty(), "Must have at least 1 chunk");
+        assert_eq!(metadata.format, "streaming-v2");
+
+        // Try to decode with NON-AAD decoder (as if we ignored the format field)
+        let mut decoder = ChunkedDecoder::new(dek, metadata);
+        let result = decoder.decrypt_chunk(0, &chunks[0].ciphertext);
+        assert!(result.is_err(),
+            "streaming-v2 ciphertext decoded without AAD must fail (AAD mismatch)");
+    }
+
+    #[test]
+    fn test_with_aad_and_chunk_size_matches_separate_calls() {
+        // Verify the combined constructor produces identical behavior
+        let dek = DekKey::generate();
+        let data = b"constructor equivalence test".repeat(100);
+        let aad = b"fula:v4:chunk:QmEquiv".to_vec();
+
+        // Method 1: with_aad_and_chunk_size
+        let mut enc1 = ChunkedEncoder::with_aad_and_chunk_size(
+            dek.clone(), aad.clone(), MIN_CHUNK_SIZE,
+        );
+        let chunks1 = enc1.update(&data).unwrap();
+        let (final1, meta1, _) = enc1.finalize().unwrap();
+
+        // Both should produce the same metadata structure
+        assert_eq!(meta1.format, "streaming-v2");
+        assert_eq!(meta1.chunk_size, MIN_CHUNK_SIZE as u32);
+        assert_eq!(meta1.num_chunks, chunks1.len() as u32 + if final1.is_some() { 1 } else { 0 });
     }
 }

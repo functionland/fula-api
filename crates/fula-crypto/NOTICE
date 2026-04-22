@@ -1,0 +1,13 @@
+Fula API
+Copyright (c) Functionland
+
+This product includes code derived from rs-wnfs (https://github.com/wnfs-wg/rs-wnfs),
+licensed under the Apache License, Version 2.0.
+
+Specifically, the `wnfs_hamt` module in crates/fula-crypto/src/wnfs_hamt/ contains
+source adapted from rs-wnfs/wnfs-hamt (Apache-2.0, Copyright Fission Labs).
+The code has been stripped of its CBOR/IPLD and BlockStore coupling and is
+used only for the in-process HAMT tree logic.
+
+Upstream license text is available at:
+    https://github.com/wnfs-wg/rs-wnfs/blob/main/LICENSE-APACHE

@@ -6,13 +6,15 @@
 use std::sync::Arc;
 use bytes::Bytes;
 
-// Use tokio::sync on native, async_lock on WASM
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::sync::Mutex;
-#[cfg(target_arch = "wasm32")]
-use async_lock::Mutex;
-
 use crate::api::types::*;
+
+/// Default cap on concurrent part uploads per handle.
+///
+/// Four parts in flight gives a healthy throughput win over serial uploads
+/// without saturating mobile bandwidth, exhausting file descriptors, or
+/// triggering 429/503s from the pinning service. Tune per-upload via
+/// [`start_multipart_with_concurrency`] if the network profile warrants it.
+const DEFAULT_MAX_CONCURRENT_PARTS: u32 = 4;
 
 // ============================================================================
 // Multipart Upload Operations
@@ -20,11 +22,25 @@ use crate::api::types::*;
 
 /// Start a new multipart upload
 ///
-/// Returns a handle that can be used to upload parts.
+/// Returns a handle that can be used to upload parts. Uses the default
+/// concurrency cap (`DEFAULT_MAX_CONCURRENT_PARTS`) for `upload_part` calls.
 pub async fn start_multipart(
     client: &FulaClientHandle,
     bucket: String,
     key: String,
+) -> anyhow::Result<MultipartHandle> {
+    start_multipart_with_concurrency(client, bucket, key, DEFAULT_MAX_CONCURRENT_PARTS).await
+}
+
+/// Start a new multipart upload with an explicit concurrency cap.
+///
+/// `max_concurrency` bounds how many `upload_part` calls can be in flight on
+/// this handle at once. Values of 0 are coerced to 1 (fully serial).
+pub async fn start_multipart_with_concurrency(
+    client: &FulaClientHandle,
+    bucket: String,
+    key: String,
+    max_concurrency: u32,
 ) -> anyhow::Result<MultipartHandle> {
     let upload = fula_client::MultipartUpload::start(
         client.inner.clone(),
@@ -32,8 +48,10 @@ pub async fn start_multipart(
         &key,
     ).await?;
 
+    let permits = max_concurrency.max(1) as usize;
     Ok(MultipartHandle {
-        inner: Arc::new(Mutex::new(upload)),
+        inner: Arc::new(upload),
+        semaphore: Arc::new(Semaphore::new(permits)),
         client: client.inner.clone(),
     })
 }
@@ -41,14 +59,27 @@ pub async fn start_multipart(
 /// Upload a part
 ///
 /// Part numbers must be between 1 and 10000.
-/// Parts can be uploaded in any order.
+/// Parts can be uploaded in any order, and concurrent calls on the same
+/// handle run their HTTP I/O in parallel up to the handle's concurrency cap.
 pub async fn upload_part(
     handle: &MultipartHandle,
     part_number: u32,
     data: Vec<u8>,
 ) -> anyhow::Result<()> {
-    let mut upload = handle.inner.lock().await;
-    upload.upload_part(part_number, Bytes::from(data)).await?;
+    // Hold the permit across the HTTP PUT; release as soon as it's done.
+    // tokio's Semaphore::acquire returns Result (Err only if the semaphore
+    // was closed — impossible here since we own the Arc). async_lock's
+    // returns a plain guard. Cfg-gate to unify.
+    #[cfg(not(target_arch = "wasm32"))]
+    let _permit = handle
+        .semaphore
+        .acquire()
+        .await
+        .map_err(|e| anyhow::anyhow!("multipart semaphore closed: {e}"))?;
+    #[cfg(target_arch = "wasm32")]
+    let _permit = handle.semaphore.acquire().await;
+
+    handle.inner.upload_part(part_number, Bytes::from(data)).await?;
     Ok(())
 }
 
@@ -57,11 +88,7 @@ pub async fn upload_part(
 /// Assembles all uploaded parts into the final object.
 /// Returns the ETag of the completed object.
 pub async fn complete_multipart(handle: MultipartHandle) -> anyhow::Result<String> {
-    let upload = Arc::try_unwrap(handle.inner)
-        .map_err(|_| anyhow::anyhow!("Cannot complete: handle still in use"))?
-        .into_inner();
-
-    let etag = upload.complete().await?;
+    let etag = handle.inner.complete().await?;
     Ok(etag)
 }
 
@@ -69,24 +96,29 @@ pub async fn complete_multipart(handle: MultipartHandle) -> anyhow::Result<Strin
 ///
 /// Cancels the upload and removes any uploaded parts.
 pub async fn abort_multipart(handle: MultipartHandle) -> anyhow::Result<()> {
-    let upload = Arc::try_unwrap(handle.inner)
-        .map_err(|_| anyhow::anyhow!("Cannot abort: handle still in use"))?
-        .into_inner();
-
-    upload.abort().await?;
+    handle.inner.abort().await?;
     Ok(())
+}
+
+/// Detach the multipart upload without aborting.
+///
+/// Suppresses the drop-time auto-abort so uploaded parts survive the
+/// handle being GC'd. Use this when pausing a resumable upload — e.g.,
+/// the user backgrounds the app mid-upload and you plan to resume later
+/// with the same upload_id. Without detach, dropping the handle issues
+/// a best-effort AbortMultipartUpload. (R4.)
+pub async fn detach_multipart(handle: &MultipartHandle) {
+    handle.inner.detach();
 }
 
 /// Get the upload ID
 pub async fn get_upload_id(handle: &MultipartHandle) -> String {
-    let upload = handle.inner.lock().await;
-    upload.upload_id().to_string()
+    handle.inner.upload_id().to_string()
 }
 
 /// Get the number of completed parts
 pub async fn get_completed_parts(handle: &MultipartHandle) -> u32 {
-    let upload = handle.inner.lock().await;
-    upload.completed_parts() as u32
+    handle.inner.completed_parts() as u32
 }
 
 // ============================================================================
@@ -111,11 +143,21 @@ pub async fn upload_large_file_simple(
     let total_size = data.len();
 
     // Start multipart upload
-    let mut upload = fula_client::MultipartUpload::start(
+    let upload = fula_client::MultipartUpload::start(
         client.inner.clone(),
         &bucket,
         &key,
     ).await?;
+
+    // M-3: arm an auto-abort guard so any `?`-propagated error below will
+    // spawn an AbortMultipartUpload instead of leaving S3 to charge for the
+    // partial upload until the bucket lifecycle sweeps it.
+    let abort_guard = fula_client::MultipartAbortGuard::new(
+        client.inner.clone(),
+        &bucket,
+        &key,
+        upload.upload_id().to_string(),
+    );
 
     // Upload parts
     let mut part_number = 1u32;
@@ -133,6 +175,7 @@ pub async fn upload_large_file_simple(
 
     // Complete upload
     let etag = upload.complete().await?;
+    abort_guard.disarm();
     Ok(etag)
 }
 

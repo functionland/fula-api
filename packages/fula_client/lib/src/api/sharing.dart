@@ -20,18 +20,19 @@ import 'types.dart';
 /// * `expires_at` - Optional expiration timestamp (Unix epoch seconds)
 ///
 /// Returns a JSON-serialized share token that can be sent to the recipient.
-Future<String> createShareToken(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String storageKey,
-        required List<int> recipientPublicKey,
-        PlatformInt64? expiresAt}) =>
-    RustLib.instance.api.crateApiSharingCreateShareToken(
-        client: client,
-        bucket: bucket,
-        storageKey: storageKey,
-        recipientPublicKey: recipientPublicKey,
-        expiresAt: expiresAt);
+Future<String> createShareToken({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String storageKey,
+  required List<int> recipientPublicKey,
+  PlatformInt64? expiresAt,
+}) => RustLib.instance.api.crateApiSharingCreateShareToken(
+  client: client,
+  bucket: bucket,
+  storageKey: storageKey,
+  recipientPublicKey: recipientPublicKey,
+  expiresAt: expiresAt,
+);
 
 /// Create a share token with a specific mode
 ///
@@ -45,52 +46,65 @@ Future<String> createShareToken(
 ///
 /// Note: Snapshot mode requires additional binding data. This function defaults
 /// to temporal mode for Snapshot shares since we don't have content hash info.
-Future<String> createShareTokenWithMode(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String storageKey,
-        required List<int> recipientPublicKey,
-        required ShareMode mode,
-        PlatformInt64? expiresAt}) =>
-    RustLib.instance.api.crateApiSharingCreateShareTokenWithMode(
-        client: client,
-        bucket: bucket,
-        storageKey: storageKey,
-        recipientPublicKey: recipientPublicKey,
-        mode: mode,
-        expiresAt: expiresAt);
+Future<String> createShareTokenWithMode({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String storageKey,
+  required List<int> recipientPublicKey,
+  required ShareMode mode,
+  PlatformInt64? expiresAt,
+}) => RustLib.instance.api.crateApiSharingCreateShareTokenWithMode(
+  client: client,
+  bucket: bucket,
+  storageKey: storageKey,
+  recipientPublicKey: recipientPublicKey,
+  mode: mode,
+  expiresAt: expiresAt,
+);
 
 /// Accept a share token received from another user
-Future<AcceptedShareHandle> acceptShare(
-        {required EncryptedClientHandle client, required String tokenJson}) =>
-    RustLib.instance.api
-        .crateApiSharingAcceptShare(client: client, tokenJson: tokenJson);
+Future<AcceptedShareHandle> acceptShare({
+  required EncryptedClientHandle client,
+  required String tokenJson,
+}) => RustLib.instance.api.crateApiSharingAcceptShare(
+  client: client,
+  tokenJson: tokenJson,
+);
 
 /// Download a file using an accepted share
-Future<Uint8List> getWithShare(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String storageKey,
-        required AcceptedShareHandle share}) =>
-    RustLib.instance.api.crateApiSharingGetWithShare(
-        client: client, bucket: bucket, storageKey: storageKey, share: share);
+Future<Uint8List> getWithShare({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String storageKey,
+  required String originalKey,
+  required AcceptedShareHandle share,
+}) => RustLib.instance.api.crateApiSharingGetWithShare(
+  client: client,
+  bucket: bucket,
+  storageKey: storageKey,
+  originalKey: originalKey,
+  share: share,
+);
 
 /// Download a file directly with a token (accept + download in one step)
-Future<Uint8List> getWithToken(
-        {required EncryptedClientHandle client,
-        required String bucket,
-        required String storageKey,
-        required String tokenJson}) =>
-    RustLib.instance.api.crateApiSharingGetWithToken(
-        client: client,
-        bucket: bucket,
-        storageKey: storageKey,
-        tokenJson: tokenJson);
+Future<Uint8List> getWithToken({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String storageKey,
+  required String originalKey,
+  required String tokenJson,
+}) => RustLib.instance.api.crateApiSharingGetWithToken(
+  client: client,
+  bucket: bucket,
+  storageKey: storageKey,
+  originalKey: originalKey,
+  tokenJson: tokenJson,
+);
 
 /// Get permissions granted by an accepted share
-Future<SharePermissions> getSharePermissions(
-        {required AcceptedShareHandle share}) =>
-    RustLib.instance.api.crateApiSharingGetSharePermissions(share: share);
+Future<SharePermissions> getSharePermissions({
+  required AcceptedShareHandle share,
+}) => RustLib.instance.api.crateApiSharingGetSharePermissions(share: share);
 
 /// Check if an accepted share has expired
 Future<bool> isShareExpired({required AcceptedShareHandle share}) =>

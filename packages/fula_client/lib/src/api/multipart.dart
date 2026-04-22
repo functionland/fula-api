@@ -10,23 +10,29 @@ import 'types.dart';
 /// Start a new multipart upload
 ///
 /// Returns a handle that can be used to upload parts.
-Future<MultipartHandle> startMultipart(
-        {required FulaClientHandle client,
-        required String bucket,
-        required String key}) =>
-    RustLib.instance.api.crateApiMultipartStartMultipart(
-        client: client, bucket: bucket, key: key);
+Future<MultipartHandle> startMultipart({
+  required FulaClientHandle client,
+  required String bucket,
+  required String key,
+}) => RustLib.instance.api.crateApiMultipartStartMultipart(
+  client: client,
+  bucket: bucket,
+  key: key,
+);
 
 /// Upload a part
 ///
 /// Part numbers must be between 1 and 10000.
 /// Parts can be uploaded in any order.
-Future<void> uploadPart(
-        {required MultipartHandle handle,
-        required int partNumber,
-        required List<int> data}) =>
-    RustLib.instance.api.crateApiMultipartUploadPart(
-        handle: handle, partNumber: partNumber, data: data);
+Future<void> uploadPart({
+  required MultipartHandle handle,
+  required int partNumber,
+  required List<int> data,
+}) => RustLib.instance.api.crateApiMultipartUploadPart(
+  handle: handle,
+  partNumber: partNumber,
+  data: data,
+);
 
 /// Complete the multipart upload
 ///
@@ -56,15 +62,16 @@ Future<int> getCompletedParts({required MultipartHandle handle}) =>
 ///
 /// Note: For flutter_rust_bridge, progress streaming requires StreamSink.
 /// This function provides a simpler interface without progress callbacks.
-Future<String> uploadLargeFileSimple(
-        {required FulaClientHandle client,
-        required String bucket,
-        required String key,
-        required List<int> data,
-        int? chunkSize}) =>
-    RustLib.instance.api.crateApiMultipartUploadLargeFileSimple(
-        client: client,
-        bucket: bucket,
-        key: key,
-        data: data,
-        chunkSize: chunkSize);
+Future<String> uploadLargeFileSimple({
+  required FulaClientHandle client,
+  required String bucket,
+  required String key,
+  required List<int> data,
+  int? chunkSize,
+}) => RustLib.instance.api.crateApiMultipartUploadLargeFileSimple(
+  client: client,
+  bucket: bucket,
+  key: key,
+  data: data,
+  chunkSize: chunkSize,
+);

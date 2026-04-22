@@ -169,6 +169,75 @@ impl KeyRotationManager {
         }
     }
 
+    /// Re-wrap multiple DEKs in parallel (batch operation with configurable concurrency)
+    ///
+    /// Uses `std::thread::scope` to process re-wrapping across multiple threads.
+    /// Each thread handles a slice of the input, and results are collected after all complete.
+    /// The `concurrency` parameter controls the maximum number of threads used.
+    pub fn rewrap_batch_parallel(
+        &self,
+        wrapped_keys: &[WrappedKeyInfo],
+        concurrency: usize,
+    ) -> RotationResult {
+        let concurrency = concurrency.max(1);
+
+        if wrapped_keys.is_empty() {
+            return RotationResult {
+                rotated_count: 0,
+                failed_count: 0,
+                failures: Vec::new(),
+                new_kek_version: self.current_version,
+            };
+        }
+
+        // Parallel re-wrapping using scoped threads
+        let chunk_size = (wrapped_keys.len() + concurrency - 1) / concurrency;
+        let results: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = wrapped_keys
+                .chunks(chunk_size.max(1))
+                .map(|chunk| {
+                    s.spawn(|| {
+                        chunk
+                            .iter()
+                            .map(|wrapped| {
+                                let result = self
+                                    .rewrap_dek(wrapped)
+                                    .map_err(|e| e.to_string());
+                                (wrapped.object_path.clone(), result)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        let mut rotated_count = 0;
+        let mut failed_count = 0;
+        let mut failures = Vec::new();
+
+        for (path, result) in results {
+            match result {
+                Ok(_) => rotated_count += 1,
+                Err(e) => {
+                    failed_count += 1;
+                    failures.push((path, e));
+                }
+            }
+        }
+
+        RotationResult {
+            rotated_count,
+            failed_count,
+            failures,
+            new_kek_version: self.current_version,
+        }
+    }
+
     /// Wrap a new DEK with the current KEK
     pub fn wrap_dek(&self, dek: &DekKey, object_path: &str) -> Result<WrappedKeyInfo> {
         let encryptor = Encryptor::new(self.current_keypair.public_key());
@@ -351,6 +420,117 @@ impl FileSystemRotation {
         self.get_keys_needing_rotation().is_empty()
     }
 
+    /// Rotate a batch of keys in parallel
+    ///
+    /// Like `rotate_batch`, but processes re-wrapping across `concurrency` threads.
+    /// The batch size is still controlled by `with_batch_size`.
+    pub fn rotate_batch_parallel(&mut self, concurrency: usize) -> RotationResult {
+        let concurrency = concurrency.max(1);
+        let current_version = self.rotation_manager.current_version();
+
+        // Find keys needing rotation
+        let to_rotate: Vec<_> = self
+            .wrapped_keys
+            .iter()
+            .filter(|(_, w)| w.kek_version < current_version)
+            .take(self.batch_size)
+            .map(|(path, wrapped)| (path.clone(), wrapped.clone()))
+            .collect();
+
+        if to_rotate.is_empty() {
+            return RotationResult {
+                rotated_count: 0,
+                failed_count: 0,
+                failures: Vec::new(),
+                new_kek_version: current_version,
+            };
+        }
+
+        // Parallel re-wrapping using scoped threads
+        let manager = &self.rotation_manager;
+        let chunk_size = (to_rotate.len() + concurrency - 1) / concurrency;
+        let results: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = to_rotate
+                .chunks(chunk_size.max(1))
+                .map(|chunk| {
+                    s.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|(path, wrapped)| {
+                                let result = manager
+                                    .rewrap_dek(wrapped)
+                                    .map_err(|e| e.to_string());
+                                (path.clone(), result)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        let mut rotated = 0;
+        let mut failed = 0;
+        let mut failures = Vec::new();
+
+        for (path, result) in results {
+            match result {
+                Ok(new_wrapped) => {
+                    self.wrapped_keys.insert(path, new_wrapped);
+                    rotated += 1;
+                }
+                Err(e) => {
+                    failed += 1;
+                    failures.push((path, e));
+                }
+            }
+        }
+
+        RotationResult {
+            rotated_count: rotated,
+            failed_count: failed,
+            failures,
+            new_kek_version: current_version,
+        }
+    }
+
+    /// Rotate all keys in parallel (with configurable concurrency)
+    ///
+    /// Like `rotate_all`, but each batch is processed with `concurrency` threads.
+    /// For 10M files with concurrency=32, this can reduce rotation time by ~30x.
+    pub fn rotate_all_parallel(&mut self, concurrency: usize) -> RotationResult {
+        let mut total_rotated = 0;
+        let mut total_failed = 0;
+        let mut all_failures = Vec::new();
+
+        loop {
+            let result = self.rotate_batch_parallel(concurrency);
+            total_rotated += result.rotated_count;
+            total_failed += result.failed_count;
+            all_failures.extend(result.failures);
+
+            if result.rotated_count == 0 {
+                break;
+            }
+        }
+
+        // Clear previous key after all rotation is complete
+        if total_failed == 0 && !self.rotation_manager.has_pending_rotation() {
+            self.rotation_manager.clear_previous();
+        }
+
+        RotationResult {
+            rotated_count: total_rotated,
+            failed_count: total_failed,
+            failures: all_failures,
+            new_kek_version: self.rotation_manager.current_version(),
+        }
+    }
+
     /// Get rotation progress
     pub fn rotation_progress(&self) -> (usize, usize) {
         let current_version = self.rotation_manager.current_version();
@@ -500,5 +680,70 @@ mod tests {
 
         // V1 should fail (previous key cleared)
         assert!(manager.unwrap_dek(&wrapped_v1).is_err());
+    }
+
+    #[test]
+    fn test_parallel_filesystem_rotation() {
+        let keypair = KekKeyPair::generate();
+        let mut fs = FileSystemRotation::new(keypair)
+            .with_batch_size(50);
+
+        // Create 100 files and remember their DEKs
+        let mut deks = Vec::new();
+        for i in 0..100 {
+            let dek = DekKey::generate();
+            fs.wrap_new_file(&format!("/file{}.txt", i), &dek).unwrap();
+            deks.push((format!("/file{}.txt", i), dek));
+        }
+
+        // Verify all at version 1
+        assert_eq!(fs.rotation_progress(), (100, 100));
+
+        // Initiate rotation
+        fs.rotate().unwrap();
+        assert_eq!(fs.get_keys_needing_rotation().len(), 100);
+
+        // Rotate first batch in parallel (50 items, 4 threads)
+        let result = fs.rotate_batch_parallel(4);
+        assert_eq!(result.rotated_count, 50);
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(fs.rotation_progress(), (50, 100));
+
+        // Rotate remaining in parallel
+        let result = fs.rotate_all_parallel(4);
+        assert_eq!(result.rotated_count, 50);
+        assert_eq!(result.failed_count, 0);
+        assert!(fs.is_rotation_complete());
+        assert_eq!(fs.rotation_progress(), (100, 100));
+
+        // Verify all DEKs are still accessible after parallel rotation
+        for (path, original_dek) in &deks {
+            let unwrapped = fs.unwrap_file(path).unwrap();
+            assert_eq!(original_dek.as_bytes(), unwrapped.as_bytes());
+        }
+    }
+
+    #[test]
+    fn test_parallel_batch_rewrap() {
+        let keypair = KekKeyPair::generate();
+        let mut manager = KeyRotationManager::new(keypair);
+
+        // Create wrapped DEKs
+        let mut wrapped_keys = Vec::new();
+        let mut original_deks = Vec::new();
+        for i in 0..20 {
+            let dek = DekKey::generate();
+            let wrapped = manager.wrap_dek(&dek, &format!("/file{}.txt", i)).unwrap();
+            wrapped_keys.push(wrapped);
+            original_deks.push(dek);
+        }
+
+        // Rotate KEK
+        manager.rotate_kek().unwrap();
+
+        // Parallel batch rewrap
+        let result = manager.rewrap_batch_parallel(&wrapped_keys, 4);
+        assert_eq!(result.rotated_count, 20);
+        assert_eq!(result.failed_count, 0);
     }
 }

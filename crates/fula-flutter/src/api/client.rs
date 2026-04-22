@@ -21,8 +21,11 @@ use crate::api::types::*;
 
 /// Create a new Fula client with the given configuration
 pub fn create_client(config: FulaConfig) -> anyhow::Result<FulaClientHandle> {
-    let inner_config = fula_client::Config::new(&config.endpoint)
+    let mut inner_config = fula_client::Config::new(&config.endpoint)
         .with_timeout(Duration::from_secs(config.timeout_seconds));
+    inner_config.per_chunk_download_timeout =
+        Duration::from_secs(config.per_chunk_download_timeout_seconds);
+    inner_config.buffered_download_max_bytes = config.buffered_download_max_bytes;
 
     let inner_config = if let Some(token) = config.access_token {
         inner_config.with_token(token)
@@ -42,8 +45,11 @@ pub fn create_encrypted_client(
     config: FulaConfig,
     encryption: EncryptionConfig,
 ) -> anyhow::Result<EncryptedClientHandle> {
-    let inner_config = fula_client::Config::new(&config.endpoint)
+    let mut inner_config = fula_client::Config::new(&config.endpoint)
         .with_timeout(Duration::from_secs(config.timeout_seconds));
+    inner_config.per_chunk_download_timeout =
+        Duration::from_secs(config.per_chunk_download_timeout_seconds);
+    inner_config.buffered_download_max_bytes = config.buffered_download_max_bytes;
 
     let inner_config = if let Some(token) = config.access_token {
         inner_config.with_token(token)
@@ -66,6 +72,7 @@ pub fn create_encrypted_client(
     };
 
     let enc_config = enc_config.with_metadata_privacy(encryption.enable_metadata_privacy);
+    #[allow(deprecated)]
     let enc_config = match encryption.obfuscation_mode {
         ObfuscationMode::Deterministic => {
             enc_config.with_obfuscation_mode(fula_client::KeyObfuscation::DeterministicHash)
@@ -94,8 +101,11 @@ pub fn create_encrypted_client_with_pinning(
     encryption: EncryptionConfig,
     pinning: PinningConfig,
 ) -> anyhow::Result<EncryptedClientHandle> {
-    let inner_config = fula_client::Config::new(&config.endpoint)
+    let mut inner_config = fula_client::Config::new(&config.endpoint)
         .with_timeout(Duration::from_secs(config.timeout_seconds));
+    inner_config.per_chunk_download_timeout =
+        Duration::from_secs(config.per_chunk_download_timeout_seconds);
+    inner_config.buffered_download_max_bytes = config.buffered_download_max_bytes;
 
     let inner_config = if let Some(token) = config.access_token {
         inner_config.with_token(token)
@@ -118,6 +128,7 @@ pub fn create_encrypted_client_with_pinning(
     };
 
     let enc_config = enc_config.with_metadata_privacy(encryption.enable_metadata_privacy);
+    #[allow(deprecated)]
     let enc_config = match encryption.obfuscation_mode {
         ObfuscationMode::Deterministic => {
             enc_config.with_obfuscation_mode(fula_client::KeyObfuscation::DeterministicHash)
@@ -277,4 +288,49 @@ pub async fn list_objects(
 ) -> anyhow::Result<ListObjectsResult> {
     let result = client.inner.list_objects(&bucket, Some(options.into())).await?;
     Ok(result.into())
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fula_config_roundtrip_plumbs_f8_f10_fields() {
+        let cfg = FulaConfig {
+            endpoint: "http://localhost:9000".into(),
+            access_token: None,
+            timeout_seconds: 30,
+            max_retries: 3,
+            per_chunk_download_timeout_seconds: 120,
+            buffered_download_max_bytes: 64 * 1024 * 1024,
+        };
+        let handle = create_client(cfg).expect("create_client should succeed");
+        let inner_cfg = handle.inner.config();
+        assert_eq!(
+            inner_cfg.per_chunk_download_timeout,
+            Duration::from_secs(120),
+            "FulaConfig::per_chunk_download_timeout_seconds must plumb into fula_client::Config::per_chunk_download_timeout",
+        );
+        assert_eq!(
+            inner_cfg.buffered_download_max_bytes,
+            64 * 1024 * 1024,
+            "FulaConfig::buffered_download_max_bytes must plumb into fula_client::Config::buffered_download_max_bytes",
+        );
+    }
+
+    #[test]
+    fn fula_config_default_plumbs_audit_defaults() {
+        let cfg = FulaConfig::default();
+        let handle = create_client(cfg).expect("create_client should succeed");
+        let inner_cfg = handle.inner.config();
+        assert_eq!(
+            inner_cfg.per_chunk_download_timeout,
+            Duration::from_secs(300),
+        );
+        assert_eq!(
+            inner_cfg.buffered_download_max_bytes,
+            256 * 1024 * 1024,
+        );
+    }
 }

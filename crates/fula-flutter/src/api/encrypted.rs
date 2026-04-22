@@ -62,6 +62,44 @@ pub async fn get_decrypted_by_storage_key(
     Ok(data.to_vec())
 }
 
+/// F8: Buffered, root-hash-verified download by original key.
+///
+/// Holds the full plaintext in RAM and only returns after the BAO root-hash
+/// check passes, closing the mid-stream truncation / chunk-reorder window
+/// that the streaming variant accepts. Rejects files larger than
+/// `FulaConfig::buffered_download_max_bytes` before any network I/O.
+///
+/// Prefer this over `get_decrypted` for disaster-recovery consumers that
+/// must not observe any plaintext until the whole file has been verified.
+pub async fn get_decrypted_buffered(
+    client: &EncryptedClientHandle,
+    bucket: String,
+    key: String,
+) -> anyhow::Result<Vec<u8>> {
+    let guard = client.inner.read().await;
+    let mut buf: Vec<u8> = Vec::new();
+    guard
+        .get_object_decrypted_buffered_to_writer(&bucket, &key, &mut buf)
+        .await?;
+    Ok(buf)
+}
+
+/// F8: Buffered, root-hash-verified download by storage key.
+///
+/// See `get_decrypted_buffered` for semantics.
+pub async fn get_decrypted_buffered_by_storage_key(
+    client: &EncryptedClientHandle,
+    bucket: String,
+    storage_key: String,
+) -> anyhow::Result<Vec<u8>> {
+    let guard = client.inner.read().await;
+    let mut buf: Vec<u8> = Vec::new();
+    guard
+        .get_object_decrypted_buffered_to_writer_by_storage_key(&bucket, &storage_key, &mut buf)
+        .await?;
+    Ok(buf)
+}
+
 /// Download and decrypt with full metadata
 pub async fn get_with_private_metadata(
     client: &EncryptedClientHandle,

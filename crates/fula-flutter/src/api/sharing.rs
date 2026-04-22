@@ -229,10 +229,11 @@ pub async fn get_with_share(
     client: &EncryptedClientHandle,
     bucket: String,
     storage_key: String,
+    original_key: String,
     share: &AcceptedShareHandle,
 ) -> anyhow::Result<Vec<u8>> {
     let guard = client.inner.read().await;
-    let data = guard.get_object_with_share(&bucket, &storage_key, &share.inner).await?;
+    let data = guard.get_object_with_share(&bucket, &storage_key, &original_key, &share.inner).await?;
     Ok(data.to_vec())
 }
 
@@ -241,13 +242,14 @@ pub async fn get_with_token(
     client: &EncryptedClientHandle,
     bucket: String,
     storage_key: String,
+    original_key: String,
     token_json: String,
 ) -> anyhow::Result<Vec<u8>> {
     let token: fula_crypto::ShareToken = serde_json::from_str(&token_json)
         .map_err(|e| anyhow::anyhow!("Invalid token format: {}", e))?;
 
     let guard = client.inner.read().await;
-    let data = guard.get_object_with_token(&bucket, &storage_key, &token).await?;
+    let data = guard.get_object_with_token(&bucket, &storage_key, &original_key, &token).await?;
     Ok(data.to_vec())
 }
 

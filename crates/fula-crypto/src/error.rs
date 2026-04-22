@@ -36,6 +36,16 @@ pub enum CryptoError {
     #[error("hash verification failed: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
 
+    /// Post-decrypt content hash mismatch against a forest-entry-bound
+    /// BLAKE3 digest (detects whole-file substitution under HPKE-to-self).
+    #[error("integrity check failed: {0}")]
+    IntegrityMismatch(String),
+
+    /// Blob version advertises a lower format version than the forest entry's
+    /// `min_version` pin allows. Blocks downgrade-to-no-AAD attacks.
+    #[error("version downgrade rejected: got {got}, required >= {required}")]
+    VersionDowngrade { got: u8, required: u8 },
+
     /// Bao verification failed
     #[error("bao verification failed: {0}")]
     BaoVerification(String),
@@ -79,4 +89,17 @@ pub enum CryptoError {
     /// Invalid format (for parsing URLs, links, etc.)
     #[error("invalid format: {0}")]
     InvalidFormat(String),
+
+    /// HAMT-level error (traversal, canonicalization, integrity check, etc.)
+    #[error("hamt error: {0}")]
+    Hamt(String),
+
+    /// Storage-backend error surfaced through the `BlobBackend` seam.
+    ///
+    /// `fula-crypto` owns the trait but never reaches the network itself;
+    /// concrete backends (e.g. S3 in `fula-client`) map their transport
+    /// failures into this variant so the trait signature can stay fully
+    /// within `fula-crypto::Result`.
+    #[error("storage backend error: {0}")]
+    Storage(String),
 }

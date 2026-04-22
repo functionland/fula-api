@@ -195,6 +195,7 @@ pub async fn create_encrypted_client(
     };
 
     let enc_config = enc_config.with_metadata_privacy(encryption.enable_metadata_privacy);
+    #[allow(deprecated)]
     let enc_config = match encryption.obfuscation_mode.as_str() {
         "deterministic" => enc_config.with_obfuscation_mode(fula_client::KeyObfuscation::DeterministicHash),
         "random" => enc_config.with_obfuscation_mode(fula_client::KeyObfuscation::RandomUuid),
@@ -533,6 +534,7 @@ pub async fn accept_share(
 /// @param client - EncryptedClient handle
 /// @param bucket - Bucket name
 /// @param storage_key - Storage key of the shared file
+/// @param original_key - Original (unobfuscated) file path for path scope validation
 /// @param share - AcceptedShare handle
 /// @returns Decrypted data as Uint8Array
 #[wasm_bindgen(js_name = getWithShare)]
@@ -540,10 +542,11 @@ pub async fn get_with_share(
     client: &EncryptedClient,
     bucket: &str,
     storage_key: &str,
+    original_key: &str,
     share: &AcceptedShare,
 ) -> Result<Vec<u8>, JsError> {
     let guard = client.inner.lock().await;
-    let data = guard.get_object_with_share(bucket, storage_key, &share.inner)
+    let data = guard.get_object_with_share(bucket, storage_key, original_key, &share.inner)
         .await
         .map_err(|e| JsError::new(&format!("Failed to get shared file: {}", e)))?;
     Ok(data.to_vec())
@@ -554,6 +557,7 @@ pub async fn get_with_share(
 /// @param client - EncryptedClient handle
 /// @param bucket - Bucket name
 /// @param storage_key - Storage key of the shared file
+/// @param original_key - Original (unobfuscated) file path for path scope validation
 /// @param token_json - JSON string containing the ShareToken
 /// @returns Decrypted data as Uint8Array
 #[wasm_bindgen(js_name = getWithToken)]
@@ -561,13 +565,14 @@ pub async fn get_with_token(
     client: &EncryptedClient,
     bucket: &str,
     storage_key: &str,
+    original_key: &str,
     token_json: &str,
 ) -> Result<Vec<u8>, JsError> {
     let token: fula_crypto::ShareToken = serde_json::from_str(token_json)
         .map_err(|e| JsError::new(&format!("Invalid share token JSON: {}", e)))?;
 
     let guard = client.inner.lock().await;
-    let data = guard.get_object_with_token(bucket, storage_key, &token)
+    let data = guard.get_object_with_token(bucket, storage_key, original_key, &token)
         .await
         .map_err(|e| JsError::new(&format!("Failed to get shared file: {}", e)))?;
     Ok(data.to_vec())

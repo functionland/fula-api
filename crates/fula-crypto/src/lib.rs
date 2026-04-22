@@ -79,11 +79,13 @@ pub mod private_forest;
 pub mod private_metadata;
 pub mod rotation;
 pub mod secret_link;
+pub mod sharded_hamt_forest;
 pub mod sharing;
 pub mod streaming;
 pub mod subtree_keys;
 pub mod symmetric;
 pub mod time;
+pub mod wnfs_hamt;
 
 pub use chunked::{ChunkedEncoder, ChunkedDecoder, ChunkedFileMetadata, EncryptedChunk, should_use_chunked, CHUNKED_THRESHOLD, VerifiedStreamingDecoder};
 #[cfg(feature = "tokio-runtime")]
@@ -101,9 +103,28 @@ pub use hybrid_kem::{
 };
 pub use inbox::{ShareEnvelope, ShareEnvelopeBuilder, InboxEntry, InboxEntryStatus, ShareInbox, INBOX_PREFIX, DEFAULT_INBOX_TTL_SECONDS};
 pub use keys::{DekKey, KekKeyPair, KeyManager, PublicKey, SecretKey};
-pub use private_forest::{PrivateForest, EncryptedForest, ForestFileEntry, ForestDirectoryEntry, ForestFormat, derive_index_key, generate_flat_key};
+pub use private_forest::{
+    PrivateForest, EncryptedForest, ForestFileEntry, ForestDirectoryEntry, ForestFormat,
+    derive_index_key, generate_flat_key,
+    ForestEvent, ForestOrManifest,
+    detect_forest_format, derive_shard_key, compute_initial_shard_count,
+    MAX_SHARDS,
+    // Sharded-HAMT forest (v7)
+    ShardV7, ShardManifestV7, EncryptedShardManifestV7,
+    V7StorageKey, V7_STORAGE_KEY_LEN,
+    manifest_v7_aad, hamt_node_v7_aad, compute_v7_node_key,
+    // Meta-HAMT manifest (S-1.2)
+    ManifestRoot, ManifestPage, EncryptedManifestPage, PageRef, PageId,
+    PAGE_SIZE, MAX_PAGES, derive_manifest_page_key, manifest_page_aad,
+    page_id_for_shard, shard_slot_in_page,
+    // Directory index (F-1.3)
+    DirectoryIndex, DirEntry, EncryptedDirectoryIndex,
+    derive_dir_index_key, dir_index_aad,
+};
+pub use wnfs_hamt::{BlobBackend, V7NodeStore, V7_NODE_PREFIX};
 pub use private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, PublicMetadata, KeyObfuscation, obfuscate_key};
 pub use rotation::{KeyRotationManager, FileSystemRotation, WrappedKeyInfo, RotationResult};
+pub use sharded_hamt_forest::{HamtEntry, ShardedHamtPrivateForest};
 pub use secret_link::{SecretLink, SecretLinkBuilder, SecretLinkPayload, is_valid_secret_link_url, extract_opaque_id, SHARE_PATH_PREFIX};
 pub use sharing::{ShareToken, ShareBuilder, ShareRecipient, AcceptedShare, FolderShareManager, AccessValidation, ShareMode, SnapshotBinding, SnapshotVerification};
 pub use streaming::{BaoEncoder, BaoDecoder, BaoOutboard, VerifiedStream};
@@ -118,6 +139,9 @@ pub const CRYPTO_VERSION: u8 = 2;
 
 /// Quantum-safe crypto version (X25519 + ML-KEM-768 hybrid)
 pub const CRYPTO_VERSION_QUANTUM_SAFE: u8 = 3;
+
+/// Content encryption version with AAD binding (storage_key bound to ciphertext)
+pub const CRYPTO_VERSION_CONTENT_AAD: u8 = 4;
 
 /// Default chunk size for streaming encryption (256 KB)
 pub const DEFAULT_CHUNK_SIZE: usize = 256 * 1024;

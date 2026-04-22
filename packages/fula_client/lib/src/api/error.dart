@@ -15,9 +15,7 @@ sealed class FulaError with _$FulaError {
   const FulaError._();
 
   /// Network/HTTP error
-  const factory FulaError.network(
-    String field0,
-  ) = FulaError_Network;
+  const factory FulaError.network(String field0) = FulaError_Network;
 
   /// Object not found
   const factory FulaError.notFound({
@@ -26,92 +24,63 @@ sealed class FulaError with _$FulaError {
   }) = FulaError_NotFound;
 
   /// Bucket not found
-  const factory FulaError.bucketNotFound(
-    String field0,
-  ) = FulaError_BucketNotFound;
+  const factory FulaError.bucketNotFound(String field0) =
+      FulaError_BucketNotFound;
 
   /// Access denied
-  const factory FulaError.accessDenied(
-    String field0,
-  ) = FulaError_AccessDenied;
+  const factory FulaError.accessDenied(String field0) = FulaError_AccessDenied;
 
   /// Encryption/decryption error
-  const factory FulaError.encryption(
-    String field0,
-  ) = FulaError_Encryption;
+  const factory FulaError.encryption(String field0) = FulaError_Encryption;
 
   /// Invalid configuration
-  const factory FulaError.invalidConfig(
-    String field0,
-  ) = FulaError_InvalidConfig;
+  const factory FulaError.invalidConfig(String field0) =
+      FulaError_InvalidConfig;
 
   /// Upload failed
-  const factory FulaError.uploadFailed(
-    String field0,
-  ) = FulaError_UploadFailed;
+  const factory FulaError.uploadFailed(String field0) = FulaError_UploadFailed;
 
   /// Download failed
-  const factory FulaError.downloadFailed(
-    String field0,
-  ) = FulaError_DownloadFailed;
+  const factory FulaError.downloadFailed(String field0) =
+      FulaError_DownloadFailed;
 
   /// XML parsing error
-  const factory FulaError.xmlParse(
-    String field0,
-  ) = FulaError_XmlParse;
+  const factory FulaError.xmlParse(String field0) = FulaError_XmlParse;
 
   /// Invalid response from server
-  const factory FulaError.invalidResponse(
-    String field0,
-  ) = FulaError_InvalidResponse;
+  const factory FulaError.invalidResponse(String field0) =
+      FulaError_InvalidResponse;
 
   /// Share token error
-  const factory FulaError.shareError(
-    String field0,
-  ) = FulaError_ShareError;
+  const factory FulaError.shareError(String field0) = FulaError_ShareError;
 
   /// Key rotation error
-  const factory FulaError.rotationError(
-    String field0,
-  ) = FulaError_RotationError;
+  const factory FulaError.rotationError(String field0) =
+      FulaError_RotationError;
 
   /// Forest/index error
-  const factory FulaError.forestError(
-    String field0,
-  ) = FulaError_ForestError;
+  const factory FulaError.forestError(String field0) = FulaError_ForestError;
 
   /// Internal error
-  const factory FulaError.internal(
-    String field0,
-  ) = FulaError_Internal;
+  const factory FulaError.internal(String field0) = FulaError_Internal;
 
   /// Get error code for categorization
   Future<void> errorCode() =>
-      RustLib.instance.api.crateApiErrorFulaErrorErrorCode(
-        that: this,
-      );
+      RustLib.instance.api.crateApiErrorFulaErrorErrorCode(that: this);
 
   /// Check if this is an access denied error
   Future<bool> isAccessDenied() =>
-      RustLib.instance.api.crateApiErrorFulaErrorIsAccessDenied(
-        that: this,
-      );
+      RustLib.instance.api.crateApiErrorFulaErrorIsAccessDenied(that: this);
 
   /// Check if this is an encryption error
   Future<bool> isEncryptionError() =>
-      RustLib.instance.api.crateApiErrorFulaErrorIsEncryptionError(
-        that: this,
-      );
+      RustLib.instance.api.crateApiErrorFulaErrorIsEncryptionError(that: this);
 
   /// Check if this is a network error
   Future<bool> isNetworkError() =>
-      RustLib.instance.api.crateApiErrorFulaErrorIsNetworkError(
-        that: this,
-      );
+      RustLib.instance.api.crateApiErrorFulaErrorIsNetworkError(that: this);
 
   /// Check if this is a "not found" error
   Future<bool> isNotFound() =>
-      RustLib.instance.api.crateApiErrorFulaErrorIsNotFound(
-        that: this,
-      );
+      RustLib.instance.api.crateApiErrorFulaErrorIsNotFound(that: this);
 }

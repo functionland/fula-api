@@ -9,7 +9,7 @@
 
 use crate::{
     ipfs::{IpfsBlockStore, IpfsConfig},
-    memory::MemoryBlockStore,
+    memory::{CachedBlockStore, MemoryBlockStore},
     pinning_service::{Pin, PinningServiceClient, PinningServiceConfig, PinningStatus},
     BlockStore, BlockStoreError, PinStore, Result,
 };
@@ -19,7 +19,16 @@ use cid::Cid;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tracing::{info, instrument, warn};
+
+/// Default cap on concurrent `POST /pins` requests issued from this blockstore.
+///
+/// Eight permits keep a multipart upload with many chunks from saturating the
+/// pinning service (which often answers 429/503 under burst) while still
+/// letting small numbers of parallel pins proceed without queuing. Tune via
+/// `IpfsPinningConfig::with_max_concurrent_pins`.
+const DEFAULT_MAX_CONCURRENT_PINS: u32 = 8;
 
 /// Configuration for the combined IPFS + Pinning store
 #[derive(Clone)]
@@ -39,10 +48,8 @@ pub struct IpfsPinningConfig {
     pub pin_timeout: Duration,
     /// Poll interval when waiting for pin
     pub pin_poll_interval: Duration,
-    /// Use local cache for reads
-    pub enable_cache: bool,
-    /// Cache capacity
-    pub cache_capacity: usize,
+    /// Cap on concurrent `POST /pins` requests from this blockstore. (R3.)
+    pub max_concurrent_pins: u32,
 }
 
 impl Default for IpfsPinningConfig {
@@ -54,8 +61,7 @@ impl Default for IpfsPinningConfig {
             wait_for_pin: false,
             pin_timeout: Duration::from_secs(300), // 5 minutes
             pin_poll_interval: Duration::from_secs(5),
-            enable_cache: true,
-            cache_capacity: 10_000,
+            max_concurrent_pins: DEFAULT_MAX_CONCURRENT_PINS,
         }
     }
 }
@@ -94,6 +100,12 @@ impl IpfsPinningConfig {
         self
     }
 
+    /// Override the concurrent-pins cap. Values of 0 coerce to 1. (R3.)
+    pub fn with_max_concurrent_pins(mut self, max: u32) -> Self {
+        self.max_concurrent_pins = max.max(1);
+        self
+    }
+
     /// Get the pinning endpoint (from either pinning_service or pinning_endpoint)
     pub fn get_pinning_endpoint(&self) -> Option<&str> {
         self.pinning_endpoint.as_deref()
@@ -101,7 +113,12 @@ impl IpfsPinningConfig {
     }
 }
 
-/// Combined IPFS + Pinning Service block store
+/// Combined IPFS + Pinning Service block store.
+///
+/// Block-level caching lives in `CachedBlockStore` at the outer
+/// `FlexibleBlockStore::Cached` layer; this struct no longer caches blocks
+/// itself. It only owns the IPFS data client, the pinning service client,
+/// and the pin-request tracking map.
 pub struct IpfsPinningBlockStore {
     /// IPFS block store for data operations
     ipfs: IpfsBlockStore,
@@ -109,10 +126,13 @@ pub struct IpfsPinningBlockStore {
     pinning_client: Option<PinningServiceClient>,
     /// Configuration
     config: IpfsPinningConfig,
-    /// Local cache for frequently accessed blocks
-    cache: Arc<DashMap<Cid, Bytes>>,
     /// Map of CID -> request_id for pin tracking
     pin_requests: Arc<DashMap<String, String>>,
+    /// Caps concurrent `POST /pins` requests — shared across both the
+    /// long-lived `pinning_client` path and the per-request token path so
+    /// burst pins from a chunked multipart upload can't stampede the
+    /// pinning service. (R3.)
+    pin_semaphore: Arc<Semaphore>,
 }
 
 impl IpfsPinningBlockStore {
@@ -128,18 +148,16 @@ impl IpfsPinningBlockStore {
             None
         };
 
-        let cache_capacity = if config.enable_cache {
-            config.cache_capacity
-        } else {
-            0
-        };
+        let pin_semaphore = Arc::new(Semaphore::new(
+            config.max_concurrent_pins.max(1) as usize,
+        ));
 
         Ok(Self {
             ipfs,
             pinning_client,
             config,
-            cache: Arc::new(DashMap::with_capacity(cache_capacity)),
             pin_requests: Arc::new(DashMap::new()),
+            pin_semaphore,
         })
     }
 
@@ -172,15 +190,29 @@ impl IpfsPinningBlockStore {
         let cid_str = cid.to_string();
 
         if let Some(ref client) = self.pinning_client {
-            // Use remote pinning service
-            let pin = if let Some(n) = name {
-                Pin::new(&cid_str).with_name(n)
-            } else {
-                Pin::new(&cid_str)
-            };
+            // Use remote pinning service. Attach the local IPFS node's
+            // multiaddrs as origins so the pinning service can fetch the
+            // CID directly from us instead of DHT-walking for the first
+            // provider. (R3.)
+            let origins = self.ipfs.origins().await;
+            let mut pin = Pin::new(&cid_str);
+            if let Some(n) = name {
+                pin = pin.with_name(n);
+            }
+            if !origins.is_empty() {
+                pin = pin.with_origins(origins);
+            }
+
+            // Cap concurrent /pins POSTs to prevent burst-storm 429/503s
+            // when a chunked multipart upload fans out. (R3.)
+            let _permit = self
+                .pin_semaphore
+                .acquire()
+                .await
+                .map_err(|e| BlockStoreError::PinFailed(format!("pin semaphore closed: {e}")))?;
 
             let response = client.add_pin(pin).await?;
-            
+
             // Store the request ID for tracking
             self.pin_requests
                 .insert(cid_str.clone(), response.request_id.clone());
@@ -239,12 +271,24 @@ impl IpfsPinningBlockStore {
         let config = PinningServiceConfig::new(endpoint, token);
         let client = PinningServiceClient::new(config)?;
 
-        // Create pin request
-        let pin = if let Some(n) = name {
-            Pin::new(&cid_str).with_name(n)
-        } else {
-            Pin::new(&cid_str)
-        };
+        // Create pin request with origins hint pointing to the local IPFS
+        // node so the pinning service can fetch us directly. (R3.)
+        let origins = self.ipfs.origins().await;
+        let mut pin = Pin::new(&cid_str);
+        if let Some(n) = name {
+            pin = pin.with_name(n);
+        }
+        if !origins.is_empty() {
+            pin = pin.with_origins(origins);
+        }
+
+        // Share the blockstore-wide semaphore so token and non-token pins
+        // count against the same concurrency budget. (R3.)
+        let _permit = self
+            .pin_semaphore
+            .acquire()
+            .await
+            .map_err(|e| BlockStoreError::PinFailed(format!("pin semaphore closed: {e}")))?;
 
         let response = client.add_pin(pin).await?;
 
@@ -306,13 +350,7 @@ impl BlockStore for IpfsPinningBlockStore {
     #[instrument(skip(self, data), fields(size = data.len()))]
     async fn put_block(&self, data: &[u8]) -> Result<Cid> {
         // Put to IPFS
-        let cid = self.ipfs.put_block(data).await?;
-
-        // Cache the data
-        if self.config.enable_cache {
-            self.cache.insert(cid, Bytes::copy_from_slice(data));
-        }
-
+        //
         // NOTE: We deliberately DO NOT pin individual blocks here.
         // Instead, the root CID should be pinned at upload completion.
         // IPFS recursive pinning will automatically pin all referenced blocks.
@@ -321,43 +359,20 @@ impl BlockStore for IpfsPinningBlockStore {
         // Pinning should happen at:
         // - put_object() completion for single objects
         // - complete_multipart_upload() for multipart uploads
-
-        Ok(cid)
+        self.ipfs.put_block(data).await
     }
 
     #[instrument(skip(self))]
     async fn get_block(&self, cid: &Cid) -> Result<Bytes> {
-        // Check cache first
-        if let Some(data) = self.cache.get(cid) {
-            return Ok(data.value().clone());
-        }
-
-        // Fetch from IPFS
-        let data = self.ipfs.get_block(cid).await?;
-
-        // Cache for future reads
-        if self.config.enable_cache {
-            self.cache.insert(*cid, data.clone());
-        }
-
-        Ok(data)
+        self.ipfs.get_block(cid).await
     }
 
     async fn has_block(&self, cid: &Cid) -> Result<bool> {
-        // Check cache first
-        if self.cache.contains_key(cid) {
-            return Ok(true);
-        }
-
-        // Check IPFS
         self.ipfs.has_block(cid).await
     }
 
     #[instrument(skip(self))]
     async fn delete_block(&self, cid: &Cid) -> Result<()> {
-        // Remove from cache
-        self.cache.remove(cid);
-
         // Unpin first
         let _ = self.unpin_cid(cid).await;
 
@@ -366,21 +381,13 @@ impl BlockStore for IpfsPinningBlockStore {
     }
 
     async fn block_size(&self, cid: &Cid) -> Result<u64> {
-        // Check cache first
-        if let Some(data) = self.cache.get(cid) {
-            return Ok(data.value().len() as u64);
-        }
-
         self.ipfs.block_size(cid).await
     }
 
     async fn put_ipld<T: serde::Serialize + Send + Sync>(&self, data: &T) -> Result<Cid> {
-        let cid = self.ipfs.put_ipld(data).await?;
-
         // NOTE: We deliberately DO NOT pin IPLD nodes inline.
         // Pin the root CID at upload completion for recursive pinning.
-
-        Ok(cid)
+        self.ipfs.put_ipld(data).await
     }
 
     async fn get_ipld<T: serde::de::DeserializeOwned>(&self, cid: &Cid) -> Result<T> {
@@ -487,12 +494,15 @@ impl PinStore for IpfsPinningBlockStore {
 }
 
 /// Fallback-capable block store that uses IPFS with pinning when available,
-/// or falls back to memory storage
+/// or falls back to memory storage. Can optionally be wrapped in an LRU
+/// cache via the `Cached` variant.
 pub enum FlexibleBlockStore {
     /// IPFS with pinning service
     IpfsPinning(IpfsPinningBlockStore),
     /// In-memory storage (fallback)
     Memory(MemoryBlockStore),
+    /// LRU-cached wrapper around any of the above (or further nesting)
+    Cached(CachedBlockStore<Box<FlexibleBlockStore>>),
 }
 
 impl FlexibleBlockStore {
@@ -510,9 +520,31 @@ impl FlexibleBlockStore {
         }
     }
 
-    /// Check if using real IPFS or memory fallback
+    /// Wrap this block store in an LRU cache sized by megabytes.
+    pub fn with_cache_mb(self, mb: usize) -> Self {
+        Self::Cached(CachedBlockStore::with_mb(Box::new(self), mb))
+    }
+
+    /// Check if using real IPFS or memory fallback (recursing through caches)
     pub fn is_persistent(&self) -> bool {
-        matches!(self, Self::IpfsPinning(_))
+        match self {
+            Self::IpfsPinning(_) => true,
+            Self::Memory(_) => false,
+            Self::Cached(cached) => {
+                // Recurse through the wrapped box to find the underlying variant
+                // via its BlockStore impl (safe — no behavioral coupling).
+                // We can't borrow the Box'd FlexibleBlockStore through
+                // CachedBlockStore directly, so expose a helper below.
+                cached.inner_is_persistent()
+            }
+        }
+    }
+}
+
+impl CachedBlockStore<Box<FlexibleBlockStore>> {
+    /// Check whether the wrapped store is persistent (recurses).
+    pub fn inner_is_persistent(&self) -> bool {
+        self.inner_ref().is_persistent()
     }
 }
 
@@ -522,6 +554,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.put_block(data).await,
             Self::Memory(store) => store.put_block(data).await,
+            Self::Cached(store) => store.put_block(data).await,
         }
     }
 
@@ -529,6 +562,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.get_block(cid).await,
             Self::Memory(store) => store.get_block(cid).await,
+            Self::Cached(store) => store.get_block(cid).await,
         }
     }
 
@@ -536,6 +570,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.has_block(cid).await,
             Self::Memory(store) => store.has_block(cid).await,
+            Self::Cached(store) => store.has_block(cid).await,
         }
     }
 
@@ -543,6 +578,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.delete_block(cid).await,
             Self::Memory(store) => store.delete_block(cid).await,
+            Self::Cached(store) => store.delete_block(cid).await,
         }
     }
 
@@ -550,6 +586,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.block_size(cid).await,
             Self::Memory(store) => store.block_size(cid).await,
+            Self::Cached(store) => store.block_size(cid).await,
         }
     }
 
@@ -557,6 +594,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.put_ipld(data).await,
             Self::Memory(store) => store.put_ipld(data).await,
+            Self::Cached(store) => store.put_ipld(data).await,
         }
     }
 
@@ -564,6 +602,7 @@ impl BlockStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.get_ipld(cid).await,
             Self::Memory(store) => store.get_ipld(cid).await,
+            Self::Cached(store) => store.get_ipld(cid).await,
         }
     }
 }
@@ -577,6 +616,7 @@ impl PinStore for FlexibleBlockStore {
                 // Memory store doesn't need pinning, just succeed silently
                 Ok(())
             }
+            Self::Cached(store) => store.inner_ref().pin(cid, name).await,
         }
     }
 
@@ -587,6 +627,7 @@ impl PinStore for FlexibleBlockStore {
                 // Memory store doesn't need pinning, just succeed silently
                 Ok(())
             }
+            Self::Cached(store) => store.inner_ref().pin_with_token(cid, name, token).await,
         }
     }
 
@@ -594,6 +635,7 @@ impl PinStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.unpin(cid).await,
             Self::Memory(_) => Ok(()),
+            Self::Cached(store) => store.inner_ref().unpin(cid).await,
         }
     }
 
@@ -601,6 +643,7 @@ impl PinStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.is_pinned(cid).await,
             Self::Memory(_) => Ok(true), // Memory store "pins" everything
+            Self::Cached(store) => store.inner_ref().is_pinned(cid).await,
         }
     }
 
@@ -608,6 +651,7 @@ impl PinStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.list_pins().await,
             Self::Memory(_) => Ok(Vec::new()),
+            Self::Cached(store) => store.inner_ref().list_pins().await,
         }
     }
 
@@ -615,6 +659,7 @@ impl PinStore for FlexibleBlockStore {
         match self {
             Self::IpfsPinning(store) => store.pin_status(cid).await,
             Self::Memory(_) => Ok(crate::PinStatus::Pinned), // Memory store "pins" everything
+            Self::Cached(store) => store.inner_ref().pin_status(cid).await,
         }
     }
 }
@@ -628,6 +673,7 @@ mod tests {
         let config = IpfsPinningConfig::default();
         assert_eq!(config.ipfs.api_url, "http://localhost:5001");
         assert!(config.pinning_service.is_none());
+        assert_eq!(config.max_concurrent_pins, DEFAULT_MAX_CONCURRENT_PINS);
     }
 
     #[test]
@@ -640,5 +686,184 @@ mod tests {
         let ps = config.pinning_service.unwrap();
         assert_eq!(ps.endpoint, "https://api.pinata.cloud/psa");
         assert_eq!(ps.access_token, "my-token");
+    }
+
+    #[test]
+    fn max_concurrent_pins_coerces_zero_to_one() {
+        let config = IpfsPinningConfig::default().with_max_concurrent_pins(0);
+        assert_eq!(config.max_concurrent_pins, 1);
+    }
+
+    // R3 regression: pin_cid must cap concurrent /pins POSTs at
+    // `max_concurrent_pins`. With cap=2 and a 300ms-per-response mock, 4
+    // concurrent pins should take ~600ms (two batches), not ~300ms.
+    #[tokio::test]
+    async fn pin_semaphore_caps_concurrent_pin_posts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Mock both IPFS (for verify_connection + node_info) and the pinning
+        // service on a single MockServer since wiremock routes by path.
+        let server = MockServer::start().await;
+
+        // /api/v0/id — verify_connection and origins fetch both hit this.
+        Mock::given(method("POST"))
+            .and(path("/api/v0/id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ID": "QmPeerTest",
+                "PublicKey": "pk",
+                "Addresses": ["/ip4/127.0.0.1/tcp/4001/p2p/QmPeerTest"],
+                "AgentVersion": "test/0.1",
+                "ProtocolVersion": "ipfs/0.1.0"
+            })))
+            .mount(&server)
+            .await;
+
+        // /pins — 300ms delay per response so we can observe serialization.
+        Mock::given(method("POST"))
+            .and(path("/pins"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(300))
+                    .set_body_json(serde_json::json!({
+                        "requestid": "req-test",
+                        "status": "queued",
+                        "created": "2026-04-20T00:00:00Z",
+                        "pin": { "cid": "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku" },
+                        "delegates": []
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        // Build the blockstore pointed at the mock server, with cap=2.
+        let ipfs = IpfsConfig::with_url(server.uri());
+        let ps = PinningServiceConfig::new(server.uri(), "token");
+        let config = IpfsPinningConfig {
+            ipfs,
+            pinning_service: Some(ps),
+            pinning_endpoint: None,
+            wait_for_pin: false,
+            pin_timeout: Duration::from_secs(30),
+            pin_poll_interval: Duration::from_secs(1),
+            max_concurrent_pins: 2,
+        };
+        let store = Arc::new(IpfsPinningBlockStore::new(config).await.unwrap());
+
+        // Parse a valid CIDv1 for the pin request.
+        let cid: Cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+            .parse()
+            .unwrap();
+
+        // Fire four concurrent pin_cid calls.
+        let start = std::time::Instant::now();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let store = Arc::clone(&store);
+            let completed = Arc::clone(&completed);
+            handles.push(tokio::spawn(async move {
+                store.pin_cid(&cid, None).await.unwrap();
+                completed.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(completed.load(Ordering::SeqCst), 4);
+        // With a cap of 2 and 300ms per response, 4 pins = 2 batches = >= ~600ms.
+        // We pad the lower bound to 500ms to tolerate scheduling jitter on CI.
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "4 pins with cap=2 finished in {:?} — semaphore did not serialize",
+            elapsed
+        );
+        // Upper bound: nowhere near the fully-serial time of 4*300ms=1200ms.
+        assert!(
+            elapsed < Duration::from_millis(1100),
+            "4 pins with cap=2 took {:?} — slower than expected",
+            elapsed
+        );
+    }
+
+    // R3 regression: pin_cid forwards local-node multiaddrs as the `origins`
+    // field so the pinning service can skip DHT discovery.
+    #[tokio::test]
+    async fn pin_cid_attaches_origins_hint_from_local_node() {
+        use std::sync::{Arc as StdArc, Mutex};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        struct CapturingResponder(StdArc<Mutex<Option<serde_json::Value>>>);
+        impl Respond for CapturingResponder {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+                *self.0.lock().unwrap() = Some(body);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "requestid": "req-test",
+                    "status": "queued",
+                    "created": "2026-04-20T00:00:00Z",
+                    "pin": { "cid": "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku" },
+                    "delegates": []
+                }))
+            }
+        }
+
+        let server = MockServer::start().await;
+        let captured: StdArc<Mutex<Option<serde_json::Value>>> =
+            StdArc::new(Mutex::new(None));
+
+        Mock::given(method("POST"))
+            .and(path("/api/v0/id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ID": "QmPeerTest",
+                "PublicKey": "pk",
+                "Addresses": [
+                    "/ip4/127.0.0.1/tcp/4001/p2p/QmPeerTest",
+                    "/ip4/10.0.0.5/tcp/4001/p2p/QmPeerTest"
+                ],
+                "AgentVersion": "test/0.1",
+                "ProtocolVersion": "ipfs/0.1.0"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/pins"))
+            .respond_with(CapturingResponder(StdArc::clone(&captured)))
+            .mount(&server)
+            .await;
+
+        let ipfs = IpfsConfig::with_url(server.uri());
+        let ps = PinningServiceConfig::new(server.uri(), "token");
+        let config = IpfsPinningConfig {
+            ipfs,
+            pinning_service: Some(ps),
+            pinning_endpoint: None,
+            wait_for_pin: false,
+            pin_timeout: Duration::from_secs(30),
+            pin_poll_interval: Duration::from_secs(1),
+            max_concurrent_pins: 4,
+        };
+        let store = IpfsPinningBlockStore::new(config).await.unwrap();
+
+        let cid: Cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+            .parse()
+            .unwrap();
+        store.pin_cid(&cid, Some("hello")).await.unwrap();
+
+        let body = captured.lock().unwrap().clone().expect("/pins never received a body");
+        let origins = body
+            .get("origins")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .expect("origins field should be set");
+        assert_eq!(origins.len(), 2, "expected 2 origins from mocked node info");
+        let first = origins[0].as_str().unwrap();
+        assert!(first.contains("/p2p/QmPeerTest"), "origin string malformed: {first}");
     }
 }

@@ -6,6 +6,7 @@ use bytes::Bytes;
 use cid::Cid;
 use reqwest::{Client, multipart};
 use serde::Deserialize;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tracing::{debug, instrument};
 
@@ -49,6 +50,11 @@ impl IpfsConfig {
 pub struct IpfsBlockStore {
     client: Client,
     config: IpfsConfig,
+    /// Cached local-node multiaddrs used as `origins` hints in
+    /// pinning-service requests. Populated lazily on first successful call to
+    /// [`IpfsBlockStore::origins`]; failed lookups are not cached so a later
+    /// call after the IPFS daemon comes up will still populate the hint. (R3.)
+    origins_cache: Arc<StdMutex<Option<Vec<String>>>>,
 }
 
 impl IpfsBlockStore {
@@ -59,11 +65,15 @@ impl IpfsBlockStore {
             .build()
             .map_err(|e| BlockStoreError::Connection(e.to_string()))?;
 
-        let store = Self { client, config };
-        
+        let store = Self {
+            client,
+            config,
+            origins_cache: Arc::new(StdMutex::new(None)),
+        };
+
         // Verify connection
         store.verify_connection().await?;
-        
+
         Ok(store)
     }
 
@@ -92,7 +102,7 @@ impl IpfsBlockStore {
     pub async fn node_info(&self) -> Result<NodeInfo> {
         let url = format!("{}/api/v0/id", self.config.api_url);
         let response = self.client.post(&url).send().await?;
-        
+
         if !response.status().is_success() {
             return Err(BlockStoreError::IpfsApi(format!(
                 "Failed to get node info: {}",
@@ -104,6 +114,36 @@ impl IpfsBlockStore {
             .json()
             .await
             .map_err(|e| BlockStoreError::IpfsApi(e.to_string()))
+    }
+
+    /// Return cached local-node multiaddrs for use as pinning-service `origins`
+    /// hints. The first call fetches `/api/v0/id` and caches the result; later
+    /// calls are O(1). If the lookup fails, returns an empty vec so callers
+    /// can skip the `origins` field without propagating the error. (R3.)
+    pub async fn origins(&self) -> Vec<String> {
+        // Fast path: already cached from a prior successful lookup.
+        if let Some(cached) = self.origins_cache.lock().ok().and_then(|g| g.clone()) {
+            return cached;
+        }
+
+        // Cold path: fetch node_info. Only cache on success so a cold-start
+        // race (IPFS daemon still warming up) doesn't permanently disable the
+        // origins hint for this process.
+        match self.node_info().await {
+            Ok(info) => {
+                if let Ok(mut guard) = self.origins_cache.lock() {
+                    *guard = Some(info.addresses.clone());
+                }
+                info.addresses
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to fetch local IPFS node multiaddrs; pinning requests will omit origins hint this call"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Add raw data to IPFS

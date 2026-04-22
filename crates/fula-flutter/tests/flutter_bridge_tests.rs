@@ -17,6 +17,10 @@ fn test_fula_config_default() {
     assert!(config.access_token.is_none());
     assert_eq!(config.timeout_seconds, 30);
     assert_eq!(config.max_retries, 3);
+    // F10 default: 5 minutes.
+    assert_eq!(config.per_chunk_download_timeout_seconds, 300);
+    // F8 default: 256 MiB ceiling on buffered downloads.
+    assert_eq!(config.buffered_download_max_bytes, 256 * 1024 * 1024);
 }
 
 #[test]
@@ -26,11 +30,15 @@ fn test_fula_config_with_values() {
         access_token: Some("test-token".to_string()),
         timeout_seconds: 60,
         max_retries: 5,
+        per_chunk_download_timeout_seconds: 120,
+        buffered_download_max_bytes: 64 * 1024 * 1024,
     };
     assert_eq!(config.endpoint, "https://api.example.com");
     assert_eq!(config.access_token, Some("test-token".to_string()));
     assert_eq!(config.timeout_seconds, 60);
     assert_eq!(config.max_retries, 5);
+    assert_eq!(config.per_chunk_download_timeout_seconds, 120);
+    assert_eq!(config.buffered_download_max_bytes, 64 * 1024 * 1024);
 }
 
 #[test]

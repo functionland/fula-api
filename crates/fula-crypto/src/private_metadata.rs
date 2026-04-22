@@ -169,6 +169,7 @@ pub enum KeyObfuscation {
     /// Hash the key with a secret prefix (deterministic - same key = same hash)
     /// Allows server-side deduplication but reveals if same file uploaded twice
     /// Server sees: `e/a7c3f9b2e8d14a6f` (reveals "e/" prefix)
+    #[deprecated(since = "0.7.0", note = "use FlatNamespace; DeterministicHash lacks domain separation and is not used in production")]
     DeterministicHash,
     /// Random UUID for each upload (non-deterministic)
     /// Maximum privacy but no dedup
@@ -192,6 +193,7 @@ pub enum KeyObfuscation {
 }
 
 /// Generate an obfuscated storage key
+#[allow(deprecated)]
 pub fn obfuscate_key(original_key: &str, dek: &DekKey, mode: KeyObfuscation) -> String {
     match mode {
         KeyObfuscation::DeterministicHash => {
@@ -231,6 +233,13 @@ pub fn obfuscate_key(original_key: &str, dek: &DekKey, mode: KeyObfuscation) -> 
         KeyObfuscation::FlatNamespace => {
             // Completely flat - no prefixes, looks like a CID
             // Uses PrivateForest module for key generation
+            //
+            // Security audit M-001: The empty salt is intentional.
+            // obfuscate_key() with FlatNamespace provides deterministic key LOOKUP
+            // without a forest context. Forest-backed storage uses
+            // PrivateForest::generate_key() which supplies the forest's random
+            // 32-byte salt. Cross-bucket correlation is not possible because
+            // each user has a unique DEK derived from their secret key.
             crate::private_forest::generate_flat_key(original_key, dek, &[])
         }
     }
@@ -246,6 +255,7 @@ fn generate_random_id() -> String {
 
 /// Reverse lookup: find obfuscated key from original
 /// Only works with DeterministicHash mode
+#[allow(deprecated)]
 pub fn find_obfuscated_key(original_key: &str, dek: &DekKey) -> String {
     obfuscate_key(original_key, dek, KeyObfuscation::DeterministicHash)
 }
@@ -275,6 +285,7 @@ impl PublicMetadata {
         let storage_key = obfuscate_key(&private.original_key, dek, mode.clone());
         let encrypted = EncryptedPrivateMetadata::encrypt(private, dek)?;
         
+        #[allow(deprecated)]
         let mode_str = match mode {
             KeyObfuscation::DeterministicHash => "hash",
             KeyObfuscation::RandomUuid => "uuid",
@@ -309,6 +320,7 @@ pub struct MetadataMapping {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

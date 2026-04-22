@@ -14,7 +14,10 @@ default = ["tokio-runtime"]
 # Note: wasm feature excludes tokio-runtime (incompatible)
 wasm = ["getrandom/js"]
 # Enable tokio-based async streaming (not WASM compatible)
-tokio-runtime = ["tokio", "async-trait"]
+tokio-runtime = ["tokio"]
+# Test-only fault injection knobs (e.g. FORCE_INITIAL_SHARD_COUNT).
+# Off by default so production builds never carry the override atomics.
+test-fault-injection = []
 
 [dependencies]
 # Core crypto
@@ -39,12 +42,15 @@ hkdf = "0.12"
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+postcard = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 
 # Async (tokio is optional for WASM compatibility)
 tokio = { workspace = true, optional = true }
-async-trait = { workspace = true, optional = true }
+async-trait = { workspace = true }
+async-recursion = { workspace = true }
+async-lock = "3"
 futures = { workspace = true }
 
 # IPLD/CID

@@ -9,12 +9,12 @@ use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::RwLock;
 #[cfg(not(target_arch = "wasm32"))]
-use tokio::sync::Mutex;
+pub(crate) use tokio::sync::Semaphore;
 
 #[cfg(target_arch = "wasm32")]
 use async_lock::RwLock;
 #[cfg(target_arch = "wasm32")]
-use async_lock::Mutex;
+pub(crate) use async_lock::Semaphore;
 
 // ============================================================================
 // Configuration Types
@@ -31,6 +31,20 @@ pub struct FulaConfig {
     pub timeout_seconds: u64,
     /// Maximum retry attempts (default: 3)
     pub max_retries: u32,
+    /// F10: per-chunk download timeout in seconds.
+    ///
+    /// Applied to every individual chunk fetched by the windowed chunked-download
+    /// engine. Guards against a slow server trickling bytes below the global
+    /// dead-connection threshold. Only active on native targets; wasm inherits
+    /// the browser fetch default. Default: 300 (5 minutes).
+    pub per_chunk_download_timeout_seconds: u64,
+    /// F8: maximum plaintext size a buffered download will accept.
+    ///
+    /// Applied *before* any network I/O by the buffered download path. If the
+    /// chunked metadata declares a `total_size` larger than this ceiling, the
+    /// buffered path returns an error instead of allocating the buffer.
+    /// Default: 256 MiB.
+    pub buffered_download_max_bytes: u64,
 }
 
 impl Default for FulaConfig {
@@ -40,6 +54,8 @@ impl Default for FulaConfig {
             access_token: None,
             timeout_seconds: 30,
             max_retries: 3,
+            per_chunk_download_timeout_seconds: 300,
+            buffered_download_max_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -405,9 +421,16 @@ pub struct RotationManagerHandle {
 }
 
 /// Handle to an ongoing multipart upload
+///
+/// The inner [`MultipartUpload`](fula_client::MultipartUpload) uses interior
+/// mutability, so parallel `upload_part` calls can run their HTTP I/O without
+/// serialising. The `semaphore` bounds how many parts are in flight at once
+/// to avoid saturating the mobile radio, file handles, or the pinning
+/// service with a burst of concurrent POSTs.
 #[derive(Clone)]
 pub struct MultipartHandle {
-    pub(crate) inner: Arc<Mutex<fula_client::MultipartUpload>>,
+    pub(crate) inner: Arc<fula_client::MultipartUpload>,
+    pub(crate) semaphore: Arc<Semaphore>,
     #[allow(dead_code)]
     pub(crate) client: Arc<fula_client::FulaClient>,
 }

@@ -3,7 +3,6 @@
 use crate::config::GatewayConfig;
 use crate::multipart::MultipartManager;
 use blake3::Hasher;
-use dashmap::DashMap;
 use fula_blockstore::{
     FlexibleBlockStore, IpfsPinningBlockStore, IpfsPinningConfig, MemoryBlockStore,
 };
@@ -32,17 +31,18 @@ pub struct AppState {
     pub bucket_manager: Arc<BucketManager<FlexibleBlockStore>>,
     /// Multipart upload manager
     pub multipart_manager: Arc<MultipartManager>,
-    /// User session cache
-    pub sessions: Arc<DashMap<String, UserSession>>,
+    /// In-memory advisory lock store used to serialize v1 -> v7 forest
+    /// migrations across devices. TTL-bounded; process-local only.
+    pub lock_store: crate::handlers::locks::LockStore,
 }
 
 impl AppState {
     /// Create a new application state
     pub async fn new(config: GatewayConfig) -> anyhow::Result<Self> {
         // Initialize block store based on configuration
-        let block_store = if config.use_memory_store {
+        let inner = if config.use_memory_store {
             info!("Using in-memory block store (data will not persist)");
-            Arc::new(FlexibleBlockStore::Memory(MemoryBlockStore::new()))
+            FlexibleBlockStore::Memory(MemoryBlockStore::new())
         } else {
             // Try to connect to IPFS with optional pinning service
             match Self::create_ipfs_store(&config).await {
@@ -51,16 +51,24 @@ impl AppState {
                     if config.pinning_service_endpoint.is_some() {
                         info!("Pinning service configured");
                     }
-                    Arc::new(FlexibleBlockStore::IpfsPinning(store))
+                    FlexibleBlockStore::IpfsPinning(store)
                 }
                 Err(e) => {
                     warn!(
                         "Failed to connect to IPFS ({}), falling back to in-memory storage",
                         e
                     );
-                    Arc::new(FlexibleBlockStore::Memory(MemoryBlockStore::new()))
+                    FlexibleBlockStore::Memory(MemoryBlockStore::new())
                 }
             }
+        };
+
+        // Optionally wrap in an LRU block cache
+        let block_store = if config.block_cache_mb > 0 {
+            info!("LRU block cache enabled ({} MB)", config.block_cache_mb);
+            Arc::new(inner.with_cache_mb(config.block_cache_mb))
+        } else {
+            Arc::new(inner)
         };
 
         // Log storage mode
@@ -106,12 +114,16 @@ impl AppState {
         // Initialize multipart manager
         let multipart_manager = Arc::new(MultipartManager::new(config.multipart_expiry_secs));
 
+        // Initialize empty lock store. The sweeper is spawned by `server::run_server`
+        // after AppState is wrapped in an Arc.
+        let lock_store = crate::handlers::locks::LockStore::new();
+
         Ok(Self {
             config,
             block_store,
             bucket_manager,
             multipart_manager,
-            sessions: Arc::new(DashMap::new()),
+            lock_store,
         })
     }
 

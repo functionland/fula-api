@@ -72,6 +72,8 @@ fn test_deep_folder_structure_50_levels() {
         modified_at: now_timestamp(),
         content_hash: None,
         user_metadata: HashMap::new(),
+        encrypted: false,
+        min_version: 0,
     };
     forest.upsert_file(entry);
     
@@ -205,6 +207,8 @@ fn test_large_file_100gb_simulated() {
             meta.insert("chunk_size".to_string(), CHUNK_SIZE.to_string());
             meta
         },
+        encrypted: false,
+        min_version: 0,
     };
     forest.upsert_file(entry);
     
@@ -355,6 +359,8 @@ fn test_large_folder_2000_files() {
                 meta.insert("location".to_string(), format!("Photo location {}", i));
                 meta
             },
+            encrypted: false,
+            min_version: 0,
         };
         forest.upsert_file(entry);
         
@@ -533,6 +539,8 @@ fn test_combined_stress_scenario() {
         modified_at: now_timestamp(),
         content_hash: None,
         user_metadata: HashMap::new(),
+        encrypted: false,
+        min_version: 0,
     };
     forest.upsert_file(entry);
 
@@ -547,6 +555,8 @@ fn test_combined_stress_scenario() {
         modified_at: now_timestamp(),
         content_hash: None,
         user_metadata: HashMap::new(),
+        encrypted: false,
+        min_version: 0,
     };
     forest.upsert_file(entry);
 
@@ -562,6 +572,8 @@ fn test_combined_stress_scenario() {
             modified_at: now_timestamp(),
             content_hash: None,
             user_metadata: HashMap::new(),
+            encrypted: false,
+            min_version: 0,
         };
         forest.upsert_file(entry);
     }

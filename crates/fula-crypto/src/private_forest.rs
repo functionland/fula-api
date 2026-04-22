@@ -51,7 +51,7 @@ use crate::{
     hamt_index::HamtIndex,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Forest format version
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +60,10 @@ pub enum ForestFormat {
     FlatMapV1,
     /// HAMT-backed index (version 2) for large forests
     HamtV2,
+    /// HAMT-per-shard (version 7) — each shard is a content-addressed HAMT
+    /// rather than a flat HashMap, so a single shard can scale to millions of
+    /// entries without any client materializing the whole shard.
+    ShardedHamtV7,
 }
 
 impl Default for ForestFormat {
@@ -124,10 +128,29 @@ pub struct ForestFileEntry {
     /// User metadata
     #[serde(default)]
     pub user_metadata: HashMap<String, String>,
+    /// Whether the underlying object MUST be fetched via the encrypted
+    /// download path. `true` for new encrypted uploads; legacy entries
+    /// deserialize as `false` via `#[serde(default)]`. The client uses this
+    /// to reject a malicious storage backend that returns
+    /// `x-fula-encrypted: false` for a path that was uploaded encrypted
+    /// (audit finding C-AUDIT-004).
+    #[serde(default)]
+    pub encrypted: bool,
+    /// Minimum blob-format version the client must accept for this entry.
+    /// `0` on legacy entries (pre-H-2); `4` once the entry is written under
+    /// v4 AAD-bound encryption. Read paths reject blobs whose declared
+    /// `version` is below this floor (audit finding H-2, defense-in-depth
+    /// against downgrade-to-no-AAD when a bucket mixes v1/v2 legacy data).
+    #[serde(default)]
+    pub min_version: u8,
 }
 
 impl ForestFileEntry {
-    /// Create from private metadata and storage key
+    /// Create from private metadata and storage key.
+    ///
+    /// Callers that created this entry in response to a successful encrypted
+    /// upload should call `mark_encrypted()` afterwards so later reads can
+    /// enforce that the object is not served in plaintext.
     pub fn from_metadata(metadata: &PrivateMetadata, storage_key: String) -> Self {
         Self {
             path: metadata.original_key.clone(),
@@ -138,6 +161,21 @@ impl ForestFileEntry {
             modified_at: metadata.modified_at,
             content_hash: metadata.content_hash.clone(),
             user_metadata: metadata.user_metadata.clone(),
+            encrypted: false,
+            min_version: 0,
+        }
+    }
+
+    /// Mark this entry as "must be fetched encrypted" and pin it to the
+    /// v4 blob-format floor. Used by the client immediately after a
+    /// successful encrypted PUT so future reads (a) refuse to accept a
+    /// plaintext response from the storage backend (C-AUDIT-004), and
+    /// (b) refuse to honor an attacker-authored v2-format (no-AAD) blob
+    /// at the same storage_key (H-2).
+    pub fn mark_encrypted(&mut self) {
+        self.encrypted = true;
+        if self.min_version < 4 {
+            self.min_version = 4;
         }
     }
 
@@ -221,6 +259,20 @@ mod hex_serde {
 const HAMT_MIGRATION_THRESHOLD: usize = 1000;
 
 impl PrivateForest {
+    /// Normalize a directory path for consistent HashMap lookups.
+    /// Strips trailing slash (except for root "/") and ensures leading slash.
+    fn normalize_dir_path(dir_path: &str) -> String {
+        if dir_path.is_empty() || dir_path == "/" {
+            return "/".to_string();
+        }
+        let trimmed = dir_path.trim_end_matches('/');
+        if trimmed.starts_with('/') {
+            trimmed.to_string()
+        } else {
+            format!("/{}", trimmed)
+        }
+    }
+
     /// Create a new empty private forest (FlatMapV1 format)
     pub fn new() -> Self {
         Self::with_format(ForestFormat::FlatMapV1)
@@ -254,6 +306,7 @@ impl PrivateForest {
         let (files, files_hamt) = match format {
             ForestFormat::FlatMapV1 => (HashMap::new(), None),
             ForestFormat::HamtV2 => (HashMap::new(), Some(HamtIndex::new())),
+            ForestFormat::ShardedHamtV7 => unreachable!("ShardedHamtV7 uses ShardedHamtPrivateForest, not PrivateForest"),
         };
 
         Self {
@@ -360,6 +413,7 @@ impl PrivateForest {
                     hamt.insert(path, entry);
                 }
             }
+            ForestFormat::ShardedHamtV7 => unreachable!("ShardedHamtV7 uses ShardedHamtPrivateForest, not PrivateForest"),
         }
     }
 
@@ -413,6 +467,7 @@ impl PrivateForest {
         let entry = match self.format {
             ForestFormat::FlatMapV1 => self.files.remove(path),
             ForestFormat::HamtV2 => self.files_hamt.as_mut().and_then(|h| h.remove(path)),
+            ForestFormat::ShardedHamtV7 => unreachable!("ShardedHamtV7 uses ShardedHamtPrivateForest, not PrivateForest"),
         };
 
         if let Some(ref e) = entry {
@@ -432,6 +487,7 @@ impl PrivateForest {
         match self.format {
             ForestFormat::FlatMapV1 => self.files.get(path),
             ForestFormat::HamtV2 => self.files_hamt.as_ref().and_then(|h| h.get(path)),
+            ForestFormat::ShardedHamtV7 => unreachable!("ShardedHamtV7 uses ShardedHamtPrivateForest, not PrivateForest"),
         }
     }
 
@@ -447,18 +503,13 @@ impl PrivateForest {
             ForestFormat::HamtV2 => self.files_hamt.as_ref()
                 .map(|h| h.iter().map(|(_, v)| v).collect())
                 .unwrap_or_default(),
+            ForestFormat::ShardedHamtV7 => unreachable!("ShardedHamtV7 uses ShardedHamtPrivateForest, not PrivateForest"),
         }
     }
 
     /// List files in a directory (non-recursive)
     pub fn list_directory(&self, dir_path: &str) -> Vec<&ForestFileEntry> {
-        let normalized = if dir_path.is_empty() || dir_path == "/" {
-            "/".to_string()
-        } else if dir_path.starts_with('/') {
-            dir_path.to_string()
-        } else {
-            format!("/{}", dir_path)
-        };
+        let normalized = Self::normalize_dir_path(dir_path);
 
         if let Some(dir) = self.directories.get(&normalized) {
             dir.files.iter()
@@ -471,13 +522,7 @@ impl PrivateForest {
 
     /// List subdirectories of a directory
     pub fn list_subdirs(&self, dir_path: &str) -> Vec<&str> {
-        let normalized = if dir_path.is_empty() || dir_path == "/" {
-            "/".to_string()
-        } else if dir_path.starts_with('/') {
-            dir_path.to_string()
-        } else {
-            format!("/{}", dir_path)
-        };
+        let normalized = Self::normalize_dir_path(dir_path);
 
         if let Some(dir) = self.directories.get(&normalized) {
             dir.subdirs.iter().map(|s| s.as_str()).collect()
@@ -511,6 +556,7 @@ impl PrivateForest {
         match self.format {
             ForestFormat::FlatMapV1 => self.files.len(),
             ForestFormat::HamtV2 => self.files_hamt.as_ref().map(|h| h.len()).unwrap_or(0),
+            ForestFormat::ShardedHamtV7 => unreachable!("ShardedHamtV7 uses ShardedHamtPrivateForest, not PrivateForest"),
         }
     }
 
@@ -557,6 +603,11 @@ impl Default for PrivateForest {
 }
 
 /// Encrypted private forest (what gets stored)
+///
+/// Version semantics:
+/// - v1/v2: legacy monolithic forest, no AAD, no replay protection.
+/// - v4: monolithic forest with AAD bound to `fula:forest:v4:<bucket>:<sequence>`
+///   and an outer `sequence` counter for replay detection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EncryptedForest {
     /// Version of the encryption format
@@ -567,6 +618,12 @@ pub struct EncryptedForest {
     /// Nonce used for encryption
     #[serde(with = "base64_serde")]
     pub nonce: Vec<u8>,
+    /// Monotonic sequence counter (v4+). Bound into AAD to prevent replay.
+    ///
+    /// Present only for version >= 4. Legacy v1/v2 blobs omit this field
+    /// to preserve on-disk format compatibility.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sequence: Option<u64>,
 }
 
 mod base64_serde {
@@ -585,31 +642,97 @@ mod base64_serde {
     }
 }
 
+/// Compute the AAD for a v4 monolithic forest.
+///
+/// Bound to bucket + sequence to prevent replay of an older forest snapshot
+/// by a malicious or compromised storage server.
+pub fn forest_v4_aad(bucket: &str, sequence: u64) -> Vec<u8> {
+    format!("fula:forest:v4:{}:{}", bucket, sequence).into_bytes()
+}
+
 impl EncryptedForest {
-    /// Encrypt a private forest with a DEK
+    /// Encrypt a private forest with a DEK (legacy v1, no AAD).
+    ///
+    /// Prefer [`EncryptedForest::encrypt_v4`] for new writes — it binds the
+    /// ciphertext to the bucket and a monotonic sequence counter for replay
+    /// protection. This legacy constructor is preserved so existing tests and
+    /// pre-v4 call sites compile, but new code paths go through v4.
     pub fn encrypt(forest: &PrivateForest, dek: &DekKey) -> Result<Self> {
         let json = serde_json::to_vec(forest)
             .map_err(|e| CryptoError::Serialization(e.to_string()))?;
-        
+
         let nonce = Nonce::generate();
         let aead = Aead::new_default(dek);
         let ciphertext = aead.encrypt(&nonce, &json)?;
-        
+
         Ok(Self {
             version: 1,
             ciphertext,
             nonce: nonce.as_bytes().to_vec(),
+            sequence: None,
         })
     }
 
-    /// Decrypt a private forest with a DEK
+    /// Encrypt a private forest with a DEK and AAD binding (v4).
+    ///
+    /// Produces an [`EncryptedForest`] with `version = 4` and a monotonic
+    /// `sequence` counter. The sequence and bucket are bound into the AEAD
+    /// via AAD, so any rollback attempt by a malicious storage server fails
+    /// the AEAD tag check.
+    pub fn encrypt_v4(
+        forest: &PrivateForest,
+        dek: &DekKey,
+        bucket: &str,
+        sequence: u64,
+    ) -> Result<Self> {
+        let json = serde_json::to_vec(forest)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(dek);
+        let aad = forest_v4_aad(bucket, sequence);
+        let ciphertext = aead.encrypt_with_aad(&nonce, &json, &aad)?;
+
+        Ok(Self {
+            version: 4,
+            ciphertext,
+            nonce: nonce.as_bytes().to_vec(),
+            sequence: Some(sequence),
+        })
+    }
+
+    /// Decrypt a private forest with a DEK (legacy v1/v2, no AAD).
     pub fn decrypt(&self, dek: &DekKey) -> Result<PrivateForest> {
         let nonce = Nonce::from_bytes(&self.nonce)?;
         let aead = Aead::new_default(dek);
         let plaintext = aead.decrypt(&nonce, &self.ciphertext)?;
-        
+
         serde_json::from_slice(&plaintext)
             .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+
+    /// Decrypt a v4 forest with a DEK, verifying bucket binding via AAD.
+    ///
+    /// Returns the decrypted forest plus the bound sequence. Callers should
+    /// compare the returned sequence against their cached last-seen sequence
+    /// to detect replay.
+    pub fn decrypt_v4(&self, dek: &DekKey, bucket: &str) -> Result<(PrivateForest, u64)> {
+        if self.version != 4 {
+            return Err(CryptoError::Decryption(format!(
+                "expected EncryptedForest version 4, got {}",
+                self.version
+            )));
+        }
+        let sequence = self.sequence.ok_or_else(|| {
+            CryptoError::Decryption("v4 EncryptedForest missing sequence field".to_string())
+        })?;
+        let nonce = Nonce::from_bytes(&self.nonce)?;
+        let aead = Aead::new_default(dek);
+        let aad = forest_v4_aad(bucket, sequence);
+        let plaintext = aead.decrypt_with_aad(&nonce, &self.ciphertext, &aad)?;
+        let forest: PrivateForest = serde_json::from_slice(&plaintext)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+        Ok((forest, sequence))
     }
 
     /// Serialize to bytes for storage
@@ -624,6 +747,1204 @@ impl EncryptedForest {
             .map_err(|e| CryptoError::Serialization(e.to_string()))
     }
 }
+
+// ============================================================================
+// Shard routing helpers (shared by v7 ShardedHamtPrivateForest)
+// ============================================================================
+
+/// Maximum number of shards.
+///
+/// Raised from 4,096 → 65,536 in S-1.2 once the manifest was split from a
+/// single serialized blob into a two-level structure (a small root indexing
+/// up to [`MAX_PAGES`] `ManifestPage`s, each carrying `PAGE_SIZE` shards).
+/// The 2-byte shard-routing hash in [`shard_for_path_v6`] already supports
+/// this width, so lifting the ceiling required no wire-format bump beyond
+/// the meta-HAMT layout.
+pub const MAX_SHARDS: usize = 65_536;
+
+/// Shards per manifest page. Each page serializes to its own encrypted S3
+/// object so no single blob approaches the 1 MiB cap even at `MAX_SHARDS`.
+///
+/// Sized so that a fully-populated page (1,024 shards × ~60 B metadata) is
+/// ~65 KB plaintext, well under the [`MAX_MANIFEST_BLOCK_SIZE`] guard.
+pub const PAGE_SIZE: usize = 1_024;
+
+/// Maximum number of manifest pages (= [`MAX_SHARDS`] / [`PAGE_SIZE`]).
+pub const MAX_PAGES: usize = MAX_SHARDS / PAGE_SIZE;
+
+/// Upper bound on any encrypted manifest block (root or page). Matches the
+/// 1 MiB block cap used by the blockstore layer; enforced inside
+/// `encrypt_v7` / `EncryptedManifestPage::encrypt` so a growing shard table
+/// surfaces as a bounded error before publish rather than a silent
+/// `put_block` failure downstream.
+const MAX_MANIFEST_BLOCK_SIZE: usize = 1024 * 1024;
+
+/// Domain for shard key derivation
+const SHARD_KEY_DOMAIN: &str = "fula/private-forest/shard/v1";
+
+/// Domain for manifest-page key derivation.
+const MANIFEST_PAGE_KEY_DOMAIN: &str = "fula/private-forest/manifest-page/v1";
+
+/// KDF domain for the per-bucket directory-index storage key.
+///
+/// One encrypted object per bucket, stored under a key derived from this
+/// domain + (forest_dek, bucket). Distinct domain from index/shard/page KDFs
+/// so the resulting key cannot collide with any shard or manifest object.
+const DIR_INDEX_KEY_DOMAIN: &str = "fula/private-forest/dir-index/v1";
+
+/// Domain for shard assignment
+const SHARD_ASSIGN_DOMAIN: &str = "fula/private-forest/shard-assign/v1";
+
+/// Identifier of a manifest page. `u16` gives headroom beyond the current
+/// [`MAX_PAGES`] budget (64) so the wire format doesn't need a migration if
+/// the page width is ever lowered.
+pub type PageId = u16;
+
+/// Which page owns the shard at `shard_idx` under [`PAGE_SIZE`].
+#[inline]
+pub fn page_id_for_shard(shard_idx: usize) -> PageId {
+    (shard_idx / PAGE_SIZE) as PageId
+}
+
+/// Slot within its owning page for `shard_idx`.
+#[inline]
+pub fn shard_slot_in_page(shard_idx: usize) -> usize {
+    shard_idx % PAGE_SIZE
+}
+
+/// Derive the S3 storage key for a specific shard
+///
+/// Deterministic from (forest_dek, bucket, shard_salt, shard_index).
+/// No need to store shard keys — they can always be recomputed.
+pub fn derive_shard_key(forest_dek: &DekKey, bucket: &str, shard_salt: &[u8], shard_index: usize) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key(SHARD_KEY_DOMAIN);
+    hasher.update(forest_dek.as_bytes());
+    hasher.update(bucket.as_bytes());
+    hasher.update(shard_salt);
+    hasher.update(&(shard_index as u32).to_le_bytes());
+    let hash = hasher.finalize();
+    format!("Qm{}", hex::encode(&hash.as_bytes()[..22]))
+}
+
+/// Derive the S3 storage key for a specific manifest page.
+///
+/// Deterministic from (forest_dek, bucket, shard_salt, page_id) — same KDF
+/// family as [`derive_shard_key`] with a distinct domain so the keys never
+/// collide with shard blobs. Pages are **index-addressed**, not
+/// content-addressed: re-PUT under the same key overwrites in place so a
+/// failed page write leaves no orphans.
+pub fn derive_manifest_page_key(
+    forest_dek: &DekKey,
+    bucket: &str,
+    shard_salt: &[u8],
+    page_id: PageId,
+) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key(MANIFEST_PAGE_KEY_DOMAIN);
+    hasher.update(forest_dek.as_bytes());
+    hasher.update(bucket.as_bytes());
+    hasher.update(shard_salt);
+    hasher.update(&page_id.to_le_bytes());
+    let hash = hasher.finalize();
+    format!("Qm{}", hex::encode(&hash.as_bytes()[..22]))
+}
+
+/// Derive the S3 storage key for a bucket's directory index.
+///
+/// One object per bucket, keyed deterministically off `(forest_dek, bucket)`.
+/// Distinct KDF domain from shard / page / forest-index keys so derivations
+/// cannot alias. No salt: there is exactly one dir-index per bucket, and
+/// overwrites happen in place via conditional PUT with `If-Match`.
+pub fn derive_dir_index_key(forest_dek: &DekKey, bucket: &str) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key(DIR_INDEX_KEY_DOMAIN);
+    hasher.update(forest_dek.as_bytes());
+    hasher.update(bucket.as_bytes());
+    let hash = hasher.finalize();
+    format!("Qm{}", hex::encode(&hash.as_bytes()[..22]))
+}
+
+/// Canonicalize a path to the directory used for v6 shard routing.
+///
+/// Always returns a non-empty string ending in `/`. Examples:
+/// - `/a/b/c.txt` → `/a/b/`
+/// - `/file.txt`  → `/`
+/// - `/a/b/`      → `/a/b/`
+/// - ``           → `/`
+/// - `/`          → `/`
+///
+/// Directories route to themselves so `list_directory` can find files by
+/// loading only the shard that owns the directory.
+pub fn parent_dir_for_routing(path: &str) -> String {
+    if path.is_empty() || path == "/" {
+        return "/".to_string();
+    }
+    if path.ends_with('/') {
+        return path.to_string();
+    }
+    match path.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(idx) => format!("{}/", &path[..idx]),
+        None => "/".to_string(),
+    }
+}
+
+/// Determine which shard a file path belongs to under v6 routing.
+///
+/// Hashes the parent directory (canonicalized via [`parent_dir_for_routing`])
+/// rather than the full path. All files sharing a parent directory land in
+/// the same shard, which gives directory-locality for `list_directory` and
+/// common co-edit patterns without leaking the directory structure to the
+/// server (the DEK is mixed into the hash, so shard IDs remain indistinct).
+///
+/// Uses two bytes of hash output (u16 range, up to 65,536) so shard counts
+/// above today's `MAX_SHARDS` = 4,096 stay wire-compatible if the manifest
+/// format later evolves to a meta-HAMT (see deferred S-1.2).
+pub fn shard_for_path_v6(path: &str, dek: &DekKey, shard_salt: &[u8], num_shards: usize) -> usize {
+    let parent = parent_dir_for_routing(path);
+    let mut hasher = blake3::Hasher::new_derive_key(SHARD_ASSIGN_DOMAIN);
+    hasher.update(dek.as_bytes());
+    hasher.update(parent.as_bytes());
+    hasher.update(shard_salt);
+    let hash = hasher.finalize();
+    let bytes = hash.as_bytes();
+    let idx = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+    idx % num_shards
+}
+
+/// Compute the initial shard count for migration based on file count
+///
+/// `max(16, next_power_of_two(file_count / 5000))`
+pub fn compute_initial_shard_count(file_count: usize) -> usize {
+    #[cfg(feature = "test-fault-injection")]
+    {
+        let forced = FORCE_INITIAL_SHARD_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        if forced > 0 {
+            return forced.min(MAX_SHARDS);
+        }
+    }
+    let target = file_count / 5000;
+    let pow2 = target.next_power_of_two().max(1);
+    pow2.max(16).min(MAX_SHARDS)
+}
+
+/// Test-only override for `compute_initial_shard_count`. Non-zero values
+/// (clamped to `MAX_SHARDS`) short-circuit the file-count heuristic so
+/// integration tests can force multi-page manifests without populating
+/// millions of files. Off by default; only compiled when the crate's
+/// `test-fault-injection` feature is on.
+#[cfg(feature = "test-fault-injection")]
+pub static FORCE_INITIAL_SHARD_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Events emitted during v1 → v7 migration for app-level notifications
+#[derive(Clone, Debug)]
+pub enum ForestEvent {
+    /// Migration completed
+    MigrationCompleted {
+        bucket: String,
+        duration_ms: u64,
+    },
+}
+
+//--------------------------------------------------------------------------------------------------
+// v7 sharded-HAMT forest
+//
+// Per-shard flat HashMap (v5/v6) is replaced with a content-addressed HAMT
+// rooted at `ShardV7::root`. A single shard can now scale to millions of
+// entries without any client materializing the whole shard. See the v7 plan
+// at /root/.claude/plans/do-a-thorough-line-cheeky-taco.md.
+//--------------------------------------------------------------------------------------------------
+
+/// Width of a v7 HAMT node storage key. Mirrors
+/// `wnfs_hamt::store::STORAGE_KEY_LEN` so the public v7 schema doesn't need
+/// to expose the internal `wnfs_hamt` module.
+pub const V7_STORAGE_KEY_LEN: usize = 22;
+
+/// Content-addressed storage key for a v7 HAMT node blob.
+///
+/// Derived as `BLAKE3(bucket_salt ‖ plaintext_node_bytes)[..V7_STORAGE_KEY_LEN]`.
+/// The per-bucket salt (from [`ShardManifestV7::shard_salt`](ShardManifestV7::shard_salt)) prevents an
+/// external observer from correlating structurally-identical nodes across
+/// buckets; plaintext hashing (not ciphertext) preserves cross-revision
+/// dedup of unchanged subtrees.
+pub type V7StorageKey = [u8; V7_STORAGE_KEY_LEN];
+
+mod v7_storage_key_serde {
+    use super::V7_STORAGE_KEY_LEN;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        key: &Option<[u8; V7_STORAGE_KEY_LEN]>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match key {
+            Some(bytes) => s.serialize_some(&hex::encode(bytes)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<[u8; V7_STORAGE_KEY_LEN]>, D::Error> {
+        let s: Option<String> = Option::deserialize(d)?;
+        match s {
+            Some(hex_str) => {
+                let bytes = hex::decode(&hex_str).map_err(serde::de::Error::custom)?;
+                if bytes.len() != V7_STORAGE_KEY_LEN {
+                    return Err(serde::de::Error::custom(format!(
+                        "v7 storage key must be {} bytes, got {}",
+                        V7_STORAGE_KEY_LEN,
+                        bytes.len()
+                    )));
+                }
+                let mut arr = [0u8; V7_STORAGE_KEY_LEN];
+                arr.copy_from_slice(&bytes);
+                Ok(Some(arr))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// Per-shard metadata in a v7 sharded-HAMT manifest.
+///
+/// `root` points to this shard's HAMT root node. `None` means the shard is
+/// empty — no node has been written yet. On every committed mutation the
+/// root advances to the newly-written root node; intermediate nodes become
+/// unreachable and are GC'd lazily.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardV7 {
+    /// HAMT root node key; `None` when the shard has no entries.
+    #[serde(with = "v7_storage_key_serde", default)]
+    pub root: Option<V7StorageKey>,
+
+    /// Monotonic per-shard sequence counter. Paired with the manifest's
+    /// conditional-PUT ETag, this protects shard root swaps against replay:
+    /// a stale manifest re-upload is rejected by S3 on ETag mismatch, and
+    /// within a winning generation `seq` gives an ordering invariant for
+    /// WAL-driven retry. It is *not* part of per-node AAD — see
+    /// [`hamt_node_v7_aad`] for why.
+    pub seq: u64,
+
+    /// Conditional-PUT ETag of the last written manifest generation for this
+    /// shard. `None` before the first successful flush.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub etag: Option<String>,
+
+    /// Entry count held in this shard (files + directories). Maintained on
+    /// each flush so top-level `file_count()` and shard-growth heuristics
+    /// stay O(num_shards) without walking any HAMT.
+    pub entry_count: u32,
+}
+
+impl ShardV7 {
+    /// Fresh, empty shard — no HAMT nodes written, sequence 0.
+    pub fn new() -> Self {
+        Self {
+            root: None,
+            seq: 0,
+            etag: None,
+            entry_count: 0,
+        }
+    }
+
+    /// True when the shard holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.root.is_none() && self.entry_count == 0
+    }
+}
+
+impl Default for ShardV7 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Pointer to a manifest page from the root.
+///
+/// Binds two things the root needs to validate a page read:
+///   * `etag`: the last-known S3 ETag, used for `If-Match` on re-PUT.
+///   * `seq`: the expected monotonic sequence. Readers reject a page whose
+///     plaintext `seq` is lower than this (M2 — staleness detection).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageRef {
+    /// ETag returned by S3 on the last successful PUT; `None` before the
+    /// first flush of this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    /// Expected monotonic page sequence (≥ whichever seq the reader sees).
+    pub seq: u64,
+}
+
+/// Root of the two-level manifest.
+///
+/// This is what [`EncryptedShardManifestV7`] wraps. Pages carry the bulk of
+/// the data (shard metadata); the root stays small enough that even at
+/// [`MAX_SHARDS`] = 65,536 the encrypted root object is tens of KB, well
+/// under [`MAX_MANIFEST_BLOCK_SIZE`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestRoot {
+    /// Manifest format version (= 7).
+    pub version: u8,
+    /// Format identifier for human-readable introspection.
+    pub format: String,
+    /// Number of shards (power of 2, capped at [`MAX_SHARDS`]).
+    pub num_shards: usize,
+    /// Random 32-byte salt used for shard routing and for content-hashing
+    /// HAMT node plaintext. Prevents cross-bucket correlation of
+    /// structurally identical nodes.
+    #[serde(with = "hex_serde")]
+    pub shard_salt: Vec<u8>,
+    /// Root directory path (usually "/").
+    pub root: String,
+    /// Creation timestamp (Unix seconds).
+    pub created_at: i64,
+    /// Last-modified timestamp (Unix seconds).
+    pub modified_at: i64,
+    /// Index of manifest pages: `page_id → PageRef`. A missing entry means
+    /// the page has never been flushed (shards in it are all-empty), so no
+    /// page blob exists in S3 yet.
+    #[serde(default)]
+    pub page_index: BTreeMap<PageId, PageRef>,
+    /// ETag of the encrypted [`DirectoryIndex`] object (F-1.3). `None` on
+    /// buckets that have not yet flushed the dir-index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir_index_etag: Option<String>,
+    /// Sequence number of the [`DirectoryIndex`] blob this root commits to.
+    /// AEAD-bound inside the dir-index envelope — a reader that fetches the
+    /// dir-index under this root MUST reject any plaintext whose `seq` does
+    /// not equal this value. Pins both rollback (serving an older dir-index
+    /// for this root) and forward-drift (serving a newer dir-index written
+    /// by a concurrent migrator under a different root), closing the race
+    /// where `dir_index_etag` alone is insufficient because `load_object`
+    /// discards S3's HEAD ETag. `None` before the first successful flush.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir_index_seq: Option<u64>,
+}
+
+impl ManifestRoot {
+    fn fresh(num_shards: usize) -> Self {
+        use rand::RngCore;
+        let num_shards = num_shards.next_power_of_two().max(16).min(MAX_SHARDS);
+        let mut shard_salt = vec![0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut shard_salt);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        Self {
+            version: 7,
+            format: "sharded-hamt-v7".to_string(),
+            num_shards,
+            shard_salt,
+            root: "/".to_string(),
+            created_at: now,
+            modified_at: now,
+            page_index: BTreeMap::new(),
+            dir_index_etag: None,
+            dir_index_seq: None,
+        }
+    }
+
+    /// How many pages a fully-populated manifest with this `num_shards` has.
+    pub fn page_count(&self) -> usize {
+        self.num_shards.div_ceil(PAGE_SIZE)
+    }
+}
+
+/// One page of the meta-HAMT manifest.
+///
+/// Carries a contiguous slice of per-shard metadata: shards
+/// `[page_id * PAGE_SIZE, page_id * PAGE_SIZE + shards.len())`. The
+/// trailing page is short when `num_shards < MAX_SHARDS` and not an exact
+/// multiple of `PAGE_SIZE` — today `num_shards` is always a power of two,
+/// so every page is either full or the sole page of a sub-`PAGE_SIZE`
+/// manifest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestPage {
+    /// Which page this is; self-describing so an out-of-slot ciphertext
+    /// cannot be accepted even if AAD binding were somehow bypassed.
+    pub page_id: PageId,
+    /// Monotonic page sequence. Incremented on every re-PUT (M2) so a
+    /// reader whose root records seq N rejects a page with plaintext
+    /// seq < N.
+    pub seq: u64,
+    /// Per-shard metadata for this page.
+    pub shards: Vec<ShardV7>,
+}
+
+impl ManifestPage {
+    fn empty(page_id: PageId, shards_in_page: usize) -> Self {
+        Self {
+            page_id,
+            seq: 0,
+            shards: (0..shards_in_page).map(|_| ShardV7::new()).collect(),
+        }
+    }
+}
+
+/// v7 sharded-HAMT manifest (in-memory representation).
+///
+/// The persisted form is the two-level meta-HAMT: a [`ManifestRoot`] in the
+/// index blob (wrapped by [`EncryptedShardManifestV7`]) pointing at up to
+/// [`MAX_PAGES`] [`ManifestPage`]s (each wrapped by [`EncryptedManifestPage`]).
+/// Accessor methods [`shard`], [`shard_mut`], [`shards_iter`] hide the page
+/// layout so mutation code looks identical to the old flat-`Vec` API.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardManifestV7 {
+    /// Root metadata persisted in the index blob.
+    pub root: ManifestRoot,
+    /// Pages loaded in memory, keyed by `page_id`. A fresh manifest and a
+    /// fully-loaded manifest both carry every page in `0..page_count()`; a
+    /// lazily-loaded manifest may omit pages that haven't been touched yet.
+    pub pages: BTreeMap<PageId, ManifestPage>,
+    /// Pages mutated since the last successful flush. The flush path drains
+    /// this set, bumps each dirty page's `seq`, and PUTs it. Not persisted
+    /// — reconstructed on each mutation.
+    pub dirty_pages: BTreeSet<PageId>,
+}
+
+impl ShardManifestV7 {
+    /// Fresh v7 manifest with `num_shards` empty shards across
+    /// `ceil(num_shards / PAGE_SIZE)` fully-materialized pages.
+    ///
+    /// `num_shards` is rounded up to the next power of two and clamped to
+    /// `[16, MAX_SHARDS]`.
+    pub fn new(num_shards: usize) -> Self {
+        let root = ManifestRoot::fresh(num_shards);
+        let actual_num = root.num_shards;
+        let page_count = root.page_count();
+        let mut pages = BTreeMap::new();
+        for page_id in 0..page_count as PageId {
+            let first_slot = (page_id as usize) * PAGE_SIZE;
+            let shards_in_page = (actual_num - first_slot).min(PAGE_SIZE);
+            pages.insert(page_id, ManifestPage::empty(page_id, shards_in_page));
+        }
+        Self {
+            root,
+            pages,
+            dirty_pages: BTreeSet::new(),
+        }
+    }
+
+    /// Reassemble a manifest from a decrypted root + its (already-loaded)
+    /// pages. Used by the open path in fula-client after fetching the root
+    /// and each page referenced by `root.page_index`.
+    ///
+    /// Validates that every page's `seq` is ≥ the seq recorded in the root
+    /// (staleness rejection, M2); returns an error if a page's contents
+    /// pre-date the root. Pages not referenced by `page_index` (i.e.
+    /// all-empty, never flushed) are synthesized on demand so shard
+    /// accessors never see a gap.
+    pub fn from_root_and_pages(
+        root: ManifestRoot,
+        pages_in: BTreeMap<PageId, ManifestPage>,
+    ) -> Result<Self> {
+        for (page_id, page) in pages_in.iter() {
+            if page.page_id != *page_id {
+                return Err(CryptoError::Serialization(format!(
+                    "manifest page_id mismatch: map key {} vs payload {}",
+                    page_id, page.page_id
+                )));
+            }
+            if let Some(expected) = root.page_index.get(page_id) {
+                if page.seq < expected.seq {
+                    return Err(CryptoError::Decryption(format!(
+                        "stale manifest page {}: plaintext seq {} < root-expected seq {}",
+                        page_id, page.seq, expected.seq
+                    )));
+                }
+            }
+        }
+
+        let mut pages = pages_in;
+        let page_count = root.page_count();
+        for page_id in 0..page_count as PageId {
+            pages.entry(page_id).or_insert_with(|| {
+                let first_slot = (page_id as usize) * PAGE_SIZE;
+                let shards_in_page = (root.num_shards - first_slot).min(PAGE_SIZE);
+                ManifestPage::empty(page_id, shards_in_page)
+            });
+        }
+
+        Ok(Self {
+            root,
+            pages,
+            dirty_pages: BTreeSet::new(),
+        })
+    }
+
+    /// Total shard count (wire-format quantity; equals `self.root.num_shards`).
+    #[inline]
+    pub fn num_shards(&self) -> usize {
+        self.root.num_shards
+    }
+
+    /// Shard-routing salt (lives in the root).
+    #[inline]
+    pub fn shard_salt(&self) -> &[u8] {
+        &self.root.shard_salt
+    }
+
+    /// Root directory path ("/" on fresh buckets).
+    #[inline]
+    pub fn root_path(&self) -> &str {
+        &self.root.root
+    }
+
+    /// Number of pages this manifest has at its current shard count.
+    #[inline]
+    pub fn page_count(&self) -> usize {
+        self.root.page_count()
+    }
+
+    fn page_for(&self, shard_idx: usize) -> &ManifestPage {
+        let page_id = page_id_for_shard(shard_idx);
+        self.pages.get(&page_id).unwrap_or_else(|| {
+            panic!(
+                "manifest page {} not loaded for shard {} (num_shards={})",
+                page_id, shard_idx, self.root.num_shards
+            )
+        })
+    }
+
+    fn page_for_mut(&mut self, shard_idx: usize) -> &mut ManifestPage {
+        let page_id = page_id_for_shard(shard_idx);
+        self.dirty_pages.insert(page_id);
+        let num = self.root.num_shards;
+        self.pages.get_mut(&page_id).unwrap_or_else(|| {
+            panic!(
+                "manifest page {} not loaded for shard {} (num_shards={})",
+                page_id, shard_idx, num
+            )
+        })
+    }
+
+    /// Immutable access to shard `idx`. Panics if `idx >= num_shards()` or
+    /// if the page containing it has not been loaded — matches the old
+    /// `manifest.shards[idx]` semantics exactly.
+    pub fn shard(&self, shard_idx: usize) -> &ShardV7 {
+        let slot = shard_slot_in_page(shard_idx);
+        let page = self.page_for(shard_idx);
+        &page.shards[slot]
+    }
+
+    /// Mutable access to shard `idx`. Marks the owning page dirty.
+    pub fn shard_mut(&mut self, shard_idx: usize) -> &mut ShardV7 {
+        let slot = shard_slot_in_page(shard_idx);
+        let page = self.page_for_mut(shard_idx);
+        &mut page.shards[slot]
+    }
+
+    /// Iterate over every shard in canonical `[0, num_shards)` order.
+    pub fn shards_iter(&self) -> impl Iterator<Item = &ShardV7> + '_ {
+        self.pages.values().flat_map(|p| p.shards.iter())
+    }
+
+    /// Mark every loaded page as dirty; used sparingly (e.g. reshard) since
+    /// it forces full re-PUT of the manifest.
+    pub fn mark_all_pages_dirty(&mut self) {
+        let ids: Vec<PageId> = self.pages.keys().copied().collect();
+        self.dirty_pages.extend(ids);
+    }
+
+    /// Drain the dirty-page set, returning the pages to re-PUT.
+    pub fn take_dirty_pages(&mut self) -> BTreeSet<PageId> {
+        std::mem::take(&mut self.dirty_pages)
+    }
+
+    /// Refresh the modified timestamp.
+    pub fn touch(&mut self) {
+        self.root.modified_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+    }
+
+    /// Total entries across all shards (O(num_shards), not O(N)).
+    pub fn entry_count(&self) -> u64 {
+        self.shards_iter().map(|s| s.entry_count as u64).sum()
+    }
+}
+
+/// Compute the AAD for a v7 shard manifest-root wrapper.
+///
+/// Distinct prefix from v5/v6 so a ciphertext of another format cannot be
+/// accepted in a v7 slot — format-downgrade is detected at AEAD verification
+/// rather than relying on the plaintext version field. Since S-1.2 this
+/// binds only the manifest root; pages carry their own AAD
+/// (see [`manifest_page_aad`]).
+pub fn manifest_v7_aad(bucket: &str, sequence: u64) -> Vec<u8> {
+    format!("fula:manifest:v7:{}:{}", bucket, sequence).into_bytes()
+}
+
+/// Compute the AAD for a v7 manifest page.
+///
+/// Binds `(bucket, page_id, seq)` so that:
+///   * A page PUT for a different bucket cannot be swapped in under
+///     [`derive_manifest_page_key`]'s deterministic key.
+///   * A page with an older `seq` cannot impersonate a newer one even if an
+///     adversary could overwrite the S3 slot out-of-band — the AAD seals the
+///     seq at encryption time, so any plaintext-seq mismatch at decrypt
+///     aborts before round-tripping JSON.
+pub fn manifest_page_aad(bucket: &str, page_id: PageId, seq: u64) -> Vec<u8> {
+    format!("fula:v4:manifest-page:{}:{}:{}", bucket, page_id, seq).into_bytes()
+}
+
+/// Compute the AAD for a v7 directory-index blob.
+///
+/// Binds `(bucket, seq)` so that a stale dir-index (older seq than the
+/// manifest root expects) fails AEAD before its plaintext is trusted for
+/// listings. Distinct prefix from shard / page / manifest-root AADs so a
+/// ciphertext of another kind can never be accepted in the dir-index slot.
+pub fn dir_index_aad(bucket: &str, seq: u64) -> Vec<u8> {
+    format!("fula:v4:dir-index:{}:{}", bucket, seq).into_bytes()
+}
+
+/// Compute the AAD for a v7 HAMT node blob.
+///
+/// Binds `bucket_id` and `shard_idx` (u16 big-endian) so a node from a
+/// different bucket or shard fails AEAD verification. Tree position (depth,
+/// bitmap slot) is deliberately NOT in the AAD — position is bound
+/// *structurally* by the parent node's recorded child [`V7StorageKey`], which
+/// is what preserves cross-revision dedup of unchanged subtrees under
+/// plaintext content-addressing.
+///
+/// `shard_seq` is intentionally absent: HAMT flushes only rewrite the path of
+/// mutated nodes, so a seq bump would invalidate untouched subtree
+/// ciphertexts whose AAD was sealed under an older seq. Replay protection
+/// lives at the manifest layer (`manifest.shard(i).seq` + ETag), and
+/// forgery-resistance comes from content-addressing the plaintext bytes.
+pub fn hamt_node_v7_aad(bucket: &str, shard_idx: u16) -> Vec<u8> {
+    let prefix = b"fula:hamt-node:v7:";
+    let mut aad = Vec::with_capacity(prefix.len() + bucket.len() + 2);
+    aad.extend_from_slice(prefix);
+    aad.extend_from_slice(bucket.as_bytes());
+    aad.extend_from_slice(&shard_idx.to_be_bytes());
+    aad
+}
+
+/// Compute a content-addressed v7 node key from the plaintext node bytes.
+///
+/// `BLAKE3(bucket_salt ‖ plaintext)[..V7_STORAGE_KEY_LEN]`. Hashing the
+/// plaintext (not ciphertext) preserves cross-revision dedup for unchanged
+/// subtrees; the per-bucket salt prevents cross-bucket correlation of
+/// structurally identical plaintext (e.g. empty nodes) by an external
+/// observer of the backing object store.
+pub fn compute_v7_node_key(bucket_salt: &[u8], plaintext: &[u8]) -> V7StorageKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(bucket_salt);
+    hasher.update(plaintext);
+    let digest = hasher.finalize();
+    let mut key = [0u8; V7_STORAGE_KEY_LEN];
+    key.copy_from_slice(&digest.as_bytes()[..V7_STORAGE_KEY_LEN]);
+    key
+}
+
+/// Encrypted v7 sharded-HAMT manifest (what gets stored at the index_key).
+///
+/// Version 7 is always AAD-bound; there is no legacy variant.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EncryptedShardManifestV7 {
+    /// Version of the encryption format (= 7).
+    pub version: u8,
+    /// AEAD ciphertext covering the serialized [`ShardManifestV7`].
+    #[serde(with = "base64_serde")]
+    pub ciphertext: Vec<u8>,
+    /// Nonce used for encryption.
+    #[serde(with = "base64_serde")]
+    pub nonce: Vec<u8>,
+    /// Monotonic manifest sequence counter bound into the AAD.
+    pub sequence: u64,
+}
+
+impl EncryptedShardManifestV7 {
+    /// Encrypt a [`ManifestRoot`] under the manifest-root AAD.
+    ///
+    /// Since S-1.2 only the root is wrapped here; per-page ciphertexts live
+    /// in [`EncryptedManifestPage`] and are PUT to keys derived via
+    /// [`derive_manifest_page_key`].
+    pub fn encrypt_v7(
+        root: &ManifestRoot,
+        dek: &DekKey,
+        bucket: &str,
+        sequence: u64,
+    ) -> Result<Self> {
+        let json = serde_json::to_vec(root)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+
+        if json.len() >= MAX_MANIFEST_BLOCK_SIZE {
+            return Err(CryptoError::Serialization(format!(
+                "v7 manifest-root plaintext size {} bytes exceeds MAX_MANIFEST_BLOCK_SIZE ({} bytes); \
+                 page_index count {} is too high for a single-block root. Consider lowering PAGE_SIZE \
+                 to pack more pages, or add a third indirection level.",
+                json.len(),
+                MAX_MANIFEST_BLOCK_SIZE,
+                root.page_index.len()
+            )));
+        }
+
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(dek);
+        let aad = manifest_v7_aad(bucket, sequence);
+        let ciphertext = aead.encrypt_with_aad(&nonce, &json, &aad)?;
+
+        Ok(Self {
+            version: 7,
+            ciphertext,
+            nonce: nonce.as_bytes().to_vec(),
+            sequence,
+        })
+    }
+
+    /// Decrypt a v7 manifest root, verifying bucket + sequence via AAD.
+    ///
+    /// Rejects any non-v7 wrapper so that a downgraded v3/v5/v6 ciphertext
+    /// cannot pass the version check silently. Returns the root only — the
+    /// caller must load referenced pages separately (via `page_index`) and
+    /// pass them to [`ShardManifestV7::from_root_and_pages`].
+    pub fn decrypt_v7(&self, dek: &DekKey, bucket: &str) -> Result<(ManifestRoot, u64)> {
+        if self.version != 7 {
+            return Err(CryptoError::Decryption(format!(
+                "expected EncryptedShardManifestV7 version 7, got {}",
+                self.version
+            )));
+        }
+        let nonce = Nonce::from_bytes(&self.nonce)?;
+        let aead = Aead::new_default(dek);
+        let aad = manifest_v7_aad(bucket, self.sequence);
+        let plaintext = aead.decrypt_with_aad(&nonce, &self.ciphertext, &aad)?;
+        let root: ManifestRoot = serde_json::from_slice(&plaintext)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+        Ok((root, self.sequence))
+    }
+
+    /// Serialize to bytes for storage.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+}
+
+/// Encrypted v7 manifest page (S-1.2).
+///
+/// One per page; stored at a key derived from
+/// [`derive_manifest_page_key`]. Each page carries a `seq` bound into its
+/// AAD — a stale blob (older seq than the root expects) fails AEAD.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EncryptedManifestPage {
+    /// Version of the encryption format (= 7).
+    pub version: u8,
+    /// Which page this ciphertext belongs to.
+    pub page_id: PageId,
+    /// AEAD ciphertext covering the serialized [`ManifestPage`].
+    #[serde(with = "base64_serde")]
+    pub ciphertext: Vec<u8>,
+    /// Nonce used for encryption.
+    #[serde(with = "base64_serde")]
+    pub nonce: Vec<u8>,
+    /// Page sequence bound into the AAD (matches the plaintext's own `seq`).
+    pub seq: u64,
+}
+
+impl EncryptedManifestPage {
+    /// Encrypt a manifest page with its `(page_id, seq)`-bound AAD.
+    pub fn encrypt(page: &ManifestPage, dek: &DekKey, bucket: &str) -> Result<Self> {
+        let json = serde_json::to_vec(page)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+
+        if json.len() >= MAX_MANIFEST_BLOCK_SIZE {
+            return Err(CryptoError::Serialization(format!(
+                "manifest page plaintext size {} bytes exceeds MAX_MANIFEST_BLOCK_SIZE ({} bytes); \
+                 page_id={} shard_count={}. Lower PAGE_SIZE or trim per-shard metadata.",
+                json.len(),
+                MAX_MANIFEST_BLOCK_SIZE,
+                page.page_id,
+                page.shards.len()
+            )));
+        }
+
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(dek);
+        let aad = manifest_page_aad(bucket, page.page_id, page.seq);
+        let ciphertext = aead.encrypt_with_aad(&nonce, &json, &aad)?;
+
+        Ok(Self {
+            version: 7,
+            page_id: page.page_id,
+            ciphertext,
+            nonce: nonce.as_bytes().to_vec(),
+            seq: page.seq,
+        })
+    }
+
+    /// Decrypt a manifest page, verifying bucket + page_id + seq via AAD.
+    ///
+    /// On success, the returned page's `page_id` and `seq` always match the
+    /// envelope — a mismatch means the storage backend returned a page from
+    /// a different slot or a tampered blob.
+    pub fn decrypt(&self, dek: &DekKey, bucket: &str) -> Result<ManifestPage> {
+        if self.version != 7 {
+            return Err(CryptoError::Decryption(format!(
+                "expected EncryptedManifestPage version 7, got {}",
+                self.version
+            )));
+        }
+        let nonce = Nonce::from_bytes(&self.nonce)?;
+        let aead = Aead::new_default(dek);
+        let aad = manifest_page_aad(bucket, self.page_id, self.seq);
+        let plaintext = aead.decrypt_with_aad(&nonce, &self.ciphertext, &aad)?;
+        let page: ManifestPage = serde_json::from_slice(&plaintext)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+        if page.page_id != self.page_id {
+            return Err(CryptoError::Decryption(format!(
+                "page_id mismatch: envelope {} vs plaintext {}",
+                self.page_id, page.page_id
+            )));
+        }
+        if page.seq != self.seq {
+            return Err(CryptoError::Decryption(format!(
+                "page seq mismatch: envelope {} vs plaintext {}",
+                self.seq, page.seq
+            )));
+        }
+        Ok(page)
+    }
+
+    /// Serialize to bytes for storage.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+}
+
+/// Per-directory summary cached in the bucket-level [`DirectoryIndex`].
+///
+/// Holds everything required to answer `list_subdirs(path)` and
+/// `directory_file_count(path)` in O(1). File entries themselves continue
+/// to live inside the shard HAMTs — the index only tracks topology.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirEntry {
+    /// Immediate child directory names (not full paths). `BTreeSet` so
+    /// listings are deterministic and set-union under concurrent mkdir
+    /// replay (plan D7).
+    #[serde(default)]
+    pub subdirs: std::collections::BTreeSet<String>,
+    /// Count of files whose parent directory is this node. Not a sum over
+    /// subtree — callers that need total sizes walk the forest explicitly.
+    #[serde(default)]
+    pub file_count: u32,
+}
+
+/// Bucket-scoped directory index (F-1.3).
+///
+/// Maps normalized directory path (`/`, `/a`, `/a/b`) → [`DirEntry`]. One
+/// object per bucket, encrypted via [`EncryptedDirectoryIndex`], conditionally
+/// PUT with `If-Match` so concurrent writers can't silently clobber each
+/// other. `list_subdirs` resolves to a single `HashMap` lookup; without the
+/// index, sharded v7 mode would have to walk every shard's HAMT.
+///
+/// Refilled from the live forest via
+/// [`rebuild_directory_index_from_forest`] when the etag in the manifest
+/// root doesn't match S3 (plan D3/D4).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectoryIndex {
+    /// Format version. Bump if wire shape changes.
+    #[serde(default = "DirectoryIndex::default_version")]
+    pub version: u8,
+    /// Directory topology. Keys are normalized via
+    /// [`DirectoryIndex::normalize_dir_path`]; always absolute, always leading
+    /// `/`, never trailing `/` except for the root.
+    #[serde(default)]
+    pub entries: HashMap<String, DirEntry>,
+}
+
+impl DirectoryIndex {
+    fn default_version() -> u8 { 1 }
+
+    /// Canonical form used as both a hash key and an index lookup target.
+    /// `""` and `/` both normalize to `/`; trailing slashes are stripped;
+    /// leading slash is ensured.
+    pub fn normalize_dir_path(dir_path: &str) -> String {
+        if dir_path.is_empty() || dir_path == "/" {
+            return "/".to_string();
+        }
+        let trimmed = dir_path.trim_end_matches('/');
+        if trimmed.starts_with('/') {
+            trimmed.to_string()
+        } else {
+            format!("/{}", trimmed)
+        }
+    }
+
+    /// Parent directory for a normalized path (produced by
+    /// [`normalize_dir_path`]). `/` has no parent → returns `None`.
+    pub fn parent_of(norm_path: &str) -> Option<String> {
+        if norm_path == "/" {
+            return None;
+        }
+        match norm_path.rfind('/') {
+            Some(0) => Some("/".to_string()),
+            Some(idx) => Some(norm_path[..idx].to_string()),
+            None => None,
+        }
+    }
+
+    /// Leaf directory name — the last `/` segment of a normalized path.
+    pub fn leaf_name(norm_path: &str) -> Option<String> {
+        if norm_path == "/" {
+            return None;
+        }
+        match norm_path.rfind('/') {
+            Some(idx) => Some(norm_path[idx + 1..].to_string()),
+            None => None,
+        }
+    }
+
+    /// Fresh empty index containing just the root.
+    pub fn new() -> Self {
+        let mut entries = HashMap::new();
+        entries.insert("/".to_string(), DirEntry::default());
+        Self {
+            version: Self::default_version(),
+            entries,
+        }
+    }
+
+    /// O(1) list of immediate subdirectory names for `dir_path`.
+    pub fn list_subdirs(&self, dir_path: &str) -> Vec<String> {
+        let norm = Self::normalize_dir_path(dir_path);
+        self.entries
+            .get(&norm)
+            .map(|de| de.subdirs.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// O(1) file-count lookup for `dir_path`.
+    pub fn file_count(&self, dir_path: &str) -> u32 {
+        let norm = Self::normalize_dir_path(dir_path);
+        self.entries.get(&norm).map(|de| de.file_count).unwrap_or(0)
+    }
+
+    /// Ensure every ancestor of `norm_dir` exists, threading child-pointers
+    /// from each parent down to its immediate child. Idempotent: repeated
+    /// calls for the same path never duplicate children (BTreeSet insert).
+    pub fn ensure_dir(&mut self, dir_path: &str) {
+        let norm = Self::normalize_dir_path(dir_path);
+        if norm == "/" {
+            self.entries.entry("/".to_string()).or_default();
+            return;
+        }
+        // Walk from root down, creating missing parents and linking each
+        // new child in via its parent's `subdirs`.
+        let mut cursor = String::from("/");
+        // Ensure root exists.
+        self.entries.entry("/".to_string()).or_default();
+        for segment in norm.trim_start_matches('/').split('/') {
+            let parent = cursor.clone();
+            let child = if parent == "/" {
+                format!("/{}", segment)
+            } else {
+                format!("{}/{}", parent, segment)
+            };
+            self.entries.entry(child.clone()).or_default();
+            if let Some(parent_entry) = self.entries.get_mut(&parent) {
+                parent_entry.subdirs.insert(segment.to_string());
+            }
+            cursor = child;
+        }
+    }
+
+    /// Record that one file has been added under `file_path`'s parent
+    /// directory. Ensures the parent directory (and its ancestors) exist.
+    pub fn insert_file(&mut self, file_path: &str) {
+        let parent = parent_dir_of_file(file_path);
+        self.ensure_dir(&parent);
+        if let Some(de) = self.entries.get_mut(&parent) {
+            de.file_count = de.file_count.saturating_add(1);
+        }
+    }
+
+    /// Record that one file has been removed from `file_path`'s parent
+    /// directory. Saturating: an over-remove (replay double-count) is
+    /// harmless rather than wrapping.
+    pub fn remove_file(&mut self, file_path: &str) {
+        let parent = parent_dir_of_file(file_path);
+        if let Some(de) = self.entries.get_mut(&parent) {
+            de.file_count = de.file_count.saturating_sub(1);
+        }
+    }
+
+    /// Remove a directory node and unlink it from its parent's `subdirs`.
+    /// Does NOT cascade to children — caller decides whether to prune the
+    /// subtree (matches v1 `PrivateForest::remove_directory` semantics).
+    pub fn remove_dir(&mut self, dir_path: &str) {
+        let norm = Self::normalize_dir_path(dir_path);
+        if norm == "/" {
+            return; // Never remove root.
+        }
+        self.entries.remove(&norm);
+        if let (Some(parent), Some(leaf)) = (Self::parent_of(&norm), Self::leaf_name(&norm)) {
+            if let Some(parent_entry) = self.entries.get_mut(&parent) {
+                parent_entry.subdirs.remove(&leaf);
+            }
+        }
+    }
+}
+
+/// Parent directory path for a file path. Always normalized.
+fn parent_dir_of_file(file_path: &str) -> String {
+    let norm = if file_path.starts_with('/') {
+        file_path.to_string()
+    } else {
+        format!("/{}", file_path)
+    };
+    match norm.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(idx) => norm[..idx].to_string(),
+        None => "/".to_string(),
+    }
+}
+
+/// Encrypted directory index stored at [`derive_dir_index_key`].
+///
+/// Envelope structure mirrors [`EncryptedShardManifestV7`]: one AEAD
+/// ciphertext over the JSON-serialized [`DirectoryIndex`], with a monotonic
+/// `sequence` bound into AAD so a stale blob can never be replayed in place
+/// of a newer one even if an attacker overwrote the S3 slot.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EncryptedDirectoryIndex {
+    /// Envelope version (= 7, tracks the broader v7 format family).
+    pub version: u8,
+    /// AEAD ciphertext over serialized [`DirectoryIndex`].
+    #[serde(with = "base64_serde")]
+    pub ciphertext: Vec<u8>,
+    /// Nonce used for encryption.
+    #[serde(with = "base64_serde")]
+    pub nonce: Vec<u8>,
+    /// Monotonic sequence bound into AAD.
+    pub sequence: u64,
+}
+
+impl EncryptedDirectoryIndex {
+    /// Encrypt a [`DirectoryIndex`] under the dir-index AAD at `(bucket, sequence)`.
+    pub fn encrypt(
+        index: &DirectoryIndex,
+        dek: &DekKey,
+        bucket: &str,
+        sequence: u64,
+    ) -> Result<Self> {
+        let json = serde_json::to_vec(index)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+
+        if json.len() >= MAX_MANIFEST_BLOCK_SIZE {
+            return Err(CryptoError::Serialization(format!(
+                "directory-index plaintext size {} bytes exceeds MAX_MANIFEST_BLOCK_SIZE ({} bytes); \
+                 entry count {}. Consider prefix-sharding the index (plan D5) once this is \
+                 observed in practice.",
+                json.len(),
+                MAX_MANIFEST_BLOCK_SIZE,
+                index.entries.len()
+            )));
+        }
+
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(dek);
+        let aad = dir_index_aad(bucket, sequence);
+        let ciphertext = aead.encrypt_with_aad(&nonce, &json, &aad)?;
+
+        Ok(Self {
+            version: 7,
+            ciphertext,
+            nonce: nonce.as_bytes().to_vec(),
+            sequence,
+        })
+    }
+
+    /// Decrypt + verify the dir-index. Returns the inner [`DirectoryIndex`]
+    /// along with the sealed `sequence` so the caller can cross-check the
+    /// manifest root's pin.
+    pub fn decrypt(&self, dek: &DekKey, bucket: &str) -> Result<(DirectoryIndex, u64)> {
+        if self.version != 7 {
+            return Err(CryptoError::Decryption(format!(
+                "expected EncryptedDirectoryIndex version 7, got {}",
+                self.version
+            )));
+        }
+        let nonce = Nonce::from_bytes(&self.nonce)?;
+        let aead = Aead::new_default(dek);
+        let aad = dir_index_aad(bucket, self.sequence);
+        let plaintext = aead.decrypt_with_aad(&nonce, &self.ciphertext, &aad)?;
+        let index: DirectoryIndex = serde_json::from_slice(&plaintext)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+        Ok((index, self.sequence))
+    }
+
+    /// Serialize envelope to bytes for storage.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+
+    /// Deserialize envelope from storage bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+}
+
+/// Result of detecting the format at the index_key
+pub enum ForestOrManifest {
+    /// Monolithic forest (version 1, 2, or 4).
+    Monolithic(EncryptedForest),
+    /// Sharded-HAMT manifest (version 7).
+    ManifestV7(EncryptedShardManifestV7),
+}
+
+/// Detect whether bytes at the index_key are a monolithic forest or sharded-HAMT manifest
+///
+/// Reads the outer `version` field to determine the format without decrypting.
+///
+/// Version mapping:
+/// - 1, 2, 4    → monolithic `EncryptedForest` (v4 carries AAD+sequence).
+/// - 7          → sharded-HAMT `EncryptedShardManifestV7`; each shard stores
+///                a content-addressed HAMT root rather than a flat HashMap.
+///
+/// Intermediate sharded formats (v3/v5/v6) were removed after the v1 → v7
+/// direct migration path was adopted; encountering one today is an error.
+pub fn detect_forest_format(bytes: &[u8]) -> Result<ForestOrManifest> {
+    let parsed: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+
+    match parsed.get("version").and_then(|v| v.as_u64()) {
+        Some(1) | Some(2) | Some(4) => {
+            Ok(ForestOrManifest::Monolithic(EncryptedForest::from_bytes(bytes)?))
+        }
+        Some(7) => {
+            Ok(ForestOrManifest::ManifestV7(EncryptedShardManifestV7::from_bytes(bytes)?))
+        }
+        Some(v @ (3 | 5 | 6)) => Err(CryptoError::Encryption(format!(
+            "legacy sharded forest version {} is no longer supported (v1 → v7 direct migration)",
+            v
+        ))),
+        Some(v) => Err(CryptoError::Encryption(format!("unsupported forest version: {}", v))),
+        None => Err(CryptoError::Serialization("missing version field in forest data".to_string())),
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -885,4 +2206,372 @@ mod tests {
         assert_eq!(decrypted.file_count(), 20);
         assert!(decrypted.get_file("/files/doc_10.txt").is_some());
     }
+
+    // ========================================================================
+    // Sharded Forest Tests (S-001)
+    // ========================================================================
+
+    #[test]
+    fn test_shard_key_derivation_determinism() {
+        let dek = DekKey::generate();
+        let salt = vec![42u8; 32];
+
+        let key1 = derive_shard_key(&dek, "my-bucket", &salt, 0);
+        let key2 = derive_shard_key(&dek, "my-bucket", &salt, 0);
+        assert_eq!(key1, key2, "same inputs must produce same shard key");
+
+        // Different shard indices produce different keys
+        let key3 = derive_shard_key(&dek, "my-bucket", &salt, 1);
+        assert_ne!(key1, key3, "different shard indices must differ");
+
+        // Keys look like CID hashes
+        assert!(key1.starts_with("Qm"), "shard key must start with Qm");
+        assert_eq!(key1.len(), 46, "shard key must be 46 chars");
+    }
+
+
+    #[test]
+    fn test_compute_initial_shard_count() {
+        assert_eq!(compute_initial_shard_count(0), 16);
+        assert_eq!(compute_initial_shard_count(100), 16);
+        assert_eq!(compute_initial_shard_count(5_000), 16);
+        assert_eq!(compute_initial_shard_count(10_000), 16);
+        assert_eq!(compute_initial_shard_count(50_000), 16);
+        // Stays at 16 for most users (handles up to ~160K files per shard at threshold)
+
+        // Post-S-1.2 meta-HAMT, MAX_SHARDS=65,536. target = file_count / 5_000,
+        // rounded up to a power of two, then clamped to [16, MAX_SHARDS].
+        //   1.28M → target 256 → 256 shards.
+        //   20M   → target 4,000 → next pow2 4,096.
+        //   100M  → target 20,000 → next pow2 32,768.
+        //   300M+ → saturates at 65,536.
+        assert_eq!(compute_initial_shard_count(1_280_000), 256);
+        assert_eq!(compute_initial_shard_count(20_000_000), 4_096);
+        assert_eq!(compute_initial_shard_count(100_000_000), 32_768);
+        assert_eq!(compute_initial_shard_count(330_000_000), MAX_SHARDS);
+        assert_eq!(compute_initial_shard_count(usize::MAX / 2), MAX_SHARDS);
+    }
+
+    #[test]
+    fn test_manifest_v7_meta_hamt_fits_under_max_block_size_at_max_shards() {
+        // S-1.2 regression gate: under the meta-HAMT layout, *every*
+        // serialized block (root + each page) must fit under
+        // MAX_MANIFEST_BLOCK_SIZE at MAX_SHARDS=65,536. If this ever fails,
+        // either PAGE_SIZE has crept up or per-shard metadata has grown
+        // past the page budget — time to revisit the layout.
+        let dek = DekKey::generate();
+        let mut manifest = ShardManifestV7::new(MAX_SHARDS);
+        assert_eq!(manifest.num_shards(), MAX_SHARDS);
+        assert_eq!(manifest.page_count(), MAX_PAGES);
+
+        // Populate every shard with realistic worst-case metadata: a root
+        // storage key, a non-zero sequence, an entry_count, and an ETag.
+        for i in 0..MAX_SHARDS {
+            let shard = manifest.shard_mut(i);
+            shard.root = Some([0xAB; V7_STORAGE_KEY_LEN]);
+            shard.seq = (i as u64) * 3;
+            shard.entry_count = 100 + i as u32;
+            shard.etag = Some(format!("\"etag-shard-{:05}\"", i));
+        }
+
+        // Populate the root's page_index with worst-case entries so the
+        // root itself picks up its full serialized size (one entry per
+        // page, each carrying an etag string).
+        for page_id in 0..MAX_PAGES as PageId {
+            manifest.root.page_index.insert(
+                page_id,
+                PageRef {
+                    etag: Some(format!("\"etag-page-{:03}\"", page_id)),
+                    seq: 1,
+                },
+            );
+        }
+        manifest.root.dir_index_etag = Some("\"etag-dir-index\"".to_string());
+        manifest.root.dir_index_seq = Some(42);
+
+        // Encrypt each page and the root, assert each stays under the cap.
+        for (page_id, page) in manifest.pages.iter() {
+            let ep = EncryptedManifestPage::encrypt(page, &dek, "bkt")
+                .expect("page must encrypt under the block cap");
+            let wire = ep.ciphertext.len() + ep.nonce.len() + 16;
+            assert!(
+                wire < 1024 * 1024,
+                "encrypted page {} wire size {} must stay under 1 MiB",
+                page_id,
+                wire
+            );
+            let decoded = ep.decrypt(&dek, "bkt").expect("page decrypts");
+            assert_eq!(decoded.page_id, *page_id);
+            assert_eq!(decoded.shards.len(), PAGE_SIZE);
+        }
+
+        let er = EncryptedShardManifestV7::encrypt_v7(&manifest.root, &dek, "bkt", 1)
+            .expect("root must encrypt under the block cap");
+        let wire = er.ciphertext.len() + er.nonce.len() + 16;
+        assert!(
+            wire < 1024 * 1024,
+            "encrypted root wire size {} must stay under 1 MiB at MAX_SHARDS={}",
+            wire,
+            MAX_SHARDS
+        );
+        let (decoded_root, seq) = er.decrypt_v7(&dek, "bkt").expect("root decrypts");
+        assert_eq!(seq, 1);
+        assert_eq!(decoded_root.num_shards, MAX_SHARDS);
+        assert_eq!(decoded_root.page_index.len(), MAX_PAGES);
+        assert_eq!(decoded_root.dir_index_etag.as_deref(), Some("\"etag-dir-index\""));
+        assert_eq!(decoded_root.dir_index_seq, Some(42));
+    }
+
+    #[test]
+    fn test_manifest_page_seq_monotonic_rejects_stale() {
+        // M2: a page whose plaintext seq is older than the seq expected by
+        // the root must be rejected on load.
+        let dek = DekKey::generate();
+        let mut root = ManifestRoot::fresh(16);
+        // Root expects page 0 at seq=5.
+        root.page_index.insert(
+            0,
+            PageRef {
+                etag: Some("\"etag\"".to_string()),
+                seq: 5,
+            },
+        );
+        let mut stale_page = ManifestPage::empty(0, 16);
+        stale_page.seq = 3;
+        let mut pages = BTreeMap::new();
+        pages.insert(0u16, stale_page);
+
+        let err = ShardManifestV7::from_root_and_pages(root, pages)
+            .expect_err("stale page must be rejected");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("stale manifest page"), "got {msg}");
+    }
+
+
+    #[test]
+    fn test_detect_forest_format_monolithic() {
+        let dek = DekKey::generate();
+        let forest = PrivateForest::new();
+        let encrypted = EncryptedForest::encrypt(&forest, &dek).unwrap();
+        let bytes = encrypted.to_bytes().unwrap();
+
+        match detect_forest_format(&bytes).unwrap() {
+            ForestOrManifest::Monolithic(_) => {} // expected
+            ForestOrManifest::ManifestV7(_) => panic!("expected monolithic"),
+        }
+    }
+
+
+    // ============================================================================
+    // Fix 1 (F-2.1 + F-7.4): AAD-bound forest/manifest/shard v4/v5/v2 tests
+    // ============================================================================
+
+    #[test]
+    fn test_forest_v4_roundtrip() {
+        let dek = DekKey::generate();
+        let mut forest = PrivateForest::new();
+        forest.upsert_file(ForestFileEntry {
+            path: "/a.txt".to_string(),
+            storage_key: "QmABC".to_string(),
+            size: 10,
+            content_type: None,
+            created_at: 0,
+            modified_at: 0,
+            user_metadata: HashMap::new(),
+            content_hash: None,
+            encrypted: false,
+            min_version: 0,
+        });
+
+        let enc = EncryptedForest::encrypt_v4(&forest, &dek, "bucket-1", 7).unwrap();
+        assert_eq!(enc.version, 4);
+        assert_eq!(enc.sequence, Some(7));
+
+        let (dec, seq) = enc.decrypt_v4(&dek, "bucket-1").unwrap();
+        assert_eq!(seq, 7);
+        assert_eq!(dec.file_count(), 1);
+    }
+
+    #[test]
+    fn test_forest_v4_wrong_bucket_fails() {
+        let dek = DekKey::generate();
+        let forest = PrivateForest::new();
+        let enc = EncryptedForest::encrypt_v4(&forest, &dek, "bucket-1", 1).unwrap();
+        let err = enc.decrypt_v4(&dek, "bucket-2");
+        assert!(err.is_err(), "decrypt with wrong bucket must fail");
+    }
+
+    #[test]
+    fn test_forest_v4_replay_tampered_sequence_fails() {
+        let dek = DekKey::generate();
+        let forest = PrivateForest::new();
+        let mut enc = EncryptedForest::encrypt_v4(&forest, &dek, "b", 5).unwrap();
+        // Server flips outer sequence to try to replay — AAD tag check must fail.
+        enc.sequence = Some(6);
+        let err = enc.decrypt_v4(&dek, "b");
+        assert!(err.is_err(), "tampered sequence must fail AAD verification");
+    }
+
+    #[test]
+    fn test_forest_v1_legacy_still_decrypts() {
+        let dek = DekKey::generate();
+        let forest = PrivateForest::new();
+        let enc = EncryptedForest::encrypt(&forest, &dek).unwrap();
+        assert_eq!(enc.version, 1);
+        assert!(enc.sequence.is_none());
+        // Legacy decrypt must still work (backward compat).
+        let _ = enc.decrypt(&dek).unwrap();
+    }
+
+    #[test]
+    fn test_detect_forest_format_v4() {
+        let dek = DekKey::generate();
+        let forest = PrivateForest::new();
+        let ef4 = EncryptedForest::encrypt_v4(&forest, &dek, "b", 1).unwrap();
+        let bytes4 = ef4.to_bytes().unwrap();
+        match detect_forest_format(&bytes4).unwrap() {
+            ForestOrManifest::Monolithic(_) => {}
+            _ => panic!("expected Monolithic for v4"),
+        }
+    }
+
+    #[test]
+    fn test_detect_forest_format_rejects_legacy_sharded_versions() {
+        // v3/v5/v6 forests were removed after v1 → v7 direct migration was
+        // adopted. detect_forest_format must now reject them with a clear
+        // error rather than silently accepting.
+        for v in [3u64, 5, 6] {
+            let bytes = format!(r#"{{"version":{}}}"#, v).into_bytes();
+            let err = match detect_forest_format(&bytes) {
+                Err(e) => e,
+                Ok(_) => panic!("expected error for legacy v{}", v),
+            };
+            let msg = format!("{}", err);
+            assert!(
+                msg.contains("legacy sharded") && msg.contains(&v.to_string()),
+                "expected legacy-sharded error for v{}, got: {}",
+                v, msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_parent_dir_for_routing() {
+        assert_eq!(parent_dir_for_routing("/a/b/c.txt"), "/a/b/");
+        assert_eq!(parent_dir_for_routing("/file.txt"), "/");
+        assert_eq!(parent_dir_for_routing("/a/b/"), "/a/b/");
+        assert_eq!(parent_dir_for_routing("/"), "/");
+        assert_eq!(parent_dir_for_routing(""), "/");
+        assert_eq!(parent_dir_for_routing("/a"), "/");
+    }
+
+    #[test]
+    fn test_shard_for_path_v6_directory_locality() {
+        let dek = DekKey::generate();
+        let salt = vec![0u8; 32];
+        let num_shards = 16;
+
+        // All files sharing the same parent directory land in the same shard.
+        let dir_a = [
+            "/dir_a/1.txt",
+            "/dir_a/2.txt",
+            "/dir_a/very_long_filename.data",
+        ];
+        let idx_a = shard_for_path_v6(dir_a[0], &dek, &salt, num_shards);
+        for path in &dir_a {
+            assert_eq!(shard_for_path_v6(path, &dek, &salt, num_shards), idx_a);
+        }
+
+        // Files in a different parent directory hash independently (may or may not
+        // differ, but over enough directories at least some differ).
+        let mut seen = std::collections::HashSet::new();
+        for d in 0..32 {
+            let p = format!("/d{}/file.txt", d);
+            seen.insert(shard_for_path_v6(&p, &dek, &salt, num_shards));
+        }
+        assert!(seen.len() > 1, "v6 routing should spread directories across shards");
+    }
+
+    #[test]
+    fn test_shard_manifest_v7_shape() {
+        let m = ShardManifestV7::new(16);
+        assert_eq!(m.root.version, 7);
+        assert_eq!(m.root.format, "sharded-hamt-v7");
+        assert_eq!(m.num_shards(), 16);
+        assert_eq!(m.shard_salt().len(), 32);
+        assert!(m.shards_iter().all(|s| s.is_empty()));
+        assert_eq!(m.entry_count(), 0);
+
+        // num_shards is rounded up to the next power of two and floored at 16.
+        let big = ShardManifestV7::new(100);
+        assert_eq!(big.num_shards(), 128);
+        let tiny = ShardManifestV7::new(1);
+        assert_eq!(tiny.num_shards(), 16);
+    }
+
+    #[test]
+    fn test_shard_manifest_v7_encrypt_decrypt_roundtrip() {
+        let dek = DekKey::generate();
+        let mut manifest = ShardManifestV7::new(16);
+        manifest.shard_mut(3).root = Some([0xAB; V7_STORAGE_KEY_LEN]);
+        manifest.shard_mut(3).seq = 42;
+        manifest.shard_mut(3).entry_count = 17;
+        manifest.shard_mut(3).etag = Some("\"abc123\"".to_string());
+
+        // Root encrypts independently of pages in the meta-HAMT scheme.
+        let em = EncryptedShardManifestV7::encrypt_v7(&manifest.root, &dek, "bucket-x", 1).unwrap();
+        assert_eq!(em.version, 7);
+        assert_eq!(em.sequence, 1);
+
+        let (decoded_root, seq) = em.decrypt_v7(&dek, "bucket-x").unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(decoded_root.version, 7);
+        assert_eq!(decoded_root.num_shards, 16);
+
+        // Wrong bucket binding fails (AAD mismatch).
+        assert!(em.decrypt_v7(&dek, "different-bucket").is_err());
+
+        // Shard-level data lives in pages; verify page round-trip.
+        let page = manifest
+            .pages
+            .get(&0)
+            .expect("page 0 is populated on a fresh 16-shard manifest");
+        let ep = EncryptedManifestPage::encrypt(page, &dek, "bucket-x").unwrap();
+        let decoded_page = ep.decrypt(&dek, "bucket-x").unwrap();
+        assert_eq!(decoded_page.shards[3].root, Some([0xAB; V7_STORAGE_KEY_LEN]));
+        assert_eq!(decoded_page.shards[3].seq, 42);
+        assert_eq!(decoded_page.shards[3].entry_count, 17);
+        assert_eq!(decoded_page.shards[3].etag.as_deref(), Some("\"abc123\""));
+    }
+
+    #[test]
+    fn test_detect_forest_format_v7() {
+        let dek = DekKey::generate();
+        let manifest = ShardManifestV7::new(16);
+        let em = EncryptedShardManifestV7::encrypt_v7(&manifest.root, &dek, "b", 1).unwrap();
+        let bytes = em.to_bytes().unwrap();
+        match detect_forest_format(&bytes).unwrap() {
+            ForestOrManifest::ManifestV7(_) => {}
+            _ => panic!("expected ManifestV7 for v7"),
+        }
+    }
+
+    #[test]
+    fn test_hamt_node_v7_aad_shape() {
+        // Confirm the structural binding: prefix + bucket + u16_be(shard).
+        let aad = hamt_node_v7_aad("bucket-a", 0x0102);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"fula:hamt-node:v7:");
+        expected.extend_from_slice(b"bucket-a");
+        expected.extend_from_slice(&0x0102u16.to_be_bytes());
+        assert_eq!(aad, expected);
+
+        // Distinct buckets / shards produce distinct AADs. Sequence is NOT in
+        // AAD — HAMT flush only rewrites path-of-change nodes, so a seq-bound
+        // AAD would invalidate untouched subtree ciphertexts. Replay
+        // resistance lives at the manifest layer (ETag + manifest shard seq).
+        assert_ne!(hamt_node_v7_aad("b", 0), hamt_node_v7_aad("c", 0));
+        assert_ne!(hamt_node_v7_aad("b", 0), hamt_node_v7_aad("b", 1));
+    }
+
 }

@@ -148,12 +148,23 @@ impl ShareEnvelope {
 
 /// An encrypted inbox entry stored in the recipient's inbox
 ///
-/// The envelope is encrypted using HPKE to the recipient's public key.
+/// The envelope is encrypted using HPKE **Auth mode** to the recipient's
+/// public key, binding the sender's long-term KEK keypair into the HPKE
+/// context (RFC 9180 §5, mode `auth`). The claimed sender public key lives
+/// outside the ciphertext (`sender_public_key`) so the recipient can
+/// bootstrap verification; tampering with that field causes the HPKE auth
+/// check to fail with a generic authentication error.
+///
+/// M-6: with Auth mode the recipient can prove that whoever produced this
+/// entry held the secret for `sender_public_key`, turning `sharer_id` /
+/// `sharer_name` from free-form claims into strings anchored to a verified
+/// key. Pinning a `sender_public_key` to a human identity remains a UI-layer
+/// concern (out-of-band fingerprint exchange).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InboxEntry {
     /// Unique ID for this entry
     pub id: String,
-    /// The encrypted share envelope
+    /// The encrypted share envelope (HPKE Auth mode)
     pub encrypted_envelope: EncryptedData,
     /// Timestamp when this entry was created
     pub created_at: i64,
@@ -161,6 +172,13 @@ pub struct InboxEntry {
     pub status: InboxEntryStatus,
     /// Hash of recipient's public key (for verification)
     pub recipient_key_hash: String,
+    /// Sender's long-term KEK public key (X25519, 32 bytes).
+    ///
+    /// Required — no Base-mode legacy envelopes survive the v5 cutover.
+    /// Under HPKE Auth mode this field is consulted by the recipient when
+    /// opening the envelope; any mismatch between this claimed value and
+    /// the keypair actually used at encrypt time fails the HPKE auth check.
+    pub sender_public_key: [u8; 32],
 }
 
 /// Status of an inbox entry
@@ -179,51 +197,104 @@ pub enum InboxEntryStatus {
     Expired,
 }
 
+/// Domain separator for the Auth-mode envelope AAD (M-6). The recipient pk
+/// hash is appended so a ciphertext captured in flight cannot be replayed
+/// to a different recipient of the same sender — the recipient reconstructs
+/// the AAD from its own pk, mismatches collapse to a generic HPKE failure.
+const ENVELOPE_AAD_PREFIX_V5: &[u8] = b"fula:v5:envelope|";
+
+/// Build the envelope AAD used by both encrypt and decrypt. Length-prefixed
+/// `recipient_pk_hash` (16 bytes) binds the recipient of the ciphertext.
+fn build_envelope_aad(recipient_pk_hash: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(ENVELOPE_AAD_PREFIX_V5.len() + 4 + recipient_pk_hash.len());
+    aad.extend_from_slice(ENVELOPE_AAD_PREFIX_V5);
+    aad.extend_from_slice(&(recipient_pk_hash.len() as u32).to_be_bytes());
+    aad.extend_from_slice(recipient_pk_hash);
+    aad
+}
+
+fn recipient_pk_hash_bytes(recipient_public_key: &PublicKey) -> [u8; 16] {
+    let hash = blake3::hash(recipient_public_key.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&hash.as_bytes()[..16]);
+    out
+}
+
 impl InboxEntry {
     /// Create a new inbox entry by encrypting an envelope for a recipient
+    /// under HPKE Auth mode (M-6). The `sender_keypair` authenticates the
+    /// producer — recipients can verify that whoever built this entry held
+    /// the matching secret key.
     pub fn create(
         envelope: &ShareEnvelope,
         recipient_public_key: &PublicKey,
+        sender_keypair: &KekKeyPair,
     ) -> Result<Self> {
         // Serialize the envelope
         let envelope_bytes = serde_json::to_vec(envelope)
             .map_err(|e| CryptoError::Encryption(e.to_string()))?;
-        
-        // Encrypt to recipient using HPKE
+
+        // Bind recipient pk hash into AAD so captures aren't replayable.
+        let recipient_pk_hash_raw = recipient_pk_hash_bytes(recipient_public_key);
+        let aad = build_envelope_aad(&recipient_pk_hash_raw);
+
+        // Encrypt to recipient using HPKE Auth mode, binding the sender keypair.
         let encryptor = Encryptor::new(recipient_public_key);
-        let encrypted = encryptor.encrypt(&envelope_bytes)?;
-        
-        // Hash recipient's public key for verification
-        let recipient_key_hash = {
-            let hash = blake3::hash(recipient_public_key.as_bytes());
-            hex::encode(&hash.as_bytes()[..16])
-        };
-        
+        let encrypted =
+            encryptor.encrypt_for_recipient_auth(sender_keypair, &envelope_bytes, &aad)?;
+
+        let mut sender_pk_bytes = [0u8; 32];
+        sender_pk_bytes.copy_from_slice(sender_keypair.public_key().as_bytes());
+
         Ok(Self {
             id: generate_entry_id(),
             encrypted_envelope: encrypted,
             created_at: current_timestamp(),
             status: InboxEntryStatus::Pending,
-            recipient_key_hash,
+            recipient_key_hash: hex::encode(recipient_pk_hash_raw),
+            sender_public_key: sender_pk_bytes,
         })
     }
-    
-    /// Decrypt the envelope using the recipient's secret key
+
+    /// Decrypt the envelope using the recipient's secret key, verifying the
+    /// sender via HPKE Auth mode. Also enforces the M-5 token-version gate
+    /// post-decrypt: envelopes whose inner `ShareToken` predates the v5
+    /// recipient-pk AAD binding are rejected even if HPKE accepts them.
     pub fn decrypt(&self, recipient_secret: &SecretKey) -> Result<ShareEnvelope> {
+        // Derive recipient pk from the supplied secret key and rebuild AAD —
+        // must be done locally so a tampered `recipient_key_hash` cannot
+        // steer the AAD construction.
+        let derived_pk = recipient_secret.public_key();
+        let recipient_pk_hash_raw = recipient_pk_hash_bytes(&derived_pk);
+        let aad = build_envelope_aad(&recipient_pk_hash_raw);
+
+        let sender_pk = PublicKey::from_bytes(&self.sender_public_key)
+            .map_err(|_| CryptoError::Decryption("authentication failed".to_string()))?;
         let decryptor = Decryptor::from_secret_key(recipient_secret);
-        let envelope_bytes = decryptor.decrypt(&self.encrypted_envelope)?;
-        
-        serde_json::from_slice(&envelope_bytes)
-            .map_err(|e| CryptoError::Decryption(e.to_string()))
+        let envelope_bytes =
+            decryptor.decrypt_for_recipient_auth(&sender_pk, &self.encrypted_envelope, &aad)?;
+
+        let envelope: ShareEnvelope = serde_json::from_slice(&envelope_bytes)
+            .map_err(|e| CryptoError::Decryption(e.to_string()))?;
+
+        // M-5 alignment: reject envelopes whose token lacks the recipient-pk
+        // AAD binding. Paired with the enqueue-time gate in Inbox::enqueue_share.
+        if envelope.token.version < crate::sharing::SHARE_TOKEN_AAD_V5 {
+            return Err(CryptoError::Decryption(
+                "inbox envelope rejected: share token predates recipient-pk AAD binding".to_string(),
+            ));
+        }
+
+        Ok(envelope)
     }
-    
+
     /// Check if this entry is for the given recipient
     pub fn is_for_recipient(&self, recipient_public_key: &PublicKey) -> bool {
         let hash = blake3::hash(recipient_public_key.as_bytes());
         let expected = hex::encode(&hash.as_bytes()[..16]);
         self.recipient_key_hash == expected
     }
-    
+
     /// Check if this entry is expired (based on creation time + default TTL)
     pub fn is_stale(&self, max_age_seconds: i64) -> bool {
         current_timestamp() - self.created_at > max_age_seconds
@@ -281,12 +352,27 @@ impl ShareInbox {
     ///
     /// This creates an encrypted inbox entry that can be stored in the
     /// recipient's inbox location.
+    ///
+    /// M-5: Rejects envelopes whose inner `ShareToken` predates the v5 AAD
+    /// binding. A pre-v5 token has no recipient-pk commitment, so enqueueing
+    /// one into a different recipient's inbox would produce an unopenable
+    /// entry (DoS / inbox-spam vector). The version gate is a cheap format
+    /// check that fails fast with a clear error, long before the envelope
+    /// ciphertext is stored.
     pub fn enqueue_share(
         &mut self,
         envelope: &ShareEnvelope,
         recipient_public_key: &PublicKey,
+        sender_keypair: &KekKeyPair,
     ) -> Result<InboxEntry> {
-        let entry = InboxEntry::create(envelope, recipient_public_key)?;
+        use crate::sharing::SHARE_TOKEN_AAD_V5;
+        if envelope.token.version < SHARE_TOKEN_AAD_V5 {
+            return Err(CryptoError::InvalidFormat(
+                "inbox envelope rejected: share token predates recipient-pk AAD binding \
+                 (token version < 5)".to_string(),
+            ));
+        }
+        let entry = InboxEntry::create(envelope, recipient_public_key, sender_keypair)?;
         self.entries.insert(entry.id.clone(), entry.clone());
         Ok(entry)
     }
@@ -606,9 +692,12 @@ impl<'a> ShareEnvelopeBuilder<'a> {
             envelope = envelope.with_metadata(k, v);
         }
         
-        // Create the encrypted inbox entry
-        let entry = InboxEntry::create(&envelope, self.recipient_public_key)?;
-        
+        // Create the encrypted inbox entry. Auth mode (M-6) binds the
+        // sender's long-term keypair into the HPKE context so the recipient
+        // can verify that `sender_public_key` actually produced the envelope.
+        let entry =
+            InboxEntry::create(&envelope, self.recipient_public_key, self.owner_keypair)?;
+
         Ok((envelope, entry))
     }
 }
@@ -657,9 +746,9 @@ mod tests {
         
         let envelope = ShareEnvelope::new(token)
             .with_label("Test Share");
-        
+
         // Create encrypted entry
-        let entry = InboxEntry::create(&envelope, recipient.public_key()).unwrap();
+        let entry = InboxEntry::create(&envelope, recipient.public_key(), &owner).unwrap();
         
         assert!(entry.is_for_recipient(recipient.public_key()));
         assert!(!entry.is_for_recipient(owner.public_key()));
@@ -684,7 +773,7 @@ mod tests {
             .unwrap();
         
         let envelope = ShareEnvelope::new(token);
-        let entry = InboxEntry::create(&envelope, intended.public_key()).unwrap();
+        let entry = InboxEntry::create(&envelope, intended.public_key(), &owner).unwrap();
         
         // Wrong recipient cannot decrypt
         let result = entry.decrypt(wrong.secret_key());
@@ -709,8 +798,8 @@ mod tests {
         let envelope = ShareEnvelope::new(token)
             .with_label("Vacation 2024")
             .with_sharer_name("Alice");
-        
-        let entry = inbox.enqueue_share(&envelope, recipient.public_key()).unwrap();
+
+        let entry = inbox.enqueue_share(&envelope, recipient.public_key(), &owner).unwrap();
         let entry_id = entry.id.clone();
         
         // Recipient lists pending shares
@@ -747,7 +836,7 @@ mod tests {
             .unwrap();
 
         let envelope = ShareEnvelope::new(token);
-        let entry = inbox.enqueue_share(&envelope, recipient.public_key()).unwrap();
+        let entry = inbox.enqueue_share(&envelope, recipient.public_key(), &owner).unwrap();
         let entry_id = entry.id.clone();
 
         // Dismiss with correct recipient
@@ -775,7 +864,7 @@ mod tests {
             .unwrap();
 
         let envelope = ShareEnvelope::new(token);
-        let entry = inbox.enqueue_share(&envelope, recipient.public_key()).unwrap();
+        let entry = inbox.enqueue_share(&envelope, recipient.public_key(), &owner).unwrap();
         let entry_id = entry.id.clone();
 
         // Wrong recipient cannot dismiss
@@ -801,7 +890,7 @@ mod tests {
             .unwrap();
 
         let envelope = ShareEnvelope::new(token);
-        inbox.enqueue_share(&envelope, recipient.public_key()).unwrap();
+        inbox.enqueue_share(&envelope, recipient.public_key(), &owner).unwrap();
 
         // Using deprecated list_all() for test purposes
         assert_eq!(inbox.list_all().len(), 1);
@@ -874,7 +963,7 @@ mod tests {
             .build()
             .unwrap();
         let envelope1 = ShareEnvelope::new(token1).with_label("Photos from Alice");
-        inbox.enqueue_share(&envelope1, recipient.public_key()).unwrap();
+        inbox.enqueue_share(&envelope1, recipient.public_key(), &owner1).unwrap();
         
         // Second share from owner2
         let token2 = ShareBuilder::new(&owner2, recipient.public_key(), &dek2)
@@ -882,7 +971,7 @@ mod tests {
             .build()
             .unwrap();
         let envelope2 = ShareEnvelope::new(token2).with_label("Music from Bob");
-        inbox.enqueue_share(&envelope2, recipient.public_key()).unwrap();
+        inbox.enqueue_share(&envelope2, recipient.public_key(), &owner2).unwrap();
         
         // Recipient sees both
         let pending = inbox.list_pending(&recipient);
@@ -901,7 +990,7 @@ mod tests {
             .unwrap();
         
         let envelope = ShareEnvelope::new(token).with_label("Test");
-        let entry = InboxEntry::create(&envelope, recipient.public_key()).unwrap();
+        let entry = InboxEntry::create(&envelope, recipient.public_key(), &owner).unwrap();
         
         // Serialize
         let json = serde_json::to_string(&entry).unwrap();
@@ -940,21 +1029,21 @@ mod tests {
             .build()
             .unwrap();
         let envelope_a = ShareEnvelope::new(token_a).with_label("For User A");
-        inbox.enqueue_share(&envelope_a, user_a.public_key()).unwrap();
+        inbox.enqueue_share(&envelope_a, user_a.public_key(), &owner).unwrap();
 
         let token_b1 = ShareBuilder::new(&owner, user_b.public_key(), &dek)
             .path_scope("/for-b-1/")
             .build()
             .unwrap();
         let envelope_b1 = ShareEnvelope::new(token_b1).with_label("For User B - 1");
-        inbox.enqueue_share(&envelope_b1, user_b.public_key()).unwrap();
+        inbox.enqueue_share(&envelope_b1, user_b.public_key(), &owner).unwrap();
 
         let token_b2 = ShareBuilder::new(&owner, user_b.public_key(), &dek)
             .path_scope("/for-b-2/")
             .build()
             .unwrap();
         let envelope_b2 = ShareEnvelope::new(token_b2).with_label("For User B - 2");
-        inbox.enqueue_share(&envelope_b2, user_b.public_key()).unwrap();
+        inbox.enqueue_share(&envelope_b2, user_b.public_key(), &owner).unwrap();
 
         // User A should only see 1 entry
         let pending_a = inbox.list_pending(&user_a);
@@ -986,7 +1075,7 @@ mod tests {
             .build()
             .unwrap();
         let envelope = ShareEnvelope::new(token);
-        let entry = inbox.enqueue_share(&envelope, intended_recipient.public_key()).unwrap();
+        let entry = inbox.enqueue_share(&envelope, intended_recipient.public_key(), &owner).unwrap();
         let entry_id = entry.id.clone();
 
         // Attacker tries to mark_read - should fail
@@ -1016,7 +1105,7 @@ mod tests {
             .build()
             .unwrap();
         let envelope = ShareEnvelope::new(token);
-        let entry = inbox.enqueue_share(&envelope, intended_recipient.public_key()).unwrap();
+        let entry = inbox.enqueue_share(&envelope, intended_recipient.public_key(), &owner).unwrap();
         let entry_id = entry.id.clone();
 
         // Attacker tries to remove - should fail
@@ -1049,7 +1138,7 @@ mod tests {
             .build()
             .unwrap();
         let envelope = ShareEnvelope::new(token).with_label("Secret Data");
-        let entry = inbox.enqueue_share(&envelope, intended_recipient.public_key()).unwrap();
+        let entry = inbox.enqueue_share(&envelope, intended_recipient.public_key(), &owner).unwrap();
         let entry_id = entry.id.clone();
 
         // Attacker tries to accept - should fail
@@ -1080,7 +1169,7 @@ mod tests {
             .build()
             .unwrap();
         let envelope = ShareEnvelope::new(token).with_label("Confidential");
-        let entry = InboxEntry::create(&envelope, intended_recipient.public_key()).unwrap();
+        let entry = InboxEntry::create(&envelope, intended_recipient.public_key(), &owner).unwrap();
 
         // Attacker cannot decrypt even with direct access to the entry
         let decrypt_result = entry.decrypt(attacker.secret_key());
@@ -1127,7 +1216,7 @@ mod tests {
             .build()
             .unwrap();
         let envelope_alice = ShareEnvelope::new(token_alice).with_label("Alice's Secret");
-        let entry_alice = inbox.enqueue_share(&envelope_alice, alice.public_key()).unwrap();
+        let entry_alice = inbox.enqueue_share(&envelope_alice, alice.public_key(), &owner).unwrap();
 
         // Create shares for Bob
         let token_bob = ShareBuilder::new(&owner, bob.public_key(), &dek)
@@ -1135,7 +1224,7 @@ mod tests {
             .build()
             .unwrap();
         let envelope_bob = ShareEnvelope::new(token_bob).with_label("Bob's Secret");
-        let entry_bob = inbox.enqueue_share(&envelope_bob, bob.public_key()).unwrap();
+        let entry_bob = inbox.enqueue_share(&envelope_bob, bob.public_key(), &owner).unwrap();
 
         // === VERIFICATION: Alice's operations ===
 
@@ -1216,7 +1305,7 @@ mod tests {
             .build()
             .unwrap();
         let envelope = ShareEnvelope::new(token);
-        inbox.enqueue_share(&envelope, user.public_key()).unwrap();
+        inbox.enqueue_share(&envelope, user.public_key(), &owner).unwrap();
 
         // list_all() still works but is deprecated
         // Prefer list_pending() with recipient key
