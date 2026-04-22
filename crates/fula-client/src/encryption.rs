@@ -2949,6 +2949,7 @@ impl EncryptedClient {
         // fresh-seq page under the old root's page_index.
         let shard_salt = manifest_snapshot.shard_salt().to_vec();
         let dirty_pages = manifest_snapshot.take_dirty_pages();
+        #[cfg(not(target_arch = "wasm32"))]
         let wal_mac = wal::derive_mac_key(&self.encryption.key_manager, bucket);
         for page_id in dirty_pages.iter().copied() {
             let page = manifest_snapshot.pages.get_mut(&page_id)
@@ -2960,6 +2961,7 @@ impl EncryptedClient {
             let old_etag = manifest_snapshot.root.page_index.get(&page_id)
                 .and_then(|r| r.etag.clone());
             page.seq = page.seq.wrapping_add(1);
+            #[cfg(not(target_arch = "wasm32"))]
             if let Err(e) = wal::append(
                 bucket,
                 &wal_mac,
@@ -3017,6 +3019,7 @@ impl EncryptedClient {
             // sufficient for idempotent-PUT replay at the same key, but
             // only this post-PUT entry lets the next flush's `If-Match`
             // match S3's actual state.
+            #[cfg(not(target_arch = "wasm32"))]
             if let Err(e) = wal::append(
                 bucket,
                 &wal_mac,
@@ -3047,6 +3050,7 @@ impl EncryptedClient {
         let new_dir_index_seq = if dir_index_dirty {
             let next_dir_seq = prior_dir_index_seq.saturating_add(1);
             let old_dir_etag = manifest_snapshot.root.dir_index_etag.clone();
+            #[cfg(not(target_arch = "wasm32"))]
             if let Err(e) = wal::append(
                 bucket,
                 &wal_mac,
@@ -3094,6 +3098,7 @@ impl EncryptedClient {
             // crash between here and the Phase-2 root PUT can be recovered
             // without re-reading the dir-index object. Mirrors the
             // post-PUT PageWrote above.
+            #[cfg(not(target_arch = "wasm32"))]
             if let Err(e) = wal::append(
                 bucket,
                 &wal_mac,
@@ -3673,6 +3678,7 @@ impl EncryptedClient {
         let mut manifest_snapshot = v7.manifest().clone();
         let shard_salt = manifest_snapshot.shard_salt().to_vec();
         let dirty_pages = manifest_snapshot.take_dirty_pages();
+        #[cfg(not(target_arch = "wasm32"))]
         let wal_mac_pages = wal::derive_mac_key(&self.encryption.key_manager, bucket);
         for page_id in dirty_pages.iter().copied() {
             let page = match manifest_snapshot.pages.get_mut(&page_id) {
@@ -3687,6 +3693,7 @@ impl EncryptedClient {
             let old_etag = manifest_snapshot.root.page_index.get(&page_id)
                 .and_then(|r| r.etag.clone());
             page.seq = page.seq.wrapping_add(1);
+            #[cfg(not(target_arch = "wasm32"))]
             if let Err(e) = wal::append(
                 bucket,
                 &wal_mac_pages,
@@ -3739,6 +3746,7 @@ impl EncryptedClient {
                 }
             };
             let etag = if put.etag.is_empty() { None } else { Some(put.etag) };
+            #[cfg(not(target_arch = "wasm32"))]
             if let Err(e) = wal::append(
                 bucket,
                 &wal_mac_pages,
@@ -3763,6 +3771,7 @@ impl EncryptedClient {
         // WAL::DirIndexWrote appended+fsynced BEFORE the PUT for crash-replay
         // idempotency (same key, same seq, identical plaintext).
         let dir_index_seq: u64 = 1;
+        #[cfg(not(target_arch = "wasm32"))]
         if let Err(e) = wal::append(
             bucket,
             &wal_mac_pages,
@@ -3814,6 +3823,7 @@ impl EncryptedClient {
         };
         let new_dir_index_etag =
             if dir_index_put.etag.is_empty() { None } else { Some(dir_index_put.etag) };
+        #[cfg(not(target_arch = "wasm32"))]
         if let Err(e) = wal::append(
             bucket,
             &wal_mac_pages,
