@@ -143,7 +143,6 @@ pub async fn list_from_forest(
 /// This is critical for large files (1GB+) where passing `Vec<u8>` through
 /// FFI would cause out-of-memory errors.
 #[cfg(not(target_arch = "wasm32"))]
-#[flutter_rust_bridge::frb(ignore)]
 pub async fn put_flat_from_path(
     client: &EncryptedClientHandle,
     bucket: String,
@@ -163,11 +162,21 @@ pub async fn put_flat_from_path(
     Ok(result.into())
 }
 
+#[cfg(target_arch = "wasm32")]
+pub async fn put_flat_from_path(
+    _client: &EncryptedClientHandle,
+    _bucket: String,
+    _path: String,
+    _file_path: String,
+    _content_type: Option<String>,
+) -> anyhow::Result<PutResult> {
+    anyhow::bail!("put_flat_from_path is not supported on WASM; read the file in Dart and call put_flat")
+}
+
 /// Upload a file from a local path without immediate forest save (deferred)
 ///
 /// Same as `put_flat_from_path` but defers the forest save for batch efficiency.
 #[cfg(not(target_arch = "wasm32"))]
-#[flutter_rust_bridge::frb(ignore)]
 pub async fn put_flat_from_path_deferred(
     client: &EncryptedClientHandle,
     bucket: String,
@@ -187,13 +196,28 @@ pub async fn put_flat_from_path_deferred(
     Ok(result.into())
 }
 
+#[cfg(target_arch = "wasm32")]
+pub async fn put_flat_from_path_deferred(
+    _client: &EncryptedClientHandle,
+    _bucket: String,
+    _path: String,
+    _file_path: String,
+    _content_type: Option<String>,
+) -> anyhow::Result<PutResult> {
+    anyhow::bail!("put_flat_from_path_deferred is not supported on WASM; read the file in Dart and call put_flat_deferred")
+}
+
 /// Get the size of a file without reading it into memory
 #[cfg(not(target_arch = "wasm32"))]
-#[flutter_rust_bridge::frb(ignore)]
 pub async fn get_file_size(file_path: String) -> anyhow::Result<u64> {
     let metadata = tokio::fs::metadata(&file_path).await
         .with_context(|| format!("Failed to get file metadata: {}", file_path))?;
     Ok(metadata.len())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn get_file_size(_file_path: String) -> anyhow::Result<u64> {
+    anyhow::bail!("get_file_size is not supported on WASM; use the browser File API in Dart")
 }
 
 // ============================================================================

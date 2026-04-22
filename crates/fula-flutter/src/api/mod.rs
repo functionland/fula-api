@@ -80,8 +80,10 @@ pub use forest::{
     get_forest_subtree,
 };
 
-// Re-export file-path-based functions (native only)
-#[cfg(not(target_arch = "wasm32"))]
+// Re-export file-path-based functions. Native impls read the file directly on
+// the Rust side (avoiding the FFI round-trip for 1GB+ files); WASM impls
+// return an error since browsers don't expose filesystem paths — WASM callers
+// should read the file themselves and use `put_flat`.
 pub use forest::{
     put_flat_from_path,
     put_flat_from_path_deferred,
