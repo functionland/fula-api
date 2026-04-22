@@ -386,6 +386,15 @@ pub struct BucketManager<S: BlockStore + PinStore> {
     /// Dirty flag: true if buckets have been modified since last persist.
     /// Avoids redundant serialization + IPFS writes on every object put.
     dirty: std::sync::atomic::AtomicBool,
+    /// Per-bucket async write lock (keyed by internal scoped bucket key).
+    /// Serializes open→mutate→flush→persist sequences on the same bucket
+    /// so concurrent PUTs don't fork from the same root_cid and lose each
+    /// other's index updates on the DashMap (last-writer-wins on flush).
+    bucket_write_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes registry persistence across all buckets: protects the
+    /// registry.cid file from concurrent overwrites and coalesces the
+    /// IPLD write when many mutations fire at once.
+    registry_persist_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<S: BlockStore + PinStore> BucketManager<S> {
@@ -398,6 +407,8 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
             default_config: BucketConfig::default(),
             registry_cid_path: None,
             dirty: std::sync::atomic::AtomicBool::new(false),
+            bucket_write_locks: Arc::new(DashMap::new()),
+            registry_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -410,6 +421,8 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
             default_config: BucketConfig::default(),
             registry_cid_path: Some(registry_cid_path.as_ref().to_path_buf()),
             dirty: std::sync::atomic::AtomicBool::new(false),
+            bucket_write_locks: Arc::new(DashMap::new()),
+            registry_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -601,7 +614,14 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
     ///
     /// Uses v1 monolithic format when bucket count <= SHARDED_REGISTRY_THRESHOLD,
     /// auto-upgrades to v2 sharded format when it exceeds the threshold.
+    ///
+    /// Serialized by `registry_persist_lock` so concurrent writers can't
+    /// interleave the bucket snapshot → IPLD write → registry.cid file
+    /// overwrite sequence. Holding this lock also coalesces redundant IPLD
+    /// writes when many mutations flush in the same instant.
     async fn persist_registry_internal(&self, token: Option<&str>) -> Result<Cid> {
+        let _persist_guard = self.registry_persist_lock.lock().await;
+
         // Collect all bucket metadata
         let buckets: Vec<BucketMetadata> = self.buckets.iter().map(|r| r.value().clone()).collect();
         let bucket_count = buckets.len();
@@ -893,6 +913,30 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
         tracing::info!(bucket_name = %name, internal_key = %internal_key, total_buckets = %self.buckets.len(), "User-scoped bucket registered");
 
         Ok(metadata)
+    }
+
+    /// Get (or lazily create) the per-bucket write lock for a user-scoped bucket.
+    ///
+    /// All index-mutating HTTP handlers (`put_object`, `delete_object`,
+    /// `copy_object`, `complete_multipart_upload`) must acquire this before
+    /// calling `open_bucket_for_user` and hold it through `bucket.flush()`
+    /// and `persist_registry_with_token()`. Without it, concurrent writes on
+    /// the same bucket fork from the same `root_cid` and their `flush()`
+    /// calls race on `DashMap::insert`, dropping all but one update.
+    ///
+    /// Keyed by the internal scoped bucket key (`{user_id}:{bucket_name}`),
+    /// so operations on different buckets — same or different users — never
+    /// contend with each other.
+    pub fn bucket_write_lock(
+        &self,
+        user_id: &str,
+        bucket_name: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let key = Self::scoped_bucket_key(user_id, bucket_name);
+        self.bucket_write_locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Open a bucket for a specific user
@@ -1331,5 +1375,146 @@ mod tests {
         assert!(manager.buckets.contains_key(
             &BucketManager::<MemoryBlockStore>::scoped_bucket_key("user_b", "beta")
         ));
+    }
+
+    /// Regression test for the HAMT-v7 download-404 bug.
+    ///
+    /// Before the per-bucket write lock landed, `fula-client` fanning out 16
+    /// parallel chunk PUTs would race in the gateway's `put_object`
+    /// handler: all 16 forked from the same `root_cid`, each flushed a
+    /// tree containing only its own chunk key, and `DashMap::insert`
+    /// last-writer-wins dropped the other 15 mappings — so downloads
+    /// returned `NoSuchKey` for most chunks. This test simulates the
+    /// handler sequence (`bucket_write_lock` → open → put → flush →
+    /// persist_registry) 32× concurrently on the same user-scoped bucket
+    /// and asserts every key survives.
+    ///
+    /// With the lock removed, this test fails (missing keys); with it,
+    /// it passes deterministically.
+    #[tokio::test]
+    async fn test_concurrent_puts_on_same_bucket_preserve_all_keys() {
+        use tempfile::tempdir;
+        use tokio::task::JoinSet;
+
+        let temp_dir = tempdir().unwrap();
+        let cid_path = temp_dir.path().join("registry.cid");
+        let store = Arc::new(MemoryBlockStore::new());
+        let manager = Arc::new(BucketManager::with_persistence(
+            Arc::clone(&store),
+            &cid_path,
+        ));
+
+        let user_id = "concurrent_user";
+        let bucket_name = "videos";
+        let owner = Owner::new(user_id);
+
+        manager
+            .create_bucket_for_user(user_id, bucket_name.to_string(), owner)
+            .await
+            .unwrap();
+
+        // Reset persistence so assertions below see fresh writes from the
+        // concurrent tasks rather than the create_bucket_for_user persist.
+        manager
+            .dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // 16 concurrent chunk PUTs is the fula-client fan-out; 32 exercises
+        // the race harder and makes any missed lock acquisition stand out.
+        const N: usize = 32;
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        for i in 0..N {
+            let manager = Arc::clone(&manager);
+            let user_id = user_id.to_string();
+            let bucket_name = bucket_name.to_string();
+            tasks.spawn(async move {
+                // Mirror the handler sequence exactly.
+                let lock = manager.bucket_write_lock(&user_id, &bucket_name);
+                let _guard = lock.lock_owned().await;
+
+                let mut bucket = manager
+                    .open_bucket_for_user(&user_id, &bucket_name)
+                    .await
+                    .expect("open_bucket_for_user");
+
+                let chunk_key = format!("obj.chunks/{:08}", i);
+                let cid = fula_blockstore::cid_utils::create_cid(
+                    format!("chunk_{}", i).as_bytes(),
+                    fula_blockstore::cid_utils::CidCodec::Raw,
+                );
+                let metadata =
+                    ObjectMetadata::new(cid, 100, format!("etag_{}", i));
+
+                bucket
+                    .put_object(chunk_key, metadata)
+                    .await
+                    .expect("put_object");
+                bucket.flush().await.expect("flush");
+
+                manager
+                    .persist_registry()
+                    .await
+                    .expect("persist_registry");
+            });
+        }
+        while let Some(res) = tasks.join_next().await {
+            res.expect("task panicked");
+        }
+
+        // 1. The in-memory bucket index must contain all N keys.
+        let bucket = manager
+            .open_bucket_for_user(user_id, bucket_name)
+            .await
+            .unwrap();
+        let list = bucket
+            .list_objects(None, None, None, Some(N + 10))
+            .await
+            .unwrap();
+        let keys: std::collections::BTreeSet<String> =
+            list.objects.iter().map(|o| o.key.clone()).collect();
+        for i in 0..N {
+            let expected = format!("obj.chunks/{:08}", i);
+            assert!(
+                keys.contains(&expected),
+                "missing in-memory key {} after {} concurrent PUTs",
+                expected,
+                N
+            );
+        }
+        assert_eq!(keys.len(), N, "expected exactly {} in-memory keys", N);
+
+        // 2. The persisted registry must round-trip with all N keys. This
+        //    is the condition that actually matters for the reported bug —
+        //    a GET after a restart walks the persisted tree and 404s on
+        //    any key that didn't make it into the registry.
+        let reloaded = Arc::new(BucketManager::with_persistence(
+            Arc::clone(&store),
+            &cid_path,
+        ));
+        reloaded.load_registry().await.unwrap();
+        let bucket = reloaded
+            .open_bucket_for_user(user_id, bucket_name)
+            .await
+            .unwrap();
+        let list = bucket
+            .list_objects(None, None, None, Some(N + 10))
+            .await
+            .unwrap();
+        let keys: std::collections::BTreeSet<String> =
+            list.objects.iter().map(|o| o.key.clone()).collect();
+        for i in 0..N {
+            let expected = format!("obj.chunks/{:08}", i);
+            assert!(
+                keys.contains(&expected),
+                "missing persisted key {} after reload",
+                expected
+            );
+        }
+        assert_eq!(
+            keys.len(),
+            N,
+            "expected exactly {} persisted keys after reload",
+            N
+        );
     }
 }

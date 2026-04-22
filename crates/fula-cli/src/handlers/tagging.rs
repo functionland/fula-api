@@ -69,9 +69,16 @@ pub async fn put_object_tagging(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
 
+    // Serialize same-bucket index mutations (see `put_object` for rationale).
+    let _bucket_guard = state
+        .bucket_manager
+        .bucket_write_lock(&session.hashed_user_id, &bucket_name)
+        .lock_owned()
+        .await;
+
     // User-scoped bucket access
     let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
-    
+
     let mut metadata = bucket.get_object(&key).await?
         .ok_or_else(|| ApiError::s3_with_resource(
             S3ErrorCode::NoSuchKey,
@@ -82,10 +89,10 @@ pub async fn put_object_tagging(
     // Parse tags from XML body
     let body_str = String::from_utf8_lossy(&body);
     let tags = parse_tagging_xml(&body_str)?;
-    
+
     // Update tags
     metadata.tags = tags;
-    
+
     bucket.put_object(key, metadata).await?;
     bucket.flush().await?;
 
@@ -102,9 +109,16 @@ pub async fn delete_object_tagging(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
 
+    // Serialize same-bucket index mutations (see `put_object` for rationale).
+    let _bucket_guard = state
+        .bucket_manager
+        .bucket_write_lock(&session.hashed_user_id, &bucket_name)
+        .lock_owned()
+        .await;
+
     // User-scoped bucket access
     let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
-    
+
     let mut metadata = bucket.get_object(&key).await?
         .ok_or_else(|| ApiError::s3_with_resource(
             S3ErrorCode::NoSuchKey,
@@ -114,7 +128,7 @@ pub async fn delete_object_tagging(
 
     // Clear tags
     metadata.tags.clear();
-    
+
     bucket.put_object(key, metadata).await?;
     bucket.flush().await?;
 

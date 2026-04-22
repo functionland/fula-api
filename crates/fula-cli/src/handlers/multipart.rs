@@ -217,6 +217,16 @@ pub async fn complete_multipart_upload(
         metadata = metadata.with_user_metadata(k, v);
     }
 
+    // Serialize same-bucket index mutations (see `put_object` rationale).
+    // Held across the open → put_object → flush → persist sequence so a
+    // concurrent put_object/delete_object/copy_object can't race the
+    // multipart completion and drop its index entry.
+    let _bucket_guard = state
+        .bucket_manager
+        .bucket_write_lock(&session.hashed_user_id, &bucket)
+        .lock_owned()
+        .await;
+
     // Store in bucket (user-scoped)
     let mut bucket_handle = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket).await?;
     bucket_handle.put_object(key.clone(), metadata).await?;

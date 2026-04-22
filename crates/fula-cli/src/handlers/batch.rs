@@ -22,6 +22,13 @@ pub async fn delete_objects(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
 
+    // Serialize same-bucket index mutations (see `put_object` for rationale).
+    let _bucket_guard = state
+        .bucket_manager
+        .bucket_write_lock(&session.hashed_user_id, &bucket_name)
+        .lock_owned()
+        .await;
+
     // User-scoped bucket access
     let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
     

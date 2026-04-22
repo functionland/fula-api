@@ -51,6 +51,19 @@ pub async fn put_object(
         None => body,
     };
 
+    // Serialize index-mutating operations on the same user-scoped bucket.
+    // Without this, parallel chunk PUTs (fula-client fans out up to 16) all
+    // open at the same root_cid, each flushes a tree containing only its
+    // own key, and DashMap::insert last-writer-wins drops every other
+    // mapping — leaving the chunk bytes in IPFS but the bucket index
+    // pointing at only one of them. Held until the end of the handler so
+    // the open → mutate → flush → persist sequence is atomic per bucket.
+    let _bucket_guard = state
+        .bucket_manager
+        .bucket_write_lock(&session.hashed_user_id, &bucket_name)
+        .lock_owned()
+        .await;
+
     // Open bucket first so conditional-write guards can consult the current
     // stored ETag without doing extra I/O later. (Moved ahead of put_block.)
     tracing::debug!(bucket = %bucket_name, "Opening user-scoped bucket");
@@ -60,15 +73,10 @@ pub async fn put_object(
             e
         })?;
 
-    // RFC 7232 conditional-write preconditions. Used by fula-client forest
-    // flush to catch concurrent writers (surfaces as ClientError::Concurrent
-    // Modification on 412). Checked before put_block to avoid an orphan
-    // block when the precondition fails.
-    //
-    // NOTE: This is a best-effort check — get_object + put_object are not
-    // atomic under concurrent PUTs on the same key (each request opens its
-    // own bucket snapshot). The client's retry-on-412 loop handles the
-    // residual commit-window race.
+    // RFC 7232 conditional-write preconditions. With the per-bucket write
+    // lock held above, get_object + put_object now observe a consistent
+    // snapshot for the same bucket; the client still needs retry-on-412
+    // for cross-device races.
     let existing = bucket.get_object(&key).await?;
     let current_etag: Option<&str> = existing.as_ref().map(|m| m.etag.as_str());
 
@@ -495,6 +503,13 @@ pub async fn delete_object(
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
 
+    // Serialize same-bucket index mutations (see `put_object` for rationale).
+    let _bucket_guard = state
+        .bucket_manager
+        .bucket_write_lock(&session.hashed_user_id, &bucket_name)
+        .lock_owned()
+        .await;
+
     // User-scoped bucket access
     let mut bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
 
@@ -596,7 +611,7 @@ pub async fn copy_object(
         .split_once('/')
         .ok_or_else(|| ApiError::s3(S3ErrorCode::InvalidArgument, "Invalid copy source format"))?;
 
-    // Get source object (user-scoped)
+    // Get source object (user-scoped). Read-only, so no write lock needed here.
     let source_bucket_handle = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, source_bucket).await?;
 
     let source_metadata = source_bucket_handle.get_object(source_key).await?
@@ -605,11 +620,22 @@ pub async fn copy_object(
             "Source object not found",
             copy_source,
         ))?;
+    drop(source_bucket_handle);
 
     // Copy to destination (user-scoped)
     let mut dest_metadata = source_metadata.clone();
     dest_metadata.last_modified = chrono::Utc::now();
     dest_metadata.owner_id = Some(session.hashed_user_id.clone());
+
+    // Serialize same-bucket index mutations on the destination (see
+    // `put_object` for rationale). Acquired after the source read so a copy
+    // within the same bucket can still proceed without the reader holding
+    // its own handle through the write.
+    let _bucket_guard = state
+        .bucket_manager
+        .bucket_write_lock(&session.hashed_user_id, &dest_bucket)
+        .lock_owned()
+        .await;
 
     let mut dest_bucket_handle = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &dest_bucket).await?;
 

@@ -12,14 +12,26 @@ use crate::api::types::*;
 // Forest Management
 // ============================================================================
 
-/// Load the forest index from storage
+/// Load the forest index from storage.
+///
+/// For v7 (sharded-HAMT) forests the underlying `load_forest` returns a
+/// marker error `"forest is sharded; use sharded API methods"` so that
+/// callers using the monolithic `PrivateForest` API know to switch. All
+/// real I/O paths on this client (`get_flat`, `put_flat`, …) go through
+/// `ensure_forest_loaded` which already handles the sharded path
+/// transparently, so from a Flutter caller's perspective that marker is
+/// not an error — the forest *is* loaded, just in sharded form. Swallow
+/// the marker here so apps don't have to special-case it.
 pub async fn load_forest(
     client: &EncryptedClientHandle,
     bucket: String,
 ) -> anyhow::Result<()> {
     let guard = client.inner.write().await;
-    guard.load_forest(&bucket).await?;
-    Ok(())
+    match guard.load_forest(&bucket).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("forest is sharded") => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Save the forest index to storage
