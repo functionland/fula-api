@@ -7559,19 +7559,18 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     mod f9_manifest_version_pin_mac {
         use super::*;
-        use std::sync::Mutex;
 
         // Tests mutate FULA_STATE_DIR; serialize across cargo's parallel
         // runner so concurrent tests cannot read each other's env var.
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-
+        // Uses the crate-wide TEST_ENV_LOCK shared with wal.rs and
+        // orphan_queue.rs so those modules' tests can't race each other.
         struct StateDirGuard {
             _dir: tempfile::TempDir,
             _lock: std::sync::MutexGuard<'static, ()>,
         }
 
         fn tmp_state_dir() -> StateDirGuard {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let dir = tempfile::tempdir().expect("tempdir");
             std::env::set_var("FULA_STATE_DIR", dir.path());
             StateDirGuard { _dir: dir, _lock: lock }

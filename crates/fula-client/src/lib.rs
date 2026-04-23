@@ -48,9 +48,10 @@ mod orphan_queue;
 #[cfg(not(target_arch = "wasm32"))]
 mod wal;
 
-// Cross-module test serializer. Unit tests in wal.rs and orphan_queue.rs both
-// mutate `FULA_STATE_DIR`; without a single shared lock, tests in each module
-// can set the env var concurrently and read each other's temp dir.
+// Cross-module test serializer. Unit tests in wal.rs, orphan_queue.rs, and the
+// f9_manifest_version_pin_mac module in encryption.rs all mutate
+// `FULA_STATE_DIR`; without a single shared lock, tests in each module can set
+// the env var concurrently and read each other's temp dir.
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
