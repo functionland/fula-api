@@ -6086,13 +6086,27 @@ impl EncryptedClient {
                 .map_err(ClientError::Encryption)?;
 
             let aead = Aead::new_default(&accepted_share.dek);
-            let version = accepted_share.encryption_version.unwrap_or(2);
-            let plaintext = if version >= 4 {
-                let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
-                aead.decrypt_with_aad(&nonce, &data, &aad)
-            } else {
-                aead.decrypt(&nonce, &data)
-            }.map_err(ClientError::Encryption)?;
+            // `encryption_version` is Option<u8>: Some when the share creator
+            // explicitly stamped the token (new fula-flutter builds), None for
+            // tokens created between 1b82b95 (inline-nonce support, Jan 2026)
+            // and the flutter-side fix (which omit the field). For None, we
+            // try v4 AAD first (current upload format) and fall back to the
+            // pre-AAD v2 format so legacy tokens still decrypt.
+            let aad = format!("fula:v4:content:{}", storage_key).into_bytes();
+            let plaintext = match accepted_share.encryption_version {
+                Some(v) if v >= 4 => aead
+                    .decrypt_with_aad(&nonce, &data, &aad)
+                    .map_err(ClientError::Encryption)?,
+                Some(_) => aead
+                    .decrypt(&nonce, &data)
+                    .map_err(ClientError::Encryption)?,
+                None => match aead.decrypt_with_aad(&nonce, &data, &aad) {
+                    Ok(pt) => pt,
+                    Err(_) => aead
+                        .decrypt(&nonce, &data)
+                        .map_err(ClientError::Encryption)?,
+                },
+            };
 
             return Ok(Bytes::from(plaintext));
         }

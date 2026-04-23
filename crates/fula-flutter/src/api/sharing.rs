@@ -83,6 +83,13 @@ pub async fn create_share_token(
         builder = builder.nonce(nonce_str);
     }
 
+    // Stamp the content encryption version so the recipient knows whether to
+    // expect AAD binding (v4+) or bare AEAD (v2). Without this, fula-client
+    // has to guess for single-object shares, which can mis-handle edge cases.
+    if let Some(v) = enc_metadata["version"].as_u64() {
+        builder = builder.encryption_version(v as u8);
+    }
+
     // Include chunked metadata for large files (> 768KB)
     if enc_metadata.get("chunked").is_some() {
         let chunked_json = serde_json::to_string(&enc_metadata["chunked"])
@@ -186,6 +193,15 @@ pub async fn create_share_token_with_mode(
     // Include nonce in share token so recipient can decrypt without S3 metadata headers
     let builder = if let Some(nonce_str) = enc_metadata["nonce"].as_str() {
         builder.nonce(nonce_str)
+    } else {
+        builder
+    };
+
+    // Stamp the content encryption version so the recipient knows whether to
+    // expect AAD binding (v4+) or bare AEAD (v2). Without this, fula-client
+    // has to guess for single-object shares, which can mis-handle edge cases.
+    let builder = if let Some(v) = enc_metadata["version"].as_u64() {
+        builder.encryption_version(v as u8)
     } else {
         builder
     };
