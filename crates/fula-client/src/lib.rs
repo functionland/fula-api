@@ -57,7 +57,7 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 
 pub use client::FulaClient;
 pub use config::Config;
-pub use encryption::{EncryptedClient, EncryptionConfig, DecryptedObjectInfo, FileMetadata, DirectoryListing, PinningCredentials};
+pub use encryption::{EncryptedClient, EncryptionConfig, DecryptedObjectInfo, FileMetadata, DirectoryListing, PinningCredentials, S3BlobBackend};
 
 /// Crash-injection atomics used by the workspace integration tests to
 /// simulate client-side aborts between phases of `migrate_v1_to_v7_internal`.
@@ -100,6 +100,16 @@ pub fn wal_append_failure_count() -> u64 {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn flush_backoff_count() -> u64 {
     encryption::flush_backoff_count()
+}
+
+/// Total `S3BlobBackend::{get, put}` retries triggered by transient 5xx
+/// responses (typically nginx `limit_req` 503 on bursty HAMT walks) since
+/// process start. Monotonic process-wide counter.
+///
+/// Native-only; the wasm32 `BlobBackend` impl is single-attempt.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn blob_backend_retry_count() -> u64 {
+    encryption::blob_backend_retry_count()
 }
 
 /// Count of WAL groups discarded on load due to partial-group truncation

@@ -88,6 +88,50 @@ fn flush_backoff_delay(attempt: usize) -> std::time::Duration {
 static FLUSH_BACKOFF_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Fixed delay base (ms) between transient-error retries on HAMT blob-backend
+/// GET/PUT. Chosen so a fully drained nginx `limit_req` burst (token bucket
+/// with sub-second refill at the gateway's configured rate) has time to refill
+/// before the next attempt. Not exponential: the rate-limit condition resets
+/// per second, so later attempts don't benefit from longer waits.
+#[cfg(not(target_arch = "wasm32"))]
+const BLOB_BACKEND_RETRY_BASE_MS: u64 = 300;
+/// Maximum added jitter for blob-backend retries. De-synchronises fan-out
+/// retries so many concurrent walkers don't all wake at the same instant.
+#[cfg(not(target_arch = "wasm32"))]
+const BLOB_BACKEND_RETRY_JITTER_MS: u64 = 100;
+/// Total attempts (including the first try) for blob-backend GET/PUT.
+#[cfg(not(target_arch = "wasm32"))]
+const BLOB_BACKEND_MAX_ATTEMPTS: u32 = 4;
+
+/// Compute the fixed-plus-jitter sleep duration for a blob-backend retry.
+///
+/// Same jitter source (`SystemTime::subsec_nanos()`) as `flush_backoff_delay`;
+/// no `rand` dependency pulled in just for this.
+#[cfg(not(target_arch = "wasm32"))]
+fn blob_backend_retry_delay() -> std::time::Duration {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let jitter = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0)
+        % (BLOB_BACKEND_RETRY_JITTER_MS + 1);
+    std::time::Duration::from_millis(BLOB_BACKEND_RETRY_BASE_MS + jitter)
+}
+
+/// Process-wide counter bumped each time `S3BlobBackend::{get,put}` sleeps on
+/// a transient-5xx retry. Observable via [`blob_backend_retry_count`] so the
+/// fault-injection integration test can assert the retry path actually ran.
+#[cfg(not(target_arch = "wasm32"))]
+static BLOB_BACKEND_RETRY_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read the total number of blob-backend transient-5xx retries since process
+/// start. Native-only.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn blob_backend_retry_count() -> u64 {
+    BLOB_BACKEND_RETRY_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Read the total number of flush-forest backoff sleeps observed since
 /// process start. Native-only.
 #[cfg(not(target_arch = "wasm32"))]
@@ -294,21 +338,70 @@ fn client_err_to_crypto(err: ClientError) -> CryptoError {
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 impl BlobBackend for S3BlobBackend {
+    /// Retries transient 5xx responses (nginx `limit_req` 503, upstream
+    /// 429/500/502/503/504, S3 `SlowDown`/`InternalError`/`ServiceUnavailable`)
+    /// with a fixed 300 ms + 0-100 ms jitter delay, up to 4 attempts total.
+    /// Non-transient errors (auth failure, NotFound, etc.) short-circuit.
     async fn get(&self, path: &str) -> fula_crypto::Result<Vec<u8>> {
-        let bytes = self
-            .inner
-            .get_object(&self.bucket, path)
-            .await
-            .map_err(client_err_to_crypto)?;
-        Ok(bytes.to_vec())
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match self.inner.get_object(&self.bucket, path).await {
+                Ok(bytes) => return Ok(bytes.to_vec()),
+                Err(e)
+                    if attempt < BLOB_BACKEND_MAX_ATTEMPTS
+                        && crate::multipart::is_transient(&e) =>
+                {
+                    tracing::debug!(
+                        bucket = %self.bucket,
+                        path = %path,
+                        attempt,
+                        error = %e,
+                        "S3BlobBackend::get retrying transient 5xx"
+                    );
+                    BLOB_BACKEND_RETRY_COUNT
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tokio::time::sleep(blob_backend_retry_delay()).await;
+                    continue;
+                }
+                Err(e) => return Err(client_err_to_crypto(e)),
+            }
+        }
     }
 
+    /// Same retry policy as `get`. `put_object` is idempotent on v7 HAMT
+    /// node keys — they are content-addressed (blake3 over the plaintext
+    /// node), so re-uploading the same bytes at the same path is safe.
     async fn put(&self, path: &str, bytes: Vec<u8>) -> fula_crypto::Result<()> {
-        self.inner
-            .put_object(&self.bucket, path, bytes)
-            .await
-            .map(|_| ())
-            .map_err(client_err_to_crypto)
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            // Clone the body each attempt: reqwest consumes the body, and we
+            // want to re-send the same bytes on retry. The retry path is cold
+            // and HAMT node blobs are small (sub-KB typical), so this is
+            // negligible on the happy path too.
+            let body = bytes.clone();
+            match self.inner.put_object(&self.bucket, path, body).await {
+                Ok(_) => return Ok(()),
+                Err(e)
+                    if attempt < BLOB_BACKEND_MAX_ATTEMPTS
+                        && crate::multipart::is_transient(&e) =>
+                {
+                    tracing::debug!(
+                        bucket = %self.bucket,
+                        path = %path,
+                        attempt,
+                        error = %e,
+                        "S3BlobBackend::put retrying transient 5xx"
+                    );
+                    BLOB_BACKEND_RETRY_COUNT
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tokio::time::sleep(blob_backend_retry_delay()).await;
+                    continue;
+                }
+                Err(e) => return Err(client_err_to_crypto(e)),
+            }
+        }
     }
 }
 

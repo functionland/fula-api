@@ -458,8 +458,10 @@ where
 ///
 /// Native-only: `retry_idempotent` short-circuits to a single attempt on
 /// wasm32 (no sleep primitive), so the classifier has no caller there.
+/// Shared with `S3BlobBackend::{get, put}` in `encryption.rs` so the
+/// blob-backend retry loop matches the same transient set.
 #[cfg(not(target_arch = "wasm32"))]
-fn is_transient(err: &ClientError) -> bool {
+pub(crate) fn is_transient(err: &ClientError) -> bool {
     match err {
         ClientError::Http(e) => {
             // `is_connect` exists only on native reqwest; the wasm build
