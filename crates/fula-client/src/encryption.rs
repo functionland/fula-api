@@ -6221,6 +6221,19 @@ impl EncryptedClient {
         chunked_meta: &ChunkedFileMetadata,
         dek: &fula_crypto::keys::DekKey,
     ) -> Result<Bytes> {
+        // Reject share tokens that claim implausible file sizes before attempting
+        // allocation. WASM's linear memory is bounded; a garbage total_size from a
+        // malformed token would otherwise surface as an opaque "memory access out
+        // of bounds" from __wbindgen_realloc instead of a clean error.
+        const MAX_CHUNKED_TOTAL_SIZE: u64 = 8 * 1024 * 1024 * 1024;
+        if chunked_meta.total_size > MAX_CHUNKED_TOTAL_SIZE {
+            return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                format!(
+                    "chunked_meta.total_size {} exceeds maximum {}",
+                    chunked_meta.total_size, MAX_CHUNKED_TOTAL_SIZE
+                ),
+            )));
+        }
         let mut output = Vec::with_capacity(chunked_meta.total_size as usize);
         self.download_chunks_windowed_to_writer(bucket, storage_key, chunked_meta, dek, &mut output, None).await?;
         Ok(Bytes::from(output))
