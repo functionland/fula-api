@@ -9,7 +9,7 @@ Fula borrows two key architectural patterns from WNFS while maintaining its own 
 | Feature | WNFS Pattern | Fula Adaptation | Status |
 |---------|--------------|-----------------|--------|
 | **Large File Streaming** | Block-level encryption + index node | Chunked encryption + index object | ✅ Implemented |
-| **HAMT Forest Index** | HamtForest for scalable tree indexing | HamtIndex/ShardedIndex for PrivateForest | ✅ Module ready, integration pending |
+| **HAMT Forest Index** | HamtForest for scalable tree indexing | Sharded HAMT v7 (`ShardedHamtPrivateForest`) | ✅ Shipped in v0.3.x; v1/v2 still readable, migrate on demand |
 
 ---
 
@@ -45,7 +45,7 @@ WNFS splits files into fixed-size blocks, each encrypted separately and stored u
 ```rust
 /// Metadata for a chunked/streaming encrypted file
 pub struct ChunkedFileMetadata {
-    pub format: String,          // "streaming-v1"
+    pub format: String,          // "streaming-v2" (new) or "streaming-v1" (legacy, still decoded)
     pub chunk_size: u32,         // Size of each chunk (default 256KB)
     pub num_chunks: u32,         // Number of chunks
     pub total_size: u64,         // Total file size
@@ -105,37 +105,49 @@ abc123.chunks/00000002  <- Encrypted chunk 2
 ...
 ```
 
-### Metadata Format (version 3)
+### Metadata Format (version 4, streaming-v2 since commit `9069817` + `f57964f`)
 
 ```json
 {
-  "version": 3,
-  "format": "streaming-v1",
+  "version": 4,
   "algorithm": "AES-256-GCM",
-  "wrapped_key": { /* HPKE-wrapped DEK */ },
+  "nonce": "<base64, 12 bytes>",
+  "wrapped_key": {
+    "version": 2,
+    "encapsulated_key": { "ephemeral_public": "<base64, 32 bytes>" },
+    "cipher": "chacha20poly1305",
+    "ciphertext": "<base64, 48 bytes: encrypted DEK + 16-byte tag>"
+  },
   "kek_version": 1,
   "chunked": {
-    "format": "streaming-v1",
+    "format": "streaming-v2",
     "chunk_size": 262144,
     "num_chunks": 10,
     "total_size": 2621440,
-    "root_hash": "...",
-    "chunk_nonces": ["...", "..."],
+    "root_hash": "<hex, 32-byte BLAKE3/Bao root>",
+    "chunk_nonces": ["<base64>", "<base64>", ...],
     "content_type": "video/mp4"
   },
-  "bao_outboard": "..."
+  "metadata_privacy": true,
+  "private_metadata": "<base64 encrypted PrivateMetadata JSON>"
 }
 ```
+
+- **`version: 4`** means the content AEAD encrypts with AAD `fula:v4:content:{storage_key}` (single-object path) or per-chunk AAD `fula:v4:chunk:{storage_key}:{index}` (chunked path). Version 2 (no AAD) is still decodable for legacy reads.
+- **`format: "streaming-v2"`** signals that chunks carry AAD. `format: "streaming-v1"` is the pre-`9069817` form and is still decoded on read.
+- **`wrapped_key.version: 2`** is the HPKE envelope version (RFC 9180 HPKE — it is unrelated to the content `version`).
+- **`bao_outboard`** is NOT stored on the server; the Bao root hash inside `chunked.root_hash` is re-verified by the streaming decoder at `finalize_and_verify`.
 
 ### Compatibility
 
 | Aspect | Preserved? | Notes |
 |--------|------------|-------|
-| S3 Compatibility | ✅ | Chunks are regular S3 objects |
-| HPKE Encryption | ✅ | DEK still wrapped with HPKE in index |
+| S3 Compatibility | ✅ | Chunks are regular S3 objects at `{storage_key}.chunks/{index:08}` |
+| HPKE Encryption | ✅ | DEK still wrapped with HPKE over X25519 in the index |
 | Full Privacy | ✅ | All chunks encrypted, index encrypted |
-| Metadata Listing | ✅ | PrivateForest tracks files normally |
-| Backward Compat | ✅ | `format: "streaming-v1"` distinguishes from v2 |
+| Metadata Listing | ✅ | PrivateForest (now HAMT v7) tracks files |
+| Backward Compat | ✅ | `format: "streaming-v1"` readers still work; `version: 2` single-object blobs still decrypt |
+| Downgrade resistance | ✅ | Forest entries written post-v4 pin `min_version: 4`; a v2/no-AAD blob at the same storage_key is rejected (H-2) |
 
 ---
 
@@ -210,21 +222,37 @@ pub struct ShardedIndex<V: Clone> {
 
 Shards entries by BLAKE3 hash prefix (default 16 shards).
 
-### Integration Plan
+### Integration Status (shipped in v7)
 
-The HAMT modules are ready but not yet integrated into `PrivateForest`. The integration will:
+HAMT forest is the production format as of `fula-api` 0.3.x. See `crates/fula-crypto/src/sharded_hamt_forest.rs` and `crates/fula-crypto/src/wnfs_hamt/`.
 
-1. Add a version field to `PrivateForest`:
-   ```rust
-   enum PrivateForestFormat {
-       FlatMapV1,  // Current format
-       HamtV2,     // New HAMT-backed format
-   }
-   ```
+`ForestFormat` in `private_forest.rs`:
 
-2. On load: detect format and deserialize appropriately
-3. On save: optionally migrate to HAMT format
-4. Keep the same `PrivateForest` API (`upsert_file`, `get_file`, etc.)
+```rust
+pub enum ForestFormat {
+    FlatMapV1,        // Legacy monolithic HashMap; still readable
+    HamtV2,           // Legacy single-HAMT monolithic format; still readable
+    ShardedHamtV7,    // Current: sharded HAMT, per-shard lazy load,
+                      // content-addressed node blobs
+}
+```
+
+**Sharded HAMT v7 specifics:**
+
+- **Shape**: 16-way trie (bitmask `u16`, one nibble per level) with a `HAMT_VALUES_BUCKET_SIZE = 3` inline-pair bucket before promotion to a child — vendored from `rs-wnfs/wnfs-hamt` (see the `// Vendored and stripped from rs-wnfs…` headers in `wnfs_hamt/node.rs` and `wnfs_hamt/pointer.rs`).
+- **Sharding**: `num_shards` is a power of two ≤ 65 536. `shard_for_path_v6(path, bucket_salt, num_shards)` hashes the directory containing the entry, so all files in a directory land in the same shard (directory listings stay cheap).
+- **Node blobs**: each HAMT node is serialized with `postcard`, then AEAD-encrypted (AAD binds bucket + shard index), then content-addressed as `BLAKE3(bucket_salt ‖ plaintext_node_bytes)[..22]` and stored under `__fula_forest_v7_nodes/<hex_key>`. Different re-encryptions of the same plaintext node share the same storage key → dedup.
+- **Manifest**: stores the per-shard root keys and monotonic sequence numbers. Atomic flip via conditional PUT (If-Match / 412 retries, see `MAX_FLUSH_RETRIES` in `encryption.rs`).
+- **Cache**: per-shard `async_lock::RwLock<LoadedShard>` with states `NotLoaded | LoadedEmpty | Loaded`, so distinct shards can be read concurrently without contention.
+
+**Migration v1 → v7** (`encryption.rs::migrate_to_sharded`):
+
+1. Guard: if a v1 WAL is on disk, return `DeferredTransientError` until the WAL drains.
+2. Advisory server-side migration lock (heartbeat'd from a RAII guard).
+3. Phase A: iterate v1 entries, upsert each into the sharded HAMT (one shard per directory).
+4. Phase B: single manifest PUT with If-Match for atomic swap.
+5. If Phase B fails, clear any orphaned WAL so the next load doesn't spin.
+6. Idempotent: running against an already-v7 bucket returns a zero-duration `MigrationCompleted`.
 
 ### Test Coverage
 
@@ -600,20 +628,21 @@ let accepted = inbox.accept_entry(&entry_id, &recipient)?;
 
 ## 9. Remaining Future Work
 
-All major WNFS/Peergos-inspired features have been implemented:
-- ✅ HAMT integration for large forests
-- ✅ Chunked streaming encryption
-- ✅ Secret links (key material in URL fragment)
-- ✅ Snapshot vs Temporal share modes
-- ✅ Subtree keys (Cryptree-style)
-- ✅ Async/offline inbox sharing
-- ✅ Multi-device key management documentation
-- ✅ Comprehensive threat model
+All major WNFS/Peergos-inspired features are shipped in v0.3.x:
+- ✅ **Sharded HAMT forest (v7)** — `ShardedHamtPrivateForest` in `sharded_hamt_forest.rs`, with vendored HAMT logic from `rs-wnfs/wnfs-hamt`.
+- ✅ **Chunked streaming encryption with AAD** — `streaming-v2` format, per-chunk AAD `fula:v4:chunk:{storage_key}:{index}`.
+- ✅ **Secret links** — key material in URL fragment (`#`), gateway never sees it.
+- ✅ **Snapshot vs Temporal share modes** — `ShareMode` + `SnapshotBinding`.
+- ✅ **Subtree keys (Cryptree-style)** — `SubtreeKeyManager`, `EncryptedSubtreeDek`, `SubtreeShareToken`.
+- ✅ **Async/offline inbox sharing** — `ShareEnvelope`, `ShareInbox`.
+- ✅ **Downgrade defences** — forest entry pins `encrypted: true` (C-AUDIT-004) and `min_version: u8` (H-2); content hash pin (H-1) re-verified on read.
+- ✅ **Key rotation** — `kek_version` on every object; `rewrap_object_dek` and `rotate_bucket` without re-encrypting content.
 
-**Optional future enhancements:**
-- Coarse forest sharding (only if very large buckets become an issue)
-- Integration with DID/identity systems for sharer verification
-- Push notifications for inbox updates
+**Still deliberate gaps** (verified against current code):
+- **Default-path post-quantum wrap.** `hybrid_kem` (X25519 + ML-KEM-768) exists as a primitive but is not wired into `Encryptor::encrypt_dek`. Apps that need PQ wrapping today can call it directly; the default client migration is a follow-up.
+- **Forest-level `diff` / `merge`.** The v7 manifest uses If-Match for atomic swap; concurrent writers don't three-way-merge. Acceptable for an S3 gateway, a gap for multi-writer filesystem use cases.
+- **Per-node ratchets.** WNFS's forward-secrecy ratchet is not replicated; Fula relies on KEK rotation + per-file DEKs + subtree rotation.
+- **Integration with DID/identity systems for sharer verification.**
 
 ---
 

@@ -248,41 +248,60 @@ await deleteFlat(encryptedClient, 'my-bucket', '/photos/vacation/beach.jpg');
 
 ### Secure Sharing
 
-Create and accept share tokens for secure file sharing:
+Create and accept share tokens for secure file sharing. Note that since `fula-api` v0.3.0 (commit `9069817`) the `getWithShare` / `getWithToken` bindings take an additional `originalKey` argument so the recipient's client can enforce the token's `path_scope` — the share token granted by `create_share_token` sets `path_scope = storage_key` for FxFiles-style single-file shares, so `originalKey` and `storageKey` are typically the same value.
 
 ```dart
-// Create a read-only share token
-final shareToken = createShareToken(
+// Create a read-only share token (FxFiles defaults to path_scope = storage_key)
+final shareToken = await createShareToken(
   encryptedClient,
+  bucket,
   storageKey,
-  ShareMode.read,
-  null, // No expiration
+  recipientPublicKey,   // 32-byte X25519 public key
+  null,                 // expiresAt: null = no expiration
 );
 
 // Create a time-limited share
-final expiresAt = DateTime.now().add(Duration(hours: 24)).millisecondsSinceEpoch ~/ 1000;
-final temporalToken = createShareToken(
+final expiresAt = DateTime.now()
+    .add(Duration(hours: 24))
+    .millisecondsSinceEpoch ~/ 1000;
+final temporalToken = await createShareTokenWithMode(
   encryptedClient,
+  bucket,
   storageKey,
-  ShareMode.temporal,
+  recipientPublicKey,
+  ShareMode.temporal,   // always resolves to the current version of the path
   expiresAt,
 );
 
-// Accept a share from someone else
-final acceptedShare = acceptShare(shareTokenJson);
+// Accept a share from someone else (parses the token locally; no network)
+final acceptedShare = await acceptShare(encryptedClient, shareTokenJson);
 
-// Get file using the share
+// Get the file using the accepted share — 5-arg form since v0.3.0.
+// originalKey must match (or be a prefix-match of) the token's path_scope.
 final sharedData = await getWithShare(
   encryptedClient,
   'shared-bucket',
-  storageKey,
+  storageKey,     // obfuscated CID-like storage key
+  storageKey,     // originalKey: path_scope check is starts_with
   acceptedShare,
 );
 
-// Check share permissions
+// Or the single-step helper (same 5-arg shape):
+final sharedDataOneStep = await getWithToken(
+  encryptedClient,
+  'shared-bucket',
+  storageKey,
+  storageKey,
+  shareTokenJson,
+);
+
+// Inspect the accepted share
 final permissions = getSharePermissions(acceptedShare);
 print('Can read: ${permissions.canRead}, Can write: ${permissions.canWrite}');
+print('Valid: ${isShareValid(acceptedShare)}');
 ```
+
+Since commit `9069817`, fula-flutter's `create_share_token` also stamps the content `encryption_version` (v4) into the token so the recipient knows to decrypt with AAD — if you see `decryption failed: aead::Error` on an old share, rebuild and re-issue the link with the current fula-flutter.
 
 ### Key Rotation
 

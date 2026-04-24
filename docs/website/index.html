@@ -44,7 +44,7 @@
         <div class="sidebar-header">
             <div class="logo">
                 <h1>Fula API</h1>
-                <span class="version">v0.1.0</span>
+                <span class="version">v0.3.6</span>
             </div>
             <button class="theme-toggle" aria-label="Toggle theme">
                 <span class="icon-sun">☀️</span>
@@ -67,9 +67,10 @@
             <h3 data-i18n="nav.onThisPage">On This Page</h3>
             <ul>
                 <li><a href="#overview" data-i18n="overview.title">Overview</a></li>
+                <li><a href="#how-it-works-plain">How It Works (plain English)</a></li>
                 <li><a href="#why-fula" data-i18n="whyFula.title">Why Fula?</a></li>
                 <li><a href="#architecture">Architecture</a></li>
-                <li><a href="#how-it-works">How It Works</a></li>
+                <li><a href="#how-it-works">Architecture Details</a></li>
                 <li><a href="#encryption">Encryption</a></li>
                 <li><a href="#data-structures">Data Structures</a></li>
                 <li><a href="#getting-started" data-i18n="gettingStarted.title">Getting Started</a></li>
@@ -125,6 +126,23 @@
                         <h3 data-i18n="feature.sync.title">Conflict-Free Sync</h3>
                         <p data-i18n="feature.sync.desc">CRDT-based metadata enables distributed updates without coordination.</p>
                     </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- How It Works (plain English) -->
+        <section id="how-it-works-plain" class="intro-section">
+            <h2>How it works (plain English)</h2>
+            <div class="overview-grid">
+                <div class="overview-text">
+                    <h3>Encryption &amp; storage</h3>
+                    <p>Every file gets its own random 32-byte key. Files up to <strong>768&nbsp;KB</strong> are sealed as a single blob; anything larger is sliced into <strong>256&nbsp;KB pieces</strong>, and each piece is sealed separately with a tag that names the file and the piece — so pieces can't be shuffled, swapped, or replayed across files. The real filename and folder are replaced with a random-looking ID before anything leaves your machine, and the per-file key is itself wrapped with your own keypair so only you can open it. A small encrypted index (the <em>"private forest"</em>) remembers which scrambled ID belongs to which real filename; for large libraries it is stored as a sharded hash-array-mapped-trie (HAMT v7, borrowed from <a href="https://github.com/wnfs-wg/rs-wnfs">rs-wnfs</a>) so the client only loads the pieces it needs.</p>
+
+                    <h3>Decryption</h3>
+                    <p>Your personal key unwraps the per-file key, the client decrypts the blob (or reassembles and checks each piece against its tag and the file's BLAKE3 root hash), and you get your bytes back. The forest entry also pins a hash of the original plaintext, so tampering after upload is detected even if the server produced a blob with a valid inner tag.</p>
+
+                    <h3>Sharing</h3>
+                    <p>To share, your client re-wraps the file's key for the recipient's public key and attaches a short note — what they can do, when the share expires, and which path it covers. The result is a small token placed in the URL after <code>#</code>, so the server never sees the key. The recipient pastes the link, their own key unwraps the token, and they fetch the encrypted bytes through a lightweight proxy endpoint (no S3 account required for the recipient). Your personal key stays private; you only hand over that one file's lock. Shares come in two flavors: <strong>temporal</strong> (always resolves to the current version of the shared path) or <strong>snapshot</strong> (locked to the exact content hash at share time).</p>
                 </div>
             </div>
         </section>

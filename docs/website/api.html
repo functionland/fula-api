@@ -43,7 +43,7 @@
         <div class="sidebar-header">
             <div class="logo">
                 <h1>Fula API</h1>
-                <span class="version">v0.1.0</span>
+                <span class="version">v0.3.6</span>
             </div>
             <button class="theme-toggle" aria-label="Toggle theme">
                 <span class="icon-sun">☀️</span>
@@ -982,32 +982,55 @@ Content-Length: 0</code></pre>
                     <h3>Encryption Metadata Header</h3>
                     <p>The <code>x-amz-meta-encryption</code> header contains JSON with encryption info:</p>
                     
-                    <h3>Fields</h3>
+                    <h3>Fields (content format v4, HPKE envelope v2)</h3>
                     <ul>
-                        <li><strong>version</strong> - Encryption format version (currently 2)</li>
-                        <li><strong>algorithm</strong> - Cipher used (AES-256-GCM)</li>
-                        <li><strong>nonce</strong> - Base64-encoded nonce</li>
-                        <li><strong>wrapped_key</strong> - HPKE-encrypted DEK</li>
-                        <li><strong>metadata_privacy</strong> - Whether private metadata is included</li>
-                        <li><strong>private_metadata</strong> - Encrypted original filename, size, etc.</li>
+                        <li><strong>version</strong> — Content AEAD format. <code>4</code> means the ciphertext is bound with AAD <code>fula:v4:content:{storage_key}</code> (single-object) or <code>fula:v4:chunk:{storage_key}:{index}</code> (chunked). Legacy value <code>2</code> means no content AAD.</li>
+                        <li><strong>algorithm</strong> — Content cipher (<code>AES-256-GCM</code> default, <code>ChaCha20-Poly1305</code> also supported).</li>
+                        <li><strong>nonce</strong> — Base64-encoded 12-byte nonce for the single-object path (absent for chunked; per-chunk nonces live inside <code>chunked.chunk_nonces</code>).</li>
+                        <li><strong>wrapped_key</strong> — HPKE envelope (RFC 9180). Contains its own <code>version</code> (<code>2</code> = RFC 9180 HPKE), <code>encapsulated_key.ephemeral_public</code> (32-byte X25519), <code>cipher</code> (<code>chacha20poly1305</code>), and <code>ciphertext</code> (48 bytes = 32-byte DEK + 16-byte tag). DEK-wrap AAD is <code>fula:v2:dek-wrap</code>.</li>
+                        <li><strong>kek_version</strong> — Which KEK rotation generation unwraps this DEK.</li>
+                        <li><strong>chunked</strong> — Present for files &gt; 768 KB. <code>format: "streaming-v2"</code> for AAD-bound chunks, <code>chunk_size</code>, <code>num_chunks</code>, <code>total_size</code>, <code>root_hash</code> (BLAKE3/Bao hex), and <code>chunk_nonces</code> array.</li>
+                        <li><strong>metadata_privacy</strong> — Whether <code>private_metadata</code> is included.</li>
+                        <li><strong>private_metadata</strong> — <code>EncryptedPrivateMetadata</code> (original filename, size, content-type, user metadata, content_hash) encrypted under the DEK.</li>
                     </ul>
                 </div>
                 <div class="example">
                     <div class="example-header">
-                        <span class="lang-label">Encryption Metadata Structure</span>
+                        <span class="lang-label">Encryption Metadata Structure (single-object, v4)</span>
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                     </div>
                     <pre><code class="language-json">{
-  "version": 2,
+  "version": 4,
   "algorithm": "AES-256-GCM",
-  "nonce": "base64_encoded_nonce",
+  "nonce": "&lt;base64, 12 bytes&gt;",
   "wrapped_key": {
-    "encapsulated_key": "base64_hpke_encapsulated_key",
-    "ciphertext": "base64_encrypted_dek",
-    "nonce": "base64_inner_nonce"
+    "version": 2,
+    "encapsulated_key": { "ephemeral_public": "&lt;base64, 32 bytes&gt;" },
+    "cipher": "chacha20poly1305",
+    "ciphertext": "&lt;base64, 48 bytes (32-byte DEK + 16-byte tag)&gt;"
   },
+  "kek_version": 1,
   "metadata_privacy": true,
-  "private_metadata": "{\"version\":1,\"ciphertext\":\"...\",\"nonce\":\"...\"}"
+  "private_metadata": "&lt;base64 encrypted PrivateMetadata&gt;"
+}</code></pre>
+
+                    <div class="example-header">
+                        <span class="lang-label">Encryption Metadata Structure (chunked, streaming-v2)</span>
+                        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    </div>
+                    <pre><code class="language-json">{
+  "version": 4,
+  "algorithm": "AES-256-GCM",
+  "wrapped_key": { "version": 2, "encapsulated_key": {"ephemeral_public": "..."}, "cipher": "chacha20poly1305", "ciphertext": "..." },
+  "kek_version": 1,
+  "chunked": {
+    "format": "streaming-v2",
+    "chunk_size": 262144,
+    "num_chunks": 10,
+    "total_size": 2621440,
+    "root_hash": "&lt;hex, 32-byte Bao root&gt;",
+    "chunk_nonces": ["&lt;base64&gt;", "&lt;base64&gt;", "..."]
+  }
 }</code></pre>
 
                     <div class="example-header">
@@ -1015,12 +1038,13 @@ Content-Length: 0</code></pre>
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                     </div>
                     <pre><code class="language-bash"># Get metadata without downloading content
-curl -I "http://localhost:9000/my-bucket/e/a7c3f9b2e8d14a6f" \
+curl -I "http://localhost:9000/my-bucket/Qm0bb7a3f40dcd6057bd5abd04d2aa80f68680ea56a978" \
     -H "Authorization: Bearer $TOKEN"
 
 # Response headers include:
-# x-amz-meta-encrypted: true
-# x-amz-meta-encryption: {"version":2,"algorithm":"AES-256-GCM",...}
+# x-amz-meta-x-fula-encrypted: true
+# x-amz-meta-x-fula-encryption: {"version":4,"algorithm":"AES-256-GCM",...}
+# x-amz-meta-x-fula-chunked: true       (if chunked)
 # Content-Type: application/octet-stream
 # Content-Length: 156821 (ciphertext size)</code></pre>
                 </div>
@@ -1109,44 +1133,52 @@ curl -I "http://localhost:9000/my-bucket/e/a7c3f9b2e8d14a6f" \
                     <p>Share encrypted files without exposing your master key. Uses HPKE to re-encrypt the DEK for each recipient.</p>
                     
                     <h3>Share Token Structure</h3>
-                    <p>A share token is a JSON object containing:</p>
+                    <p>A share token is a JSON object containing (see <code>crates/fula-crypto/src/sharing.rs::ShareToken</code>):</p>
                     <ul>
-                        <li><strong>share_id</strong> - Unique identifier (random 16-byte hex)</li>
-                        <li><strong>path_scope</strong> - Folder path this share grants access to</li>
-                        <li><strong>expires_at</strong> - Unix timestamp when share expires (optional)</li>
-                        <li><strong>permissions</strong> - Read, write, delete flags</li>
-                        <li><strong>encrypted_dek</strong> - HPKE-encrypted DEK for recipient</li>
-                        <li><strong>owner_public_key</strong> - Owner's public key (for verification)</li>
+                        <li><strong>id</strong> — 16-byte hex identifier.</li>
+                        <li><strong>version</strong> — Share token envelope version (<code>SHARE_TOKEN_AAD_V5</code> as of v0.3.x; bumped when the AAD binding shape changes).</li>
+                        <li><strong>path_scope</strong> — Scope the share grants access to. <code>is_valid_for_path(p)</code> accepts any <code>p</code> that <em>starts with</em> <code>path_scope</code>. For FxFiles-style single-file shares this is the file's <code>storage_key</code> (CID).</li>
+                        <li><strong>wrapped_key</strong> — HPKE-wrapped DEK for the recipient (same envelope shape as the storage metadata's <code>wrapped_key</code>; DEK-wrap AAD here is domain-separated by the token body so any mutation of other fields invalidates the unwrap).</li>
+                        <li><strong>permissions</strong> — <code>can_read</code>, <code>can_write</code>, <code>can_delete</code> flags.</li>
+                        <li><strong>mode</strong> — <code>Temporal</code> (resolves to the latest version under the path, the default) or <code>Snapshot</code> (locked to <code>snapshot_binding</code>).</li>
+                        <li><strong>snapshot_binding</strong> (optional, only in Snapshot mode) — BLAKE3 content hash, size, modified_at, and storage_key captured at share time.</li>
+                        <li><strong>nonce</strong> (optional) — 12-byte content nonce for single-object shares. Present since `1b82b95` so the recipient can decrypt without fetching S3 metadata headers.</li>
+                        <li><strong>chunked_metadata</strong> (optional) — serialized <code>ChunkedFileMetadata</code> JSON for chunked files. Present since `1b82b95`.</li>
+                        <li><strong>encryption_version</strong> (optional, <code>u8</code>) — the content AEAD version (e.g. <code>4</code>) the recipient should decrypt with. Stamped by fula-flutter since commit `9069817`; if absent, the recipient tries v4-AAD first and falls back to v2 (no AAD) for legacy tokens.</li>
+                        <li><strong>created_at</strong> — Unix seconds.</li>
+                        <li><strong>expires_at</strong> — Unix seconds (optional; <code>None</code> = never expires).</li>
                     </ul>
-                    
-                    <h3>Permissions</h3>
+
+                    <h3>Permissions builder helpers</h3>
                     <ul>
-                        <li><code>read_only()</code> - Can decrypt and read files</li>
-                        <li><code>read_write()</code> - Can read and upload new files</li>
-                        <li><code>full_access()</code> - Can read, write, and delete</li>
+                        <li><code>ShareBuilder::read_only()</code> — Can decrypt and read files within <code>path_scope</code>.</li>
+                        <li><code>ShareBuilder::read_write()</code> — Can also upload under <code>path_scope</code>.</li>
+                        <li><code>ShareBuilder::full_access()</code> — Read, write, and delete.</li>
                     </ul>
                 </div>
                 <div class="example">
                     <div class="example-header">
-                        <span class="lang-label">Share Token JSON Structure</span>
+                        <span class="lang-label">Share Token JSON Structure (post-v0.3.0)</span>
                         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
                     </div>
                     <pre><code class="language-json">{
-  "share_id": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
-  "path_scope": "/photos/vacation/",
-  "created_at": 1701388800,
-  "expires_at": 1702252800,
-  "permissions": {
-    "read": true,
-    "write": false,
-    "delete": false
+  "id": "a137662366191e7456ff20213f2ff012",
+  "version": 5,
+  "path_scope": "Qmf6de2bfec2be33a7effd5e791ceed78ff5375e586bd3",
+  "wrapped_key": {
+    "version": 2,
+    "encapsulated_key": { "ephemeral_public": "&lt;base64, 32 bytes&gt;" },
+    "cipher": "chacha20poly1305",
+    "ciphertext": "&lt;base64&gt;"
   },
-  "encrypted_dek": {
-    "encapsulated_key": "base64...",
-    "ciphertext": "base64...",
-    "nonce": "base64..."
-  },
-  "owner_public_key": "base64_x25519_public_key"
+  "permissions": { "can_read": true, "can_write": false, "can_delete": false },
+  "mode": "Temporal",
+  "snapshot_binding": null,
+  "nonce": "&lt;base64, 12 bytes&gt;",
+  "chunked_metadata": null,
+  "encryption_version": 4,
+  "created_at": 1777500000,
+  "expires_at": 1778104800
 }</code></pre>
 
                     <div class="example-header">

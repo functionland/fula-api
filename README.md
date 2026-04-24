@@ -10,11 +10,19 @@
 Fula Storage provides an Amazon S3-compatible API backed by a decentralized network of IPFS nodes. It enables developers to build applications using familiar S3 tools and SDKs while benefiting from:
 
 - **🌐 Decentralization**: Data is stored across a network of individually owned IPFS nodes
-- **🔒 End-to-End Encryption**: Client-side HPKE encryption - storage nodes never see your data
-- **🛡️ Quantum-Safe Cryptography**: Hybrid X25519 + ML-KEM-768 (NIST FIPS 203) for post-quantum security
-- **✅ Verified Streaming**: BLAKE3/Bao ensures data integrity from untrusted nodes
+- **🔒 End-to-End Encryption**: Client-side AEAD (AES-256-GCM) with per-file keys wrapped via RFC 9180 HPKE over X25519 — storage nodes never see your data. A hybrid X25519 + ML-KEM-768 primitive ships in `fula-crypto::hybrid_kem` for applications that want post-quantum wrapping today; the default client path is X25519-only while that migration is in flight.
+- **✅ Verified Streaming**: BLAKE3/Bao root hash plus per-chunk AAD binding ensures large files reassemble from exactly the bytes that were uploaded
+- **🧭 Private index (forest)**: an encrypted per-bucket index that maps real paths to scrambled storage keys — now a sharded HAMT (v7) borrowed from [rs-wnfs](https://github.com/wnfs-wg/rs-wnfs), so a bucket with millions of entries doesn't require downloading the whole index
 - **🔄 Conflict-Free Sync**: CRDT-based metadata for distributed updates
-- **📈 Efficient Indexing**: Prolly Trees for O(log n) bucket operations
+- **📈 Efficient Indexing**: Prolly Trees for O(log n) bucket operations on the server side
+
+## How it works (plain English)
+
+**Encryption & storage.** Every file gets its own random 32-byte key. Files up to 768 KB are sealed as a single blob; anything larger is sliced into 256 KB pieces and each piece is sealed separately with a tag that names the file and the piece — so pieces can't be shuffled, swapped, or replayed across files. The real filename and folder are replaced by a random-looking ID before anything leaves your machine, and the per-file key is itself wrapped with your own keypair so only you can open it. A small encrypted index (the "private forest") remembers which scrambled ID belongs to which real filename; it lives in the same bucket but is itself encrypted, and for large libraries it's stored as a sharded hash-array-mapped-trie (HAMT) so the client only loads the pieces it needs.
+
+**Decryption.** Your personal key unwraps the per-file key, the client decrypts the blob (or reassembles and checks each piece against its tag and the file's BLAKE3 root hash), and you get your bytes back. The forest also pins a hash of the original plaintext, so tampering after upload is detected even if the server somehow produced a blob with a valid inner tag.
+
+**Sharing.** To share, the client re-wraps the file's key for the recipient's public key and attaches a short note — what they can do, when the share expires, and which path it covers. The result is a small token placed in the URL fragment after `#`, so the server never sees the key. The recipient pastes the link, their own key unwraps the token, and they fetch the encrypted bytes through a lightweight proxy endpoint (no S3 account required for the recipient). Your personal key stays private; you're only handing over that one file's lock. Shares come in two flavors: **temporal** (always resolves to the current version of the shared path) or **snapshot** (locked to the exact content hash at share time, refuses to serve a newer version).
 
 ## 📖 Documentation
 
@@ -26,32 +34,46 @@ Fula Storage provides an Amazon S3-compatible API backed by a decentralized netw
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Application Layer                         │
-│         (boto3, AWS SDK, curl, any S3 client)               │
-├─────────────────────────────────────────────────────────────┤
-│                     Fula Gateway                             │
-│    ┌─────────────┬──────────────┬──────────────────────┐    │
-│    │    Auth     │ Rate Limiter │   S3 API Handlers    │    │
-│    └─────────────┴──────────────┴──────────────────────┘    │
-├─────────────────────────────────────────────────────────────┤
-│                      fula-core                               │
-│    ┌─────────────┬──────────────┬──────────────────────┐    │
-│    │Prolly Trees │    Buckets   │       CRDTs          │    │
-│    └─────────────┴──────────────┴──────────────────────┘    │
-├─────────────────────────────────────────────────────────────┤
-│                   fula-blockstore                            │
-│    ┌─────────────┬──────────────┬──────────────────────┐    │
-│    │    IPFS     │ IPFS Cluster │      Chunking        │    │
-│    └─────────────┴──────────────┴──────────────────────┘    │
-├─────────────────────────────────────────────────────────────┤
-│                    fula-crypto (Quantum-Safe)                │
-│    ┌─────────────┬──────────────┬──────────────────────┐    │
-│    │ Hybrid KEM  │   BLAKE3     │        Bao           │    │
-│    │ X25519+MLKEM│              │                      │    │
-│    └─────────────┴──────────────┴──────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│                      Application Layer                         │
+│          (boto3, AWS SDK, Flutter/React-Native app, browser)   │
+├────────────────────────────────────────────────────────────────┤
+│           fula-client  /  fula-flutter  /  fula-js (WASM)      │
+│  ┌──────────────┬────────────────────┬──────────────────────┐  │
+│  │  Per-file    │  Chunked streaming │  Sharded HAMT v7     │  │
+│  │  AEAD +      │  (256 KB chunks,   │  private forest      │  │
+│  │  path        │   per-chunk AAD,   │  (encrypted index,   │  │
+│  │  obfuscation │   Bao root hash)   │   lazy shard load)   │  │
+│  └──────────────┴────────────────────┴──────────────────────┘  │
+├────────────────────────────────────────────────────────────────┤
+│                       Fula Gateway                             │
+│    ┌─────────────┬──────────────┬──────────────────────┐       │
+│    │    Auth     │ Rate Limiter │   S3 API Handlers    │       │
+│    └─────────────┴──────────────┴──────────────────────┘       │
+├────────────────────────────────────────────────────────────────┤
+│                        fula-core                               │
+│    ┌─────────────┬──────────────┬──────────────────────┐       │
+│    │Prolly Trees │    Buckets   │       CRDTs          │       │
+│    └─────────────┴──────────────┴──────────────────────┘       │
+├────────────────────────────────────────────────────────────────┤
+│                     fula-blockstore                            │
+│    ┌─────────────┬──────────────┬──────────────────────┐       │
+│    │    IPFS     │ IPFS Cluster │  FastCDC (IPFS-layer)│       │
+│    └─────────────┴──────────────┴──────────────────────┘       │
+├────────────────────────────────────────────────────────────────┤
+│                        fula-crypto                             │
+│  ┌───────────────┬──────────────┬──────────────┬────────────┐  │
+│  │  RFC 9180     │   BLAKE3     │     Bao      │ hybrid_kem │  │
+│  │  HPKE         │   hashing    │   verified   │ X25519 +   │  │
+│  │  (X25519 KEM) │              │   streaming  │ ML-KEM-768 │  │
+│  │               │              │              │ (opt-in)   │  │
+│  └───────────────┴──────────────┴──────────────┴────────────┘  │
+└────────────────────────────────────────────────────────────────┘
 ```
+
+The client stack (top) is where all encryption, obfuscation, and forest-index
+work happens. The gateway and block-store layers never see plaintext, nor
+real paths — they see random-looking content-addressed keys.
 
 ## Quick Start
 
@@ -212,11 +234,13 @@ let etag = upload_large_file(
 
 | Crate | Description |
 |-------|-------------|
-| `fula-crypto` | Quantum-safe cryptography (Hybrid X25519+ML-KEM, HPKE, BLAKE3, Bao) |
-| `fula-blockstore` | IPFS block storage and chunking |
-| `fula-core` | Storage engine (Prolly Trees, CRDTs) |
+| `fula-crypto` | Cryptographic primitives: RFC 9180 HPKE over X25519 (`hpke.rs`), AES-256-GCM/ChaCha20-Poly1305 AEAD (`symmetric.rs`), chunked streaming with per-chunk AAD (`chunked.rs`), BLAKE3 + Bao verified streaming (`streaming.rs`, `hashing.rs`), sharded HAMT v7 private forest (`sharded_hamt_forest.rs`, vendored `wnfs_hamt/`), share tokens (`sharing.rs`), key rotation (`rotation.rs`), opt-in hybrid PQ KEM X25519 + ML-KEM-768 (`hybrid_kem.rs`) |
+| `fula-blockstore` | IPFS block storage (content-addressed) |
+| `fula-core` | Storage engine: Prolly Trees for server-side bucket metadata, CRDT sync |
 | `fula-cli` | S3-compatible gateway server |
-| `fula-client` | Client SDK with encryption support |
+| `fula-client` | Client SDK: encrypts, obfuscates paths, maintains the sharded HAMT forest, handles resumable chunked uploads, downgrade-gated reads |
+| `fula-flutter` | `flutter_rust_bridge` bindings over `fula-client` for the FxFiles app |
+| `fula-js` | WASM/TypeScript bindings (`wasm-bindgen`) for browsers — powers the web share-viewer and anything embedding `@functionland/fula-client` |
 
 ## Configuration
 
@@ -290,32 +314,23 @@ cargo run --example flat_namespace_demo
 
 ## Security
 
-### 🛡️ Quantum-Safe Cryptography
+### 🔐 Cryptographic Primitives
 
-Fula implements **post-quantum cryptographic protection** using a hybrid approach that provides defense-in-depth:
-
-| Component | Algorithm | Security Level |
-|-----------|-----------|----------------|
-| Key Encapsulation | **X25519 + ML-KEM-768** | Hybrid classical + post-quantum |
-| Symmetric Encryption | AES-256-GCM / ChaCha20-Poly1305 | 256-bit (quantum-resistant) |
-| Hashing | BLAKE3 | 256-bit (quantum-resistant) |
-| Integrity | Bao (BLAKE3-based) | Verified streaming |
-
-**Why Hybrid?**
-- If quantum computers break X25519 (Shor's algorithm), ML-KEM-768 still protects your data
-- If ML-KEM has unforeseen weaknesses, X25519 still provides classical security
-- ML-KEM-768 is NIST FIPS 203 standardized (formerly Kyber768)
+| Component | Algorithm | Where it's used |
+|-----------|-----------|-----------------|
+| Symmetric AEAD (content) | AES-256-GCM (default), ChaCha20-Poly1305 | Per-file and per-chunk content encryption, 12-byte random nonce, 16-byte tag, AAD `fula:v4:content:{storage_key}` (single) / `fula:v4:chunk:{storage_key}:{index}` (chunked) |
+| Key Encapsulation (KEM) | RFC 9180 HPKE over X25519 (HkdfSha256, ChaCha20-Poly1305) | Wrapping the per-file DEK for the owner's keypair and for share recipients; DEK-wrap AAD = `fula:v2:dek-wrap` |
+| Integrity | BLAKE3 + Bao verified streaming | Root hash of the plaintext of chunked files; checked at `finalize_and_verify` |
+| Forest integrity pin | Unkeyed BLAKE3 over plaintext | Stored in the forest entry so a swap of tagged-but-wrong ciphertext still fails (audit finding H-1) |
+| Version pin | `min_version: u8` in forest entry | Rejects downgrade to pre-AAD blobs after a v4 upload (audit finding H-2) |
+| Post-quantum KEM (opt-in) | `fula_crypto::hybrid_kem` — X25519 + ML-KEM-768 (libcrux-ml-kem, NIST FIPS 203) | Available as a primitive; **not** wired into the default `EncryptedClient` wrap path yet. Applications can use it directly if they want PQ wrapping today. |
 
 ```rust
+// Opt-in hybrid PQ wrap — standalone primitive, not the default client path.
 use fula_crypto::{HybridKeyPair, hybrid_encapsulate, hybrid_decapsulate};
 
-// Generate quantum-safe keypair (X25519 + ML-KEM-768)
 let keypair = HybridKeyPair::generate();
-
-// Sender encapsulates shared secret
 let (encapsulated_key, shared_secret) = hybrid_encapsulate(keypair.public_key())?;
-
-// Recipient decapsulates
 let recovered = hybrid_decapsulate(&encapsulated_key, keypair.secret_key())?;
 assert_eq!(shared_secret, recovered);
 ```
@@ -340,51 +355,51 @@ assert_eq!(shared_secret, recovered);
 
 Raw S3 tools (AWS CLI, boto3) do NOT encrypt data - they upload plaintext that gateway operators can see.
 
-**What's encrypted** (with EncryptedClient):
-- ✅ File content
-- ✅ File names (FlatNamespace mode)
-- ✅ Directory structure
-- ✅ User IDs (hashed)
+**What's encrypted** (with `EncryptedClient` in its default `FlatNamespace` mode):
+- ✅ File content (AEAD with per-file DEK; chunked files also carry per-chunk AAD)
+- ✅ File names and folder paths (server only sees CID-like `Qm…` keys; the forest index that maps the real path back is itself encrypted)
+- ✅ Directory structure (no `/` in storage keys; folder membership is only visible inside the encrypted forest)
+- ✅ User IDs (hashed via BLAKE3 KDF + path-specific key derivation)
+- ✅ Listings: the `list_files_from_forest` path decrypts the forest client-side; the server cannot answer `ls` queries with structural info
 
-**What remains visible**:
-- ⚠️ Bucket names
-- ⚠️ Approximate file sizes
-- ⚠️ Request timestamps
+**What remains visible to the gateway**:
+- ⚠️ Bucket names (not encrypted by design — they're routing identifiers)
+- ⚠️ Approximate ciphertext sizes (per-file for single-object; per-chunk for chunked — the 256 KB chunking partially smooths this for large files)
+- ⚠️ Request timestamps and access patterns
+- ⚠️ The existence of chunk objects at `{storage_key}.chunks/{index:08}` (the pattern reveals "this file is chunked" and roughly how many chunks)
 
 See [docs/PRIVACY.md](docs/PRIVACY.md) for full privacy policy.
 
 ### Large File Support (WNFS-inspired)
 
-For files larger than 5MB, use chunked upload for better memory efficiency and partial read support:
+Chunking is **automatic**. Anything larger than 768 KB (the `CHUNKED_THRESHOLD`, also the IPFS block-size safety ceiling) is split into 256 KB chunks by default, each sealed with its own AEAD tag bound to the file and chunk index (`fula:v4:chunk:{storage_key}:{index}`). You keep calling `put_object_encrypted`; the client picks the right path:
 
 ```rust
 use fula_client::EncryptedClient;
 
-// Large file - use chunked upload
-let large_data = std::fs::read("movie.mp4")?;
-if EncryptedClient::should_use_chunked(large_data.len()) {
-    client.put_object_chunked(
-        "my-bucket",
-        "/videos/movie.mp4",
-        &large_data,
-        Some(512 * 1024), // 512KB chunks (optional)
-    ).await?;
-}
+// Same API for small and large files — chunking is automatic.
+let data = std::fs::read("movie.mp4")?;
+client.put_object_encrypted("my-bucket", "/videos/movie.mp4", &data).await?;
 
-// Partial read - only downloads needed chunks
+// Partial read — only downloads the chunks covering the requested range.
 let partial = client.get_object_range(
     "my-bucket",
     "/videos/movie.mp4",
-    1024 * 1024,  // offset: 1MB
-    1024 * 1024,  // length: 1MB
+    1024 * 1024,  // offset: 1 MiB
+    1024 * 1024,  // length: 1 MiB
 ).await?;
+
+// Explicit chunked API is still available if you want to override the
+// default chunk size (clamped to [64 KB, 768 KB]):
+client.put_object_chunked("my-bucket", "/videos/movie.mp4", &data, Some(256 * 1024)).await?;
 ```
 
 **Benefits:**
-- Memory efficient: processes one chunk at a time
+- Memory efficient: chunks are decrypted and written one at a time (bounded window = 16 concurrent fetches)
 - Partial reads: download only the bytes you need
-- Resumable: failed uploads can restart from last chunk
-- Integrity: Bao hash tree for verified streaming
+- Resumable: failed uploads can restart from the last chunk (see `put_object_encrypted_resumable`)
+- Integrity: per-chunk AEAD + Bao root hash over the whole plaintext, verified on `finalize`
+- Downgrade-proof: the forest entry pins `min_version = 4`, so an attacker-authored legacy (no-AAD) blob at the same storage key is rejected on read (H-2)
 
 See [docs/wnfs-borrowed-features.md](docs/wnfs-borrowed-features.md) for implementation details.
 

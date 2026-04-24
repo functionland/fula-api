@@ -68,7 +68,8 @@ All observations and examples below are based on *current code* in these repos, 
       - `directories: HashMap<String, ForestDirectoryEntry>` with direct children.
       - Random `salt` used when generating flat storage keys.
     - Format versioning via `ForestFormat`:
-      - `FlatMapV1` (original) and `HamtV2` (HAMT with auto‑migration past a file‑count threshold).
+      - `FlatMapV1` (original monolithic HashMap), `HamtV2` (single monolithic HAMT, legacy), and **`ShardedHamtV7`** (current production): per-shard lazy-loaded HAMT with content-addressed node blobs under `__fula_forest_v7_nodes/<hex>` and atomic If-Match manifest PUTs. Intermediate variants v3–v6 were removed in commit `67d1f3b` ("remove v3-v6 unused code").
+      - Migration path `v1 → v7` is driven by `EncryptedClient::migrate_to_sharded` (WAL-guarded, heartbeat'd server-side lock, idempotent).
     - `ForestFileEntry::from_metadata` is derived from `PrivateMetadata` and `storage_key`.
   - Storage keys:
     - `generate_flat_key(original_path, dek, salt)` → CID‑like `Qm…` string (no `/` or plaintext hints).
@@ -132,7 +133,7 @@ All observations and examples below are based on *current code* in these repos, 
       - Optionally decrypt `EncryptedPrivateMetadata` for original path, size, timestamps, and user metadata.
     - Streaming path for large files (`put_object_chunked`, `get_object_chunked`, `get_object_range`):
       - Splits large files into AES‑GCM‑encrypted chunks uploaded as separate objects under `<storage_key>.chunks/<index>`.
-      - Uses an HPKE‑wrapped DEK stored in a small index object under the obfuscated storage key with `x-fula-chunked: true` and version 3 metadata.
+      - Uses an HPKE‑wrapped DEK stored in a small index object under the obfuscated storage key with `x-fula-chunked: true` and version **4** metadata (`format: "streaming-v2"`, per-chunk AAD `fula:v4:chunk:{storage_key}:{index}`). Legacy `streaming-v1` (no per-chunk AAD) and `version: 2` (no content AAD) are still decoded on read.
       - Supports partial reads and Bao‑verified streaming via chunked metadata and `ChunkedDecoder`/`VerifiedStreamingDecoder`.
     - PrivateForest integration:
       - `load_forest` / `save_forest` transparently maintain a per‑bucket encrypted index object (`x-fula-forest: true`) storing either a flat map or a HAMT‑backed index (with automatic migration for large forests).
@@ -517,9 +518,9 @@ Scores are **1–10**, where 10 is best given typical modern requirements. Score
   - Large files are split into AES‑GCM‑encrypted chunks (default 256KB), each stored as a separate object; a small index object under the obfuscated storage key contains HPKE‑wrapped DEK, chunk metadata, and Bao root hash.
   - Memory usage is O(chunk_size) and partial reads only download needed chunks; Bao‑based streaming verification detects corruption during download.
 - **Deep/wide trees:**
-  - In FlatNamespace mode, **one encrypted PrivateForest object per bucket** still holds all path and directory metadata, but the internal file index can now be HAMT‑backed (`ForestFormat::HamtV2`) for large forests.
-  - Listing or walking the tree still requires fetching and decrypting the index object, but internal operations (upserts/lookups) scale better for very large file sets.
-  - For huge, multi‑tenant deployments, sharding forests across buckets or further splitting index objects may still be desirable.
+  - In FlatNamespace mode the bucket's private forest is now a **sharded HAMT (`ForestFormat::ShardedHamtV7`)**: one manifest object plus many content-addressed per-shard HAMT node blobs (`__fula_forest_v7_nodes/<hex>`). Only the shards the client actually touches are fetched and decrypted, so listings and point lookups no longer require materializing the full forest.
+  - Legacy `FlatMapV1` / `HamtV2` monolithic forests are still readable; migration is driven by `migrate_to_sharded` (WAL-guarded, heartbeat'd server-side lock, idempotent).
+  - For multi-tenant deployments each tenant has their own bucket → their own forest, so sharding across buckets is already the on-disk reality.
 
 #### WNFS
 
@@ -668,9 +669,9 @@ From a security & feature perspective, after the latest updates Fula is much clo
   - WNFS: each private node has its own `Ratchet` → `TemporalKey` → `SnapshotKey`; compromise of one node's key doesn't expose others, and multi‑head revision graphs are well‑specified.
   - Fula: now has per‑object DEKs, subtree keys, and snapshot/temporal share modes, but no per‑node ratchets or multi‑head revision model. Forward secrecy still relies on KEK rotation, subtree rotation, and DEK randomness, which is acceptable for an object store but less granular than WNFS.
 
-- **2. Fully sharded forest structure with diff/merge for extremely large trees**
-  - WNFS: `HamtForest` shards the index across many nodes and supports `diff`/`merge` operations for synchronization and conflict resolution.
-  - Fula: `PrivateForest` supports a HAMT‑backed index (`ForestFormat::HamtV2`) with O(log N) operations, but the forest is still stored as a single encrypted index object per bucket. For extremely large per‑user trees or sophisticated sync scenarios, a fully sharded, diff/merge‑capable forest (or optional coarse sharding) would still be an improvement.
+- **2. Diff/merge at the forest level for multi-device conflict resolution**
+  - WNFS: `HamtForest` exposes `diff` and `merge` for multi-head revision reconciliation.
+  - Fula: `ForestFormat::ShardedHamtV7` already splits the forest across per-directory shards with content-addressed node blobs, so point lookups and single-shard writes don't materialize the whole tree. The remaining WNFS-style capability that Fula does not implement is **forest-level `diff` / `merge`** — when two clients write concurrently, the If-Match manifest PUT prevents lost writes but Fula re-reads the loser's changes rather than three-way merging them. This is the right tradeoff for an S3-compatible gateway (conflicts are rare per-object) but is a gap for multi-device filesystems with concurrent writers to the same directory.
 
 - **3. Deep filesystem‑level semantics (multi‑head merges, complex rename/move histories)**
   - WNFS: explicitly models revisions, multi‑head merges, and name accumulator semantics at the filesystem level.
@@ -687,7 +688,7 @@ These are **deliberate tradeoffs**: Fula optimizes for a secure, metadata‑hidi
 - ✅ **Secret link URL patterns**: `SecretLink` and `SecretLinkBuilder` keep share credentials in the URL fragment, ensuring gateways never see key material.
 - ✅ **Key rotation integration**: object metadata includes `kek_version`; `rewrap_object_dek()` and `rotate_bucket()` provide complete rotation workflows.
 - ✅ **Streaming encryption for large files**: `put_object_chunked`, `get_object_chunked`, and `get_object_range` implement chunked uploads, partial reads, and Bao‑verified streaming.
-- ✅ **HAMT‑backed forest index**: `PrivateForest` supports `ForestFormat::HamtV2` with `HamtIndex`, auto‑migrated for large forests.
+- ✅ **Sharded HAMT forest index (v7)**: `ForestFormat::ShardedHamtV7` in `sharded_hamt_forest.rs` splits the forest into per-directory shards with content-addressed node blobs and lazy per-shard loading. Legacy `FlatMapV1` / `HamtV2` monolithic forests are still readable; `migrate_to_sharded` handles the upgrade.
 
 
 ---

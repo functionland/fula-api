@@ -42,7 +42,7 @@
         <div class="sidebar-header">
             <div class="logo">
                 <h1>Fula API</h1>
-                <span class="version">v0.1.0</span>
+                <span class="version">v0.3.6</span>
             </div>
             <button class="theme-toggle" aria-label="Toggle theme">
                 <span class="icon-sun">☀️</span>
@@ -96,11 +96,11 @@
                 <h1>🔒 Security & Encryption</h1>
                 <p class="hero-subtitle">In-Depth Technical Documentation of Fula's Cryptographic Implementation</p>
                 <div class="hero-badges">
-                    <span class="badge-item">🛡️ Quantum-Safe</span>
-                    <span class="badge-item">🔐 HPKE (RFC 9180)</span>
-                    <span class="badge-item">⚡ AES-256-GCM</span>
-                    <span class="badge-item">🔑 X25519 + ML-KEM-768</span>
-                    <span class="badge-item">✅ BLAKE3</span>
+                    <span class="badge-item">🔐 HPKE (RFC 9180) over X25519</span>
+                    <span class="badge-item">⚡ AES-256-GCM (AAD-bound)</span>
+                    <span class="badge-item">🔑 ML-KEM-768 available (opt-in)</span>
+                    <span class="badge-item">✅ BLAKE3 + Bao</span>
+                    <span class="badge-item">🧭 Private forest (HAMT v7)</span>
                 </div>
             </div>
         </section>
@@ -135,72 +135,57 @@
                 </div>
 
                 <div class="crypto-stack">
-                    <h3>Cryptographic Primitives Stack</h3>
+                    <h3>Cryptographic Primitives (what the production client actually runs)</h3>
                     <table class="crypto-table">
                         <thead>
                             <tr>
                                 <th>Layer</th>
                                 <th>Algorithm</th>
-                                <th>Purpose</th>
-                                <th>Security Level</th>
+                                <th>Purpose &amp; binding</th>
+                                <th>Where in the code</th>
                             </tr>
                         </thead>
                         <tbody>
                             <tr class="highlight-row">
-                                <td>🛡️ Quantum-Safe KEM</td>
-                                <td><strong>X25519 + ML-KEM-768</strong></td>
-                                <td>Hybrid key encapsulation (classical + post-quantum)</td>
-                                <td>NIST Level 3 + 128-bit classical</td>
+                                <td>Key Encapsulation (default)</td>
+                                <td><strong>RFC 9180 HPKE over X25519</strong><br>(DHKEM X25519 + HkdfSha256 + ChaCha20-Poly1305)</td>
+                                <td>Wraps the per-file DEK for the owner's keypair and for share recipients. DEK-wrap AAD is <code>fula:v2:dek-wrap</code>; info parameter is <code>fula-storage-v2</code>.</td>
+                                <td><code>fula-crypto/src/hpke.rs</code></td>
                             </tr>
                             <tr>
-                                <td>Key Exchange</td>
-                                <td><strong>X25519</strong></td>
-                                <td>Classical Elliptic Curve Diffie-Hellman</td>
-                                <td>128-bit classical</td>
+                                <td>Content AEAD (single-object)</td>
+                                <td><strong>AES-256-GCM</strong> (default) or <strong>ChaCha20-Poly1305</strong></td>
+                                <td>Seals the file body. Nonce: 12 random bytes. Tag: 16 bytes. AAD: <code>fula:v4:content:{storage_key}</code> — an attacker cannot swap ciphertexts across storage keys.</td>
+                                <td><code>fula-crypto/src/symmetric.rs</code></td>
                             </tr>
                             <tr>
-                                <td>Post-Quantum KEM</td>
-                                <td><strong>ML-KEM-768 (Kyber)</strong></td>
-                                <td>NIST FIPS 203 lattice-based KEM</td>
-                                <td>192-bit post-quantum (NIST Level 3)</td>
+                                <td>Content AEAD (chunked, streaming-v2)</td>
+                                <td><strong>AES-256-GCM</strong> per chunk</td>
+                                <td>Default 256&nbsp;KB chunks (threshold 768&nbsp;KB). Per-chunk AAD: <code>fula:v4:chunk:{storage_key}:{index}</code>. Bao (BLAKE3 tree) root hash stored in metadata and re-verified at <code>finalize_and_verify</code>.</td>
+                                <td><code>fula-crypto/src/chunked.rs</code></td>
                             </tr>
                             <tr>
-                                <td>Key Derivation</td>
-                                <td><strong>HKDF-SHA256</strong></td>
-                                <td>Combine X25519 + ML-KEM shared secrets</td>
-                                <td>256-bit output</td>
+                                <td>Integrity — forest pin</td>
+                                <td><strong>Unkeyed BLAKE3</strong> over plaintext</td>
+                                <td>Written into the forest entry alongside <code>min_version: 4</code>. Defends against <em>(a)</em> a storage backend serving a differently-tagged-but-valid ciphertext, and <em>(b)</em> a backend serving a legacy (pre-AAD) blob at the same storage key (H-1 / H-2).</td>
+                                <td><code>fula-crypto/src/private_forest.rs</code></td>
                             </tr>
                             <tr>
-                                <td>Symmetric Encryption</td>
-                                <td><strong>AES-256-GCM</strong></td>
-                                <td>Authenticated encryption of data</td>
-                                <td>256-bit (quantum-resistant)</td>
+                                <td>Private index</td>
+                                <td><strong>Sharded HAMT v7</strong> (16-way trie, BLAKE3-keyed)</td>
+                                <td>Encrypted per-bucket index mapping real paths to scrambled storage keys. Per-shard lazy load. Manifest PUT uses If-Match for atomic swap. HAMT logic is vendored from <a href="https://github.com/wnfs-wg/rs-wnfs">rs-wnfs</a>; the encryption layer and shard routing are Fula's.</td>
+                                <td><code>fula-crypto/src/sharded_hamt_forest.rs</code>, <code>wnfs_hamt/</code></td>
                             </tr>
                             <tr>
-                                <td>Alternative Cipher</td>
-                                <td><strong>ChaCha20-Poly1305</strong></td>
-                                <td>Authenticated encryption (software-optimized)</td>
-                                <td>256-bit (quantum-resistant)</td>
-                            </tr>
-                            <tr>
-                                <td>Hashing</td>
-                                <td><strong>BLAKE3</strong></td>
-                                <td>Content addressing, integrity verification</td>
-                                <td>256-bit (quantum-resistant)</td>
-                            </tr>
-                            <tr>
-                                <td>Streaming Verification</td>
-                                <td><strong>Bao</strong></td>
-                                <td>Incremental integrity verification</td>
-                                <td>Merkle tree based</td>
+                                <td>Post-quantum KEM (opt-in)</td>
+                                <td><strong>hybrid_kem: X25519 + ML-KEM-768</strong><br>(libcrux-ml-kem, NIST FIPS 203)</td>
+                                <td>Available as a standalone primitive — same shape as the X25519 path, but combines the X25519 shared secret with the ML-KEM-768 shared secret via HKDF-SHA256. <strong>Not wired into the default <code>EncryptedClient</code> wrap path yet</strong>; applications can use it directly.</td>
+                                <td><code>fula-crypto/src/hybrid_kem.rs</code></td>
                             </tr>
                         </tbody>
                     </table>
                     <div class="quantum-note">
-                        <strong>🛡️ Post-Quantum Security:</strong> The hybrid X25519 + ML-KEM-768 approach provides defense-in-depth. 
-                        If quantum computers break X25519, ML-KEM-768 still protects your data. 
-                        If ML-KEM has unforeseen weaknesses, X25519 provides classical security.
-                        ML-KEM-768 is NIST FIPS 203 standardized (formerly Kyber768).
+                        <strong>Honest status on post-quantum:</strong> The default <code>EncryptedClient</code> wraps per-file DEKs with X25519 HPKE today. The hybrid X25519 + ML-KEM-768 primitive exists in <code>fula-crypto::hybrid_kem</code> and is exported, but it has no callers inside <code>fula-client</code>, <code>fula-flutter</code>, or <code>fula-js</code> as of v0.3.6. Wiring it into the default path is a planned follow-up. Applications that need PQ wrapping today can call <code>hybrid_encapsulate</code> / <code>hybrid_decapsulate</code> directly.
                     </div>
                 </div>
             </div>
