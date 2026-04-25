@@ -103,6 +103,8 @@ class RequestMetric:
     status_code: int = 0
     error: str = ""
     error_category: str = ""
+    retries: int = 0            # how many retries were attempted
+    was_stored: Optional[bool] = None  # phantom-success: set post-hoc by HEAD probe
 
 
 @dataclass
@@ -128,10 +130,28 @@ class TestResult:
         return [m for m in self.metrics if not m.success]
 
     @property
+    def phantom_success(self) -> list[RequestMetric]:
+        # Client got an error but HEAD later confirmed the object is stored.
+        return [m for m in self.metrics if (not m.success) and m.was_stored is True]
+
+    @property
+    def hard_failed(self) -> list[RequestMetric]:
+        # Genuine failures: no client success AND HEAD confirmed not stored,
+        # or HEAD was never run (treat unknown as hard failure for safety).
+        return [m for m in self.metrics if (not m.success) and m.was_stored is not True]
+
+    @property
     def success_rate(self) -> float:
         if not self.metrics:
             return 0.0
         return len(self.successful) / len(self.metrics) * 100
+
+    @property
+    def server_side_success_rate(self) -> float:
+        """Success rate including phantom-success (object stored, client missed response)."""
+        if not self.metrics:
+            return 0.0
+        return (len(self.successful) + len(self.phantom_success)) / len(self.metrics) * 100
 
     def _percentile(self, values: list[float], p: float) -> float:
         if not values:
@@ -199,13 +219,18 @@ CONCURRENCY_LEVELS = [1, 10, 50]
 S3_NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 
 
-def _timeout_for_size(size: int) -> aiohttp.ClientTimeout:
+def _timeout_for_size(size: int, concurrency: int = 1) -> aiohttp.ClientTimeout:
+    # Base timeout per-request; scaled up when many requests run in parallel
+    # because server-side queueing inflates tail latency for the last
+    # request in a batch.
     if size <= 64 * 1024:
-        return aiohttp.ClientTimeout(total=30, connect=10)
+        base = 30
     elif size <= 1 * 1024 * 1024:
-        return aiohttp.ClientTimeout(total=60, connect=10)
+        base = 90
     else:
-        return aiohttp.ClientTimeout(total=120, connect=10)
+        base = 300
+    scale = 1.0 + max(0, concurrency - 1) / 10.0
+    return aiohttp.ClientTimeout(total=int(base * scale), connect=15)
 
 
 def _categorize_error(exc: Exception | None, status: int) -> str:
@@ -293,13 +318,14 @@ class S3BenchmarkClient:
 
     # -- Object operations --------------------------------------------------
 
-    async def put_object(self, bucket: str, key: str, data: bytes) -> RequestMetric:
+    async def put_object(self, bucket: str, key: str, data: bytes, concurrency: int = 1) -> RequestMetric:
         metric = RequestMetric(operation="PUT", key=key, size=len(data))
         session = await self._get_session()
-        timeout = _timeout_for_size(len(data))
+        timeout = _timeout_for_size(len(data), concurrency)
         headers = self._headers({"Content-Type": "application/octet-stream"})
 
         retries = 0
+        max_retries = 3
         while True:
             try:
                 start = time.monotonic()
@@ -314,9 +340,10 @@ class S3BenchmarkClient:
                     metric.total_ms = (time.monotonic() - start) * 1000
                     metric.status_code = resp.status
 
-                    if resp.status == 429 and retries < 3:
+                    # Retry 429 and 5xx with exponential backoff (standard S3 client behavior)
+                    if (resp.status == 429 or 500 <= resp.status < 600) and retries < max_retries:
                         retries += 1
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(min(2 ** retries, 8) * 0.5)
                         continue
 
                     if 200 <= resp.status < 300:
@@ -333,16 +360,17 @@ class S3BenchmarkClient:
                 metric.error = str(exc)[:200]
                 metric.error_category = _categorize_error(exc, 0)
                 break
-
+        metric.retries = retries
         return metric
 
-    async def get_object(self, bucket: str, key: str, expected_size: int = 0) -> RequestMetric:
+    async def get_object(self, bucket: str, key: str, expected_size: int = 0, concurrency: int = 1) -> RequestMetric:
         metric = RequestMetric(operation="GET", key=key, size=expected_size)
         session = await self._get_session()
-        timeout = _timeout_for_size(expected_size)
+        timeout = _timeout_for_size(expected_size, concurrency)
         headers = self._headers()
 
         retries = 0
+        max_retries = 3
         while True:
             try:
                 start = time.monotonic()
@@ -356,9 +384,9 @@ class S3BenchmarkClient:
                     metric.total_ms = (time.monotonic() - start) * 1000
                     metric.status_code = resp.status
 
-                    if resp.status == 429 and retries < 3:
+                    if (resp.status == 429 or 500 <= resp.status < 600) and retries < max_retries:
                         retries += 1
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(min(2 ** retries, 8) * 0.5)
                         continue
 
                     if 200 <= resp.status < 300:
@@ -376,7 +404,7 @@ class S3BenchmarkClient:
                 metric.error = str(exc)[:200]
                 metric.error_category = _categorize_error(exc, 0)
                 break
-
+        metric.retries = retries
         return metric
 
     async def head_object(self, bucket: str, key: str) -> bool:
@@ -470,10 +498,25 @@ class BenchmarkRunner:
         """Issue a few throwaway requests to warm up connections."""
         self._log("  Warming up (3 requests)...")
         data = os.urandom(1024)
+        successes = 0
         for i in range(3):
             key = f"bench/_warmup/{uuid.uuid4().hex}"
-            await self.client.put_object(self.bucket, key, data)
+            m = await self.client.put_object(self.bucket, key, data)
+            if m.success:
+                successes += 1
+            else:
+                self._log(
+                    f"    warmup PUT failed: status={m.status_code} "
+                    f"category={m.error_category} err={m.error[:160]!r}"
+                )
             await self.client.delete_object(self.bucket, key)
+        self._log(f"  Warmup: {successes}/3 succeeded")
+        if successes == 0:
+            self._log(
+                "  WARNING: zero warmup successes. The benchmark will likely "
+                "report 0% across all phases. Check endpoint/auth/timeouts "
+                "before trusting the report."
+            )
 
     async def phase1_setup(self):
         self._log(f"[Phase 1/5] Setup: Creating bucket '{self.bucket}'...")
@@ -504,6 +547,44 @@ class BenchmarkRunner:
             metrics.append(m)
         return metrics
 
+    async def verify_phantom_puts(self, metrics: list[RequestMetric]) -> None:
+        """For each failed PUT, HEAD the key to see if the server stored it anyway.
+
+        This catches the common case where the client timed out or lost the
+        connection AFTER the server successfully stored the object. Sets
+        `metric.was_stored = True/False` on each failed PUT metric in place.
+        """
+        failed_puts = [m for m in metrics if m.operation == "PUT" and not m.success]
+        if not failed_puts:
+            return
+
+        sem = asyncio.Semaphore(20)
+
+        async def _probe(m: RequestMetric):
+            async with sem:
+                m.was_stored = await self.client.head_object(self.bucket, m.key)
+
+        await asyncio.gather(*(_probe(m) for m in failed_puts), return_exceptions=True)
+
+    def _summarize_failures(self, result: TestResult) -> Optional[str]:
+        """Build a one-line breakdown of failure categories, status codes,
+        phantom-success count, and a sample error. Returns None if no failures."""
+        if not result.failed:
+            return None
+        cats: dict[str, int] = {}
+        codes: dict[int, int] = {}
+        for m in result.failed:
+            cats[m.error_category or "unknown"] = cats.get(m.error_category or "unknown", 0) + 1
+            codes[m.status_code] = codes.get(m.status_code, 0) + 1
+        sample = next((m.error for m in result.failed if m.error), "")
+        phantom = len(result.phantom_success)
+        parts = [f"cats={cats}", f"codes={codes}"]
+        if phantom:
+            parts.append(f"phantom_stored={phantom}")
+        if sample:
+            parts.append(f"sample_err={sample[:120]!r}")
+        return "  FAIL breakdown: " + " ".join(parts)
+
     async def phase2_write_benchmark(self):
         self._log("[Phase 2/5] Write Benchmark (uploading objects):")
         for size_label, size_bytes in OBJECT_SIZES:
@@ -519,11 +600,16 @@ class BenchmarkRunner:
                     ops.append((key, data))
 
                 coro_funcs = [
-                    (lambda k=k, d=d: self.client.put_object(self.bucket, k, d))
+                    (lambda k=k, d=d, c=conc: self.client.put_object(self.bucket, k, d, c))
                     for k, d in ops
                 ]
 
                 metrics = await self.run_concurrent_ops(coro_funcs, conc)
+
+                # Before building the result, classify phantom-success for failed PUTs:
+                # objects that are stored server-side even though the client timed
+                # out or lost the connection waiting for the response.
+                await self.verify_phantom_puts(metrics)
 
                 result = TestResult(
                     label=label,
@@ -535,18 +621,27 @@ class BenchmarkRunner:
                 )
                 self.results.append(result)
 
+                # Record both real successes and phantom-successes so phase 3
+                # can read them back. Phantom-successes are real on the server;
+                # the benchmark just didn't see the response.
                 for m in metrics:
-                    if m.success:
+                    if m.success or m.was_stored is True:
                         self._uploaded_keys[size_label].append((m.key, size_bytes))
 
                 succ = len(result.successful)
                 total = result.total_ops
                 pct = result.success_rate
+                server_pct = result.server_side_success_rate
                 avg = result.ttfb_stats()["mean"]
+                phantom = len(result.phantom_success)
+                phantom_note = f" (+{phantom} phantom-stored = {server_pct:.0f}% server-side)" if phantom else ""
                 self._log(
                     f"  [Upload] {size_label}, {conc} parallel: "
-                    f"{succ}/{total} ({pct:.0f}%) avg={avg:.0f}ms"
+                    f"{succ}/{total} ({pct:.0f}%){phantom_note} avg={avg:.0f}ms"
                 )
+                breakdown = self._summarize_failures(result)
+                if breakdown:
+                    self._log(breakdown)
 
     async def phase3_read_benchmark(self):
         self._log("[Phase 3/5] Read Benchmark (downloading objects):")
@@ -563,7 +658,7 @@ class BenchmarkRunner:
                 chosen = [random.choice(available) for _ in range(num_ops)]
 
                 coro_funcs = [
-                    (lambda k=k, s=s: self.client.get_object(self.bucket, k, s))
+                    (lambda k=k, s=s, c=conc: self.client.get_object(self.bucket, k, s, c))
                     for k, s in chosen
                 ]
 
@@ -587,6 +682,9 @@ class BenchmarkRunner:
                     f"  [Download] {size_label}, {conc} parallel: "
                     f"{succ}/{total} ({pct:.0f}%) avg={avg:.0f}ms"
                 )
+                breakdown = self._summarize_failures(result)
+                if breakdown:
+                    self._log(breakdown)
 
     async def phase4_mixed_workload(self):
         self._log("[Phase 4/5] Mixed Workload (80% reads + 20% writes, 1MB objects):")
@@ -594,10 +692,8 @@ class BenchmarkRunner:
         available = self._uploaded_keys.get("1MB", [])
 
         for conc in CONCURRENCY_LEVELS:
-            total_ops = 100
             num_reads = 80
             num_writes = 20
-            label = f"Mixed 80/20 / {conc} parallel"
 
             ops = []
             for _ in range(num_reads):
@@ -616,36 +712,79 @@ class BenchmarkRunner:
 
             write_data_cache: dict[str, bytes] = {}
 
-            def _make_coro(op_type, key, sz):
+            def _make_coro(op_type, key, sz, c=conc):
                 if op_type == "GET":
-                    return lambda: self.client.get_object(self.bucket, key, sz)
+                    return lambda: self.client.get_object(self.bucket, key, sz, c)
                 else:
                     if key not in write_data_cache:
                         write_data_cache[key] = os.urandom(sz)
                     data = write_data_cache[key]
-                    return lambda: self.client.put_object(self.bucket, key, data)
+                    return lambda: self.client.put_object(self.bucket, key, data, c)
 
             coro_funcs = [_make_coro(ot, k, s) for ot, k, s in ops]
             metrics = await self.run_concurrent_ops(coro_funcs, conc)
 
+            # Classify phantom-stored objects for failed PUTs inside the mix.
+            await self.verify_phantom_puts(metrics)
+
             for m in metrics:
-                if m.operation == "PUT" and m.success:
+                if m.operation == "PUT" and (m.success or m.was_stored is True):
                     self._uploaded_keys.setdefault("1MB", []).append((m.key, mixed_size))
 
-            result = TestResult(
-                label=label,
+            # Split into per-operation results so TTFB / latency / throughput
+            # stats aren't averaged across two very different operations.
+            get_metrics = [m for m in metrics if m.operation == "GET"]
+            put_metrics = [m for m in metrics if m.operation == "PUT"]
+            phase_results = []
+            if get_metrics:
+                phase_results.append(TestResult(
+                    label=f"Mixed GETs / {conc} parallel",
+                    operation="GET",
+                    size_label="1MB",
+                    size_bytes=mixed_size,
+                    concurrency=conc,
+                    metrics=get_metrics,
+                ))
+            if put_metrics:
+                phase_results.append(TestResult(
+                    label=f"Mixed PUTs / {conc} parallel",
+                    operation="PUT",
+                    size_label="1MB",
+                    size_bytes=mixed_size,
+                    concurrency=conc,
+                    metrics=put_metrics,
+                ))
+            # Also keep a combined MIXED result for the top-line summary row.
+            combined = TestResult(
+                label=f"Mixed 80/20 / {conc} parallel",
                 operation="MIXED",
                 size_label="1MB",
                 size_bytes=mixed_size,
                 concurrency=conc,
                 metrics=metrics,
             )
-            self.results.append(result)
+            self.results.extend(phase_results)
+            self.results.append(combined)
 
-            succ = len(result.successful)
-            total = result.total_ops
-            pct = result.success_rate
-            self._log(f"  [Mixed] {conc} parallel: {succ}/{total} ({pct:.0f}%)")
+            succ = len(combined.successful)
+            total = combined.total_ops
+            pct = combined.success_rate
+            server_pct = combined.server_side_success_rate
+            phantom = len(combined.phantom_success)
+            phantom_note = f" (+{phantom} phantom-stored = {server_pct:.0f}% server-side)" if phantom else ""
+            self._log(f"  [Mixed] {conc} parallel: {succ}/{total} ({pct:.0f}%){phantom_note}")
+            for sub in phase_results:
+                s_succ = len(sub.successful)
+                s_total = sub.total_ops
+                s_pct = sub.success_rate
+                s_avg = sub.ttfb_stats()["mean"]
+                self._log(
+                    f"    └─ {sub.operation} subset: "
+                    f"{s_succ}/{s_total} ({s_pct:.0f}%) avg={s_avg:.0f}ms"
+                )
+            breakdown = self._summarize_failures(combined)
+            if breakdown:
+                self._log(breakdown)
 
     async def phase5_cleanup(self):
         self._log("[Phase 5/5] Cleanup:")
@@ -788,23 +927,31 @@ class ReportGenerator:
         lines.append("## Results at a Glance\n")
         lines.append(
             "Each row is one test scenario. "
-            '"TTFB" columns show how fast the server started responding; '
-            '"Throughput" shows the average transfer speed.\n'
+            '"Client Success" is what the benchmark observed end-to-end. '
+            '"Server Success" additionally counts "phantom-stored" objects — '
+            "uploads where the client lost the response (timeout/connection) but "
+            "the server had already stored the object (verified via HEAD). "
+            'When the two columns differ, the gap measures *response-path* issues, '
+            'not storage failures.\n'
         )
         lines.append(
-            "| Scenario | Requests | Success Rate | "
+            "| Scenario | Requests | Client Success | Server Success | "
             "Avg TTFB | Median (p50) | p90 | p95 | p99 | Avg Throughput |"
         )
         lines.append(
-            "|----------|----------|--------------|"
+            "|----------|----------|----------------|----------------|"
             "----------|--------------|-----|-----|-----|----------------|"
         )
 
         for r in self.results:
             ts = r.ttfb_stats()
             tp = r.throughput_stats()
+            server_pct = r.server_side_success_rate
+            server_cell = (
+                f"{server_pct:.1f}%" if server_pct != r.success_rate else "—"
+            )
             lines.append(
-                f"| {r.label} | {r.total_ops} | {r.success_rate:.1f}% "
+                f"| {r.label} | {r.total_ops} | {r.success_rate:.1f}% | {server_cell} "
                 f"| {ts['mean']:.0f} ms | {ts['p50']:.0f} ms | {ts['p90']:.0f} ms "
                 f"| {ts['p95']:.0f} ms | {ts['p99']:.0f} ms | {tp['mean']:.2f} MB/s |"
             )
@@ -874,14 +1021,30 @@ class ReportGenerator:
             "latency is expected. The key comparison is against IPFS gateways.\n"
         )
 
-        # Build comparison rows
+        # Build comparison rows — use Phase 2/3 pure-workload results only.
+        # The MIXED-split results (labels starting with "Mixed ") would otherwise
+        # overwrite pure numbers with numbers from a contended test.
         fula_get = {}
         fula_put = {}
         for r in self.results:
-            if r.operation == "GET" and r.concurrency == 1:
-                fula_get[r.size_label] = r.ttfb_stats()["p50"]
-            if r.operation == "PUT" and r.concurrency == 1:
-                fula_put[r.size_label] = r.ttfb_stats()["p50"]
+            if r.label.startswith("Mixed"):
+                continue
+            if r.concurrency != 1:
+                continue
+            p50 = r.ttfb_stats()["p50"]
+            if p50 <= 0:  # no successful samples
+                continue
+            if r.operation == "GET":
+                fula_get[r.size_label] = p50
+            elif r.operation == "PUT":
+                fula_put[r.size_label] = p50
+
+        def _fmt_fula(values: dict, key: str) -> str:
+            v = values.get(key)
+            # Distinguish "no successful samples" from "fast" — 0 ms is misleading
+            if v is None or v <= 0:
+                return "**n/a**"
+            return f"**{v:.0f} ms**"
 
         lines.append("### Download (GET) — Median TTFB at 1 parallel request\n")
         lines.append("| Service | 64 KB | 1 MB | 10 MB | Source |")
@@ -889,9 +1052,9 @@ class ReportGenerator:
         # Fula row
         lines.append(
             f"| **Fula S3 Gateway** | "
-            f"**{fula_get.get('64KB', 0):.0f} ms** | "
-            f"**{fula_get.get('1MB', 0):.0f} ms** | "
-            f"**{fula_get.get('10MB', 0):.0f} ms** | This benchmark |"
+            f"{_fmt_fula(fula_get, '64KB')} | "
+            f"{_fmt_fula(fula_get, '1MB')} | "
+            f"{_fmt_fula(fula_get, '10MB')} | This benchmark |"
         )
         for service, data in INDUSTRY_BENCHMARKS.items():
             g = data["GET"]
@@ -908,9 +1071,9 @@ class ReportGenerator:
         lines.append("|---------|-------|------|-------|--------|")
         lines.append(
             f"| **Fula S3 Gateway** | "
-            f"**{fula_put.get('64KB', 0):.0f} ms** | "
-            f"**{fula_put.get('1MB', 0):.0f} ms** | "
-            f"**{fula_put.get('10MB', 0):.0f} ms** | This benchmark |"
+            f"{_fmt_fula(fula_put, '64KB')} | "
+            f"{_fmt_fula(fula_put, '1MB')} | "
+            f"{_fmt_fula(fula_put, '10MB')} | This benchmark |"
         )
         for service, data in INDUSTRY_BENCHMARKS.items():
             p = data["PUT"]
@@ -931,7 +1094,8 @@ class ReportGenerator:
             if r.operation == "GET" and r.concurrency == 1 and r.throughput_stats()["mean"] > 0
         ]
         fula_tp = statistics.mean(fula_tp_vals) if fula_tp_vals else 0
-        lines.append(f"| **Fula S3 Gateway** | **{fula_tp:.1f}** | This benchmark |")
+        tp_cell = f"**{fula_tp:.1f}**" if fula_tp > 0 else "**n/a**"
+        lines.append(f"| **Fula S3 Gateway** | {tp_cell} | This benchmark |")
         for service, data in INDUSTRY_BENCHMARKS.items():
             tp = data.get("throughput_single", 0)
             src = _benchmark_source(service)
@@ -948,7 +1112,7 @@ class ReportGenerator:
         all_errors: dict[str, int] = {}
         for r in self.results:
             for cat, count in r.error_breakdown().items():
-                all_errors[cat] = all_errors.get(cat, 0) + 1
+                all_errors[cat] = all_errors.get(cat, 0) + count
 
         if all_errors:
             lines.append("## Error Summary\n")
@@ -964,24 +1128,80 @@ class ReportGenerator:
                 lines.append(f"| {name} | {count} | {explanation} |")
             lines.append("")
 
+        # -- Phantom-success (response-path issue) summary --
+        # Exclude MIXED combined row: its metrics are already counted in the
+        # split GET/PUT rows, so summing both would double-count.
+        non_combined = [r for r in self.results if r.operation != "MIXED"]
+        total_phantom = sum(len(r.phantom_success) for r in non_combined)
+        total_failed = sum(len(r.failed) for r in non_combined)
+        if total_phantom:
+            lines.append("## Phantom-Stored Uploads (Response-Path Issues)\n")
+            lines.append(
+                f"**{total_phantom} of {total_failed} failed uploads were actually "
+                f"stored by the server** — the object exists (verified via HEAD) "
+                "but the client never received a valid 2xx response within the "
+                "timeout. This indicates response-path latency (server processes "
+                "the request correctly but takes too long to send the response, "
+                "or the response is truncated). It is **not** a storage failure "
+                "and not a capacity failure. Typical causes:\n"
+            )
+            lines.append("- Synchronous backend work (e.g. IPFS pin / DAG build) that exceeds the client timeout")
+            lines.append("- Reverse-proxy / load-balancer prematurely closing responses")
+            lines.append("- HTTP keep-alive / chunked-encoding mishandling")
+            lines.append("")
+            lines.append(
+                "Action: raise the client-side timeout until phantom count drops "
+                "to ~0, or fix the server to acknowledge earlier (e.g. async pinning)."
+            )
+            lines.append("")
+
         # -- Conclusion --
         lines.append("## Conclusion\n")
-        total_ops = sum(r.total_ops for r in self.results)
-        total_success = sum(len(r.successful) for r in self.results)
+        # Only count each metric once: MIXED combined result double-counts
+        # its GET/PUT subsets that are also in self.results as separate rows.
+        totaling = [r for r in self.results if r.operation != "MIXED"]
+        total_ops = sum(r.total_ops for r in totaling)
+        total_success = sum(len(r.successful) for r in totaling)
+        total_phantom = sum(len(r.phantom_success) for r in totaling)
         overall_rate = (total_success / total_ops * 100) if total_ops else 0
+        server_side_rate = ((total_success + total_phantom) / total_ops * 100) if total_ops else 0
 
         lines.append(f"**Total requests made:** {total_ops}  ")
-        lines.append(f"**Overall success rate:** {overall_rate:.1f}%\n")
+        lines.append(f"**Client-observed success rate:** {overall_rate:.1f}%  ")
+        if total_phantom:
+            lines.append(
+                f"**Server-side success rate:** {server_side_rate:.1f}% "
+                f"(includes {total_phantom} phantom-stored uploads where the server "
+                "stored the object but the client lost the response)\n"
+            )
+        else:
+            lines.append("")
 
         checks = []
-        if overall_rate >= 99:
-            checks.append(f"PASS — Excellent reliability: {overall_rate:.1f}% success rate (target: >= 95%)")
-        elif overall_rate >= 95:
-            checks.append(f"PASS — Good reliability: {overall_rate:.1f}% success rate (target: >= 95%)")
+        # Use server-side rate for verdict when phantom-success was observed —
+        # the storage layer worked, the response path didn't.
+        verdict_rate = server_side_rate if total_phantom else overall_rate
+        verdict_label = "server-side success rate" if total_phantom else "success rate"
+        if verdict_rate >= 99:
+            checks.append(f"PASS — Excellent reliability: {verdict_rate:.1f}% {verdict_label} (target: >= 95%)")
+        elif verdict_rate >= 95:
+            checks.append(f"PASS — Good reliability: {verdict_rate:.1f}% {verdict_label} (target: >= 95%)")
         else:
-            checks.append(f"FAIL — Reliability below target: {overall_rate:.1f}% success rate (target: >= 95%)")
+            checks.append(f"FAIL — Reliability below target: {verdict_rate:.1f}% {verdict_label} (target: >= 95%)")
+        if total_phantom:
+            checks.append(
+                f"WARN — {total_phantom} uploads were stored server-side but failed on the client. "
+                "This is a response-path issue (see 'Phantom-Stored Uploads' section above); "
+                "storage is working but the client cannot confirm it within the current timeout."
+            )
 
-        read_results = [r for r in self.results if r.operation == "GET"]
+        # Only include pure-phase results in verdict averages (exclude Mixed
+        # splits and the combined MIXED row to avoid biasing the per-op TTFB
+        # with contended workload numbers).
+        read_results = [
+            r for r in self.results
+            if r.operation == "GET" and not r.label.startswith("Mixed")
+        ]
         if read_results:
             valid_ttfbs = [r.ttfb_stats()["mean"] for r in read_results if r.ttfb_stats()["mean"] > 0]
             if valid_ttfbs:
@@ -1007,7 +1227,10 @@ class ReportGenerator:
                         f"(exceeds typical IPFS uncached latency)"
                     )
 
-        write_results = [r for r in self.results if r.operation == "PUT"]
+        write_results = [
+            r for r in self.results
+            if r.operation == "PUT" and not r.label.startswith("Mixed")
+        ]
         if write_results:
             valid_ttfbs = [r.ttfb_stats()["mean"] for r in write_results if r.ttfb_stats()["mean"] > 0]
             if valid_ttfbs:
@@ -1088,8 +1311,16 @@ class ReportGenerator:
         COLOR_BOX_DOWNLOAD = "#F0A975" # light orange
         COLOR_BOX_MIXED = "#A8D5A2"    # light green
 
-        write_results = [r for r in self.results if r.operation == "PUT"]
-        read_results = [r for r in self.results if r.operation == "GET"]
+        # Charts 1 and 2 show pure upload vs download; exclude MIXED splits
+        # so the bars reflect Phase 2 / Phase 3 data, not contended workload.
+        write_results = [
+            r for r in self.results
+            if r.operation == "PUT" and not r.label.startswith("Mixed")
+        ]
+        read_results = [
+            r for r in self.results
+            if r.operation == "GET" and not r.label.startswith("Mixed")
+        ]
 
         # --- Chart 1: TTFB Comparison with industry reference lines ---
         fname = "benchmark_ttfb_comparison.png"
