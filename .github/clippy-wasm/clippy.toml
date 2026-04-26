@@ -1,0 +1,11 @@
+# WASM-only clippy configuration.
+#
+# Loaded by the `test-wasm` job in flutter-ci.yml via CLIPPY_CONF_DIR. Bans
+# stdlib time APIs that compile cleanly on wasm32-unknown-unknown but panic at
+# runtime with "time not implemented on this platform". Native clippy never
+# loads this file, so heartbeat/WAL/retry-backoff code that's
+# `#[cfg(not(target_arch = "wasm32"))]`-gated remains free to use SystemTime.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "panics on wasm32; use web_time::Instant::now()" },
+    { path = "std::time::SystemTime::now", reason = "panics on wasm32; use fula_crypto::time::now_timestamp() or web_time" },
+]

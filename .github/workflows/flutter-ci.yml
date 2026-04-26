@@ -41,11 +41,14 @@ jobs:
           shared-key: rust-ci
 
       - name: Run Rust tests
-        run: |
-          cargo test -p fula-flutter --lib
-          cargo test -p fula-js --lib
-          cargo test -p fula-client --lib
-          cargo test -p fula-crypto --lib
+        # `--workspace --all-targets` covers lib + integration tests under each
+        # crate's tests/ AND the workspace-root tests/. The previous
+        # `-p X --lib` form silently excluded tests/migration_tests.rs and the
+        # rest of the integration suite, so bugs that integration tests would
+        # have caught (including v1→v7 migration correctness on native) never
+        # gated PRs. `--no-fail-fast` lets every failure report on the first
+        # run with the broader scope.
+        run: cargo test --workspace --all-targets --no-fail-fast
 
   # Test WASM compilation (fula-js npm package)
   test-wasm:
@@ -78,6 +81,46 @@ jobs:
           grep -q "getDecrypted" crates/fula-js/pkg/fula_js.d.ts
           grep -q "deriveKey" crates/fula-js/pkg/fula_js.d.ts
           echo "All expected exports found!"
+
+      # Layer 1: ban panic-on-wasm stdlib time APIs at compile time.
+      # The disallowed-methods config lives at `.github/clippy-wasm/clippy.toml`
+      # and is loaded only here via `CLIPPY_CONF_DIR`, so native clippy never
+      # sees the bans (cfg(not(target_arch = "wasm32"))-gated heartbeat / WAL /
+      # retry-backoff code in encryption.rs is free to keep using SystemTime).
+      # Two clippy invocations are needed because fula-crypto's default features
+      # include `tokio-runtime`, which doesn't compile on wasm32. The other
+      # crates pull fula-crypto with `default-features = false, features = ["wasm"]`
+      # via target-conditional deps, but a direct `-p fula-crypto` would use its
+      # own defaults. We use `-D clippy::disallowed_methods` (not `-D warnings`)
+      # to scope the failure mode to the panic-on-wasm bug class only — pre-existing
+      # style/idiom warnings in the workspace shouldn't gate this PR.
+      #
+      # `--lib` only: integration tests under `tests/` pull in tokio with full
+      # features and don't compile on wasm32. The lint applies to library code,
+      # which is what actually ships into the browser bundle.
+      - name: WASM clippy — fula-client / fula-flutter / fula-js
+        env:
+          CLIPPY_CONF_DIR: ${{ github.workspace }}/.github/clippy-wasm
+        run: |
+          cargo clippy --target wasm32-unknown-unknown \
+            -p fula-client -p fula-flutter -p fula-js \
+            --lib -- -D clippy::disallowed_methods
+
+      - name: WASM clippy — fula-crypto (forced wasm features)
+        env:
+          CLIPPY_CONF_DIR: ${{ github.workspace }}/.github/clippy-wasm
+        run: |
+          cargo clippy --target wasm32-unknown-unknown \
+            -p fula-crypto --no-default-features --features wasm \
+            --lib -- -D clippy::disallowed_methods
+
+      # Layer 2: actually exercise the time wiring at runtime in a browser.
+      # Catches dependency-config regressions clippy can't see (e.g. someone
+      # later sets default-features = false on chrono and drops `wasmbind`).
+      - name: Install Firefox + geckodriver for wasm-pack test
+        uses: browser-actions/setup-firefox@v1
+      - name: WASM runtime smoke tests
+        run: wasm-pack test --headless --firefox crates/fula-flutter
 
   # Generate and validate Dart bindings
   generate-bindings:

@@ -53,6 +53,9 @@ async-lock = "3.4"
 [dev-dependencies]
 # For WASM tests
 wasm-bindgen-test = "0.3"
+# Used by tests/wasm_time_smoke.rs to assert that the wasm-incompat stdlib
+# time APIs aren't re-introduced into the migration path.
+web-time = "1"
 
 [features]
 default = []
