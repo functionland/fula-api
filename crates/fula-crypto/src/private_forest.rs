@@ -289,10 +289,7 @@ impl PrivateForest {
         let mut salt = vec![0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut salt);
         
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = crate::time::now_timestamp();
 
         let mut directories = HashMap::new();
         directories.insert("/".to_string(), ForestDirectoryEntry {
@@ -368,10 +365,7 @@ impl PrivateForest {
 
     /// Update the modified timestamp
     fn touch(&mut self) {
-        self.modified_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        self.modified_at = crate::time::now_timestamp();
     }
 
     /// Generate a storage key for a new file
@@ -1128,10 +1122,7 @@ impl ManifestRoot {
         let mut shard_salt = vec![0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut shard_salt);
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = crate::time::now_timestamp();
 
         Self {
             version: 7,
@@ -1356,10 +1347,7 @@ impl ShardManifestV7 {
 
     /// Refresh the modified timestamp.
     pub fn touch(&mut self) {
-        self.root.modified_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        self.root.modified_at = crate::time::now_timestamp();
     }
 
     /// Total entries across all shards (O(num_shards), not O(N)).

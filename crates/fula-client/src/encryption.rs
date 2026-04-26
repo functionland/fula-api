@@ -3592,7 +3592,12 @@ impl EncryptedClient {
         forest_dek: &fula_crypto::keys::DekKey,
         v1_etag_hint: Option<&str>,
     ) -> Result<MigrationOutcome> {
-        let start = std::time::Instant::now();
+        // `web_time::Instant` is std::time::Instant on native and a
+        // performance.now()-backed shim on wasm32-unknown-unknown, so this
+        // call is safe on every target the workspace supports. Using
+        // std::time::Instant here panics in browser WASM with "time not
+        // implemented on this platform".
+        let start = web_time::Instant::now();
         let index_key = derive_index_key(forest_dek, bucket);
 
         // ── Step 0: WAL defer ────────────────────────────────────────────────

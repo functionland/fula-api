@@ -19,6 +19,12 @@ futures = { workspace = true }
 
 # Time
 chrono = { workspace = true }
+# Drop-in replacement for std::time::Instant that uses performance.now() on
+# wasm32-unknown-unknown. std::time::Instant::now() panics in browser WASM
+# ("time not implemented on this platform"), which broke the v1→v7 forest
+# migration path on the web target. On native targets web-time delegates to
+# std, so this is a transparent shim.
+web-time = "1"
 
 # Utilities
 bytes = { workspace = true }
