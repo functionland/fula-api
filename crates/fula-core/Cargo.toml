@@ -51,7 +51,3 @@ test-log = { workspace = true }
 tempfile = { workspace = true }
 rstest = { workspace = true }
 tokio-test = "0.4"
-
-[[bench]]
-name = "prolly_benchmarks"
-harness = false

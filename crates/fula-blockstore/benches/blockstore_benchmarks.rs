@@ -1,8 +1,7 @@
 //! Benchmarks for BlockStore operations
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use fula_blockstore::{BlockStore, memory::MemoryBlockStore};
-use fula_blockstore::chunking::Chunker;
+use fula_blockstore::{BlockStore, memory::MemoryBlockStore, Chunker, ChunkerConfig};
 
 fn generate_data(size: usize) -> Vec<u8> {
     (0..size).map(|i| (i % 256) as u8).collect()
@@ -63,9 +62,11 @@ fn bench_chunking(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(*size as u64));
         group.bench_with_input(BenchmarkId::new("fixed", size), size, |b, _| {
             b.iter(|| {
-                let chunker = Chunker::fixed(256 * 1024);
-                let chunks: Vec<_> = chunker.chunk(&data).collect();
-                black_box(chunks)
+                let chunker = Chunker::with_config(
+                    ChunkerConfig::with_chunk_size(256 * 1024).unwrap(),
+                );
+                let result = chunker.chunk_bytes(&data);
+                black_box(result)
             });
         });
     }
