@@ -130,9 +130,16 @@ pub async fn put_object(
         metadata = metadata.with_content_type(ct);
     }
 
-    // Extract user metadata (x-amz-meta-*)
+    // Extract user metadata (x-amz-meta-*).
+    // Internal Fula control headers (consumed by the handler, not stored as
+    // object metadata) are filtered out — they would otherwise pollute every
+    // object's persisted metadata.
+    const FULA_CONTROL_HEADERS: &[&str] = &["fula-bucket-lookup-h"];
     for (name, value) in headers.iter() {
         if let Some(key) = name.as_str().strip_prefix("x-amz-meta-") {
+            if FULA_CONTROL_HEADERS.contains(&key) {
+                continue;
+            }
             if let Ok(v) = value.to_str() {
                 metadata = metadata.with_user_metadata(key, v);
             }
@@ -145,13 +152,71 @@ pub async fn put_object(
             tracing::error!(error = %e, key = %key, "Failed to put object");
             e
         })?;
-    
+
     tracing::debug!("Flushing bucket");
     let bucket_root_cid = bucket.flush().await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to flush bucket");
             e
         })?;
+
+    // Phase 1.2 of master-independent reads: if the SDK included
+    // `x-amz-meta-fula-bucket-lookup-h` (only set on the Phase 2 manifest
+    // root PUT in `save_sharded_hamt_forest`), populate the bucket-level
+    // `bucket_lookup_h` field if currently None. Idempotent — never
+    // overwrites. Gated by env so we can stage the rollout: SDK always
+    // sends the header (cheap); master only consumes it when ready.
+    //
+    // Failures are non-fatal — bad/missing headers must not break uploads.
+    // Placement: AFTER bucket.flush() (so the flush has already replaced
+    // the DashMap entry) and BEFORE persist_registry_with_token (so the
+    // updated field gets serialized into the registry CBOR on this same
+    // request, no extra IPFS write).
+    let buckets_index_enabled = std::env::var("FULA_BUCKET_LOOKUP_H_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if buckets_index_enabled {
+        if let Some(hex_str) = headers
+            .get("x-amz-meta-fula-bucket-lookup-h")
+            .and_then(|v| v.to_str().ok())
+        {
+            match hex::decode(hex_str) {
+                Ok(bytes) if bytes.len() == 16 => {
+                    let mut lookup_h = [0u8; 16];
+                    lookup_h.copy_from_slice(&bytes);
+                    match state.bucket_manager.populate_lookup_h_if_missing(
+                        &session.hashed_user_id,
+                        &bucket_name,
+                        lookup_h,
+                    ) {
+                        Ok(true) => tracing::debug!(
+                            bucket = %bucket_name,
+                            "Populated bucket_lookup_h (Phase 1.2)"
+                        ),
+                        Ok(false) => { /* already set; idempotent skip */ }
+                        // BucketNotFound on a successful PUT to a real bucket
+                        // is an internal-consistency violation — promote to
+                        // error level so operators notice the signal.
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            bucket = %bucket_name,
+                            user = %session.hashed_user_id,
+                            "populate_lookup_h_if_missing failed on a bucket that just accepted a PUT"
+                        ),
+                    }
+                }
+                Ok(other) => tracing::warn!(
+                    actual_len = other.len(),
+                    "x-amz-meta-fula-bucket-lookup-h: expected 16-byte hex (32 chars), got {} bytes",
+                    other.len()
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "Failed to hex-decode x-amz-meta-fula-bucket-lookup-h"
+                ),
+            }
+        }
+    }
 
     // Persist the bucket registry so the new root CID survives restarts.
     // This MUST succeed — otherwise the new tree root is lost on restart.

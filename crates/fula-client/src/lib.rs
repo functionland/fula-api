@@ -37,10 +37,15 @@
 //! }
 //! ```
 
+#[cfg(not(target_arch = "wasm32"))]
+mod block_cache;
 mod client;
 mod config;
 mod encryption;
 mod error;
+#[cfg(not(target_arch = "wasm32"))]
+mod gateway_fetch;
+mod health_gate;
 mod multipart;
 mod types;
 #[cfg(not(target_arch = "wasm32"))]

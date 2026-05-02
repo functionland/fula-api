@@ -98,6 +98,14 @@ pub enum ClientError {
     /// re-enter the load-time migration path.
     #[error("Migration lock held for bucket {bucket} (expires at {expires_at} ms)")]
     MigrationLockHeld { bucket: String, expires_at: i64 },
+
+    /// Phase 2.1 of master-independent reads: the SDK's health gate
+    /// observed master is unreachable and short-circuited the request.
+    /// Phase 2.4 will catch this variant and trigger the gateway-race
+    /// fallback. Standalone (Phase 2.1 only), this turns "wait 3s for
+    /// timeout" into "fast-fail with a clear signal."
+    #[error("Master unreachable (health gate; down for ~{down_for_secs}s)")]
+    MasterUnreachable { down_for_secs: u64 },
 }
 
 impl ClientError {

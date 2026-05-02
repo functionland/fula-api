@@ -2902,6 +2902,26 @@ impl EncryptedClient {
         Ok(())
     }
 
+    /// Phase 1.2 of master-independent reads: compute the blinded bucket
+    /// lookup key as hex for the `x-amz-meta-fula-bucket-lookup-h` header.
+    ///
+    /// `bucket_lookup_h = BLAKE3(MetadataKey || bucket_name)[..16]`, where
+    /// `MetadataKey = derive_path_key("fula-metadata-v1")`. Hex-encoded
+    /// (32 chars). The 16-byte truncation matches master's `hashed_user_id`
+    /// convention. Master never sees `MetadataKey`.
+    ///
+    /// Attached on every manifest root commit (sharded v7, monolithic v4,
+    /// and the v1→v7 migration path) so master's put_object handler can
+    /// populate `BucketMetadata.bucket_lookup_h` regardless of which forest
+    /// format the SDK is using. Idempotent on master's side.
+    fn compute_bucket_lookup_h_hex(&self, bucket: &str) -> String {
+        let metadata_key = self.encryption.key_manager.derive_path_key("fula-metadata-v1");
+        let mut input = metadata_key.as_bytes().to_vec();
+        input.extend_from_slice(bucket.as_bytes());
+        let hash = blake3::hash(&input);
+        hex::encode(&hash.as_bytes()[..16])
+    }
+
     /// Save the private forest index for a bucket (monolithic v4 format with AAD+sequence)
     pub async fn save_forest(&self, bucket: &str, forest: &PrivateForest) -> Result<()> {
         let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
@@ -2924,8 +2944,11 @@ impl EncryptedClient {
         let data = encrypted.to_bytes()
             .map_err(ClientError::Encryption)?;
 
+        // Phase 1.2: monolithic v4 forest is also a manifest-root commit.
+        // Same header semantics as save_sharded_hamt_forest's Phase 2 PUT.
         let metadata = ObjectMetadata::new()
-            .with_content_type("application/octet-stream");
+            .with_content_type("application/octet-stream")
+            .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket));
 
         let put_result = self.inner.put_object_with_metadata_conditional(
             bucket,
@@ -3237,8 +3260,11 @@ impl EncryptedClient {
         let data = encrypted_manifest.to_bytes()
             .map_err(ClientError::Encryption)?;
 
+        // Phase 1.2: sharded HAMT v7 manifest root commit. See
+        // compute_bucket_lookup_h_hex for header semantics.
         let metadata = ObjectMetadata::new()
-            .with_content_type("application/octet-stream");
+            .with_content_type("application/octet-stream")
+            .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket));
 
         let put_result = self.inner.put_object_with_metadata_conditional(
             bucket,
@@ -3956,11 +3982,20 @@ impl EncryptedClient {
         // our HEAD (or GET) and this PUT loses the race — we defer and retry
         // next session. Crucial because the in-process `migration_lock.write()`
         // is NOT held during load-time-triggered migration.
+        //
+        // Phase 1.2: v1→v7 migration is a manifest-root commit. Attach the
+        // bucket-lookup-h header so master can populate `bucket_lookup_h`
+        // here too — otherwise users who migrate to v7 via this path (rather
+        // than save_sharded_hamt_forest) would never get their lookup_h set.
         let put_result = match self.inner.put_object_with_metadata_conditional(
             bucket,
             &index_key,
             Bytes::from(manifest_data),
-            Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
+            Some(
+                ObjectMetadata::new()
+                    .with_content_type("application/octet-stream")
+                    .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket)),
+            ),
             Some(&v1_etag),
             None,
         ).await {

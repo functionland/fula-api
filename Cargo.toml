@@ -169,6 +169,12 @@ lru = "0.12"
 semver = "1.0"
 bitvec = "1.0"
 
+# Embedded persistent KV (block cache, Phase 2.2 of master-independent reads).
+# Pinned to 2.6.x to avoid silent file-format drift in routine cargo update.
+# A 2.x bump is a deliberate decision (verify file-format compatibility before
+# upgrading; cache files in production may need migration handling).
+redb = "~2.6"
+
 # Testing
 criterion = "0.5"
 proptest = "1.5"

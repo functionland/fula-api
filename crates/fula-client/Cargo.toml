@@ -48,6 +48,14 @@ reqwest = { workspace = true }
 uuid = { workspace = true }
 fs2 = "0.4"
 dirs = "5"
+# Embedded persistent KV for the BlockCache (Phase 2.2 of master-independent reads).
+# Native-only — wasm builds skip the cache (no persistent storage there anyway).
+redb = { workspace = true }
+cid = { workspace = true }
+# CID verification on gateway-fetched bytes (Phase 2.3 of master-independent reads).
+sha2 = { workspace = true }
+# Mutex for per-gateway state in gateway_fetch (Phase 2.3).
+parking_lot = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # WASM: disable default features (no tokio), enable wasm feature

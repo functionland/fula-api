@@ -2,11 +2,13 @@
 
 use crate::{
     Config, ClientError, Result,
+    health_gate::{HealthGate, GateDecision},
     types::*,
 };
 use bytes::Bytes;
 use reqwest::{Client, Response, header};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, instrument};
 
 /// Fula storage client
@@ -14,6 +16,12 @@ use tracing::{debug, instrument};
 pub struct FulaClient {
     config: Config,
     http: Client,
+    /// Phase 2.1 of master-independent reads. `Some` when
+    /// `Config::health_gate_enabled = true`; shared across all clones via
+    /// `Arc` so a failure observed in one task immediately silences the
+    /// rest. `None` when the feature is off — request path then runs
+    /// exactly as before (backward-compat).
+    health_gate: Option<Arc<HealthGate>>,
 }
 
 impl FulaClient {
@@ -34,7 +42,13 @@ impl FulaClient {
 
         let http = builder.build().map_err(ClientError::Http)?;
 
-        Ok(Self { config, http })
+        let health_gate = if config.health_gate_enabled {
+            Some(Arc::new(HealthGate::new(config.health_gate_ttl)))
+        } else {
+            None
+        };
+
+        Ok(Self { config, http, health_gate })
     }
 
     /// Create with default configuration
@@ -460,8 +474,24 @@ impl FulaClient {
         headers: Option<HashMap<String, String>>,
         body: Option<Bytes>,
     ) -> Result<Response> {
+        // Phase 2.1: consult the health gate before sending. When Down +
+        // within TTL, short-circuit with MasterUnreachable so the caller
+        // doesn't pay the per-read timeout. When the TTL has elapsed the
+        // gate auto-allows a probe through.
+        if let Some(gate) = &self.health_gate {
+            if let GateDecision::ShortCircuit { down_for_secs } = gate.decide() {
+                debug!(
+                    method = %method,
+                    path = %path,
+                    "health gate Down → short-circuiting (down_for_secs={})",
+                    down_for_secs
+                );
+                return Err(ClientError::MasterUnreachable { down_for_secs });
+            }
+        }
+
         let url = format!("{}{}", self.config.endpoint, path);
-        
+
         let mut req = match method {
             "GET" => self.http.get(&url),
             "PUT" => self.http.put(&url),
@@ -494,10 +524,36 @@ impl FulaClient {
         }
 
         debug!("Sending {} request to {}", method, url);
-        let response = req.send().await?;
+        let response = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // Connection-level error (refused, RST, DNS, timeout). Treat
+                // as a master-down signal for the gate's purposes. Returning
+                // the original error preserves caller diagnostics.
+                if let Some(gate) = &self.health_gate {
+                    gate.record_failure();
+                }
+                return Err(ClientError::Http(e));
+            }
+        };
 
         // Check for errors
         let status = response.status();
+
+        // Phase 2.1: classify the response status for the health gate.
+        //   5xx → master-side failure → record_failure
+        //   4xx → request-level (auth, not-found, precondition, etc.); NOT
+        //         a master-down signal — the server responded, the request
+        //         was just bad. Don't touch the gate.
+        //   2xx/3xx → success → record_success (also clears any prior Down)
+        if let Some(gate) = &self.health_gate {
+            if status.is_server_error() {
+                gate.record_failure();
+            } else if status.is_success() {
+                gate.record_success();
+            }
+        }
+
         if !status.is_success() {
             // 412 Precondition Failed surfaces as ConcurrentModification so
             // callers using If-Match / If-None-Match can retry distinctly.

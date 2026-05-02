@@ -8,6 +8,7 @@ pub mod multipart;
 pub mod object;
 pub mod service;
 pub mod tagging;
+pub mod users_index_publisher;
 
 pub use admin::*;
 pub use batch::*;

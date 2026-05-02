@@ -43,6 +43,17 @@ pub struct Config {
     /// mid-stream per-chunk AEAD + size check in the engine itself, so the
     /// ceiling is an allocation guard, not a security boundary.
     pub buffered_download_max_bytes: u64,
+
+    /// Phase 2.1 of master-independent reads: enable the master health
+    /// gate. Off by default (backward-compat). When on, the SDK observes
+    /// request outcomes and short-circuits with `MasterUnreachable` after
+    /// two consecutive failures, instead of paying the per-read timeout.
+    pub health_gate_enabled: bool,
+
+    /// TTL of the `Down` state when `health_gate_enabled = true`. After
+    /// this duration elapses, the next request is allowed through as a
+    /// probe (without resetting state — only an observed success resets).
+    pub health_gate_ttl: Duration,
 }
 
 impl Default for Config {
@@ -58,6 +69,8 @@ impl Default for Config {
             multipart_chunk_size: 256 * 1024,       // 256 KB (must be < 1MB for IPFS)
             per_chunk_download_timeout: Duration::from_secs(300), // 5 min
             buffered_download_max_bytes: 256 * 1024 * 1024,       // 256 MB
+            health_gate_enabled: false, // backward-compat: off by default
+            health_gate_ttl: Duration::from_secs(30),
         }
     }
 }

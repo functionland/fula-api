@@ -1,0 +1,1450 @@
+//! Phase 3.2 master-side users-index publisher.
+//!
+//! Builds a global users-index CBOR mapping every active user's
+//! `userKey` (= `hashed_user_id`) to that user's per-user
+//! `bucketsIndex` CID, pins it via the existing pinning chain
+//! (cluster), and publishes the new CID via IPNS for SDK clients to
+//! resolve during master-down cold-starts.
+//!
+//! This module owns three responsibilities:
+//!
+//! 1. **State persistence** (this file, A1) — a tiny 3-line text file
+//!    that survives master restarts: `(latest_global_cid, sequence,
+//!    updated_at_unix)`. Crash safety mirrored from
+//!    `BucketManager::persist_registry_internal` (atomic write +
+//!    `.bak` backup). Sequence is monotonic; it only increments.
+//!
+//! 2. **Tick logic** (A2 — coming next) — snapshot
+//!    `BucketManager.buckets`, build per-user bucketsIndex CBORs
+//!    only for users whose state changed since the last tick (diff
+//!    cache), build the global users-index CBOR, pin both via cluster.
+//!
+//! 3. **IPNS publish + internal endpoints** (A3 — after A2) — call
+//!    kubo `/api/v0/name/publish`; expose `GET /_internal/users-index-state`
+//!    for the daily chain cron in `mainnet-reward-server`.
+//!
+//! Background-task lifecycle mirrors `handlers::locks::start_sweeper`:
+//! one `tokio::spawn` from `server::run_server` after `AppState` is
+//! wrapped in `Arc`. The task lives for the process lifetime.
+
+#![allow(dead_code)] // A3 will consume `internal_token`
+
+use anyhow::Result as AnyResult;
+use cid::Cid;
+use fula_blockstore::{BlockStore, PinStore};
+use fula_core::{metadata::BucketMetadata, BucketManager};
+use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// State that persists across master restarts. Single source of truth
+/// for "what did we last successfully publish?". Written **after** a
+/// successful pin + IPNS publish. Read on startup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedState {
+    /// CID of the most recently pinned global users-index CBOR.
+    /// `None` = nothing has been published yet (fresh master).
+    pub global_cid: Option<Cid>,
+    /// Monotonic sequence number embedded in the most recent global
+    /// users-index CBOR's payload. Always increments. SDK clients
+    /// reject responses with a regression as a replay defense.
+    pub sequence: u64,
+    /// Wall-clock seconds-since-epoch when the most recent publish
+    /// committed. Used for diagnostics and for the
+    /// `/_internal/users-index-state` HTTP response.
+    pub updated_at_unix: u64,
+}
+
+impl Default for PersistedState {
+    fn default() -> Self {
+        Self {
+            global_cid: None,
+            sequence: 0,
+            updated_at_unix: 0,
+        }
+    }
+}
+
+impl PersistedState {
+    /// Load state from `path`. Returns `Ok(default)` if the file
+    /// doesn't exist (fresh master). Returns an error on any other
+    /// I/O failure or parse problem — the caller surfaces this so
+    /// the operator can fix it (e.g., truncated file from a
+    /// half-completed write).
+    ///
+    /// Format: 3 lines separated by `\n`:
+    ///   line 1 = CID string (or empty for `None`)
+    ///   line 2 = sequence (u64 decimal)
+    ///   line 3 = updated_at_unix (u64 decimal); optional — older
+    ///            two-line files parse to `updated_at_unix = 0`
+    pub fn load(path: &Path) -> Result<Self, PersistError> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(e) => return Err(PersistError::Io(e)),
+        };
+        Self::parse(&raw)
+    }
+
+    fn parse(raw: &str) -> Result<Self, PersistError> {
+        let mut lines = raw.lines();
+        let cid_line = lines.next().unwrap_or("").trim();
+        let seq_line = lines.next().unwrap_or("").trim();
+        let ts_line = lines.next().unwrap_or("").trim();
+
+        let global_cid = if cid_line.is_empty() {
+            None
+        } else {
+            Some(cid_line.parse::<Cid>().map_err(|e| {
+                PersistError::Parse(format!("invalid CID '{}': {}", cid_line, e))
+            })?)
+        };
+
+        let sequence: u64 = if seq_line.is_empty() {
+            0
+        } else {
+            seq_line.parse().map_err(|e| {
+                PersistError::Parse(format!("invalid sequence '{}': {}", seq_line, e))
+            })?
+        };
+
+        let updated_at_unix: u64 = if ts_line.is_empty() {
+            0
+        } else {
+            ts_line.parse().map_err(|e| {
+                PersistError::Parse(format!("invalid updated_at '{}': {}", ts_line, e))
+            })?
+        };
+
+        Ok(Self {
+            global_cid,
+            sequence,
+            updated_at_unix,
+        })
+    }
+
+    fn serialize(&self) -> String {
+        format!(
+            "{}\n{}\n{}\n",
+            self.global_cid.map_or(String::new(), |c| c.to_string()),
+            self.sequence,
+            self.updated_at_unix
+        )
+    }
+
+    /// Atomically write to `path`. If `path` already exists, copy it
+    /// to `path.bak` first (mirrors `BucketManager::persist_registry_internal`'s
+    /// backup pattern). Tolerates missing parent directory by creating
+    /// it; tolerates missing existing file by skipping the backup.
+    pub fn save(&self, path: &Path) -> Result<(), PersistError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(PersistError::Io)?;
+            }
+        }
+
+        // Backup the previous state file before overwriting. This
+        // mirrors the fula-bucket-registry persistence pattern; if a
+        // crash interrupts the write, the operator can recover from
+        // the .bak.
+        if path.exists() {
+            let backup_path = with_bak_suffix(path);
+            // Best-effort backup; failure to back up should not block
+            // the main write (we'd rather lose the .bak than the
+            // primary). Surfaces only as a tracing log.
+            if let Err(e) = std::fs::copy(path, &backup_path) {
+                tracing::warn!(
+                    error = %e,
+                    backup_path = %backup_path.display(),
+                    "users-index state-file backup failed; continuing with primary write"
+                );
+            }
+        }
+
+        // Atomic rename: write to a tmp sibling then rename onto the
+        // target. On most filesystems this is atomic; on Windows it
+        // requires the destination to be removable, which our
+        // backup-first step makes safe.
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, self.serialize()).map_err(PersistError::Io)?;
+        std::fs::rename(&tmp_path, path).map_err(PersistError::Io)?;
+        Ok(())
+    }
+
+    /// Compose the next state from a successful publish:
+    /// increment sequence, set new CID, refresh timestamp.
+    pub fn next(&self, new_cid: Cid) -> Self {
+        Self {
+            global_cid: Some(new_cid),
+            sequence: self.sequence.saturating_add(1),
+            updated_at_unix: now_unix(),
+        }
+    }
+}
+
+fn with_bak_suffix(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".bak");
+    PathBuf::from(s)
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PersistError {
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("parse error: {0}")]
+    Parse(String),
+}
+
+// ============================================================
+// CBOR data structures (Phase 3.2.a)
+// ============================================================
+
+/// Per-user `bucketsIndex` CBOR. Pinned per user; one CBOR per user
+/// per snapshot if their state changed. Map keys are either:
+///   - 32-hex BLAKE3-derived `bucketLookupH` (Phase 1.2 blinded form)
+///   - plaintext bucket name (Phase 1.2 lazy-migration legacy form)
+/// `legacy=true` distinguishes the latter so SDK cold-start can
+/// dispatch correctly.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserBucketsIndex {
+    pub v: u32,
+    /// `BTreeMap` for **deterministic** key ordering — same input
+    /// must produce byte-identical CBOR (and thus the same CID)
+    /// across master restarts and across hosts. dag-cbor sorts map
+    /// keys but using BTreeMap upstream is belt-and-suspenders.
+    pub buckets: BTreeMap<String, BucketEntry>,
+    pub updated_at_unix: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketEntry {
+    /// CID of the user's per-bucket forest manifest (Prolly Tree
+    /// root from `BucketMetadata.root_cid`). Stored as string so
+    /// the CBOR doesn't grow IPLD-link semantics that would change
+    /// the recursive-pin walk.
+    pub manifest: String,
+    /// `true` ⇔ map key is plaintext `bucket_name` (Phase 1.2 hadn't
+    /// run for this bucket yet — i.e., user hasn't uploaded with a
+    /// Phase-1.2-aware client since the field was introduced). SDK
+    /// lookup falls through from blinded-key to legacy-name on miss.
+    pub legacy: bool,
+}
+
+/// Global users-index CBOR. Master pins one per snapshot; the CID
+/// is published via IPNS (every flush) and to the chain anchor
+/// (every 12h).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalUsersIndex {
+    pub v: u32,
+    /// Monotonic publisher sequence. Replay defense: SDK persists
+    /// `highest_seen_sequence`; rejects payloads with regression.
+    pub sequence: u64,
+    pub updated_at_unix: u64,
+    /// `userKey_hex` (32 hex chars = 16-byte hashed_user_id) →
+    /// per-user bucketsIndex CID (string). BTreeMap for determinism.
+    pub users: BTreeMap<String, String>,
+}
+
+// ============================================================
+// Per-user diff cache
+// ============================================================
+
+/// One row of the publisher's diff cache. The publisher uses
+/// `content_hash` to detect "this user's bucket set changed since
+/// the last tick" without re-pinning a brand-new CBOR every time.
+///
+/// `content_hash` is BLAKE3 over a deterministic encoding of the
+/// user's complete bucket set — see [`compute_user_content_hash`].
+/// Changing any bucket's name, root_cid, or bucket_lookup_h
+/// triggers a rebuild on the next tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PerUserDiffEntry {
+    pub content_hash: [u8; 32],
+    pub buckets_index_cid: Cid,
+}
+
+/// Build a per-user `bucketsIndex` CBOR from that user's full
+/// bucket list. Pure — no I/O. The caller pins the resulting CBOR
+/// via `BlockStore::put_ipld` + `PinStore::pin_with_token`.
+pub fn build_user_buckets_index(
+    buckets: &[BucketMetadata],
+    now_unix: u64,
+) -> UserBucketsIndex {
+    let mut entries: BTreeMap<String, BucketEntry> = BTreeMap::new();
+    for b in buckets {
+        let (key, legacy) = match b.bucket_lookup_h {
+            Some(h) => (hex::encode(h), false),
+            None => (b.name.clone(), true),
+        };
+        entries.insert(
+            key,
+            BucketEntry {
+                manifest: b.root_cid.to_string(),
+                legacy,
+            },
+        );
+    }
+    UserBucketsIndex {
+        v: 2,
+        buckets: entries,
+        updated_at_unix: now_unix,
+    }
+}
+
+/// Build the global users-index CBOR from a per-user CID map.
+/// `entries` is `userKey_hex (32 hex) → bucketsIndexCid`.
+pub fn build_global_users_index(
+    entries: &BTreeMap<String, Cid>,
+    sequence: u64,
+    now_unix: u64,
+) -> GlobalUsersIndex {
+    let users: BTreeMap<String, String> = entries
+        .iter()
+        .map(|(uk, cid)| (uk.clone(), cid.to_string()))
+        .collect();
+    GlobalUsersIndex {
+        v: 1,
+        sequence,
+        updated_at_unix: now_unix,
+        users,
+    }
+}
+
+/// Compute a deterministic content hash over a user's full bucket
+/// set. Used for diff-cache lookups: if this hash matches the
+/// cached value, skip rebuilding+re-pinning the per-user CBOR.
+///
+/// Encoding: each bucket contributes the byte-concatenation of
+/// `name_bytes || 0x00 || root_cid_bytes || 0x00 || lookup_h_bytes_or_marker`.
+/// Buckets are sorted by `name` first (BLAKE3 is itself
+/// order-sensitive). Domain separator at the start defends against
+/// cross-namespace collisions.
+pub(crate) fn compute_user_content_hash(buckets: &[BucketMetadata]) -> [u8; 32] {
+    let mut sorted: Vec<&BucketMetadata> = buckets.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fula:users-index-publisher:user-content-hash:v1");
+    for b in &sorted {
+        hasher.update(b.name.as_bytes());
+        hasher.update(&[0u8]);
+        hasher.update(&b.root_cid.to_bytes());
+        hasher.update(&[0u8]);
+        match b.bucket_lookup_h {
+            Some(h) => {
+                hasher.update(b"H");
+                hasher.update(&h);
+            }
+            None => {
+                hasher.update(b"N");
+            }
+        }
+        hasher.update(&[0u8]);
+    }
+    let h = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.as_bytes());
+    out
+}
+
+// ============================================================
+// Publisher configuration
+// ============================================================
+
+#[derive(Clone, Debug)]
+pub struct PublisherConfig {
+    /// How often the publisher tick fires when there are changes.
+    /// Default 5 min — matches the user-facing latency expectation
+    /// for cross-device-fresh-data when using the IPNS path.
+    pub flush_interval: Duration,
+    /// Cap on the per-user pin operations the first tick fires per
+    /// second. The first tick after deploy has to pin every user's
+    /// bucketsIndex CBOR (cache is empty), so for large user sets
+    /// this can be tens of thousands of pin requests. Throttle to
+    /// avoid swamping the pinning-service.
+    pub first_publish_max_pins_per_sec: u32,
+    /// IPNS record lifetime. 36h gives a 24h margin over the 12h
+    /// chain-cron cadence — see plan section 3.2.b.
+    pub ipns_lifetime: Duration,
+    /// IPNS DHT cache TTL hint for resolvers. 15min keeps the SDK's
+    /// IPNS lookup latency low without aggressive re-fetch.
+    pub ipns_ttl: Duration,
+    /// Kubo IPNS key NAME (kubo's local label, e.g.,
+    /// `fula-users-index`). Distinct from the IPNS NAME (libp2p
+    /// public-key hash) that clients use. See plan 3.2.b.
+    pub ipns_key_name: String,
+    /// Path to the persisted `(global_cid, sequence, updated_at)`
+    /// state file. Mirrors the `registry_cid_path` pattern.
+    pub state_file_path: PathBuf,
+    /// Kubo HTTP API URL (e.g., `http://localhost:5001`). Used for
+    /// `/api/v0/name/publish`.
+    pub ipfs_api_url: String,
+    /// Internal-endpoint shared-secret token. Disabled (returns 503)
+    /// if not set. Required in production.
+    pub internal_token: Option<String>,
+}
+
+impl PublisherConfig {
+    pub fn default_for(state_file_path: PathBuf, ipfs_api_url: String) -> Self {
+        Self {
+            flush_interval: Duration::from_secs(300),
+            first_publish_max_pins_per_sec: 100,
+            ipns_lifetime: Duration::from_secs(36 * 3600),
+            ipns_ttl: Duration::from_secs(15 * 60),
+            ipns_key_name: "fula-users-index".to_string(),
+            state_file_path,
+            ipfs_api_url,
+            internal_token: None,
+        }
+    }
+}
+
+// ============================================================
+// In-memory latest-published view (read by /_internal/users-index-state)
+// ============================================================
+
+/// Snapshot of the last-published state. Updated under a write lock
+/// inside the publisher tick. Read by the internal HTTP endpoint
+/// without blocking the publisher.
+#[derive(Clone, Debug, Default)]
+pub struct LatestPublished {
+    pub global_cid: Option<Cid>,
+    pub sequence: u64,
+    pub updated_at_unix: u64,
+}
+
+impl From<&PersistedState> for LatestPublished {
+    fn from(p: &PersistedState) -> Self {
+        Self {
+            global_cid: p.global_cid,
+            sequence: p.sequence,
+            updated_at_unix: p.updated_at_unix,
+        }
+    }
+}
+
+// ============================================================
+// Publisher skeleton
+// ============================================================
+
+/// The publisher. Generic over the block store so tests can use
+/// `MemoryBlockStore` while production uses `FlexibleBlockStore`.
+pub struct UsersIndexPublisher<S: BlockStore + PinStore + 'static> {
+    config: PublisherConfig,
+    bucket_manager: Arc<BucketManager<S>>,
+    block_store: Arc<S>,
+    /// Per-user diff cache — owner_id → (content_hash, bucketsIndexCid).
+    /// `Mutex` (not `RwLock`) because the tick is the only writer and
+    /// the lock window is tiny (a HashMap insert).
+    diff_cache: Mutex<HashMap<String, PerUserDiffEntry>>,
+    /// Mirror of the on-disk state, refreshed after every successful
+    /// publish. Read by the internal endpoint.
+    latest: RwLock<LatestPublished>,
+    /// Serializes `run_tick` invocations so a periodic firing and an
+    /// admin `publish-now` call (A3) never race the rename of the state
+    /// file or produce two competing `sequence` values for the same
+    /// underlying state. Tokio mutex (not parking_lot) because the tick
+    /// holds it across `await`s on the pin chain.
+    tick_lock: tokio::sync::Mutex<()>,
+}
+
+/// Outcome of a single `run_tick` call. Useful for tests and for
+/// observability counters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TickOutcome {
+    /// Number of distinct users whose per-user CBOR was rebuilt and
+    /// re-pinned this tick. Always equal to `total_users` on the
+    /// first tick (cache is empty).
+    pub changed_users: usize,
+    /// Total number of users in `BucketManager.buckets` at this tick.
+    pub total_users: usize,
+    /// CID of the global users-index CBOR pinned this tick.
+    pub global_cid: Cid,
+    /// Sequence number embedded in the global CBOR's payload.
+    pub sequence: u64,
+    /// `true` iff the global users-index actually changed (i.e., at
+    /// least one user changed OR the cache was empty). When `false`
+    /// the publisher could in principle skip the global rebuild —
+    /// but for simplicity the current implementation always rebuilds
+    /// the global CBOR. Field kept for future optimization.
+    pub global_rebuilt: bool,
+}
+
+impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
+    /// Construct from config + handles to the bucket manager and
+    /// block store. Loads existing state-file on-disk; fresh master
+    /// starts with `PersistedState::default()`.
+    pub fn open(
+        config: PublisherConfig,
+        bucket_manager: Arc<BucketManager<S>>,
+        block_store: Arc<S>,
+    ) -> Result<Self, PersistError> {
+        let persisted = PersistedState::load(&config.state_file_path)?;
+        let latest = LatestPublished::from(&persisted);
+        Ok(Self {
+            config,
+            bucket_manager,
+            block_store,
+            diff_cache: Mutex::new(HashMap::new()),
+            latest: RwLock::new(latest),
+            tick_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Snapshot of the last successful publish. Cheap-clone via the
+    /// underlying RwLock read guard.
+    pub fn latest(&self) -> LatestPublished {
+        self.latest.read().clone()
+    }
+
+    /// Read the on-disk persisted state directly (bypasses the
+    /// in-memory `latest` cache). Used by tests and by the startup
+    /// chain-cross-check (see plan 3.2.b advisor note).
+    pub fn read_persisted(&self) -> Result<PersistedState, PersistError> {
+        PersistedState::load(&self.config.state_file_path)
+    }
+
+    /// Number of entries in the diff cache. Test-only accessor.
+    #[cfg(test)]
+    fn diff_cache_len(&self) -> usize {
+        self.diff_cache.lock().len()
+    }
+
+    /// Atomically write the next state to disk and update the
+    /// in-memory `latest` mirror. Called by `run_tick` AFTER a
+    /// successful pin — the documented order is "pin → persist"
+    /// (IPNS publish lands in A3, between these two). A crash
+    /// between pin and persist leaks the orphan-pinned CBOR;
+    /// cluster GC reaps it; on-chain `require(newSequence > sequence)`
+    /// keeps sequence monotonic regardless. (Advisor note, plan 3.2.a.)
+    fn commit_state(&self, next: PersistedState) -> Result<(), PersistError> {
+        next.save(&self.config.state_file_path)?;
+        *self.latest.write() = LatestPublished::from(&next);
+        Ok(())
+    }
+
+    /// Run one publisher tick: snapshot the bucket manager, rebuild
+    /// per-user CBORs only for users whose `content_hash` changed
+    /// since the last tick, build the global users-index CBOR, pin
+    /// both via the `PinStore` (cluster), persist the new state.
+    ///
+    /// IPNS publishing lands in A3 — this method does not call kubo's
+    /// `name/publish`. Tests assert the pin chain and the persisted
+    /// state; the IPNS step will plug in afterward without changing
+    /// the contract here.
+    ///
+    /// **Concurrency.** `BucketManager.buckets` is a `DashMap`; we
+    /// snapshot to a `Vec` in one synchronous block (no `await` while
+    /// the iterator is alive — that would be a shard-guard-deadlock
+    /// hazard).
+    pub async fn run_tick(&self) -> AnyResult<TickOutcome> {
+        // Single-tick-at-a-time. The periodic scheduler and the
+        // admin `publish-now` (A3) will both invoke run_tick; this
+        // ensures they never race the rename of the state file or
+        // emit two competing `sequence` values from the same
+        // starting state.
+        let _guard = self.tick_lock.lock().await;
+
+        // 1. Snapshot every user's full bucket set. `list_buckets`
+        //    iterates the DashMap and clones each value; drops the
+        //    iterator before returning, so no shard guard survives
+        //    into our subsequent `await`s.
+        let snapshot: Vec<BucketMetadata> = self.bucket_manager.list_buckets();
+
+        // 2. Group by owner_id.
+        let mut by_user: HashMap<String, Vec<BucketMetadata>> = HashMap::new();
+        for b in snapshot {
+            by_user.entry(b.owner_id.clone()).or_default().push(b);
+        }
+        let total_users = by_user.len();
+        let now = now_unix();
+
+        // 3. For each user: compute content_hash; if cache miss or
+        //    diff, rebuild + pin per-user CBOR.
+        let max_concurrent = self
+            .config
+            .first_publish_max_pins_per_sec
+            .max(1) as usize;
+        let to_rebuild: Vec<(String, Vec<BucketMetadata>)> = {
+            let cache = self.diff_cache.lock();
+            by_user
+                .iter()
+                .filter_map(|(owner_id, buckets)| {
+                    let hash = compute_user_content_hash(buckets);
+                    let unchanged = cache
+                        .get(owner_id)
+                        .map(|e| e.content_hash == hash)
+                        .unwrap_or(false);
+                    if unchanged {
+                        None
+                    } else {
+                        Some((owner_id.clone(), buckets.clone()))
+                    }
+                })
+                .collect()
+            // cache guard drops here, before any `await`
+        };
+
+        // Buffer-unordered keeps at most `max_concurrent` pin ops in
+        // flight at any time (advisor's first-publish throttle).
+        let block_store = Arc::clone(&self.block_store);
+        let pin_results: Vec<AnyResult<(String, [u8; 32], Cid)>> = {
+            use futures::stream::{self, StreamExt};
+            stream::iter(to_rebuild.into_iter().map(|(owner_id, buckets)| {
+                let bs = Arc::clone(&block_store);
+                async move {
+                    let hash = compute_user_content_hash(&buckets);
+                    let cbor = build_user_buckets_index(&buckets, now);
+                    let cid = bs.put_ipld(&cbor).await?;
+                    bs.pin(&cid, Some("fula-users-index-per-user"))
+                        .await?;
+                    Ok::<_, anyhow::Error>((owner_id, hash, cid))
+                }
+            }))
+            .buffer_unordered(max_concurrent)
+            .collect()
+            .await
+        };
+
+        let mut changed_users = 0usize;
+        for r in pin_results {
+            let (owner_id, hash, cid) = r?;
+            self.diff_cache.lock().insert(
+                owner_id,
+                PerUserDiffEntry {
+                    content_hash: hash,
+                    buckets_index_cid: cid,
+                },
+            );
+            changed_users += 1;
+        }
+
+        // Prune diff-cache rows for users who disappeared from
+        // `BucketManager` since the last tick (deleted account,
+        // user deleted all their buckets, etc.). Without this, the
+        // cache would grow forever AND — critically — a removed
+        // user would keep appearing in published globals because
+        // the early-return below would never fire a rebuild for a
+        // pure-deletion tick. We track `users_pruned` to fold
+        // deletions into the rebuild trigger.
+        let users_pruned = {
+            let mut cache = self.diff_cache.lock();
+            let before = cache.len();
+            cache.retain(|owner_id, _| by_user.contains_key(owner_id));
+            before - cache.len()
+        };
+
+        let prior = self.latest.read().clone();
+
+        // 4. Skip-if-no-change: every user's cache row matched AND
+        //    no users were pruned AND we've already published at
+        //    least once → tick is a no-op. Returning early avoids
+        //    pin/unpin churn and keeps `sequence` from advancing
+        //    for free, so the 12h chain cron sees the same
+        //    `(cid, sequence)` and skips the on-chain publish.
+        //    Including `users_pruned == 0` is load-bearing: a
+        //    pure-deletion tick has `changed_users == 0` but MUST
+        //    rebuild so the deleted user disappears from the
+        //    published global.
+        if changed_users == 0 && users_pruned == 0 && prior.global_cid.is_some() {
+            return Ok(TickOutcome {
+                changed_users: 0,
+                total_users,
+                global_cid: prior.global_cid.expect("checked is_some"),
+                sequence: prior.sequence,
+                global_rebuilt: false,
+            });
+        }
+
+        // 5. Build the user → bucketsIndexCid map from the now-up-to-date
+        //    cache. Iterating `by_user.keys()` ensures we include every
+        //    user even if their cache row was already up to date.
+        let mut user_to_cid: BTreeMap<String, Cid> = BTreeMap::new();
+        let cache_snapshot = self.diff_cache.lock().clone();
+        for owner_id in by_user.keys() {
+            if let Some(entry) = cache_snapshot.get(owner_id) {
+                user_to_cid.insert(owner_id.clone(), entry.buckets_index_cid);
+            }
+        }
+
+        // 6. Build + pin global users-index CBOR. Sequence increments
+        //    relative to the last persisted state; new state is committed
+        //    only after the pin succeeds.
+        let next_sequence = prior.sequence.saturating_add(1);
+        let global = build_global_users_index(&user_to_cid, next_sequence, now);
+        let global_cid = self.block_store.put_ipld(&global).await?;
+        self.block_store
+            .pin(&global_cid, Some("fula-users-index-global"))
+            .await?;
+
+        // 7. Best-effort unpin previous global. Failure is fine —
+        //    cluster GC will eventually reap it.
+        if let Some(prev) = prior.global_cid {
+            if prev != global_cid {
+                if let Err(e) = self.block_store.unpin(&prev).await {
+                    tracing::debug!(
+                        prev = %prev,
+                        error = %e,
+                        "users-index publisher: unpin previous global failed (best-effort; cluster GC will reap)"
+                    );
+                }
+            }
+        }
+
+        // 8. Persist new state. (A3 will insert IPNS publish between
+        //    pin and persist; commit_state stays last so a crash mid-
+        //    IPNS leaves us in a recoverable place.)
+        let next_state = PersistedState {
+            global_cid: Some(global_cid),
+            sequence: next_sequence,
+            updated_at_unix: now,
+        };
+        self.commit_state(next_state)?;
+
+        Ok(TickOutcome {
+            changed_users,
+            total_users,
+            global_cid,
+            sequence: next_sequence,
+            global_rebuilt: true,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cid::multihash::Multihash;
+    use fula_blockstore::MemoryBlockStore;
+    use fula_core::metadata::Owner;
+    use tempfile::TempDir;
+
+    fn fixture_cid(seed: u8) -> Cid {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        let mh = Multihash::<64>::wrap(0x1e /* blake3 */, &bytes).unwrap();
+        Cid::new_v1(0x71 /* dag-cbor */, mh)
+    }
+
+    /// Build a synthetic `BucketMetadata` for the **pure** (no-IPFS)
+    /// builder + content-hash tests. Uses `BucketMetadata::new` so the
+    /// struct stays in sync with field additions. Real `run_tick`
+    /// integration tests use `create_bucket_for_user` instead so they
+    /// exercise the real DashMap insertion path.
+    fn bucket_meta(
+        owner_id: &str,
+        name: &str,
+        root_seed: u8,
+        lookup_h: Option<[u8; 16]>,
+    ) -> BucketMetadata {
+        let mut m = BucketMetadata::new(
+            name.to_string(),
+            owner_id.to_string(),
+            fixture_cid(root_seed),
+        );
+        m.bucket_lookup_h = lookup_h;
+        m
+    }
+
+    /// Construct a publisher backed by `MemoryBlockStore` for tests.
+    /// Returns `(publisher, store, manager)` so individual tests can
+    /// poke at the manager (insert buckets etc.) and inspect the
+    /// store (verify pins).
+    fn fixture_publisher(
+        path: PathBuf,
+    ) -> (
+        UsersIndexPublisher<MemoryBlockStore>,
+        Arc<MemoryBlockStore>,
+        Arc<BucketManager<MemoryBlockStore>>,
+    ) {
+        let store = Arc::new(MemoryBlockStore::new());
+        let manager = Arc::new(BucketManager::new(Arc::clone(&store)));
+        let publisher = UsersIndexPublisher::open(
+            fixture_config(path),
+            Arc::clone(&manager),
+            Arc::clone(&store),
+        )
+        .expect("open");
+        (publisher, store, manager)
+    }
+
+    // ============================================================
+    // PersistedState round-trip
+    // ============================================================
+
+    #[test]
+    fn test_persisted_state_default_is_empty() {
+        let s = PersistedState::default();
+        assert!(s.global_cid.is_none());
+        assert_eq!(s.sequence, 0);
+        assert_eq!(s.updated_at_unix, 0);
+    }
+
+    #[test]
+    fn test_load_missing_file_returns_default() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nonexistent.state");
+        let s = PersistedState::load(&path).expect("missing file is not an error");
+        assert_eq!(s, PersistedState::default());
+    }
+
+    #[test]
+    fn test_save_then_load_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let cid = fixture_cid(0xab);
+        let s = PersistedState {
+            global_cid: Some(cid),
+            sequence: 42,
+            updated_at_unix: 1_700_000_000,
+        };
+        s.save(&path).expect("save");
+        let loaded = PersistedState::load(&path).expect("load");
+        assert_eq!(loaded, s);
+    }
+
+    #[test]
+    fn test_save_creates_parent_directory() {
+        // Mirrors `persist_registry_internal`'s parent-creation
+        // behavior — operators may configure a path under a missing
+        // directory; the publisher must not fail.
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("sub").join("dir").join("state.txt");
+        let s = PersistedState::default();
+        s.save(&nested).expect("save");
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn test_save_creates_bak_on_overwrite() {
+        // Critical for crash recovery: the previous state file must
+        // be backed up to .bak before being overwritten, so a half-
+        // completed write doesn't lose the prior valid state.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let s1 = PersistedState {
+            global_cid: Some(fixture_cid(1)),
+            sequence: 1,
+            updated_at_unix: 100,
+        };
+        s1.save(&path).expect("save 1");
+
+        let s2 = PersistedState {
+            global_cid: Some(fixture_cid(2)),
+            sequence: 2,
+            updated_at_unix: 200,
+        };
+        s2.save(&path).expect("save 2");
+
+        let bak = with_bak_suffix(&path);
+        assert!(bak.exists(), ".bak file must be created on overwrite");
+        let bak_loaded = PersistedState::load(&bak).expect("load bak");
+        assert_eq!(bak_loaded, s1, ".bak must hold the previous state");
+
+        let primary_loaded = PersistedState::load(&path).expect("load primary");
+        assert_eq!(primary_loaded, s2);
+    }
+
+    #[test]
+    fn test_first_save_does_not_create_bak() {
+        // No prior file → no .bak created. Avoids leaving a stray
+        // empty file on first write.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let s = PersistedState::default();
+        s.save(&path).expect("save");
+        let bak = with_bak_suffix(&path);
+        assert!(!bak.exists(), ".bak must NOT exist on first write");
+    }
+
+    #[test]
+    fn test_parse_two_line_legacy_format() {
+        // Forward-tolerant: an older two-line file (CID + sequence,
+        // no timestamp) must parse with `updated_at = 0`. This isn't
+        // a current production format, but the parser is permissive.
+        let cid = fixture_cid(7);
+        let raw = format!("{}\n5\n", cid);
+        let s = PersistedState::parse(&raw).expect("parse");
+        assert_eq!(s.global_cid, Some(cid));
+        assert_eq!(s.sequence, 5);
+        assert_eq!(s.updated_at_unix, 0);
+    }
+
+    #[test]
+    fn test_parse_empty_lines_are_treated_as_missing() {
+        // An empty-string CID line means "nothing published yet."
+        // An empty sequence line means seq=0. Tolerates the
+        // edge case where a pre-publish state file gets persisted.
+        let s = PersistedState::parse("\n\n\n").expect("parse");
+        assert_eq!(s, PersistedState::default());
+    }
+
+    #[test]
+    fn test_parse_corrupt_cid_returns_error() {
+        let raw = "not-a-cid\n0\n";
+        let result = PersistedState::parse(raw);
+        assert!(matches!(result, Err(PersistError::Parse(_))));
+    }
+
+    #[test]
+    fn test_parse_corrupt_sequence_returns_error() {
+        let cid = fixture_cid(1);
+        let raw = format!("{}\nnot-a-number\n", cid);
+        let result = PersistedState::parse(&raw);
+        assert!(matches!(result, Err(PersistError::Parse(_))));
+    }
+
+    #[test]
+    fn test_next_increments_sequence() {
+        let s = PersistedState {
+            global_cid: Some(fixture_cid(1)),
+            sequence: 99,
+            updated_at_unix: 1_700_000_000,
+        };
+        let next_cid = fixture_cid(2);
+        let n = s.next(next_cid);
+        assert_eq!(n.global_cid, Some(next_cid));
+        assert_eq!(n.sequence, 100, "sequence must increment exactly once");
+        assert!(
+            n.updated_at_unix >= 1_700_000_000,
+            "timestamp must be monotonic-or-equal"
+        );
+    }
+
+    #[test]
+    fn test_next_from_default_starts_at_one() {
+        // First-ever publish: sequence transitions from 0 → 1.
+        let initial = PersistedState::default();
+        let n = initial.next(fixture_cid(0));
+        assert_eq!(n.sequence, 1);
+    }
+
+    #[test]
+    fn test_next_saturating_at_max() {
+        // Defensive: if sequence somehow reaches u64::MAX (impossible
+        // in practice but worth not panicking on), `saturating_add`
+        // keeps us from overflow.
+        let s = PersistedState {
+            global_cid: Some(fixture_cid(1)),
+            sequence: u64::MAX,
+            updated_at_unix: 0,
+        };
+        let n = s.next(fixture_cid(2));
+        assert_eq!(n.sequence, u64::MAX);
+    }
+
+    // ============================================================
+    // UsersIndexPublisher::open + commit_state
+    // ============================================================
+
+    fn fixture_config(state_path: PathBuf) -> PublisherConfig {
+        PublisherConfig::default_for(state_path, "http://localhost:5001".to_string())
+    }
+
+    #[test]
+    fn test_open_with_empty_state_starts_fresh() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, _store, _manager) = fixture_publisher(path);
+        let latest = publisher.latest();
+        assert!(latest.global_cid.is_none());
+        assert_eq!(latest.sequence, 0);
+    }
+
+    #[test]
+    fn test_open_with_existing_state_loads_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+
+        // Write existing state, then open
+        let prior = PersistedState {
+            global_cid: Some(fixture_cid(0xaa)),
+            sequence: 17,
+            updated_at_unix: 1_700_000_000,
+        };
+        prior.save(&path).expect("seed");
+
+        let (publisher, _store, _manager) = fixture_publisher(path);
+        let latest = publisher.latest();
+        assert_eq!(latest.global_cid, Some(fixture_cid(0xaa)));
+        assert_eq!(latest.sequence, 17);
+        assert_eq!(latest.updated_at_unix, 1_700_000_000);
+    }
+
+    #[test]
+    fn test_commit_state_updates_disk_and_memory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, _store, _manager) = fixture_publisher(path.clone());
+
+        let next = PersistedState {
+            global_cid: Some(fixture_cid(1)),
+            sequence: 1,
+            updated_at_unix: 1_700_000_001,
+        };
+        publisher.commit_state(next.clone()).expect("commit");
+
+        // In-memory `latest` reflects the commit.
+        let latest = publisher.latest();
+        assert_eq!(latest.global_cid, next.global_cid);
+        assert_eq!(latest.sequence, next.sequence);
+
+        // On-disk file matches.
+        let disk = PersistedState::load(&path).expect("reload");
+        assert_eq!(disk, next);
+    }
+
+    #[test]
+    fn test_commit_state_survives_subsequent_open() {
+        // The crash-recovery path: master commits state, then
+        // restarts. New publisher instance must see the committed
+        // state.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+
+        {
+            let (publisher, _store, _manager) = fixture_publisher(path.clone());
+            let next = PersistedState {
+                global_cid: Some(fixture_cid(0xee)),
+                sequence: 12,
+                updated_at_unix: 1_700_000_012,
+            };
+            publisher.commit_state(next).expect("commit");
+            // publisher drops here, simulating master restart
+        }
+
+        let (publisher, _store, _manager) = fixture_publisher(path);
+        let latest = publisher.latest();
+        assert_eq!(latest.global_cid, Some(fixture_cid(0xee)));
+        assert_eq!(latest.sequence, 12);
+    }
+
+    #[test]
+    fn test_open_returns_error_on_corrupt_state_file() {
+        // Operator must be told if the state file is corrupt rather
+        // than silently starting with a default that would re-issue
+        // already-used sequence numbers.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        std::fs::write(&path, "not-a-cid\nnot-a-number\n").expect("seed");
+
+        let store = Arc::new(MemoryBlockStore::new());
+        let manager = Arc::new(BucketManager::new(Arc::clone(&store)));
+        let result = UsersIndexPublisher::open(fixture_config(path), manager, store);
+        assert!(matches!(result, Err(PersistError::Parse(_))));
+    }
+
+    // ============================================================
+    // Phase 3.2 A2 — pure CBOR builders + content-hash determinism
+    // ============================================================
+
+    #[test]
+    fn test_build_user_buckets_index_empty() {
+        let cbor = build_user_buckets_index(&[], 1_700_000_000);
+        assert_eq!(cbor.v, 2);
+        assert!(cbor.buckets.is_empty());
+        assert_eq!(cbor.updated_at_unix, 1_700_000_000);
+    }
+
+    #[test]
+    fn test_build_user_buckets_index_legacy_only() {
+        // Bucket with `bucket_lookup_h = None` → legacy plaintext key.
+        let buckets = vec![bucket_meta("alice", "photos", 1, None)];
+        let cbor = build_user_buckets_index(&buckets, 1_700_000_000);
+        assert_eq!(cbor.buckets.len(), 1);
+        let entry = cbor.buckets.get("photos").expect("photos under plaintext key");
+        assert!(entry.legacy, "missing lookup_h → must be legacy");
+        assert_eq!(entry.manifest, fixture_cid(1).to_string());
+    }
+
+    #[test]
+    fn test_build_user_buckets_index_blinded_only() {
+        let h = [0x42u8; 16];
+        let buckets = vec![bucket_meta("alice", "photos", 1, Some(h))];
+        let cbor = build_user_buckets_index(&buckets, 1_700_000_000);
+        assert_eq!(cbor.buckets.len(), 1);
+        let entry = cbor.buckets.get(&hex::encode(h)).expect("blinded key");
+        assert!(!entry.legacy, "lookup_h present → must NOT be legacy");
+        assert!(
+            !cbor.buckets.contains_key("photos"),
+            "blinded entry must not also leak under plaintext name"
+        );
+    }
+
+    #[test]
+    fn test_build_user_buckets_index_mixed_legacy_and_blinded() {
+        // One bucket migrated, one not. Both appear in the CBOR
+        // under their respective key types (Phase 1.2 lazy-
+        // migration semantics).
+        let h = [0xaau8; 16];
+        let buckets = vec![
+            bucket_meta("alice", "photos", 1, Some(h)),
+            bucket_meta("alice", "tax-2024", 2, None),
+        ];
+        let cbor = build_user_buckets_index(&buckets, 1_700_000_000);
+        assert_eq!(cbor.buckets.len(), 2);
+        let blinded = cbor.buckets.get(&hex::encode(h)).expect("blinded entry");
+        assert!(!blinded.legacy);
+        let legacy = cbor
+            .buckets
+            .get("tax-2024")
+            .expect("legacy entry under plaintext name");
+        assert!(legacy.legacy);
+    }
+
+    #[test]
+    fn test_compute_user_content_hash_is_deterministic() {
+        // Same inputs in any iteration order must produce the same
+        // hash. Critical: dag-cbor maps + the diff cache both rely
+        // on this for determinism.
+        let h = [0x11u8; 16];
+        let a = vec![
+            bucket_meta("alice", "photos", 1, Some(h)),
+            bucket_meta("alice", "videos", 2, None),
+        ];
+        let b = vec![
+            bucket_meta("alice", "videos", 2, None),
+            bucket_meta("alice", "photos", 1, Some(h)),
+        ];
+        assert_eq!(compute_user_content_hash(&a), compute_user_content_hash(&b));
+    }
+
+    #[test]
+    fn test_compute_user_content_hash_differs_on_root_cid_change() {
+        // Same bucket name, different root_cid → different hash.
+        // This is what triggers a re-pin on the next tick.
+        let a = vec![bucket_meta("alice", "photos", 1, None)];
+        let b = vec![bucket_meta("alice", "photos", 2, None)];
+        assert_ne!(compute_user_content_hash(&a), compute_user_content_hash(&b));
+    }
+
+    #[test]
+    fn test_compute_user_content_hash_differs_on_lookup_h_change() {
+        // None → Some([..]) is the lazy-migration path. The
+        // content_hash MUST detect this so the publisher rebuilds
+        // the per-user CBOR (replacing legacy entry with blinded).
+        let a = vec![bucket_meta("alice", "photos", 1, None)];
+        let b = vec![bucket_meta("alice", "photos", 1, Some([0u8; 16]))];
+        assert_ne!(compute_user_content_hash(&a), compute_user_content_hash(&b));
+    }
+
+    #[test]
+    fn test_build_global_users_index_sorted_by_userkey() {
+        // BTreeMap ordering — same input produces same byte-output
+        // and same CID across master restarts/hosts.
+        let mut entries: BTreeMap<String, Cid> = BTreeMap::new();
+        entries.insert("zzz_user".to_string(), fixture_cid(1));
+        entries.insert("aaa_user".to_string(), fixture_cid(2));
+        let cbor = build_global_users_index(&entries, 5, 1_700_000_000);
+        assert_eq!(cbor.v, 1);
+        assert_eq!(cbor.sequence, 5);
+        // First key in the BTreeMap iteration is the lex-smallest.
+        let first = cbor.users.keys().next().expect("nonempty");
+        assert_eq!(first, "aaa_user");
+    }
+
+    // ============================================================
+    // Phase 3.2 A2 — run_tick orchestration tests
+    // ============================================================
+    //
+    // run_tick tests use the real `create_bucket_for_user` /
+    // `delete_bucket_for_user` / `populate_lookup_h_if_missing` API
+    // to seed `BucketManager` — no private-field reach-in. Root CIDs
+    // are whatever the freshly-built forest produces; tests assert
+    // *behavior* (sequence advance, pin/unpin, diff-cache state),
+    // not exact CID values.
+
+    async fn create_user_bucket(
+        manager: &BucketManager<MemoryBlockStore>,
+        user_id: &str,
+        bucket_name: &str,
+    ) {
+        manager
+            .create_bucket_for_user(
+                user_id,
+                bucket_name.to_string(),
+                Owner::new(user_id),
+            )
+            .await
+            .expect("create_bucket_for_user");
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_first_publish_pins_global_and_per_user() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, store, manager) = fixture_publisher(path);
+
+        // Two users, three buckets total.
+        create_user_bucket(&manager, "alice", "photos").await;
+        create_user_bucket(&manager, "alice", "videos").await;
+        create_user_bucket(&manager, "bob", "docs").await;
+
+        let outcome = publisher.run_tick().await.expect("tick");
+        assert_eq!(outcome.total_users, 2);
+        assert_eq!(outcome.changed_users, 2);
+        assert!(outcome.global_rebuilt);
+        assert_eq!(outcome.sequence, 1);
+
+        // The global CBOR is pinned and retrievable.
+        assert!(store.is_pinned(&outcome.global_cid).await.unwrap());
+
+        // After the first tick, the persisted state mirrors the in-memory.
+        let persisted = publisher.read_persisted().expect("read");
+        assert_eq!(persisted.global_cid, Some(outcome.global_cid));
+        assert_eq!(persisted.sequence, 1);
+
+        // Decode the global CBOR and verify both users are present.
+        let global_cbor: GlobalUsersIndex =
+            store.get_ipld(&outcome.global_cid).await.expect("global");
+        assert_eq!(global_cbor.users.len(), 2);
+        assert!(global_cbor.users.contains_key("alice"));
+        assert!(global_cbor.users.contains_key("bob"));
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_idempotent_skips_when_no_changes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, _store, manager) = fixture_publisher(path);
+
+        create_user_bucket(&manager, "alice", "photos").await;
+        let first = publisher.run_tick().await.expect("first");
+        assert_eq!(first.sequence, 1);
+
+        // Second tick — nothing changed in the manager.
+        let second = publisher.run_tick().await.expect("second");
+        assert_eq!(second.changed_users, 0);
+        assert!(!second.global_rebuilt, "no-change tick must NOT rebuild");
+        assert_eq!(second.sequence, 1, "sequence must NOT advance on no-op");
+        assert_eq!(second.global_cid, first.global_cid);
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_advances_sequence_on_real_change() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, _store, manager) = fixture_publisher(path);
+
+        create_user_bucket(&manager, "alice", "photos").await;
+        let first = publisher.run_tick().await.expect("first");
+
+        // Add a new bucket → user content_hash changes → re-pin.
+        create_user_bucket(&manager, "alice", "videos").await;
+        let second = publisher.run_tick().await.expect("second");
+
+        assert_eq!(second.changed_users, 1);
+        assert_eq!(second.sequence, 2, "sequence advances by exactly 1");
+        assert_ne!(second.global_cid, first.global_cid);
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_diff_cache_prunes_deleted_users() {
+        // Pure-deletion tick: every surviving user's content_hash
+        // matches cache (changed_users == 0), but the global MUST
+        // still rebuild so the deleted user disappears from the
+        // published map. This guards against the early-return
+        // that previously fired on `changed_users == 0` alone.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, store, manager) = fixture_publisher(path);
+
+        create_user_bucket(&manager, "alice", "photos").await;
+        create_user_bucket(&manager, "bob", "docs").await;
+        let first = publisher.run_tick().await.expect("first");
+        assert_eq!(publisher.diff_cache_len(), 2);
+
+        // Verify both users present in the first global.
+        let first_global: GlobalUsersIndex =
+            store.get_ipld(&first.global_cid).await.expect("first global");
+        assert!(first_global.users.contains_key("alice"));
+        assert!(first_global.users.contains_key("bob"));
+
+        // Delete bob's bucket — bob disappears from BucketManager.
+        manager
+            .delete_bucket_for_user("bob", "docs")
+            .await
+            .expect("delete");
+        let second = publisher.run_tick().await.expect("second");
+        assert_eq!(
+            publisher.diff_cache_len(),
+            1,
+            "diff cache must shrink when a user disappears"
+        );
+        assert_eq!(second.changed_users, 0, "no per-user CBOR rebuilt");
+        assert!(
+            second.global_rebuilt,
+            "pure-deletion tick MUST rebuild global"
+        );
+        assert_eq!(
+            second.sequence, 2,
+            "deletion-only tick advances sequence (chain cron must observe new state)"
+        );
+        assert_ne!(
+            second.global_cid, first.global_cid,
+            "global CID must change when membership changes"
+        );
+
+        let second_global: GlobalUsersIndex =
+            store.get_ipld(&second.global_cid).await.expect("second global");
+        assert!(second_global.users.contains_key("alice"));
+        assert!(
+            !second_global.users.contains_key("bob"),
+            "deleted user MUST disappear from published global"
+        );
+        // Idempotency: alice's content didn't change, so her per-
+        // user `bucketsIndexCid` MUST be byte-identical across the
+        // two globals. If this drifts, something in the diff-cache
+        // logic is silently re-pinning unchanged users.
+        assert_eq!(
+            first_global.users["alice"], second_global.users["alice"],
+            "unchanged user's bucketsIndex CID must be stable across deletion ticks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_after_restart_rebuilds_with_advanced_sequence() {
+        // Crash-recovery scenario: master commits state, restarts.
+        // The new publisher's in-memory diff cache is empty, so
+        // every user looks "changed" on the first tick and the
+        // sequence advances by 1. The per-user `bucketsIndexCid`s
+        // are deterministic CIDs over the same content, so the
+        // pin operations are idempotent — but the global CBOR
+        // embeds a fresh `sequence` + `updated_at_unix`, so its
+        // CID changes. Documented expected behavior.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+
+        let first_global_cid;
+        {
+            let (publisher, _store, manager) = fixture_publisher(path.clone());
+            create_user_bucket(&manager, "alice", "photos").await;
+            create_user_bucket(&manager, "bob", "docs").await;
+            let first = publisher.run_tick().await.expect("first tick");
+            assert_eq!(first.sequence, 1);
+            first_global_cid = first.global_cid;
+        } // publisher drops, simulating master restart
+
+        // Re-open against the same state file AND a *fresh*
+        // BucketManager. We re-create the same buckets so the
+        // post-restart manager mirrors what `load_registry` would
+        // produce in production (same owner_ids + bucket_names).
+        let (publisher, _store, manager) = fixture_publisher(path);
+        create_user_bucket(&manager, "alice", "photos").await;
+        create_user_bucket(&manager, "bob", "docs").await;
+
+        // State persisted before restart is loaded.
+        assert_eq!(publisher.latest().sequence, 1);
+        assert_eq!(publisher.latest().global_cid, Some(first_global_cid));
+
+        // First post-restart tick: cache is empty → every user
+        // gets a re-pin. Sequence advances exactly once.
+        let second = publisher.run_tick().await.expect("post-restart tick");
+        assert_eq!(second.changed_users, 2, "empty cache → all users re-pinned");
+        assert_eq!(second.total_users, 2);
+        assert_eq!(
+            second.sequence, 2,
+            "sequence advances by exactly 1 across restart"
+        );
+        assert!(second.global_rebuilt);
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_legacy_to_blinded_replaces_entry() {
+        // Phase 3.2.1(d) backward-compat scenario: write under old
+        // client (no lookup_h), then again under new client (with
+        // lookup_h). The published CBOR must contain a single
+        // blinded entry for the bucket — NOT both legacy and blinded.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, store, manager) = fixture_publisher(path);
+
+        create_user_bucket(&manager, "alice", "photos").await;
+        let first = publisher.run_tick().await.expect("first");
+
+        // Simulate the upgrade: populate lookup_h via the public
+        // helper (this is what the PUT handler calls in production
+        // when a Phase-1.2-aware client uploads).
+        let h = [0x77u8; 16];
+        let changed = manager
+            .populate_lookup_h_if_missing("alice", "photos", h)
+            .expect("populate ok");
+        assert!(changed, "must transition None → Some");
+
+        let second = publisher.run_tick().await.expect("second");
+        assert_eq!(second.changed_users, 1);
+        assert_ne!(second.global_cid, first.global_cid);
+
+        // Fetch and decode the per-user CBOR via the global. There
+        // should be exactly ONE entry — keyed under the blinded
+        // hex of `h`, not under "photos".
+        let global_cbor: GlobalUsersIndex =
+            store.get_ipld(&second.global_cid).await.expect("global");
+        let alice_user_key = global_cbor
+            .users
+            .keys()
+            .next()
+            .expect("alice should be present");
+        let alice_buckets_cid: Cid = global_cbor.users[alice_user_key]
+            .parse()
+            .expect("parse cid");
+        let user_cbor: UserBucketsIndex = store
+            .get_ipld(&alice_buckets_cid)
+            .await
+            .expect("user buckets");
+        assert_eq!(
+            user_cbor.buckets.len(),
+            1,
+            "exactly one bucket — legacy must NOT coexist with blinded"
+        );
+        assert!(
+            user_cbor.buckets.contains_key(&hex::encode(h)),
+            "blinded key present"
+        );
+        assert!(
+            !user_cbor.buckets.contains_key("photos"),
+            "plaintext name must NOT appear after migration"
+        );
+        let entry = user_cbor.buckets.get(&hex::encode(h)).unwrap();
+        assert!(!entry.legacy);
+    }
+
+    // NOTE: there is intentionally no `test_run_tick_unpins_previous_global` test.
+    // `MemoryBlockStore::unpin` is a no-op (memory.rs:108-111) and `is_pinned`
+    // resolves to `has_block`, so the in-memory backend can't observe a
+    // pin/unpin distinction. The unpin call itself is exercised — code path
+    // executes — but observability requires a real `IpfsPinning` or `Cluster`
+    // backend (covered in Phase 3.6 staging-mirror verification step 8).
+    // Adding a counting `PinStore` wrapper here would be ~80 LOC of scaffolding
+    // for one assertion; not worth it.
+
+    #[tokio::test]
+    async fn test_run_tick_no_users_first_publish_emits_empty_global() {
+        // Edge case: master starts up with zero buckets. First tick
+        // still publishes (so the SDK can fetch and find an empty
+        // user map without falling back to chain).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, _store, _manager) = fixture_publisher(path);
+
+        let outcome = publisher.run_tick().await.expect("tick");
+        assert_eq!(outcome.total_users, 0);
+        assert_eq!(outcome.changed_users, 0);
+        assert!(outcome.global_rebuilt, "first publish must run even on empty");
+        assert_eq!(outcome.sequence, 1);
+    }
+}

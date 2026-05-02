@@ -123,6 +123,14 @@ impl From<fula_client::ClientError> for FulaError {
             ClientError::MigrationLockHeld { bucket, expires_at } => FulaError::InvalidResponse(
                 format!("migration lock held for bucket {} (expires at {} ms)", bucket, expires_at),
             ),
+            // Phase 2.1 of master-independent reads: surface as a Network
+            // error to existing Flutter callers — the closest existing
+            // category, since the master is effectively unreachable.
+            // Phase 2.4 catches this variant earlier and falls back to the
+            // gateway race before reaching this conversion.
+            ClientError::MasterUnreachable { down_for_secs } => FulaError::Network(
+                format!("master unreachable (health gate; down for ~{}s)", down_for_secs),
+            ),
         }
     }
 }

@@ -228,12 +228,23 @@ pub struct BucketMetadata {
     
     /// Object count (cached)
     pub object_count: u64,
-    
+
     /// Total size in bytes (cached)
     pub total_size: u64,
-    
+
     /// Last modified timestamp
     pub last_modified: DateTime<Utc>,
+
+    /// Blinded lookup key for the per-user bucketsIndex CBOR published in
+    /// Phase 3 chain snapshots. Computed client-side as
+    /// `BLAKE3(MetadataKey || bucket_name)` truncated to 16 bytes (matches
+    /// `hashed_user_id`'s 128-bit convention). `None` for buckets created
+    /// before this field was added; populated lazily on the next forest
+    /// flush via `BucketManager::populate_lookup_h_if_missing`.
+    /// `#[serde(default)]` makes existing `fula-bucket-registry` CBOR blocks
+    /// deserialize fine without migration.
+    #[serde(default)]
+    pub bucket_lookup_h: Option<[u8; 16]>,
 }
 
 impl BucketMetadata {
@@ -253,6 +264,7 @@ impl BucketMetadata {
             object_count: 0,
             total_size: 0,
             last_modified: now,
+            bucket_lookup_h: None,
         }
     }
 
@@ -389,5 +401,124 @@ mod tests {
 
         assert_eq!(bucket.name, "my-bucket");
         assert!(!bucket.versioning_enabled);
+    }
+
+    // ============================================================
+    // Phase 1.2 (master-independent reads) — bucket_lookup_h tests
+    // ============================================================
+
+    #[test]
+    fn test_bucket_lookup_h_default_is_none() {
+        // Newly-created BucketMetadata must have bucket_lookup_h = None.
+        // The field is populated lazily on the next forest flush via the SDK header.
+        let cid = fula_blockstore::cid_utils::create_cid(
+            b"root",
+            fula_blockstore::cid_utils::CidCodec::DagCbor,
+        );
+        let bucket = BucketMetadata::new("b".to_string(), "owner".to_string(), cid);
+        assert_eq!(bucket.bucket_lookup_h, None);
+    }
+
+    #[test]
+    fn test_bucket_lookup_h_dagcbor_roundtrip() {
+        // BucketMetadata with Some(...) and None must both round-trip cleanly
+        // through dag-cbor (the production registry format).
+        let cid = fula_blockstore::cid_utils::create_cid(
+            b"root",
+            fula_blockstore::cid_utils::CidCodec::DagCbor,
+        );
+
+        // None case
+        let none_bucket = BucketMetadata::new("b1".into(), "owner".into(), cid);
+        let bytes = serde_ipld_dagcbor::to_vec(&none_bucket).expect("serialize None");
+        let restored: BucketMetadata =
+            serde_ipld_dagcbor::from_slice(&bytes).expect("deserialize None");
+        assert_eq!(restored.bucket_lookup_h, None);
+        assert_eq!(restored.name, "b1");
+
+        // Some case
+        let mut some_bucket = BucketMetadata::new("b2".into(), "owner".into(), cid);
+        let h: [u8; 16] = [
+            0xd2, 0xe4, 0xc4, 0x3d, 0xa6, 0x60, 0xe0, 0xb8,
+            0x5e, 0x7b, 0x08, 0xb6, 0x98, 0x91, 0x26, 0xb3,
+        ];
+        some_bucket.bucket_lookup_h = Some(h);
+        let bytes = serde_ipld_dagcbor::to_vec(&some_bucket).expect("serialize Some");
+        let restored: BucketMetadata =
+            serde_ipld_dagcbor::from_slice(&bytes).expect("deserialize Some");
+        assert_eq!(restored.bucket_lookup_h, Some(h));
+        assert_eq!(restored.name, "b2");
+    }
+
+    #[test]
+    fn test_bucket_lookup_h_legacy_cbor_deserializes_to_none() {
+        // BACKWARD-COMPAT GOLD STANDARD (Phase 1.2 hard-constraint #1):
+        // existing fula-bucket-registry blocks pinned to IPFS BEFORE this
+        // field was added must deserialize cleanly into the new struct,
+        // with bucket_lookup_h = None. Production data must not break.
+        //
+        // We simulate this by defining a struct with the same shape as
+        // BucketMetadata but WITHOUT the new field, serializing it via
+        // dag-cbor, then deserializing as the new BucketMetadata. The
+        // #[serde(default)] on the new field is what makes this work.
+        #[derive(Serialize, Deserialize)]
+        struct LegacyBucketMetadata {
+            name: String,
+            created_at: DateTime<Utc>,
+            owner_id: String,
+            #[serde(with = "cid_serde")]
+            root_cid: Cid,
+            #[serde(default)]
+            versioning_enabled: bool,
+            #[serde(default)]
+            default_storage_class: StorageClass,
+            #[serde(default)]
+            tags: HashMap<String, String>,
+            cors_config: Option<CorsConfiguration>,
+            #[serde(default)]
+            lifecycle_rules: Vec<LifecycleRule>,
+            object_count: u64,
+            total_size: u64,
+            last_modified: DateTime<Utc>,
+            // NOTE: deliberately no `bucket_lookup_h` field — this is the
+            // pre-Phase-1.2 shape.
+        }
+
+        let cid = fula_blockstore::cid_utils::create_cid(
+            b"root",
+            fula_blockstore::cid_utils::CidCodec::DagCbor,
+        );
+        let now = Utc::now();
+        let legacy = LegacyBucketMetadata {
+            name: "videos".to_string(),
+            created_at: now,
+            owner_id: "9797dfb1947e5315e62c11f2ce477c28".to_string(),
+            root_cid: cid,
+            versioning_enabled: false,
+            default_storage_class: StorageClass::default(),
+            tags: HashMap::new(),
+            cors_config: None,
+            lifecycle_rules: Vec::new(),
+            object_count: 2984,
+            total_size: 764_932_382,
+            last_modified: now,
+        };
+
+        let legacy_bytes =
+            serde_ipld_dagcbor::to_vec(&legacy).expect("serialize legacy bucket");
+
+        // Deserialize the legacy bytes as the NEW BucketMetadata struct.
+        // This is exactly what happens at runtime when master loads a
+        // pre-Phase-1.2 fula-bucket-registry block from IPFS.
+        let modern: BucketMetadata =
+            serde_ipld_dagcbor::from_slice(&legacy_bytes).expect("legacy → modern");
+
+        assert_eq!(modern.name, "videos");
+        assert_eq!(modern.owner_id, "9797dfb1947e5315e62c11f2ce477c28");
+        assert_eq!(modern.object_count, 2984);
+        assert_eq!(modern.total_size, 764_932_382);
+        // The critical assertion — Phase 1.2's serde(default) preserves
+        // the no-migration property for existing CBOR registries.
+        assert_eq!(modern.bucket_lookup_h, None);
     }
 }
