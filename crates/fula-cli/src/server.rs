@@ -1,6 +1,6 @@
 //! Server startup and lifecycle
 
-use crate::handlers::locks;
+use crate::handlers::{locks, users_index_publisher};
 use crate::{AppState, GatewayConfig, routes};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,6 +15,13 @@ pub async fn run_server(config: GatewayConfig) -> anyhow::Result<()> {
     // Spawn the migration-lock TTL sweeper. Holds a cheap clone of the store;
     // lives for the lifetime of the process.
     locks::start_sweeper(state.lock_store.clone());
+
+    // Phase 3.2 — spawn the users-index publisher loop iff the env
+    // flag enabled the publisher at AppState construction time. When
+    // disabled, this is a no-op and nothing about S3 routing changes.
+    if let Some(publisher) = state.users_index_publisher.clone() {
+        users_index_publisher::start_publisher_loop(publisher);
+    }
 
     // Create router
     let app = routes::create_router(state);
@@ -40,6 +47,13 @@ pub async fn run_server_with_shutdown(
     let state = Arc::new(AppState::new(config.clone()).await?);
 
     locks::start_sweeper(state.lock_store.clone());
+
+    // Phase 3.2 — spawn the users-index publisher loop iff the env
+    // flag enabled the publisher at AppState construction time. When
+    // disabled, this is a no-op and nothing about S3 routing changes.
+    if let Some(publisher) = state.users_index_publisher.clone() {
+        users_index_publisher::start_publisher_loop(publisher);
+    }
 
     let app = routes::create_router(state);
 

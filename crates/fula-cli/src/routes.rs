@@ -25,6 +25,25 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     // Public routes that must bypass auth (e.g., container health checks)
     let public = Router::new().route("/healthz", get(handlers::healthz));
 
+    // Phase 3.2 internal endpoints. Bearer-token-protected at the
+    // handler level (see handlers::internal::authenticate). They
+    // bypass the user-JWT auth middleware so the chain cron in
+    // mainnet-reward-server can consume them with a shared secret,
+    // not a JWT. When the publisher is disabled OR the token is
+    // unset, both endpoints fail-closed with 503.
+    let internal = Router::new()
+        .route(
+            "/_internal/users-index-state",
+            get(handlers::internal::users_index_state),
+        )
+        .route(
+            "/_internal/publish-now",
+            post(handlers::internal::publish_now),
+        )
+        .layer(axum_middleware::from_fn(middleware::request_id_middleware))
+        .layer(axum_middleware::from_fn(middleware::logging_middleware))
+        .with_state(state.clone());
+
     // Admin routes (protected by admin middleware)
     let admin = Router::new()
         .route("/admin/users/{user_id}/buckets", get(handlers::list_user_buckets))
@@ -82,10 +101,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         ))
         .with_state(state.clone());
 
-    // Combine public, admin, and private, then apply shared layers
+    // Combine public, admin, internal, and private, then apply shared layers
     Router::new()
         .merge(public)
         .merge(admin)
+        .merge(internal)
         .merge(private)
         .layer(cors)
         .layer(TraceLayer::new_for_http())

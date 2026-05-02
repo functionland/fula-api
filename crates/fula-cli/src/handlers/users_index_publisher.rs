@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{info, warn};
 
 /// State that persists across master restarts. Single source of truth
 /// for "what did we last successfully publish?". Written **after** a
@@ -438,6 +439,98 @@ impl From<&PersistedState> for LatestPublished {
 }
 
 // ============================================================
+// IPNS publisher (kubo HTTP API client)
+// ============================================================
+
+/// Kubo `/api/v0/name/publish` response body. We only care about
+/// `Name` (= the IPNS NAME, libp2p key hash) for logging — clients
+/// resolve via the configured IPNS NAME, not via this response.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct IpnsPublishResponse {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Value")]
+    pub value: String,
+}
+
+/// Thin client over kubo's `/api/v0/name/publish`. Plain HTTP POST,
+/// no auth (kubo's API is localhost-only by default). Failures are
+/// surfaced via `Result` and the caller decides what to do — for
+/// the publisher tick, an IPNS failure logs at `warn!` and lets the
+/// commit proceed (chain backup at 12h still works).
+#[derive(Clone)]
+pub struct IpnsPublisher {
+    client: reqwest::Client,
+    api_url: String,
+}
+
+impl IpnsPublisher {
+    /// Construct a publisher targeting `api_url` (e.g.,
+    /// `http://localhost:5001`). The client uses kubo's default
+    /// timeout; the caller is responsible for outer timeouts if
+    /// needed (advisor noted: don't add inner backoff/timeout).
+    pub fn new(api_url: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_url,
+        }
+    }
+
+    /// Construct from an existing `reqwest::Client` (test hook —
+    /// lets wiremock-based tests inject a client with custom timeouts
+    /// if needed; production uses [`new`]).
+    #[doc(hidden)]
+    pub fn with_client(client: reqwest::Client, api_url: String) -> Self {
+        Self { client, api_url }
+    }
+
+    /// Publish `cid` under IPNS `key_name` with the given lifetime
+    /// + DHT-cache TTL.
+    ///
+    /// Kubo's API: `POST /api/v0/name/publish?arg=<cid>&key=<name>&lifetime=<dur>&ttl=<dur>`.
+    /// Lifetime/ttl are Go duration strings (`36h`, `15m`, …).
+    /// Returns the `(Name, Value)` from the response — `Name` is the
+    /// IPNS NAME (libp2p public-key hash). `Value` is the path the
+    /// IPNS record now resolves to (the input CID, prefixed with
+    /// `/ipfs/`).
+    pub async fn publish(
+        &self,
+        cid: &Cid,
+        key_name: &str,
+        lifetime: Duration,
+        ttl: Duration,
+    ) -> AnyResult<IpnsPublishResponse> {
+        let url = format!(
+            "{}/api/v0/name/publish?arg={}&key={}&lifetime={}&ttl={}",
+            self.api_url.trim_end_matches('/'),
+            cid,
+            urlencoding::encode(key_name),
+            format_go_duration(lifetime),
+            format_go_duration(ttl),
+        );
+        let resp = self.client.post(&url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "kubo /api/v0/name/publish failed: status={}, body={}",
+                status,
+                body
+            );
+        }
+        let body: IpnsPublishResponse = resp.json().await?;
+        Ok(body)
+    }
+}
+
+/// Format a `Duration` as a Go-style duration string accepted by
+/// kubo (`<seconds>s` is universally accepted; we don't need
+/// pretty-formatting). E.g., `36h` → `129600s`. Kubo accepts both.
+fn format_go_duration(d: Duration) -> String {
+    format!("{}s", d.as_secs())
+}
+
+// ============================================================
 // Publisher skeleton
 // ============================================================
 
@@ -447,6 +540,10 @@ pub struct UsersIndexPublisher<S: BlockStore + PinStore + 'static> {
     config: PublisherConfig,
     bucket_manager: Arc<BucketManager<S>>,
     block_store: Arc<S>,
+    /// Optional IPNS publisher. `None` disables IPNS — useful for
+    /// tests that exercise just the pin/persist path, and for
+    /// operators who want the chain-backup path only.
+    ipns_publisher: Option<IpnsPublisher>,
     /// Per-user diff cache — owner_id → (content_hash, bucketsIndexCid).
     /// `Mutex` (not `RwLock`) because the tick is the only writer and
     /// the lock window is tiny (a HashMap insert).
@@ -488,10 +585,38 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
     /// Construct from config + handles to the bucket manager and
     /// block store. Loads existing state-file on-disk; fresh master
     /// starts with `PersistedState::default()`.
+    ///
+    /// IPNS is enabled by default (constructed from `config.ipfs_api_url`).
+    /// Tests may disable it via [`open_without_ipns`] to exercise the
+    /// pin/persist path independently.
     pub fn open(
         config: PublisherConfig,
         bucket_manager: Arc<BucketManager<S>>,
         block_store: Arc<S>,
+    ) -> Result<Self, PersistError> {
+        let ipns_publisher = Some(IpnsPublisher::new(config.ipfs_api_url.clone()));
+        Self::open_with_ipns(config, bucket_manager, block_store, ipns_publisher)
+    }
+
+    /// Construct without IPNS. Tick still pins + persists; the chain
+    /// path (12h cron in `mainnet-reward-server`) still works. Useful
+    /// for operators who don't want the kubo IPNS hop, and for the
+    /// pin/persist-only unit tests.
+    pub fn open_without_ipns(
+        config: PublisherConfig,
+        bucket_manager: Arc<BucketManager<S>>,
+        block_store: Arc<S>,
+    ) -> Result<Self, PersistError> {
+        Self::open_with_ipns(config, bucket_manager, block_store, None)
+    }
+
+    /// Internal constructor — also used by tests to inject a
+    /// wiremock-backed IPNS client.
+    pub fn open_with_ipns(
+        config: PublisherConfig,
+        bucket_manager: Arc<BucketManager<S>>,
+        block_store: Arc<S>,
+        ipns_publisher: Option<IpnsPublisher>,
     ) -> Result<Self, PersistError> {
         let persisted = PersistedState::load(&config.state_file_path)?;
         let latest = LatestPublished::from(&persisted);
@@ -499,6 +624,7 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
             config,
             bucket_manager,
             block_store,
+            ipns_publisher,
             diff_cache: Mutex::new(HashMap::new()),
             latest: RwLock::new(latest),
             tick_lock: tokio::sync::Mutex::new(()),
@@ -509,6 +635,13 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
     /// underlying RwLock read guard.
     pub fn latest(&self) -> LatestPublished {
         self.latest.read().clone()
+    }
+
+    /// Read-only access to the publisher config. Used by the internal
+    /// HTTP endpoints to surface `internal_token` (auth check) and
+    /// `ipns_key_name` (response field).
+    pub fn config(&self) -> &PublisherConfig {
+        &self.config
     }
 
     /// Read the on-disk persisted state directly (bypasses the
@@ -705,9 +838,50 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
             }
         }
 
-        // 8. Persist new state. (A3 will insert IPNS publish between
-        //    pin and persist; commit_state stays last so a crash mid-
-        //    IPNS leaves us in a recoverable place.)
+        // 8. IPNS publish (best-effort). Order is documented as
+        //    "pin → IPNS → persist" (plan 3.2.b + advisor): an IPNS
+        //    publish failure does NOT abort the commit because the
+        //    chain-backup cron at 12h still works. If the publish
+        //    succeeds but persist fails, the next tick republishes
+        //    the same CID under sequence+1 — IPNS is idempotent on
+        //    `(cid, sequence)`. If we flipped the order to
+        //    persist-then-IPNS, a crash mid-IPNS would leave an
+        //    advanced on-disk sequence pointing at a CID never
+        //    published. Don't flip.
+        if let Some(ipns) = &self.ipns_publisher {
+            match ipns
+                .publish(
+                    &global_cid,
+                    &self.config.ipns_key_name,
+                    self.config.ipns_lifetime,
+                    self.config.ipns_ttl,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    info!(
+                        cid = %global_cid,
+                        sequence = next_sequence,
+                        ipns_name = %resp.name,
+                        ipns_value = %resp.value,
+                        "users-index publisher: IPNS publish succeeded"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        cid = %global_cid,
+                        sequence = next_sequence,
+                        error = %e,
+                        "users-index publisher: IPNS publish failed (best-effort; chain backup at 12h still works; next tick will retry)"
+                    );
+                }
+            }
+        }
+
+        // 9. Persist new state. commit_state is last so a crash mid-
+        //    IPNS leaves us in a recoverable place — the next tick
+        //    will retry IPNS with the same content (and on-chain
+        //    sequence enforcement keeps things monotonic regardless).
         let next_state = PersistedState {
             global_cid: Some(global_cid),
             sequence: next_sequence,
@@ -723,6 +897,68 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
             global_rebuilt: true,
         })
     }
+
+    /// Test-only accessor: read the IPNS publisher's API URL.
+    #[cfg(test)]
+    fn ipns_api_url_for_test(&self) -> Option<String> {
+        self.ipns_publisher.as_ref().map(|p| p.api_url.clone())
+    }
+}
+
+/// Spawn a background task that calls `publisher.run_tick()` on
+/// `flush_interval`. Mirrors `handlers::locks::start_sweeper`:
+/// holds an `Arc` to the publisher, lives for the process lifetime.
+///
+/// `MissedTickBehavior::Delay` ensures that if a single tick takes
+/// unusually long (e.g., master kubo blocked), the next tick fires
+/// after a fresh `flush_interval` rather than firing back-to-back to
+/// "catch up" — bursts can swamp the pinning service. The first tick
+/// is gated by an immediate `interval.tick().await` at the top of
+/// the loop, which fires after one interval has elapsed; if you want
+/// the first tick at startup, log + call run_tick once before the
+/// loop. We do NOT do that here: the operator's sequence-of-events
+/// at master startup is `BucketManager.load_registry → spawn this
+/// task → first tick fires after flush_interval` so the registry
+/// has time to load and persist before the publisher reads from it.
+pub fn start_publisher_loop<S: BlockStore + PinStore + 'static>(
+    publisher: Arc<UsersIndexPublisher<S>>,
+) {
+    let interval_dur = publisher.config.flush_interval;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(interval_dur);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the first tick (which fires immediately) — see fn doc.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match publisher.run_tick().await {
+                Ok(outcome) => {
+                    if outcome.global_rebuilt {
+                        info!(
+                            sequence = outcome.sequence,
+                            changed_users = outcome.changed_users,
+                            total_users = outcome.total_users,
+                            cid = %outcome.global_cid,
+                            "users-index publisher: tick committed new global"
+                        );
+                    } else {
+                        tracing::debug!(
+                            sequence = outcome.sequence,
+                            total_users = outcome.total_users,
+                            "users-index publisher: tick was no-op"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "users-index publisher: tick failed; will retry on next interval");
+                }
+            }
+        }
+    });
+    info!(
+        interval_secs = interval_dur.as_secs(),
+        "users-index publisher loop started"
+    );
 }
 
 #[cfg(test)]
@@ -1446,5 +1682,182 @@ mod tests {
         assert_eq!(outcome.changed_users, 0);
         assert!(outcome.global_rebuilt, "first publish must run even on empty");
         assert_eq!(outcome.sequence, 1);
+    }
+
+    // ============================================================
+    // Phase 3.2 A3 — IPNS publisher tests (wiremock)
+    // ============================================================
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Construct a publisher that targets `mock_url` for IPNS calls
+    /// (instead of a real kubo). The mock has full control over
+    /// success/failure responses.
+    fn fixture_publisher_with_ipns(
+        state_path: PathBuf,
+        ipns_api_url: String,
+    ) -> (
+        UsersIndexPublisher<MemoryBlockStore>,
+        Arc<MemoryBlockStore>,
+        Arc<BucketManager<MemoryBlockStore>>,
+    ) {
+        let store = Arc::new(MemoryBlockStore::new());
+        let manager = Arc::new(BucketManager::new(Arc::clone(&store)));
+        let mut config = fixture_config(state_path);
+        // Speed up: short lifetime/ttl in tests (kubo accepts them
+        // but our format function is tested below).
+        config.ipns_lifetime = Duration::from_secs(60);
+        config.ipns_ttl = Duration::from_secs(15);
+        let ipns = IpnsPublisher::new(ipns_api_url);
+        let publisher = UsersIndexPublisher::open_with_ipns(
+            config,
+            Arc::clone(&manager),
+            Arc::clone(&store),
+            Some(ipns),
+        )
+        .expect("open");
+        (publisher, store, manager)
+    }
+
+    #[test]
+    fn test_format_go_duration() {
+        assert_eq!(format_go_duration(Duration::from_secs(36 * 3600)), "129600s");
+        assert_eq!(format_go_duration(Duration::from_secs(15 * 60)), "900s");
+        assert_eq!(format_go_duration(Duration::from_secs(0)), "0s");
+    }
+
+    #[tokio::test]
+    async fn test_ipns_publisher_success() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/name/publish"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Name": "k51qzi5uqu5dh-mock",
+                "Value": "/ipfs/QmFakeCidValue",
+            })))
+            .mount(&mock)
+            .await;
+
+        let publisher = IpnsPublisher::new(mock.uri());
+        let cid = fixture_cid(0xab);
+        let resp = publisher
+            .publish(
+                &cid,
+                "fula-users-index",
+                Duration::from_secs(36 * 3600),
+                Duration::from_secs(15 * 60),
+            )
+            .await
+            .expect("publish");
+        assert_eq!(resp.name, "k51qzi5uqu5dh-mock");
+        assert_eq!(resp.value, "/ipfs/QmFakeCidValue");
+    }
+
+    #[tokio::test]
+    async fn test_ipns_publisher_propagates_5xx_error() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/name/publish"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .mount(&mock)
+            .await;
+
+        let publisher = IpnsPublisher::new(mock.uri());
+        let cid = fixture_cid(0xab);
+        let result = publisher
+            .publish(
+                &cid,
+                "fula-users-index",
+                Duration::from_secs(60),
+                Duration::from_secs(15),
+            )
+            .await;
+        assert!(result.is_err(), "5xx must surface as error");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("status=500"), "error message exposes status");
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_calls_ipns_with_correct_cid_and_sequence() {
+        // Verifies the integration point: run_tick fires kubo's
+        // /api/v0/name/publish with the freshly-built global CID.
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/name/publish"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Name": "k51qzi5uqu5dh-mock",
+                "Value": "/ipfs/QmIgnored",
+            })))
+            .expect(1) // exactly one IPNS publish per tick
+            .mount(&mock)
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, _store, manager) =
+            fixture_publisher_with_ipns(path, mock.uri());
+
+        create_user_bucket(&manager, "alice", "photos").await;
+        let outcome = publisher.run_tick().await.expect("tick");
+        assert_eq!(outcome.sequence, 1);
+        // wiremock's expect(1) verifies on drop that exactly one
+        // request hit the IPNS endpoint.
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_succeeds_when_ipns_5xx() {
+        // Operating-state matrix: kubo IPNS endpoint returns 500.
+        // The tick MUST still return Ok, the persisted state MUST
+        // still advance, and the global CID MUST still be pinned.
+        // Otherwise a flaky kubo blocks the entire publisher,
+        // which blocks subsequent writes on master.
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/name/publish"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("kubo down"))
+            .mount(&mock)
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, store, manager) =
+            fixture_publisher_with_ipns(path.clone(), mock.uri());
+
+        create_user_bucket(&manager, "alice", "photos").await;
+        let outcome = publisher.run_tick().await.expect("tick still Ok on IPNS 5xx");
+        assert_eq!(outcome.sequence, 1);
+        assert!(outcome.global_rebuilt);
+
+        // Pin happened → block exists in store.
+        assert!(store.is_pinned(&outcome.global_cid).await.unwrap());
+
+        // Persist happened → state file reflects new sequence.
+        let persisted = PersistedState::load(&path).expect("load");
+        assert_eq!(persisted.sequence, 1);
+        assert_eq!(persisted.global_cid, Some(outcome.global_cid));
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_no_ipns_configured_still_pins_and_persists() {
+        // open_without_ipns: tick still pins + persists; chain backup
+        // path is the only publish channel. Useful regression check
+        // for operators who deploy without IPNS.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let store = Arc::new(MemoryBlockStore::new());
+        let manager = Arc::new(BucketManager::new(Arc::clone(&store)));
+        let publisher = UsersIndexPublisher::open_without_ipns(
+            fixture_config(path.clone()),
+            Arc::clone(&manager),
+            Arc::clone(&store),
+        )
+        .expect("open");
+
+        create_user_bucket(&manager, "alice", "photos").await;
+        let outcome = publisher.run_tick().await.expect("tick");
+        assert_eq!(outcome.sequence, 1);
+        assert!(outcome.global_rebuilt);
+        assert!(publisher.ipns_api_url_for_test().is_none());
     }
 }

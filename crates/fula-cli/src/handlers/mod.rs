@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod batch;
 pub mod bucket;
+pub mod internal;
 pub mod locks;
 pub mod multipart;
 pub mod object;

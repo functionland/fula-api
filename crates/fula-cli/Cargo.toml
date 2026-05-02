@@ -82,3 +82,6 @@ tempfile = { workspace = true }
 rstest = { workspace = true }
 tokio-test = "0.4"
 reqwest = { workspace = true }
+# Used by users_index_publisher A3 tests to mock kubo's
+# /api/v0/name/publish HTTP endpoint without spinning up a real IPFS daemon.
+wiremock = { workspace = true }
