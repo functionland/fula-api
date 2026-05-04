@@ -42,7 +42,7 @@
         <div class="sidebar-header">
             <div class="logo">
                 <h1>Fula API</h1>
-                <span class="version">v0.3.7</span>
+                <span class="version">v0.4.0</span>
             </div>
             <button class="theme-toggle" aria-label="Toggle theme">
                 <span class="icon-sun">☀️</span>
@@ -70,6 +70,7 @@
                 <li><a href="#file-manager">File Manager API</a></li>
                 <li><a href="#secure-sharing">Secure Sharing</a></li>
                 <li><a href="#multipart">Multipart Uploads</a></li>
+                <li><a href="#offline-reads">Offline Reads (v0.4.0)</a></li>
                 <li><a href="#aws-cli">AWS CLI</a></li>
                 <li><a href="#python">Python (boto3)</a></li>
                 <li><a href="#javascript">JavaScript</a></li>
@@ -625,6 +626,183 @@ for (i, chunk) in data.chunks(5 * 1024 * 1024).enumerate() {
 // Complete upload
 let final_etag = upload.complete().await?;
 println!("Complete: {}", final_etag);</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="offline-reads" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>📡 Offline Reads (v0.4.0)</h2>
+                    <p>
+                        When the master gateway is unreachable, the SDK can transparently fall back to public IPFS gateways (warm-device path) and, on a fresh device install, cold-start by resolving a globally-published users-index from IPNS or the chain anchor — no client wallet, no fresh master required.
+                    </p>
+                    <p>
+                        Every flag defaults <strong>OFF</strong> for backward compatibility. Apps that don't opt in see byte-identical behavior to pre-v0.4.0 builds.
+                    </p>
+
+                    <h3>Three-tier read path</h3>
+                    <ul>
+                        <li><strong>Master up</strong> — direct master read (fast path, byte-identical to today)</li>
+                        <li><strong>Master down + warm cache</strong> — gateway race using the cached <code>(bucket, key) → cid</code> map (Phase 2.x)</li>
+                        <li><strong>Master down + fresh install</strong> — cold-start hybrid resolver fetches the global users-index via IPNS first, then chain anchor as backup; walks the per-user manifest from there (Phase 3.3)</li>
+                    </ul>
+
+                    <h3>Rust — enable warm-device offline reads</h3>
+<pre><code class="language-rust">use fula_client::{Config, FulaClient};
+use std::time::Duration;
+
+let mut config = Config::new("https://your-fula-gateway.com:9000")
+    .with_token(jwt);
+
+// Phase 2.1 — detect master-down without per-read timeout tax
+config.health_gate_enabled = true;
+config.health_gate_ttl = Duration::from_secs(30);
+
+// Phase 2.2 — persistent block cache (gateway hits land here)
+config.block_cache_enabled = true;
+// config.block_cache_path = Some(...);  // None → platform default
+config.block_cache_max_bytes = 256 * 1024 * 1024;
+
+// Phase 2.4 — fall back to public gateways when master is down
+config.gateway_fallback_enabled = true;
+// config.gateway_fallback_urls = vec![...];  // [] → SDK ships 6 default gateways
+config.gateway_race_concurrency = 3;
+
+let client = FulaClient::new(config)?;
+</code></pre>
+
+                    <h3>Rust — also enable cold-start (fresh device install)</h3>
+<pre><code class="language-rust">use fula_client::derive_user_key_from_email;
+
+// Compute userKey ONCE at sign-in. Email is hashed locally; the SDK
+// never persists or transmits it.
+let user_key = derive_user_key_from_email(&user_email);
+
+// In addition to the warm-device flags above:
+config.users_index_chain_rpc_url = "https://mainnet.base.org".into();
+config.users_index_anchor_address =
+    "0x...FulaUsersIndexAnchor...".into();
+config.users_index_ipns_name = "k51qzi5uqu5dh...".into();
+config.users_index_user_key = Some(user_key);
+// config.users_index_ipns_gateway_urls = vec![...];  // [] → SDK defaults
+// config.users_index_ipfs_gateway_urls = vec![...];  // [] → SDK defaults
+</code></pre>
+
+                    <h3>Rust — read with transparency fields</h3>
+<pre><code class="language-rust">use fula_client::{ReadSource, ReadFreshness};
+
+let result = client
+    .get_object_with_offline_fallback("my-bucket", "photos/cat.jpg")
+    .await?;
+
+let bytes = &result.inner.data;
+match result.source {
+    ReadSource::Master           => log::debug!("served by master"),
+    ReadSource::LocalCache       => log::info!("served from local cache (offline)"),
+    ReadSource::Gateway(url)     => log::info!("served via {}", url),
+}
+match result.freshness {
+    ReadFreshness::Live                                 => {}
+    ReadFreshness::Cached { observed_at }               => {
+        log::info!("cached entry from unix-millis {}", observed_at);
+    }
+    ReadFreshness::StaleByDesign { snapshot_age_secs }  => { /* Phase 3.3 */ }
+    ReadFreshness::StaleByOutage { snapshot_age_secs }  => { /* Phase 3.3 */ }
+}
+</code></pre>
+
+                    <h3>Flutter / Dart — same surface via FRB bindings</h3>
+<pre><code class="language-dart">// 1. Compute userKey at sign-in
+final userKey = deriveUserKeyFromEmail(userEmail);
+
+// 2. Construct config with all relevant flags
+final config = FulaConfig(
+  endpoint: 'https://your-fula-gateway.com:9000',
+  accessToken: jwt,
+  healthGateEnabled: true,
+  blockCacheEnabled: true,
+  gatewayFallbackEnabled: true,
+  // cold-start (Phase 3.3) — native-only at runtime
+  usersIndexChainRpcUrl: 'https://mainnet.base.org',
+  usersIndexAnchorAddress: '0x...',
+  usersIndexIpnsName: 'k51qzi5uqu5dh...',
+  usersIndexUserKey: userKey,
+);
+final client = await createClient(config);
+
+// 3. Read with transparency
+final result = await getObjectWithOfflineFallback(client, 'my-bucket', 'photos/cat.jpg');
+final bytes = result.inner.data;
+print('source: ${result.source}, freshness: ${result.freshness}');
+</code></pre>
+
+                    <h3>JavaScript / TypeScript — wasm-bindgen surface</h3>
+<pre><code class="language-typescript">import {
+  createEncryptedClient,
+  getObjectWithOfflineFallback,
+  deriveUserKeyFromEmail,
+  pollMasterHealthEvents,
+  getLastMasterHealthEvent,
+} from '@functionland/fula-client';
+
+const userKey = deriveUserKeyFromEmail(userEmail);
+
+const client = await createEncryptedClient(
+  {
+    endpoint: 'https://your-fula-gateway.com:9000',
+    accessToken: jwt,
+    healthGateEnabled: true,                 // functional on web
+    blockCacheEnabled: true,                 // accepted but inert on web
+    gatewayFallbackEnabled: true,            // accepted but inert on web
+    usersIndexChainRpcUrl: '...',            // accepted but inert on web
+    usersIndexAnchorAddress: '0x...',
+    usersIndexIpnsName: 'k51qzi5...',
+    usersIndexUserKey: userKey,
+  },
+  encryptionConfig,
+);
+
+const result = await getObjectWithOfflineFallback(client, 'my-bucket', 'photos/cat.jpg');
+console.log(result.source);     // {kind: 'Master'} | {kind: 'LocalCache'} | {kind: 'Gateway', url: ...}
+console.log(result.freshness);  // {kind: 'Live'} | {kind: 'Cached', observedAt: ...}
+</code></pre>
+
+                    <h3>Health-event subscription (Phase 19)</h3>
+                    <p>Two patterns are exposed in every binding (Rust closure / Dart polling / JS polling); pick whichever fits your app.</p>
+
+<pre><code class="language-typescript">// JS / TS — drain on a timer or UI rebuild
+const events = pollMasterHealthEvents(client);  // Array&lt;MasterHealthEvent&gt;
+for (const event of events) {
+  switch (event.kind) {
+    case 'Online':                  setOffline(false); break;
+    case 'OfflineFallbackActive':   setOffline(true); break;
+    case 'SeverelyDegraded':        disableNewBucketUI(); break;
+  }
+}
+
+// Or read latest on mount
+const last = getLastMasterHealthEvent(client);
+if (last && last.kind === 'OfflineFallbackActive') {
+  // app started while master is down
+}
+</code></pre>
+
+                    <h3>What works where</h3>
+                    <table style="margin-top: 1em;">
+                        <thead><tr><th>Surface</th><th>Native (Rust / Flutter)</th><th>Web (wasm / JS)</th></tr></thead>
+                        <tbody>
+                            <tr><td>Health gate (Phase 2.1)</td><td>✅ functional</td><td>✅ functional</td></tr>
+                            <tr><td>Block cache (Phase 2.2)</td><td>✅ functional</td><td>⚪ flag accepted, inert</td></tr>
+                            <tr><td>Gateway race (Phase 2.3 / 2.4)</td><td>✅ functional</td><td>⚪ flag accepted, inert</td></tr>
+                            <tr><td>Cold-start resolver (Phase 3.3)</td><td>✅ functional</td><td>⚪ fields accepted, inert</td></tr>
+                            <tr><td>Transparency types &amp; polling (Phase 19)</td><td>✅ functional</td><td>✅ functional (returns Master/Live on the inert paths)</td></tr>
+                            <tr><td><code>derive_user_key_from_email</code> helper</td><td>✅</td><td>✅ (computed locally; useful for cross-platform identity flows)</td></tr>
+                        </tbody>
+                    </table>
+                    <p>
+                        See <a href="#" onclick="window.location='wasm-compatibility.html'; return false;">WASM Compatibility</a> for the full gating story.
+                    </p>
                 </div>
             </div>
         </section>

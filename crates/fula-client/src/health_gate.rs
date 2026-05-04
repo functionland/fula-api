@@ -30,7 +30,7 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// Phase 19 transparency surface — events the SDK emits when its
 /// view of master-server reachability changes. Apps wire a
@@ -218,15 +218,18 @@ pub enum GateDecision {
     ShortCircuit { down_for_secs: u64 },
 }
 
-/// Current unix-time in milliseconds. Wall-clock based (so SystemTime
-/// adjustments can shift the gate's perceived "since" — acceptable here
-/// since we only compare durations, and a clock jump is at worst a slight
-/// TTL anomaly).
+/// Current unix-time in milliseconds. Wall-clock based (so a system-
+/// clock adjustment can shift the gate's perceived "since" —
+/// acceptable here since we only compare durations, and a clock jump
+/// is at worst a slight TTL anomaly).
+///
+/// Routed through `fula_crypto::time::now_millis` so the wasm32 build
+/// uses `js_sys::Date::now()` instead of `SystemTime::now()` (the
+/// latter panics on wasm32 with "time not implemented on this
+/// platform" — the wasm clippy `disallowed-methods` config catches
+/// this at lint time).
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    fula_crypto::time::now_millis()
 }
 
 #[cfg(test)]

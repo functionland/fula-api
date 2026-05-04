@@ -43,7 +43,7 @@
         <div class="sidebar-header">
             <div class="logo">
                 <h1>Fula API</h1>
-                <span class="version">v0.3.7</span>
+                <span class="version">v0.4.0</span>
             </div>
             <button class="theme-toggle" aria-label="Toggle theme">
                 <span class="icon-sun">☀️</span>
@@ -113,6 +113,16 @@
                 <li><a href="#encryption-headers">Encryption Headers</a></li>
                 <li><a href="#metadata-privacy">Metadata Privacy</a></li>
                 <li><a href="#secure-sharing-api">Secure Sharing</a></li>
+            </ul>
+        </div>
+        <div class="nav-section">
+            <h3>Master-Independent Reads (v0.4.0)</h3>
+            <ul>
+                <li><a href="#mir-overview">Overview</a></li>
+                <li><a href="#mir-bucket-lookup-h">Bucket Lookup-H Header</a></li>
+                <li><a href="#mir-internal-state">Users-Index State</a></li>
+                <li><a href="#mir-publish-now">Publish-Now Trigger</a></li>
+                <li><a href="#mir-anchor-trigger">Anchor Trigger</a></li>
             </ul>
         </div>
     </nav>
@@ -1210,6 +1220,130 @@ curl -I "http://localhost:9000/my-bucket/Qm0bb7a3f40dcd6057bd5abd04d2aa80f68680e
 │     • Path checked against scope                                │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="mir-overview" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h1>Master-Independent Reads (v0.4.0)</h1>
+                    <p>
+                        v0.4.0 adds a coordinated server + SDK story so non-blox clients can read their own files even when the master gateway is offline.
+                        The <strong>SDK-side</strong> surfaces (gateway race, block cache, cold-start resolver, transparency types) live in <a href="sdk.html#offline-reads">SDK Examples</a>;
+                        this section documents the <strong>HTTP-level</strong> additions on the master server itself.
+                    </p>
+                    <h3>What's new on the master</h3>
+                    <ul>
+                        <li>Optional PUT header <code>x-amz-meta-fula-bucket-lookup-h</code> the SDK attaches on Phase&nbsp;2 manifest-root commits (Phase&nbsp;1.2).</li>
+                        <li>Background <strong>users-index publisher</strong> that pins per-user + global CBORs to ipfs-cluster, publishes to IPNS every 5 min, and exposes the latest state via an internal endpoint (Phase&nbsp;3.2).</li>
+                        <li>Bearer-protected <strong>internal admin endpoints</strong> at <code>/_internal/*</code> (master) and <code>/admin/users-index-anchor/trigger</code> (mainnet-rewards-server) so operators can force a publish / chain-submit on demand instead of waiting up to 12&nbsp;hours.</li>
+                    </ul>
+                    <p>Every new server-side path is gated by an env flag <strong>default OFF</strong>; old fula-clients see byte-identical behavior to pre-v0.4.0 builds.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="mir-bucket-lookup-h" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>Phase 1.2 — <code>x-amz-meta-fula-bucket-lookup-h</code></h2>
+                    <p>
+                        Optional user-metadata header that the encrypted SDK attaches on the Phase&nbsp;2 manifest-root PUT.
+                        Carries a 16-byte client-derived <strong>blinded</strong> bucket lookup key (BLAKE3 of <code>MetadataKey || bucket_name</code>),
+                        so the published global users-index CBOR can key its bucket entries without leaking plaintext bucket names to anyone who fetches it.
+                    </p>
+                    <h3>Format</h3>
+                    <pre><code>x-amz-meta-fula-bucket-lookup-h: &lt;32 hex chars&gt;</code></pre>
+                    <p>32 lowercase hex chars (16 bytes). Master-side handler at <code>fula-cli/src/handlers/object.rs</code> calls <code>BucketManager::populate_lookup_h_if_missing</code> after the flush.</p>
+                    <h3>Behavior</h3>
+                    <ul>
+                        <li><strong>Idempotent</strong> — once populated for a bucket, the field is never overwritten on subsequent PUTs.</li>
+                        <li><strong>Non-fatal</strong> — a malformed or missing header is logged at <code>warn!</code> level; the PUT response is unchanged.</li>
+                        <li><strong>Env-gated</strong> — master ignores the header unless <code>FULA_BUCKET_LOOKUP_H_ENABLED=1</code>.</li>
+                        <li><strong>Backward-compat</strong> — old clients (no header) work unchanged. Buckets created without the header are emitted in the published CBOR with <code>legacy: true</code> and a plaintext-name key, so cold-start can still find them.</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <section id="mir-internal-state" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>Phase 3.2 — <code>GET /_internal/users-index-state</code></h2>
+                    <p>Returns the master's current published users-index state. Consumed by the chain-anchor cron in <code>mainnet-rewards-server</code>; rarely useful to apps directly.</p>
+                    <h3>Auth</h3>
+                    <p><code>Authorization: Bearer &lt;FULA_USERS_INDEX_INTERNAL_TOKEN&gt;</code> — generated by the operator setup script and shared between master + cron + (optionally) pinning-webui.</p>
+                    <h3>Response codes</h3>
+                    <ul>
+                        <li><strong>200</strong> — success; body documented below.</li>
+                        <li><strong>401</strong> — bearer missing or wrong (constant-time compared).</li>
+                        <li><strong>503</strong> — fail-closed: publisher disabled (<code>FULA_USERS_INDEX_PUBLISHER_ENABLED</code> unset) OR token unset.</li>
+                    </ul>
+                    <h3>Response body (JSON)</h3>
+<pre><code>{
+  "cid": "bafyrei...",          // CID of the latest pinned global users-index CBOR (or null on pre-first-tick)
+  "sequence": 17,                // monotonic sequence inside the CBOR payload
+  "updated_at_unix": 1714780000, // wall-clock timestamp of last commit
+  "ipns_key_name": "fula-users-index"
+}</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="mir-publish-now" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>Operator — <code>POST /_internal/publish-now</code></h2>
+                    <p>Triggers an immediate publisher tick instead of waiting up to <code>FULA_USERS_INDEX_FLUSH_INTERVAL_SECS</code> (default 5 min). Useful during deploy verification.</p>
+                    <h3>Auth</h3>
+                    <p>Same bearer token as <code>/_internal/users-index-state</code>. Same 401 / 503 fail-closed semantics.</p>
+                    <h3>Response (200) body</h3>
+<pre><code>{
+  "global_cid": "bafyrei...",
+  "sequence": 18,
+  "changed_users": 1,    // users whose per-user CBOR was newly pinned
+  "failed_users": 0,     // per-user pins that failed (tick continues; failed users retry next tick)
+  "total_users": 6,
+  "global_rebuilt": true
+}</code></pre>
+                    <h3>Operator UI</h3>
+                    <p>
+                        The <strong>pinning-webui</strong> admin section (<code>/admin/fula</code>) ships a "Publish now" button that proxies to this endpoint.
+                        Reuses the operator's session cookie for the inbound auth and the bearer token for the outbound call.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <section id="mir-anchor-trigger" class="endpoint">
+            <div class="endpoint-content">
+                <div class="description">
+                    <h2>Operator — <code>POST /admin/users-index-anchor/trigger</code></h2>
+                    <p>
+                        On the <strong>mainnet-rewards-server</strong> (not the master gateway). Triggers an immediate users-index chain-anchor submission instead of waiting up to 12 h for the periodic cron.
+                    </p>
+                    <h3>Auth</h3>
+                    <p>Reuses <code>FULA_USERS_INDEX_INTERNAL_TOKEN</code> via <code>Authorization: Bearer ...</code>. Constant-time compare.</p>
+                    <h3>Response codes</h3>
+                    <ul>
+                        <li><strong>200</strong> — tick committed; per-network results in body.</li>
+                        <li><strong>401</strong> — wrong/missing bearer.</li>
+                        <li><strong>409</strong> — another tick is already in flight (cron OR a prior HTTP trigger). Retry after a moment.</li>
+                        <li><strong>503</strong> — fail-closed: anchor service disabled (<code>FULA_USERS_INDEX_ANCHOR_ENABLED</code> unset) OR token unset.</li>
+                    </ul>
+                    <h3>Response (200) body</h3>
+<pre><code>{
+  "committed": true,
+  "masterCid": "bafyrei...",
+  "masterSequence": "18",
+  "networks": [
+    { "network": "base",  "status": "fulfilled", "submitted": true },
+    { "network": "skale", "status": "fulfilled", "submitted": false }
+  ]
+}</code></pre>
+                    <h3>Concurrency</h3>
+                    <p>An in-flight flag inside <code>runTick</code> prevents two simultaneous ticks from racing the on-chain <code>latest()</code> reads + <code>publish()</code> calls (which would cause one tx to revert with <code>NonMonotonicSequence</code>). HTTP triggers that contend with the periodic cron get a clean 409.</p>
                 </div>
             </div>
         </section>

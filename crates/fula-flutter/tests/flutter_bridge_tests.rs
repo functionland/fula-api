@@ -25,6 +25,12 @@ fn test_fula_config_default() {
 
 #[test]
 fn test_fula_config_with_values() {
+    // Construct via `..Default::default()` so adding new fields to
+    // `FulaConfig` (e.g., Phase 2.x / 3.3 / 19) doesn't require
+    // updating this test. The pre-Phase-2.x fields below are the
+    // ones this test specifically exercises; everything else inherits
+    // from `Default::default()` which is the documented backward-
+    // compat shape (all new flags off / empty).
     let config = FulaConfig {
         endpoint: "https://api.example.com".to_string(),
         access_token: Some("test-token".to_string()),
@@ -32,6 +38,7 @@ fn test_fula_config_with_values() {
         max_retries: 5,
         per_chunk_download_timeout_seconds: 120,
         buffered_download_max_bytes: 64 * 1024 * 1024,
+        ..Default::default()
     };
     assert_eq!(config.endpoint, "https://api.example.com");
     assert_eq!(config.access_token, Some("test-token".to_string()));

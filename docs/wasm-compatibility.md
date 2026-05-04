@@ -248,6 +248,40 @@ The API surface is identical between native and WASM builds. However:
 2. **Multithreading:** WASM is single-threaded. Async operations use the event loop.
 3. **Timing:** High-resolution timers may be limited in WASM for security reasons.
 
+## Master-Independent Reads (v0.4.0) — what works on wasm
+
+v0.4.0 adds the offline-read story (Phase 2.1 / 2.2 / 2.3 / 2.4 / 3.3 / 19). The full surface is exposed in **both** `fula-flutter` and `fula-js` bindings for API symmetry, but several layers are **inert at runtime on wasm32** because their dependencies (redb, `parking_lot`-based gateway pool, reqwest-with-tls, `std::time::SystemTime`) don't compile cleanly in browsers.
+
+### Functional on wasm32
+
+| Surface | Notes |
+|---|---|
+| **Health gate (Phase 2.1)** | `health_gate_enabled` + `health_gate_ttl` work. Internal `now_ms()` routes through `fula_crypto::time::now_millis()` which uses `js_sys::Date::now()` on wasm32 (the `clippy::disallowed_methods` config in `.github/clippy-wasm/clippy.toml` bans `std::time::SystemTime::now` to catch regressions at lint time). Two consecutive request failures still trip the gate; reads short-circuit with `MasterUnreachable` instead of paying the timeout tax. |
+| **Transparency polling (Phase 19)** | `pollMasterHealthEvents()` and `getLastMasterHealthEvent()` work. The dispatcher captures every transition fired by the in-Rust health gate. On wasm32 the gate fires for the same conditions as native (failed master requests), so apps see the same event stream. `MasterHealthEvent::SeverelyDegraded` is only emitted by the cold-start resolver, which is native-only — on wasm you'll see `Online` / `OfflineFallbackActive` only. |
+| **`derive_user_key_from_email`** | Pure `sha256` + `blake3` + `hex` — no native-only deps. Apps can compute the userKey on web for cross-platform identity flows (e.g., compute on a desktop Tauri app, replicate on a web companion using the same email + algorithm). |
+| **`get_object_with_offline_fallback`** | Compiles and runs on wasm32. With block_cache + gateway_fallback inert (see below), the wasm path always returns `source: Master, freshness: Live` — i.e., it's effectively `get_object_with_metadata` wrapped in the `OfflineGetResult` shape. Apps can consume the result identically across native + web. |
+
+### Inert on wasm32 (fields accepted, runtime no-op)
+
+| Surface | Why inert | Effect |
+|---|---|---|
+| **Block cache (Phase 2.2)** | `redb` is a native-only embedded KV (mmap + file locks). The whole `crates/fula-client/src/block_cache.rs` file is gated `#![cfg(not(target_arch = "wasm32"))]`. | Setting `block_cache_enabled = true` on wasm is silently ignored. The SDK never persists block bytes and never observes the `(bucket, key) → cid` map needed by the gateway-race fallback. |
+| **Gateway race (Phase 2.3 / 2.4)** | Depends on the block cache (for the `(bucket, key) → cid` lookup table) AND on `parking_lot`'s native-only mutex behavior in the gateway-state ring. Whole `gateway_fetch.rs` is gated. | Setting `gateway_fallback_enabled = true` on wasm is silently ignored. Master-down reads on web surface as `MasterUnreachable` errors instead of falling through to a public gateway. |
+| **Cold-start hybrid resolver (Phase 3.3)** | `registry_resolver.rs` is gated `#![cfg(not(target_arch = "wasm32"))]` because it depends on `reqwest` with native-tls, `parking_lot`, and `serde_ipld_dagcbor` paths that the wasm build chain doesn't currently support. | Setting `users_index_*` fields on wasm is silently ignored. Cold-start GETs (master-down + cache miss) surface `UsersIndexResolutionFailed`. |
+
+### Why expose inert flags at all
+
+The fields are accepted on every target so a TypeScript app sharing a config struct between mobile (where everything works) and web (where some flags are silently inert) can construct one config object without per-platform branches. On web, the offline path simply degrades to "no offline path" — typed errors come back instead of fallback paths firing. Apps that want web-side offline reads today should rely on browser caching (HTTP-level service workers) until the wasm-side gateway race lands in a future release.
+
+### Adding new wasm-incompatible API to fula-client
+
+When adding a new SDK surface that depends on `std::time::SystemTime::now`, `std::time::Instant::now`, file I/O, or any other native-only call:
+
+1. **Either** gate the function with `#[cfg(not(target_arch = "wasm32"))]` so it's excluded from wasm builds entirely.
+2. **Or** route the call through `fula_crypto::time::now_timestamp()` / `now_millis()` (or `web_time::Instant::now()` for monotonic timing).
+
+The CI's `test-wasm` job loads `.github/clippy-wasm/clippy.toml` via `CLIPPY_CONF_DIR` and runs `cargo clippy --target wasm32-unknown-unknown -D clippy::disallowed-methods`. This catches `SystemTime::now` / `Instant::now` regressions before merge. Native clippy ignores the config.
+
 ## Performance Considerations
 
 1. **Crypto operations:** libcrux-ml-kem is optimized but may be ~10-20% slower than native C in WASM.
