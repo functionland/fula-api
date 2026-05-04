@@ -35,6 +35,14 @@ url = "2.5"
 base64 = { workspace = true }
 hex = { workspace = true }
 blake3 = { workspace = true }
+# Phase 3.3 — `derive_user_key_from_email` lives in `src/user_key.rs`
+# and is exposed on every target (wasm + native) so the wasm-bindgen
+# binding can compute the user_key without round-tripping through
+# `fula-crypto::derive_key_argon2id`. sha2 is a pure-Rust dep that
+# builds cleanly on wasm32; was previously gated to native-only when
+# the helper still lived inside the native-gated `registry_resolver`
+# module, but with the helper extracted we need cross-target.
+sha2 = { workspace = true }
 mime_guess = "2.0"
 tokio = { version = "1.42", default-features = false, features = ["sync"] }
 dashmap = { workspace = true }
@@ -52,8 +60,6 @@ dirs = "5"
 # Native-only — wasm builds skip the cache (no persistent storage there anyway).
 redb = { workspace = true }
 cid = { workspace = true }
-# CID verification on gateway-fetched bytes (Phase 2.3 of master-independent reads).
-sha2 = { workspace = true }
 # Mutex for per-gateway state in gateway_fetch (Phase 2.3).
 parking_lot = { workspace = true }
 # Phase 3.3 cold-start hybrid resolver — parses the master-published

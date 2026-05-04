@@ -217,15 +217,15 @@ impl ResolverConfig {
 /// stay in lockstep with the master's `hash_user_id`; the
 /// `derive_user_key_matches_master_state_rs_algorithm` test below
 /// reproduces the master algorithm step-by-step and asserts equality.
-pub fn derive_user_key_from_email(email: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let user_id_digest = Sha256::digest(email.to_lowercase().as_bytes());
-    let user_id_hex = hex::encode(user_id_digest);
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"fula:user_id:");
-    hasher.update(user_id_hex.as_bytes());
-    hex::encode(&hasher.finalize().as_bytes()[..16])
-}
+///
+/// Source-of-truth lives in `crate::user_key` (extracted there so the
+/// wasm-bindgen binding can expose it — the `registry_resolver`
+/// module itself is gated to native targets). This re-export keeps
+/// the historical `fula_client::registry_resolver::derive_user_key_from_email`
+/// import path working for native callers AND lets the test module
+/// in this file (line 1485+) call the function via `use super::*;`.
+#[allow(unused_imports)]
+pub use crate::user_key::derive_user_key_from_email;
 
 /// Default IPNS-aware gateway list. Excludes
 /// `trustless-gateway.link` (only serves `/ipfs/`, not `/ipns/`).

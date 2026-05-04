@@ -106,6 +106,52 @@ pub struct FulaConfig {
     /// CID. Default: 3. Capped at the gateway-pool length.
     /// Native-only.
     pub gateway_race_concurrency: u32,
+
+    // ============================================================
+    // Phase 3.3 — cold-start hybrid resolver
+    // ============================================================
+    //
+    // The resolver activates iff ALL of the following four fields
+    // are populated:
+    //   - users_index_chain_rpc_url (non-empty)
+    //   - users_index_anchor_address (non-empty)
+    //   - users_index_ipns_name (non-empty)
+    //   - users_index_user_key (non-empty)
+    //
+    // When any one is empty the resolver stays disabled; cold-start
+    // GETs fall through with `UsersIndexResolutionFailed`. Default
+    // values are all empty strings → resolver disabled (backward
+    // compat with pre-Phase-3.3 builds).
+
+    /// JSON-RPC URL for the chain anchor contract (Base or SKALE).
+    /// Required to enable Phase 3.3 cold-start. Empty → disabled.
+    pub users_index_chain_rpc_url: String,
+
+    /// `FulaUsersIndexAnchor.sol` contract address (20 bytes hex,
+    /// optionally `0x`-prefixed). Required to enable Phase 3.3.
+    pub users_index_anchor_address: String,
+
+    /// IPNS NAME (libp2p public-key hash, e.g. `k51qzi5...`) under
+    /// which the master publishes the global users-index CBOR.
+    /// Required to enable Phase 3.3.
+    pub users_index_ipns_name: String,
+
+    /// 32-hex-char `userKey` (= `BLAKE3("fula:user_id:" || sha256(lower(email)))[..16]`).
+    /// Compute via the free function [`derive_user_key_from_email`]
+    /// at sign-in time and pass in here. The SDK does not store the
+    /// raw email. Required to enable Phase 3.3.
+    pub users_index_user_key: String,
+
+    /// IPNS-aware gateway URL templates (each must contain `{name}`).
+    /// Empty Vec = use SDK-shipped defaults
+    /// (Cloudflare/dweb.link/ipfs.io/4everland/Pinata).
+    /// Native-only — wasm cold-start uses the typed-error path.
+    pub users_index_ipns_gateway_urls: Vec<String>,
+
+    /// `/ipfs/{cid}` gateway URL templates (each must contain `{cid}`).
+    /// Empty Vec = use SDK-shipped 6-gateway default list.
+    /// Native-only.
+    pub users_index_ipfs_gateway_urls: Vec<String>,
 }
 
 impl Default for FulaConfig {
@@ -128,8 +174,90 @@ impl Default for FulaConfig {
             gateway_fallback_enabled: false,
             gateway_fallback_urls: Vec::new(),
             gateway_race_concurrency: 3,
+            // Phase 3.3 — resolver disabled by default. Operator
+            // sets the four required fields at sign-in to enable
+            // cold-start; cold-start surfaces UsersIndexResolutionFailed
+            // until they're set, mirroring the Rust core's behavior.
+            users_index_chain_rpc_url: String::new(),
+            users_index_anchor_address: String::new(),
+            users_index_ipns_name: String::new(),
+            users_index_user_key: String::new(),
+            users_index_ipns_gateway_urls: Vec::new(),
+            users_index_ipfs_gateway_urls: Vec::new(),
         }
     }
+}
+
+// ============================================================
+// Phase 19 — transparency surfaces
+// ============================================================
+
+/// Where the bytes of a successfully-served read came from. Mirrors
+/// `fula_client::ReadSource`. Apps surface "you're reading from
+/// cache" / "served by a public gateway" UI based on this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FulaReadSource {
+    /// Master S3 served the request directly (fast path).
+    Master,
+    /// On-disk redb BLOCKS table served the bytes — no network at all.
+    LocalCache,
+    /// Public IPFS gateway served the bytes (master-down fallback).
+    /// The string is the URL template (e.g. `https://ipfs.io/ipfs/{cid}`)
+    /// that won the gateway race — useful for diagnostics or
+    /// "served by ipfs.io" labeling.
+    Gateway(String),
+}
+
+/// Freshness of a successfully-served read. Mirrors
+/// `fula_client::ReadFreshness`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FulaReadFreshness {
+    /// Master-served bytes (fresh, by definition).
+    Live,
+    /// Served from on-disk cache. `observed_at` is the unix-millis
+    /// when the entry was first written to cache.
+    Cached { observed_at: u64 },
+    /// Cold-start cross-device read; snapshot age within the
+    /// publisher cadence (≤ `USERS_INDEX_FLUSH_INTERVAL`). Apps
+    /// can surface "synced N min ago".
+    StaleByDesign { snapshot_age_secs: u64 },
+    /// Cold-start cross-device read; snapshot age exceeds the
+    /// publisher cadence — likely indicates an actual master outage.
+    StaleByOutage { snapshot_age_secs: u64 },
+}
+
+/// Wrapper around `GetObjectResult` adding Phase 19 transparency
+/// fields. Mirrors `fula_client::OfflineGetResult`. Apps that
+/// don't care about transparency just read `.inner.data`.
+#[derive(Debug, Clone)]
+pub struct OfflineGetResult {
+    /// Underlying `GetObjectResult` — `data`, `etag`, `content_type`,
+    /// `content_length`, `last_modified`, `metadata` are on `inner`.
+    pub inner: GetObjectResult,
+    /// Where the bytes ultimately came from.
+    pub source: FulaReadSource,
+    /// How fresh the bytes are.
+    pub freshness: FulaReadFreshness,
+}
+
+/// Master-server reachability transition events. Mirrors
+/// `fula_client::MasterHealthEvent`. Subscribed via
+/// `subscribe_master_health_events`; apps wire the stream to
+/// online/offline UI affordances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MasterHealthEvent {
+    /// Master S3 is reachable; reads use the fast path.
+    Online,
+    /// Master S3 is unreachable; SDK is falling back to IPFS
+    /// gateways (Phase 2.4) or cold-start resolver (Phase 3.3).
+    OfflineFallbackActive { reason: String },
+    /// Both master S3 AND chain RPC are unreachable. Cold-start
+    /// reads fail; warm reads (cached metadata) still work via
+    /// gateways. Apps should disable "open new bucket" / "first-
+    /// read" UI affordances when this fires. Emitted only from
+    /// the cold-start failure path — the health gate alone can't
+    /// authoritatively detect "both down" without trying.
+    SeverelyDegraded { reason: String },
 }
 
 /// Configuration for client-side encryption
@@ -471,6 +599,14 @@ pub struct UploadProgress {
 #[derive(Clone)]
 pub struct FulaClientHandle {
     pub(crate) inner: Arc<fula_client::FulaClient>,
+    /// Phase 19 — dispatcher for `MasterHealthEvent` stream
+    /// subscribers. The Config's `health_callback` (set by
+    /// `build_inner_config`) captures a clone of this `Arc` and
+    /// forwards each transition to all live subscribers AND to a
+    /// "last event seen" slot exposed via `get_last_master_health_event`.
+    /// Always present so apps can subscribe at any time without
+    /// re-creating the client.
+    pub(crate) health_dispatcher: Arc<HealthEventDispatcher>,
 }
 
 /// Handle to an EncryptedClient instance
@@ -479,6 +615,86 @@ pub struct FulaClientHandle {
 #[derive(Clone)]
 pub struct EncryptedClientHandle {
     pub(crate) inner: Arc<RwLock<fula_client::EncryptedClient>>,
+    /// Phase 19 — same dispatcher pattern as FulaClientHandle.
+    /// Encrypted-client construction also threads the callback into
+    /// the underlying `fula_client::Config` so warm-cache + cold-
+    /// start transitions both surface to subscribers.
+    pub(crate) health_dispatcher: Arc<HealthEventDispatcher>,
+}
+
+/// Phase 19 — internal dispatcher that captures `MasterHealthEvent`
+/// transitions for two consumption patterns:
+///
+///   1. **Polling drain** (`poll_master_health_events`): apps call
+///      this periodically (or on UI rebuilds) and receive every
+///      event observed since the last call. The internal buffer is
+///      a bounded `VecDeque` capped at `MAX_BUFFERED_EVENTS`; if the
+///      app falls so far behind that the buffer overflows, oldest
+///      events are dropped first (apps care about the *latest* state,
+///      not the entire history).
+///
+///   2. **Latest-state read** (`get_last_master_health_event`):
+///      returns the most recent event without draining. Useful for
+///      apps that want to display "you're offline" immediately on
+///      mount based on whatever the SDK has observed so far.
+///
+/// **Why polling instead of a Dart `Stream`:** wiring `StreamSink<T>`
+/// requires the FRB codegen to have seen `MasterHealthEvent` — a
+/// chicken-and-egg dependency on `flutter_rust_bridge_codegen
+/// generate` having run after this commit. Polling sidesteps that
+/// while still giving apps every event in order. A future iteration
+/// can layer a `Stream<MasterHealthEvent>` on top once codegen has
+/// registered the type, without breaking this polling API.
+///
+/// Wrapping the buffer in `parking_lot::Mutex` (sync, no `await`)
+/// is required because the dispatcher is invoked from the SDK's hot
+/// path inside `health_gate::fire_event`, which doesn't tolerate
+/// async locks.
+pub struct HealthEventDispatcher {
+    /// Pending events not yet drained by `poll_master_health_events`.
+    /// Bounded by [`MAX_BUFFERED_EVENTS`].
+    buffer: parking_lot::Mutex<std::collections::VecDeque<MasterHealthEvent>>,
+    /// Most recent event observed, regardless of whether it was
+    /// drained. Read by `get_last_master_health_event`.
+    last_event: parking_lot::Mutex<Option<MasterHealthEvent>>,
+}
+
+/// Maximum number of pending events held by [`HealthEventDispatcher`]
+/// before older ones get dropped. 64 is plenty for typical apps —
+/// a healthy session sees a handful of transitions per hour at most.
+const MAX_BUFFERED_EVENTS: usize = 64;
+
+impl HealthEventDispatcher {
+    pub(crate) fn new() -> Self {
+        Self {
+            buffer: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+            last_event: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Called from the `health_callback` set on the underlying
+    /// `fula_client::Config`. Captures the event for both polling
+    /// drain and latest-state read.
+    pub(crate) fn dispatch(&self, event: fula_client::MasterHealthEvent) {
+        let app_event: MasterHealthEvent = event.into();
+        *self.last_event.lock() = Some(app_event.clone());
+        let mut buf = self.buffer.lock();
+        if buf.len() >= MAX_BUFFERED_EVENTS {
+            // Drop oldest to make room for newest. Apps care about
+            // the latest state more than ancient history.
+            buf.pop_front();
+        }
+        buf.push_back(app_event);
+    }
+
+    pub(crate) fn drain_events(&self) -> Vec<MasterHealthEvent> {
+        let mut buf = self.buffer.lock();
+        buf.drain(..).collect()
+    }
+
+    pub(crate) fn last_event(&self) -> Option<MasterHealthEvent> {
+        self.last_event.lock().clone()
+    }
 }
 
 /// Handle to an accepted share
@@ -600,6 +816,62 @@ impl From<fula_client::GetObjectResult> for GetObjectResult {
             metadata: r.metadata.into_iter()
                 .map(|(k, v)| MetadataEntry { key: k, value: v })
                 .collect(),
+        }
+    }
+}
+
+// Phase 19 transparency conversions. These bridge the Rust-core
+// `fula_client::*` types to FRB-friendly Dart-side equivalents.
+// They're plain unit/struct/string-payload variants so FRB v2's
+// codegen produces a sealed Dart class without any custom adapter.
+
+impl From<fula_client::ReadSource> for FulaReadSource {
+    fn from(s: fula_client::ReadSource) -> Self {
+        match s {
+            fula_client::ReadSource::Master => FulaReadSource::Master,
+            fula_client::ReadSource::LocalCache => FulaReadSource::LocalCache,
+            fula_client::ReadSource::Gateway(url) => FulaReadSource::Gateway(url),
+        }
+    }
+}
+
+impl From<fula_client::ReadFreshness> for FulaReadFreshness {
+    fn from(f: fula_client::ReadFreshness) -> Self {
+        match f {
+            fula_client::ReadFreshness::Live => FulaReadFreshness::Live,
+            fula_client::ReadFreshness::Cached { observed_at } => {
+                FulaReadFreshness::Cached { observed_at }
+            }
+            fula_client::ReadFreshness::StaleByDesign { snapshot_age_secs } => {
+                FulaReadFreshness::StaleByDesign { snapshot_age_secs }
+            }
+            fula_client::ReadFreshness::StaleByOutage { snapshot_age_secs } => {
+                FulaReadFreshness::StaleByOutage { snapshot_age_secs }
+            }
+        }
+    }
+}
+
+impl From<fula_client::OfflineGetResult> for OfflineGetResult {
+    fn from(r: fula_client::OfflineGetResult) -> Self {
+        Self {
+            inner: r.inner.into(),
+            source: r.source.into(),
+            freshness: r.freshness.into(),
+        }
+    }
+}
+
+impl From<fula_client::MasterHealthEvent> for MasterHealthEvent {
+    fn from(e: fula_client::MasterHealthEvent) -> Self {
+        match e {
+            fula_client::MasterHealthEvent::Online => MasterHealthEvent::Online,
+            fula_client::MasterHealthEvent::OfflineFallbackActive { reason } => {
+                MasterHealthEvent::OfflineFallbackActive { reason }
+            }
+            fula_client::MasterHealthEvent::SeverelyDegraded { reason } => {
+                MasterHealthEvent::SeverelyDegraded { reason }
+            }
         }
     }
 }
