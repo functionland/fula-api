@@ -115,6 +115,82 @@ pub struct GetObjectResult {
     pub metadata: std::collections::HashMap<String, String>,
 }
 
+/// Phase 19 — origin of a successfully-served byte payload.
+///
+/// Apps that surface offline indicators inspect this field to decide
+/// what to show: `Master` is the fast path, `LocalCache` is a redb
+/// BLOCKS hit (no network), and `Gateway(url)` records which IPFS
+/// gateway the gateway-race elected. Defaulting to `Master` keeps
+/// pre-Phase-19 callers byte-identical (they ignore the field).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadSource {
+    /// Master S3 served the request directly.
+    Master,
+    /// On-disk redb BLOCKS table served the bytes — no network round-trip.
+    LocalCache,
+    /// Public IPFS gateway served the bytes (master-down fallback path).
+    /// The string is the URL template (e.g. `https://ipfs.io/ipfs/{cid}`)
+    /// used at fetch time, useful for diagnostics or "served by Cloudflare"
+    /// surfacing in operator dashboards.
+    Gateway(String),
+}
+
+/// Phase 19 — freshness signal for a successfully-served byte payload.
+///
+/// `Live` is the master-served fast path. `Cached { observed_at }` is
+/// returned when bytes came from local redb (BLOCKS hit) — apps may
+/// choose to surface "viewing a saved copy" UI based on age. The
+/// `StaleByDesign` / `StaleByOutage` variants are reserved for Phase
+/// 3.3 cold-start where the SDK can attribute snapshot age to the
+/// publisher cadence vs. an actual master outage; today the master-down
+/// fallback path emits `Cached`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadFreshness {
+    /// Master-served bytes (fresh).
+    Live,
+    /// Served from on-disk redb cache; `observed_at` is the unix-millis
+    /// when the entry was first written. Apps display age relative to
+    /// this if they care to show staleness.
+    Cached { observed_at: u64 },
+    /// Cold-start cross-device read; snapshot age within the configured
+    /// publisher cadence (≤ `USERS_INDEX_FLUSH_INTERVAL`). Apps may
+    /// surface "synced N min ago".
+    ///
+    /// **Phase 3.3 scaffolding — not emitted by Phase 19.** Wired in
+    /// when the cold-start resolver lands (task #18); resolver computes
+    /// `snapshot_age_secs = now - resolved.payload.updated_at_unix`
+    /// and selects this vs. `StaleByOutage` based on whether age is
+    /// inside the publisher cadence.
+    StaleByDesign { snapshot_age_secs: u64 },
+    /// Cold-start cross-device read; snapshot age exceeds the
+    /// publisher cadence — likely indicates an actual master outage.
+    ///
+    /// **Phase 3.3 scaffolding — not emitted by Phase 19.** See
+    /// `StaleByDesign` doc above.
+    StaleByOutage { snapshot_age_secs: u64 },
+}
+
+/// Phase 19 — wrapper around `GetObjectResult` carrying transparency
+/// fields (`source`, `freshness`).
+///
+/// **Why a wrapper instead of fields on `GetObjectResult`:** the
+/// existing struct is part of the SDK's public API consumed by callers
+/// that pattern-match it exhaustively. Adding fields breaks them. A
+/// new wrapper type lets callers opt in to the transparency surface
+/// while existing consumers (including encrypted-SDK internals that
+/// read `.data` / `.etag`) keep using `GetObjectResult` unchanged.
+#[derive(Clone, Debug)]
+pub struct OfflineGetResult {
+    /// The underlying `GetObjectResult` — `data`, `etag`, etc., are on
+    /// `inner`. Callers that don't care about transparency just read
+    /// `result.inner.data`.
+    pub inner: GetObjectResult,
+    /// Where the bytes ultimately came from. See `ReadSource` for variants.
+    pub source: ReadSource,
+    /// How fresh the bytes are. See `ReadFreshness` for variants.
+    pub freshness: ReadFreshness,
+}
+
 /// Head object result
 #[derive(Clone, Debug)]
 pub struct HeadObjectResult {

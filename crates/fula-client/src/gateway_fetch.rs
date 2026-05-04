@@ -395,13 +395,21 @@ impl GatewayPool {
         }
     }
 
+    // `len` and `is_empty` are public monitoring API for app
+    // integrators that want to surface "configured N gateways" or
+    // detect a misconfigured empty pool before issuing requests.
+    // The crate itself doesn't call them internally — silence the
+    // workspace warning while keeping the surface stable for apps.
+
     /// Number of gateways in the pool.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.gateways.len()
     }
 
     /// True if no gateways are configured (effectively disables
     /// gateway-race fallback).
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.gateways.is_empty()
     }
@@ -457,6 +465,27 @@ impl GatewayPool {
         cid: &Cid,
         http: &reqwest::Client,
     ) -> Result<Bytes, GatewayPoolError> {
+        self.fetch_verified_with_source(cid, http)
+            .await
+            .map(|(b, _url)| b)
+    }
+
+    /// Phase 19 — like `fetch_verified` but also returns which gateway
+    /// URL template won the race. Used by the offline-fallback path
+    /// (Phase 2.4) to populate `OfflineGetResult.source =
+    /// ReadSource::Gateway(url)` for transparency surfacing. The URL
+    /// is the configured template (e.g. `https://ipfs.io/ipfs/{cid}`),
+    /// NOT the per-CID-substituted URL — apps display "served by
+    /// ipfs.io" without the per-fetch CID noise.
+    ///
+    /// Crate-private: this is an internal seam consumed only by
+    /// `try_offline_fallback`. Apps should call `fetch_verified` (which
+    /// is `pub` and forwards to this) when they need the bytes alone.
+    pub(crate) async fn fetch_verified_with_source(
+        &self,
+        cid: &Cid,
+        http: &reqwest::Client,
+    ) -> Result<(Bytes, String), GatewayPoolError> {
         use futures::stream::FuturesUnordered;
         use futures::StreamExt;
 
@@ -487,9 +516,10 @@ impl GatewayPool {
             match result {
                 Ok(body) => {
                     g.record_success();
+                    let url = g.url_template.clone();
                     // Drop in_flight to cancel remaining racers.
                     drop(in_flight);
-                    return Ok(body);
+                    return Ok((body, url));
                 }
                 Err(FetchError::Transient(msg)) => {
                     g.record_transient_failure();

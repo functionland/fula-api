@@ -130,14 +130,13 @@ pub async fn put_object(
         metadata = metadata.with_content_type(ct);
     }
 
-    // Extract user metadata (x-amz-meta-*).
-    // Internal Fula control headers (consumed by the handler, not stored as
-    // object metadata) are filtered out — they would otherwise pollute every
-    // object's persisted metadata.
-    const FULA_CONTROL_HEADERS: &[&str] = &["fula-bucket-lookup-h"];
+    // Extract user metadata (x-amz-meta-*). Internal Fula control
+    // headers (consumed by the handler, not stored as object metadata)
+    // are filtered out via `is_fula_control_header` — they would
+    // otherwise pollute every object's persisted metadata.
     for (name, value) in headers.iter() {
         if let Some(key) = name.as_str().strip_prefix("x-amz-meta-") {
-            if FULA_CONTROL_HEADERS.contains(&key) {
+            if is_fula_control_header(key) {
                 continue;
             }
             if let Ok(v) = value.to_str() {
@@ -180,10 +179,8 @@ pub async fn put_object(
             .get("x-amz-meta-fula-bucket-lookup-h")
             .and_then(|v| v.to_str().ok())
         {
-            match hex::decode(hex_str) {
-                Ok(bytes) if bytes.len() == 16 => {
-                    let mut lookup_h = [0u8; 16];
-                    lookup_h.copy_from_slice(&bytes);
+            match parse_bucket_lookup_h_header(hex_str) {
+                Ok(lookup_h) => {
                     match state.bucket_manager.populate_lookup_h_if_missing(
                         &session.hashed_user_id,
                         &bucket_name,
@@ -205,12 +202,12 @@ pub async fn put_object(
                         ),
                     }
                 }
-                Ok(other) => tracing::warn!(
-                    actual_len = other.len(),
+                Err(BucketLookupHError::WrongLength { actual }) => tracing::warn!(
+                    actual_len = actual,
                     "x-amz-meta-fula-bucket-lookup-h: expected 16-byte hex (32 chars), got {} bytes",
-                    other.len()
+                    actual
                 ),
-                Err(e) => tracing::warn!(
+                Err(BucketLookupHError::InvalidHex(e)) => tracing::warn!(
                     error = %e,
                     "Failed to hex-decode x-amz-meta-fula-bucket-lookup-h"
                 ),
@@ -766,6 +763,255 @@ fn parse_etag_list(s: &str) -> impl Iterator<Item = String> + '_ {
         let t = t.strip_prefix('"')?.strip_suffix('"')?;
         Some(t.to_string())
     })
+}
+
+// ============================================================
+// Phase 1.2 wire-path helpers (master-side)
+// ============================================================
+//
+// These are extracted out of the put_object handler so the
+// header-parsing + control-header-filter logic can be unit-tested
+// without spinning up the full HTTP server stack. Audit follow-up
+// item #5: cover the wire path beyond the BucketManager-direct
+// integration test in users_index_publisher.rs.
+
+/// Internal Fula control headers (consumed by handler logic, NOT
+/// persisted as object metadata). The list is `pub(crate)` so it
+/// can be referenced from sibling modules; tests below assert it
+/// stays in lockstep with the handler's filtering.
+pub(crate) const FULA_CONTROL_HEADERS: &[&str] = &["fula-bucket-lookup-h"];
+
+/// Returns `true` if the given x-amz-meta key (already stripped of
+/// the `x-amz-meta-` prefix) is a Fula control header — meaning it
+/// should NOT end up in `ObjectMetadata.user_metadata` even though
+/// it's a perfectly valid `x-amz-meta-*` name.
+pub(crate) fn is_fula_control_header(stripped_key: &str) -> bool {
+    FULA_CONTROL_HEADERS.contains(&stripped_key)
+}
+
+/// Parse error for the `x-amz-meta-fula-bucket-lookup-h` header
+/// value. Three failure modes today; expanding this enum is
+/// backward-compatible (the handler matches exhaustively).
+#[derive(Debug)]
+pub(crate) enum BucketLookupHError {
+    /// hex::decode failed — non-hex characters in the value.
+    InvalidHex(hex::FromHexError),
+    /// Decoded byte length wasn't 16 (the only legal width per
+    /// Phase 1.2 spec — `userKey`-equivalent 128-bit blinded key).
+    WrongLength { actual: usize },
+}
+
+impl From<hex::FromHexError> for BucketLookupHError {
+    fn from(e: hex::FromHexError) -> Self {
+        BucketLookupHError::InvalidHex(e)
+    }
+}
+
+/// Parse `x-amz-meta-fula-bucket-lookup-h` header value into a
+/// 16-byte fixed array. Pure: no I/O, no allocations beyond the
+/// transient hex::decode buffer. Used by `put_object` to convert
+/// the wire-format string into the format
+/// `BucketManager::populate_lookup_h_if_missing` expects.
+pub(crate) fn parse_bucket_lookup_h_header(
+    hex_str: &str,
+) -> Result<[u8; 16], BucketLookupHError> {
+    let bytes = hex::decode(hex_str)?;
+    if bytes.len() != 16 {
+        return Err(BucketLookupHError::WrongLength { actual: bytes.len() });
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod phase_1_2_wire_tests {
+    //! Phase 1.2 wire-path tests. Covers what the existing
+    //! `users_index_publisher::test_run_tick_legacy_to_blinded_replaces_entry`
+    //! test does NOT cover: the HTTP-layer header extraction +
+    //! parsing logic that sits between an SDK request and a
+    //! `populate_lookup_h_if_missing` call.
+
+    use super::*;
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    #[test]
+    fn control_header_filter_includes_lookup_h() {
+        // Audit gold: the lookup_h header IS recognized as a control
+        // header. If someone removes it from FULA_CONTROL_HEADERS the
+        // header would leak into user_metadata storage on every PUT.
+        assert!(is_fula_control_header("fula-bucket-lookup-h"));
+    }
+
+    #[test]
+    fn control_header_filter_excludes_arbitrary_user_metadata() {
+        // Defensive: an app's own metadata keys must NOT be filtered.
+        assert!(!is_fula_control_header("content-language"));
+        assert!(!is_fula_control_header("x-fula-encrypted"));
+        assert!(!is_fula_control_header(""));
+    }
+
+    #[test]
+    fn parse_lookup_h_accepts_valid_32_char_hex() {
+        // Mirrors what `compute_bucket_lookup_h_hex` produces in the
+        // SDK: 32 lowercase hex chars = 16 bytes.
+        let valid = "deadbeefcafebabefeedfacef00dbabe";
+        let parsed = parse_bucket_lookup_h_header(valid).expect("valid 32-char hex");
+        assert_eq!(parsed.len(), 16);
+        assert_eq!(parsed[0], 0xde);
+        assert_eq!(parsed[15], 0xbe);
+    }
+
+    #[test]
+    fn parse_lookup_h_accepts_uppercase_hex() {
+        // hex::decode is case-insensitive; we don't normalize.
+        let valid = "DEADBEEFCAFEBABEFEEDFACEF00DBABE";
+        let parsed = parse_bucket_lookup_h_header(valid).expect("uppercase ok");
+        assert_eq!(parsed[0], 0xde);
+    }
+
+    #[test]
+    fn parse_lookup_h_rejects_too_short() {
+        // 30 hex chars = 15 bytes — one short.
+        let too_short = "deadbeefcafebabefeedfacef00dba";
+        match parse_bucket_lookup_h_header(too_short) {
+            Err(BucketLookupHError::WrongLength { actual: 15 }) => {}
+            other => panic!("expected WrongLength{{actual:15}}, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_lookup_h_rejects_too_long() {
+        // 34 hex chars = 17 bytes — one byte over.
+        let too_long = "deadbeefcafebabefeedfacef00dbabe11";
+        match parse_bucket_lookup_h_header(too_long) {
+            Err(BucketLookupHError::WrongLength { actual: 17 }) => {}
+            other => panic!("expected WrongLength{{actual:17}}, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_lookup_h_rejects_non_hex_chars() {
+        // 'z' is not a valid hex char; even at correct length this
+        // fails with InvalidHex.
+        let bad_chars = "zzadbeefcafebabefeedfacef00dbabe";
+        match parse_bucket_lookup_h_header(bad_chars) {
+            Err(BucketLookupHError::InvalidHex(_)) => {}
+            other => panic!("expected InvalidHex, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_lookup_h_rejects_empty_string() {
+        // An empty header value reaches us as "" — must not parse
+        // to a zero-byte array.
+        match parse_bucket_lookup_h_header("") {
+            Err(BucketLookupHError::WrongLength { actual: 0 }) => {}
+            other => panic!("expected WrongLength{{actual:0}}, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_lookup_h_rejects_odd_length_hex() {
+        // 31 chars — odd-length is invalid per hex spec; hex::decode
+        // returns OddLength, which we surface as InvalidHex.
+        let odd = "deadbeefcafebabefeedfacef00dbab";
+        match parse_bucket_lookup_h_header(odd) {
+            Err(BucketLookupHError::InvalidHex(_)) => {}
+            other => panic!("expected InvalidHex (odd length), got {:?}", other),
+        }
+    }
+
+    /// End-to-end-ish wire-path simulation: from a real `HeaderMap`
+    /// (as the put_object handler would receive), extract:
+    /// - the user_metadata that should be persisted (lookup_h MUST
+    ///   NOT appear there)
+    /// - the parsed lookup_h bytes (MUST equal what the SDK sent)
+    ///
+    /// This is the critical regression guard for "old client uploads
+    /// without header → no populate" vs "new client uploads with
+    /// header → populate fires with correct bytes". The integration
+    /// with `BucketManager` and the publisher is already covered by
+    /// `users_index_publisher::test_run_tick_legacy_to_blinded_replaces_entry`.
+    #[test]
+    fn old_client_no_header_means_no_populate() {
+        let mut headers = HeaderMap::new();
+        // Old client sends content-type and a user metadata key; no
+        // lookup_h header.
+        headers.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("image/jpeg"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-amz-meta-myapp-tag"),
+            HeaderValue::from_static("vacation"),
+        );
+
+        // Wire-path step 1: lookup_h header absent → handler skips populate.
+        let lookup_h_present = headers.get("x-amz-meta-fula-bucket-lookup-h").is_some();
+        assert!(!lookup_h_present, "no header on old-client PUT");
+
+        // Wire-path step 2: user_metadata extraction filters control
+        // headers (none to filter here, but the loop must include the
+        // app's own tag).
+        let mut user_meta: Vec<(String, String)> = Vec::new();
+        for (name, value) in headers.iter() {
+            if let Some(key) = name.as_str().strip_prefix("x-amz-meta-") {
+                if is_fula_control_header(key) {
+                    continue;
+                }
+                if let Ok(v) = value.to_str() {
+                    user_meta.push((key.to_string(), v.to_string()));
+                }
+            }
+        }
+        assert_eq!(user_meta, vec![("myapp-tag".to_string(), "vacation".to_string())]);
+    }
+
+    #[test]
+    fn new_client_header_parses_and_does_not_leak_into_user_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("image/jpeg"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-amz-meta-fula-bucket-lookup-h"),
+            HeaderValue::from_static("aabbccddeeff00112233445566778899"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-amz-meta-myapp-tag"),
+            HeaderValue::from_static("vacation"),
+        );
+
+        // Wire-path step 1: lookup_h header parses to expected bytes.
+        let hex_str = headers
+            .get("x-amz-meta-fula-bucket-lookup-h")
+            .and_then(|v| v.to_str().ok())
+            .expect("present");
+        let parsed = parse_bucket_lookup_h_header(hex_str).expect("valid hex");
+        assert_eq!(parsed, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+                            0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99]);
+
+        // Wire-path step 2: user_metadata extraction MUST drop the
+        // lookup_h header and keep the app's own tag.
+        let mut user_meta: Vec<(String, String)> = Vec::new();
+        for (name, value) in headers.iter() {
+            if let Some(key) = name.as_str().strip_prefix("x-amz-meta-") {
+                if is_fula_control_header(key) {
+                    continue;
+                }
+                if let Ok(v) = value.to_str() {
+                    user_meta.push((key.to_string(), v.to_string()));
+                }
+            }
+        }
+        assert_eq!(
+            user_meta,
+            vec![("myapp-tag".to_string(), "vacation".to_string())],
+            "lookup_h header must NOT leak into user_metadata"
+        );
+    }
 }
 
 #[cfg(test)]

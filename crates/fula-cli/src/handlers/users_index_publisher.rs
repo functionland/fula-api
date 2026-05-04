@@ -27,7 +27,13 @@
 //! one `tokio::spawn` from `server::run_server` after `AppState` is
 //! wrapped in `Arc`. The task lives for the process lifetime.
 
-#![allow(dead_code)] // A3 will consume `internal_token`
+// `dead_code` is permitted for module-level helpers that are exercised
+// only in tests (e.g. `ipns_api_url_for_test`) or that are reserved for
+// the planned Phase 3.3 SDK-side caller (e.g. structured config getters).
+// Production paths (`run_tick`, `start_publisher_loop`, internal HTTP
+// handlers) DO consume every field; this allow simply silences the
+// warning chatter on the test-only accessors.
+#![allow(dead_code)]
 
 use anyhow::Result as AnyResult;
 use cid::Cid;
@@ -567,6 +573,22 @@ pub struct TickOutcome {
     /// re-pinned this tick. Always equal to `total_users` on the
     /// first tick (cache is empty).
     pub changed_users: usize,
+    /// Number of users whose per-user CBOR pin attempt failed this
+    /// tick. Per-user failures are tolerated: the tick continues with
+    /// the users that succeeded, the global is rebuilt with whatever
+    /// state the diff-cache currently holds (which means failed users
+    /// retain their PRIOR `bucketsIndexCid` if they had one, and are
+    /// absent from the published global if they had no prior pin).
+    /// Failed users are retried on the next tick because their
+    /// `content_hash` still mismatches the cache row.
+    ///
+    /// Operators monitor this field: a sustained non-zero value
+    /// across many ticks indicates a user whose data triggers a
+    /// pinning-service edge case and warrants investigation. The
+    /// publisher loop also emits a `warn!` line per failed user
+    /// inside `run_tick` (with the user_id and full error chain) so
+    /// the failing user is identifiable from logs alone.
+    pub failed_users: usize,
     /// Total number of users in `BucketManager.buckets` at this tick.
     pub total_users: usize,
     /// CID of the global users-index CBOR pinned this tick.
@@ -734,18 +756,27 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
 
         // Buffer-unordered keeps at most `max_concurrent` pin ops in
         // flight at any time (advisor's first-publish throttle).
+        //
+        // Per-user error tolerance: each task returns
+        // `(owner_id, AnyResult<(hash, cid)>)` so the outer loop can
+        // identify WHICH user failed and log it. Without this, an
+        // anyhow `?` in the inner closure would drop the owner_id
+        // and the loop level would only see an opaque error.
         let block_store = Arc::clone(&self.block_store);
-        let pin_results: Vec<AnyResult<(String, [u8; 32], Cid)>> = {
+        let pin_results: Vec<(String, AnyResult<([u8; 32], Cid)>)> = {
             use futures::stream::{self, StreamExt};
             stream::iter(to_rebuild.into_iter().map(|(owner_id, buckets)| {
                 let bs = Arc::clone(&block_store);
                 async move {
-                    let hash = compute_user_content_hash(&buckets);
-                    let cbor = build_user_buckets_index(&buckets, now);
-                    let cid = bs.put_ipld(&cbor).await?;
-                    bs.pin(&cid, Some("fula-users-index-per-user"))
-                        .await?;
-                    Ok::<_, anyhow::Error>((owner_id, hash, cid))
+                    let inner: AnyResult<([u8; 32], Cid)> = async {
+                        let hash = compute_user_content_hash(&buckets);
+                        let cbor = build_user_buckets_index(&buckets, now);
+                        let cid = bs.put_ipld(&cbor).await?;
+                        bs.pin(&cid, Some("fula-users-index-per-user")).await?;
+                        Ok((hash, cid))
+                    }
+                    .await;
+                    (owner_id, inner)
                 }
             }))
             .buffer_unordered(max_concurrent)
@@ -753,17 +784,43 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
             .await
         };
 
+        // Per-user error tolerance: a single user's pin failure must
+        // NOT abort the tick. Today's behavior (abort on first error)
+        // means at scale a single corrupted user blocks every user's
+        // cold-start visibility. With tolerance:
+        //   - succeeded users update their diff_cache row
+        //   - failed users keep their PRIOR diff_cache row (or have
+        //     none if never succeeded)
+        //   - global is rebuilt from the cache as it stands
+        //   - failed users retry on the next tick because their
+        //     `content_hash` still mismatches the (un-updated) cache row
+        //
+        // The `warn!` per failure carries owner_id + full anyhow chain
+        // so an operator can identify the failing user and root cause
+        // without combing through thread-of-execution traces.
         let mut changed_users = 0usize;
-        for r in pin_results {
-            let (owner_id, hash, cid) = r?;
-            self.diff_cache.lock().insert(
-                owner_id,
-                PerUserDiffEntry {
-                    content_hash: hash,
-                    buckets_index_cid: cid,
-                },
-            );
-            changed_users += 1;
+        let mut failed_users = 0usize;
+        for (owner_id, r) in pin_results {
+            match r {
+                Ok((hash, cid)) => {
+                    self.diff_cache.lock().insert(
+                        owner_id,
+                        PerUserDiffEntry {
+                            content_hash: hash,
+                            buckets_index_cid: cid,
+                        },
+                    );
+                    changed_users += 1;
+                }
+                Err(e) => {
+                    failed_users += 1;
+                    warn!(
+                        user = %owner_id,
+                        error = %e,
+                        "users-index publisher: per-user pin failed; user will retry on next tick"
+                    );
+                }
+            }
         }
 
         // Prune diff-cache rows for users who disappeared from
@@ -796,6 +853,14 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
         if changed_users == 0 && users_pruned == 0 && prior.global_cid.is_some() {
             return Ok(TickOutcome {
                 changed_users: 0,
+                // `failed_users` IS surfaced even on the no-op path —
+                // operators need to see "we tried to advance state for
+                // these N users this tick but couldn't" even when the
+                // global itself is unchanged. Without this, repeated
+                // failures on the same user would be invisible at the
+                // tick-outcome layer (only via the per-user warn! line
+                // inside run_tick).
+                failed_users,
                 total_users,
                 global_cid: prior.global_cid.expect("checked is_some"),
                 sequence: prior.sequence,
@@ -891,6 +956,7 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
 
         Ok(TickOutcome {
             changed_users,
+            failed_users,
             total_users,
             global_cid,
             sequence: next_sequence,
@@ -933,10 +999,28 @@ pub fn start_publisher_loop<S: BlockStore + PinStore + 'static>(
             interval.tick().await;
             match publisher.run_tick().await {
                 Ok(outcome) => {
+                    // Tick-level failure surfacing: when ≥ 1 user's
+                    // pin failed but the tick otherwise progressed,
+                    // emit a warn so the failure is visible at the
+                    // loop layer (the per-user warn! inside run_tick
+                    // identifies WHICH user; this one summarizes the
+                    // shape so a log scraper / alerting rule can
+                    // count `failed_users` per tick).
+                    if outcome.failed_users > 0 {
+                        warn!(
+                            sequence = outcome.sequence,
+                            changed_users = outcome.changed_users,
+                            failed_users = outcome.failed_users,
+                            total_users = outcome.total_users,
+                            global_rebuilt = outcome.global_rebuilt,
+                            "users-index publisher: tick had per-user pin failures; failed users will retry next tick"
+                        );
+                    }
                     if outcome.global_rebuilt {
                         info!(
                             sequence = outcome.sequence,
                             changed_users = outcome.changed_users,
+                            failed_users = outcome.failed_users,
                             total_users = outcome.total_users,
                             cid = %outcome.global_cid,
                             "users-index publisher: tick committed new global"
@@ -1404,11 +1488,14 @@ mod tests {
     // *behavior* (sequence advance, pin/unpin, diff-cache state),
     // not exact CID values.
 
-    async fn create_user_bucket(
-        manager: &BucketManager<MemoryBlockStore>,
+    async fn create_user_bucket<S>(
+        manager: &BucketManager<S>,
         user_id: &str,
         bucket_name: &str,
-    ) {
+    )
+    where
+        S: fula_blockstore::BlockStore + fula_blockstore::PinStore + 'static,
+    {
         manager
             .create_bucket_for_user(
                 user_id,
@@ -1859,5 +1946,438 @@ mod tests {
         assert_eq!(outcome.sequence, 1);
         assert!(outcome.global_rebuilt);
         assert!(publisher.ipns_api_url_for_test().is_none());
+    }
+
+    // ============================================================
+    // Per-user error tolerance (Phase 3.2 production hardening)
+    // ============================================================
+    //
+    // Before this hardening: a single user's pin failure aborted the
+    // ENTIRE tick (the `for r in pin_results { let (...) = r?; }`
+    // pattern at the per-user collection step). At scale this means
+    // one corrupted user blocks every user's cold-start visibility.
+    //
+    // After: per-user failures are tolerated. The tick continues with
+    // succeeded users, the global is rebuilt from whatever the
+    // diff_cache currently holds (failed users keep their PRIOR cache
+    // row if any), and failed users naturally retry on the next tick
+    // because their `content_hash` still mismatches the unchanged
+    // cache row.
+    //
+    // The four scenarios below come from the advisor's required
+    // matrix:
+    //  1. Partial failure → succeeded users in global, failed users
+    //     not in global, sequence advances.
+    //  2. All-unchanged + 1 new-but-failing → no rebuild needed,
+    //     sequence does NOT advance (early-return path), and the
+    //     "stale-but-consistent" property holds: prior global keeps
+    //     serving prior CIDs.
+    //  3. All-fail-first-tick → empty global, sequence = 1,
+    //     failed_users = N (deliberate empty-global semantic, same
+    //     as zero-users-on-first-tick).
+    //  4. Failed user retries successfully on next tick → eventually
+    //     appears in global.
+
+    /// Test-only fault-injecting block store. Wraps `MemoryBlockStore`
+    /// and fails `put_ipld` whenever the serialized CBOR bytes contain
+    /// the configured marker substring. Tests set up a fault by
+    /// naming a bucket with the marker; the per-user CBOR for that
+    /// user contains the bucket name (Phase 1.2 legacy mode keys
+    /// entries by plaintext name when `bucket_lookup_h = None`), so
+    /// `put_ipld(&UserBucketsIndex)` for that user fails with the
+    /// marker present.
+    ///
+    /// **Why content-driven, not order-driven.** Production failures
+    /// are content-driven (a specific user's data triggers a
+    /// pinning-service edge case). Substring matching captures that
+    /// failure shape and stays robust to any future refactor of
+    /// `buffer_unordered` ordering inside `run_tick`.
+    ///
+    /// The marker is also (incidentally) present in `BucketRegistry`
+    /// CBORs that `BucketManager::persist_registry` writes, but that
+    /// failure is caught by `create_bucket_for_user` (line 909-911
+    /// in bucket.rs) and only logged at warn level — the in-memory
+    /// `BucketManager.buckets` is updated regardless, which is what
+    /// the publisher reads.
+    #[derive(Clone)]
+    struct FaultyBlockStore {
+        inner: Arc<MemoryBlockStore>,
+        fail_marker: Arc<Mutex<Option<Vec<u8>>>>,
+    }
+
+    impl FaultyBlockStore {
+        fn new(inner: Arc<MemoryBlockStore>) -> Self {
+            Self {
+                inner,
+                fail_marker: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        /// Configure the marker. `Some(s)` causes `put_ipld` to fail
+        /// when serialized bytes contain `s`. `None` clears injection.
+        fn set_fail_marker(&self, marker: Option<&str>) {
+            *self.fail_marker.lock() = marker.map(|s| s.as_bytes().to_vec());
+        }
+
+        /// Test helper: clone the inner store handle to inspect what
+        /// got pinned (since FaultyBlockStore.pin delegates).
+        fn inner(&self) -> Arc<MemoryBlockStore> {
+            Arc::clone(&self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fula_blockstore::BlockStore for FaultyBlockStore {
+        async fn put_block(&self, data: &[u8]) -> fula_blockstore::Result<Cid> {
+            self.inner.put_block(data).await
+        }
+        async fn get_block(&self, cid: &Cid) -> fula_blockstore::Result<bytes::Bytes> {
+            self.inner.get_block(cid).await
+        }
+        async fn has_block(&self, cid: &Cid) -> fula_blockstore::Result<bool> {
+            self.inner.has_block(cid).await
+        }
+        async fn delete_block(&self, cid: &Cid) -> fula_blockstore::Result<()> {
+            self.inner.delete_block(cid).await
+        }
+        async fn block_size(&self, cid: &Cid) -> fula_blockstore::Result<u64> {
+            self.inner.block_size(cid).await
+        }
+        async fn put_ipld<T: serde::Serialize + Send + Sync>(
+            &self,
+            data: &T,
+        ) -> fula_blockstore::Result<Cid> {
+            // Delegate to the inner store first so the bytes are
+            // available for marker inspection via `get_block`. This
+            // avoids depending on serde_ipld_dagcbor directly (which
+            // isn't a fula-cli direct dep). The "block stored but
+            // not pinned" outcome models real production failures
+            // where a block reaches kubo but the cluster pin call
+            // fails — which is exactly the failure-mode this
+            // tolerance work guards against.
+            let cid = self.inner.put_ipld(data).await?;
+            // Snapshot the marker out of the parking_lot mutex guard
+            // before any `.await`. parking_lot's `MutexGuard` is not
+            // `Send`, so holding it across an await point makes the
+            // future non-Send and tokio refuses to spawn it.
+            let marker_snapshot: Option<Vec<u8>> = self.fail_marker.lock().clone();
+            if let Some(marker) = marker_snapshot {
+                if !marker.is_empty() {
+                    let bytes = self.inner.get_block(&cid).await?;
+                    if bytes.windows(marker.len()).any(|w| w == marker.as_slice()) {
+                        return Err(fula_blockstore::BlockStoreError::PinFailed(
+                            "test-injected fault: marker substring present in stored block".into(),
+                        ));
+                    }
+                }
+            }
+            Ok(cid)
+        }
+        async fn get_ipld<T: serde::de::DeserializeOwned>(
+            &self,
+            cid: &Cid,
+        ) -> fula_blockstore::Result<T> {
+            self.inner.get_ipld(cid).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fula_blockstore::PinStore for FaultyBlockStore {
+        async fn pin(&self, cid: &Cid, name: Option<&str>) -> fula_blockstore::Result<()> {
+            self.inner.pin(cid, name).await
+        }
+        async fn pin_with_token(
+            &self,
+            cid: &Cid,
+            name: Option<&str>,
+            token: &str,
+        ) -> fula_blockstore::Result<()> {
+            self.inner.pin_with_token(cid, name, token).await
+        }
+        async fn unpin(&self, cid: &Cid) -> fula_blockstore::Result<()> {
+            self.inner.unpin(cid).await
+        }
+        async fn is_pinned(&self, cid: &Cid) -> fula_blockstore::Result<bool> {
+            self.inner.is_pinned(cid).await
+        }
+        async fn list_pins(&self) -> fula_blockstore::Result<Vec<Cid>> {
+            self.inner.list_pins().await
+        }
+        async fn pin_status(&self, cid: &Cid) -> fula_blockstore::Result<fula_blockstore::PinStatus> {
+            self.inner.pin_status(cid).await
+        }
+    }
+
+    /// Marker substring used by the per-user-error-tolerance tests.
+    /// Picked to be:
+    ///   - lowercase letters + hyphens only → passes
+    ///     `validate_bucket_name` so it can be a real bucket name
+    ///   - long enough (19 chars) that a false-positive substring
+    ///     match in random CBOR bytes is implausible
+    const FAULT_MARKER: &str = "fault-inject-bucket";
+
+    fn fixture_publisher_with_faulty_store(
+        path: PathBuf,
+    ) -> (
+        UsersIndexPublisher<FaultyBlockStore>,
+        Arc<FaultyBlockStore>,
+        Arc<BucketManager<FaultyBlockStore>>,
+    ) {
+        let inner = Arc::new(MemoryBlockStore::new());
+        let faulty = Arc::new(FaultyBlockStore::new(Arc::clone(&inner)));
+        let manager = Arc::new(BucketManager::new(Arc::clone(&faulty)));
+        let publisher = UsersIndexPublisher::open_without_ipns(
+            fixture_config(path),
+            Arc::clone(&manager),
+            Arc::clone(&faulty),
+        )
+        .expect("open");
+        (publisher, faulty, manager)
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_partial_failure_publishes_succeeded_users() {
+        // Scenario 1: alice has a normal bucket, bob has a bucket
+        // whose name contains FAULT_MARKER. Bob's per-user CBOR
+        // pin fails. Alice's succeeds. The tick continues, advances
+        // sequence, and the published global contains alice but
+        // NOT bob.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, store, manager) = fixture_publisher_with_faulty_store(path);
+
+        store.set_fail_marker(Some(FAULT_MARKER));
+
+        create_user_bucket(&manager, "alice", "photos").await;
+        // Bob's bucket name contains the marker. The per-user CBOR
+        // for bob is keyed by plaintext bucket name (Phase 1.2 legacy
+        // mode), so the marker substring lands in the CBOR bytes.
+        create_user_bucket(&manager, "bob", FAULT_MARKER).await;
+
+        let outcome = publisher
+            .run_tick()
+            .await
+            .expect("tick MUST return Ok despite per-user pin failure");
+
+        assert_eq!(
+            outcome.changed_users, 1,
+            "exactly one user's CBOR was newly pinned (alice)"
+        );
+        assert_eq!(
+            outcome.failed_users, 1,
+            "exactly one user's pin failed (bob)"
+        );
+        assert_eq!(outcome.total_users, 2);
+        assert!(
+            outcome.global_rebuilt,
+            "global must be rebuilt to reflect alice's commit"
+        );
+        assert_eq!(outcome.sequence, 1);
+
+        // Decode the global CBOR: alice present, bob absent.
+        let inner = store.inner();
+        let global: GlobalUsersIndex =
+            inner.get_ipld(&outcome.global_cid).await.expect("global");
+        assert!(
+            global.users.contains_key("alice"),
+            "alice's userKey must be in published global"
+        );
+        assert!(
+            !global.users.contains_key("bob"),
+            "bob's userKey must NOT be in published global (his pin failed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_failed_user_keeps_prior_cid_in_global() {
+        // Scenario 2 (advisor-mandated rigor): tick 1 — alice + bob
+        // both succeed. Tick 2 — alice gets a new bucket (will succeed),
+        // bob gets a marker bucket (will fail). The "stale-but-
+        // consistent" property: bob's entry in tick 2's published
+        // global must equal bob's PRIOR CID (from tick 1), NOT his
+        // new failed-pin CID.
+        //
+        // This guards against a future refactor that might
+        // accidentally republish bob with a stale-or-empty entry. If
+        // that happens, cold-start would point at content that isn't
+        // pinned, breaking bob's reads.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, store, manager) = fixture_publisher_with_faulty_store(path);
+
+        // Tick 1: both users succeed.
+        create_user_bucket(&manager, "alice", "photos").await;
+        create_user_bucket(&manager, "bob", "docs").await;
+        let first = publisher.run_tick().await.expect("first tick");
+        assert_eq!(first.changed_users, 2);
+        assert_eq!(first.failed_users, 0);
+
+        // Capture bob's PRIOR per-user bucketsIndex CID.
+        let inner = store.inner();
+        let first_global: GlobalUsersIndex =
+            inner.get_ipld(&first.global_cid).await.expect("first global");
+        // CIDs in the global are stored as strings (not Cid), so
+        // clone for comparison after the next get_ipld call.
+        let bob_prior_cid = first_global.users["bob"].clone();
+        let alice_prior_cid = first_global.users["alice"].clone();
+
+        // Defensive sanity: bob's prior CID's bytes are present in
+        // the inner store. If a future refactor made `bob_prior_cid`
+        // a default/empty Cid, the equality assertion below would
+        // pass for the wrong reason. This catches that.
+        let bob_prior_cid_parsed: Cid = bob_prior_cid.parse().expect("parse prior cid");
+        assert!(
+            inner.get_block(&bob_prior_cid_parsed).await.is_ok(),
+            "bob's prior bucketsIndex CID must reference real bytes (sanity)"
+        );
+
+        // Now turn on fault injection.
+        store.set_fail_marker(Some(FAULT_MARKER));
+
+        // Alice gets a new (clean) bucket → her CBOR rebuilds + pins OK.
+        create_user_bucket(&manager, "alice", "videos").await;
+        // Bob gets a marker bucket → his per-user CBOR pin fails.
+        create_user_bucket(&manager, "bob", FAULT_MARKER).await;
+
+        let second = publisher.run_tick().await.expect("second tick");
+        assert_eq!(
+            second.changed_users, 1,
+            "alice's CBOR rebuild succeeded; bob's failed"
+        );
+        assert_eq!(
+            second.failed_users, 1,
+            "bob's pin failed"
+        );
+        assert!(
+            second.global_rebuilt,
+            "alice's change forces global rebuild"
+        );
+        assert_eq!(second.sequence, 2, "sequence advances on real change");
+        assert_ne!(
+            second.global_cid, first.global_cid,
+            "global CID must change because alice changed"
+        );
+
+        // Decode tick 2's global. bob's entry MUST be his PRIOR cid;
+        // alice's entry MUST be her new cid.
+        let second_global: GlobalUsersIndex =
+            inner.get_ipld(&second.global_cid).await.expect("second global");
+        assert_eq!(
+            second_global.users["bob"], bob_prior_cid,
+            "stale-but-consistent: bob's failed pin must NOT erase his prior CID; \
+             cold-start serves bob's prior bucketsIndex (still pinned + accessible)"
+        );
+        assert_ne!(
+            second_global.users["alice"], alice_prior_cid,
+            "alice's CID changed because her content changed and her pin succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_all_users_fail_first_tick_publishes_empty_global() {
+        // Scenario 3: every user's pin fails on the first tick.
+        // No prior state to preserve → publisher proceeds to publish
+        // an EMPTY global (same code path as "zero users on first
+        // tick", which the existing
+        // `test_run_tick_no_users_first_publish_emits_empty_global`
+        // test already pins down).
+        //
+        // Operators see this as a nonzero `failed_users` in TickOutcome
+        // + per-user `warn!` lines. The empty-global publish itself
+        // is not a regression: the next tick when users start
+        // succeeding republishes with non-empty global, sequence
+        // advances. The chain anchor cron eventually submits the
+        // first non-empty CID. No data corruption, no stuck state.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, store, manager) = fixture_publisher_with_faulty_store(path);
+
+        store.set_fail_marker(Some(FAULT_MARKER));
+
+        // Both users have marker buckets → both pins fail.
+        create_user_bucket(&manager, "alice", FAULT_MARKER).await;
+        // Different bucket name to ensure two distinct users (BucketManager
+        // accepts duplicate names per-user but we want two USERS).
+        let bob_bucket_name = format!("{}-2", FAULT_MARKER);
+        create_user_bucket(&manager, "bob", &bob_bucket_name).await;
+
+        let outcome = publisher
+            .run_tick()
+            .await
+            .expect("tick MUST return Ok even when every per-user pin fails");
+
+        assert_eq!(
+            outcome.changed_users, 0,
+            "no per-user CBOR was successfully pinned"
+        );
+        assert_eq!(outcome.failed_users, 2);
+        assert_eq!(outcome.total_users, 2);
+        assert!(
+            outcome.global_rebuilt,
+            "first publish must run even when every user failed (same as zero-users path)"
+        );
+        assert_eq!(outcome.sequence, 1);
+
+        let inner = store.inner();
+        let global: GlobalUsersIndex =
+            inner.get_ipld(&outcome.global_cid).await.expect("global");
+        assert_eq!(
+            global.users.len(),
+            0,
+            "global has zero users — every user's CBOR pin failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_failed_user_retries_on_next_tick() {
+        // Scenario 4: bob fails on tick 1. Marker is cleared between
+        // ticks. On tick 2, bob's content_hash STILL mismatches his
+        // (unupdated) diff_cache row, so he's in `to_rebuild`. His
+        // pin succeeds this time; he appears in tick 2's global.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.txt");
+        let (publisher, store, manager) = fixture_publisher_with_faulty_store(path);
+
+        // Set up: alice clean, bob with marker.
+        create_user_bucket(&manager, "alice", "photos").await;
+        create_user_bucket(&manager, "bob", FAULT_MARKER).await;
+
+        // Tick 1: marker active → bob fails.
+        store.set_fail_marker(Some(FAULT_MARKER));
+        let first = publisher.run_tick().await.expect("first tick");
+        assert_eq!(first.changed_users, 1);
+        assert_eq!(first.failed_users, 1);
+
+        let inner = store.inner();
+        let first_global: GlobalUsersIndex =
+            inner.get_ipld(&first.global_cid).await.expect("first global");
+        assert!(
+            !first_global.users.contains_key("bob"),
+            "bob absent from tick 1's global (failed pin)"
+        );
+
+        // Tick 2: clear the marker. bob's content_hash still doesn't
+        // match the (empty) cache row, so he's re-attempted. Pin
+        // succeeds this time → bob is in the global.
+        store.set_fail_marker(None);
+        let second = publisher.run_tick().await.expect("second tick");
+        assert_eq!(
+            second.changed_users, 1,
+            "bob's retry succeeded; alice was unchanged"
+        );
+        assert_eq!(second.failed_users, 0);
+        assert!(second.global_rebuilt);
+        assert_eq!(second.sequence, 2);
+
+        let second_global: GlobalUsersIndex =
+            inner.get_ipld(&second.global_cid).await.expect("second global");
+        assert!(
+            second_global.users.contains_key("bob"),
+            "bob present in tick 2's global (retry succeeded)"
+        );
+        assert!(
+            second_global.users.contains_key("alice"),
+            "alice still present (unchanged across the two ticks)"
+        );
     }
 }

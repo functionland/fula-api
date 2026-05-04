@@ -63,6 +63,15 @@ pub struct PublishNowResponse {
     pub global_cid: String,
     pub sequence: u64,
     pub changed_users: usize,
+    /// Number of users whose per-user CBOR pin failed this tick.
+    /// Surfaces the per-user-error-tolerance count from
+    /// `TickOutcome.failed_users` so an operator clicking
+    /// "publish now" in the admin UI sees per-user pin failures
+    /// without tailing logs. A non-zero value means the published
+    /// global may exclude one or more users (or carry their prior
+    /// CIDs). The per-user `warn!` lines inside `run_tick` identify
+    /// WHICH users failed; this field is the count for surfacing.
+    pub failed_users: usize,
     pub total_users: usize,
     pub global_rebuilt: bool,
 }
@@ -159,6 +168,7 @@ pub async fn publish_now(
                 global_cid: outcome.global_cid.to_string(),
                 sequence: outcome.sequence,
                 changed_users: outcome.changed_users,
+                failed_users: outcome.failed_users,
                 total_users: outcome.total_users,
                 global_rebuilt: outcome.global_rebuilt,
             };

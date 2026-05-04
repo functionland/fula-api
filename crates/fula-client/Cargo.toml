@@ -56,6 +56,12 @@ cid = { workspace = true }
 sha2 = { workspace = true }
 # Mutex for per-gateway state in gateway_fetch (Phase 2.3).
 parking_lot = { workspace = true }
+# Phase 3.3 cold-start hybrid resolver — parses the master-published
+# global users-index dag-cbor payload directly (the resolver doesn't
+# go through the full BlockStore trait, so it needs the codec by hand).
+# `serde_json` for the chain-side eth_call request body is already
+# pulled in via the cross-platform top-level deps.
+serde_ipld_dagcbor = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # WASM: disable default features (no tokio), enable wasm feature
@@ -72,6 +78,10 @@ tokio = { workspace = true }
 tokio-test = "0.4"
 wiremock = { workspace = true }
 tempfile = { workspace = true }
+# Phase 3.3 — verifies the hardcoded `latest()` ABI selector matches
+# `Keccak256("latest()")[..4]`. Tests-only; the prod build hardcodes
+# the 4-byte constant to avoid a runtime crypto dep on the hot path.
+sha3 = "0.10"
 
 [features]
 default = []

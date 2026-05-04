@@ -15,24 +15,55 @@ use async_lock::RwLock;
 
 use crate::api::types::*;
 
+/// Build the underlying `fula_client::Config` from the Dart-facing
+/// `FulaConfig`, plumbing every Phase 1.2 / 2.x field through. Used by
+/// `create_client`, `create_encrypted_client`, and
+/// `create_encrypted_client_with_pinning` to keep the three constructors
+/// in lockstep — adding a new field to FulaConfig only requires a
+/// change here.
+fn build_inner_config(config: &FulaConfig) -> fula_client::Config {
+    let mut inner = fula_client::Config::new(&config.endpoint)
+        .with_timeout(Duration::from_secs(config.timeout_seconds));
+
+    // Existing F8/F10 fields.
+    inner.per_chunk_download_timeout =
+        Duration::from_secs(config.per_chunk_download_timeout_seconds);
+    inner.buffered_download_max_bytes = config.buffered_download_max_bytes;
+
+    // Phase 2.1 — health gate.
+    inner.health_gate_enabled = config.health_gate_enabled;
+    inner.health_gate_ttl = Duration::from_secs(config.health_gate_ttl_seconds);
+
+    // Phase 2.2 — block cache. The path-string conversion treats
+    // empty string as `None` so the SDK's `dirs`-based platform
+    // default kicks in.
+    inner.block_cache_enabled = config.block_cache_enabled;
+    inner.block_cache_path = if config.block_cache_path.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(&config.block_cache_path))
+    };
+    inner.block_cache_max_bytes = config.block_cache_max_bytes;
+
+    // Phase 2.3 / 2.4 — gateway race + offline fallback.
+    inner.gateway_fallback_enabled = config.gateway_fallback_enabled;
+    inner.gateway_fallback_urls = config.gateway_fallback_urls.clone();
+    inner.gateway_race_concurrency = config.gateway_race_concurrency as usize;
+
+    if let Some(token) = &config.access_token {
+        inner = inner.with_token(token.clone());
+    }
+
+    inner
+}
+
 // ============================================================================
 // Client Creation
 // ============================================================================
 
 /// Create a new Fula client with the given configuration
 pub fn create_client(config: FulaConfig) -> anyhow::Result<FulaClientHandle> {
-    let mut inner_config = fula_client::Config::new(&config.endpoint)
-        .with_timeout(Duration::from_secs(config.timeout_seconds));
-    inner_config.per_chunk_download_timeout =
-        Duration::from_secs(config.per_chunk_download_timeout_seconds);
-    inner_config.buffered_download_max_bytes = config.buffered_download_max_bytes;
-
-    let inner_config = if let Some(token) = config.access_token {
-        inner_config.with_token(token)
-    } else {
-        inner_config
-    };
-
+    let inner_config = build_inner_config(&config);
     let client = fula_client::FulaClient::new(inner_config)?;
 
     Ok(FulaClientHandle {
@@ -45,17 +76,7 @@ pub fn create_encrypted_client(
     config: FulaConfig,
     encryption: EncryptionConfig,
 ) -> anyhow::Result<EncryptedClientHandle> {
-    let mut inner_config = fula_client::Config::new(&config.endpoint)
-        .with_timeout(Duration::from_secs(config.timeout_seconds));
-    inner_config.per_chunk_download_timeout =
-        Duration::from_secs(config.per_chunk_download_timeout_seconds);
-    inner_config.buffered_download_max_bytes = config.buffered_download_max_bytes;
-
-    let inner_config = if let Some(token) = config.access_token {
-        inner_config.with_token(token)
-    } else {
-        inner_config
-    };
+    let inner_config = build_inner_config(&config);
 
     // Create encryption config
     let enc_config = if let Some(secret_key) = encryption.secret_key {
@@ -101,17 +122,7 @@ pub fn create_encrypted_client_with_pinning(
     encryption: EncryptionConfig,
     pinning: PinningConfig,
 ) -> anyhow::Result<EncryptedClientHandle> {
-    let mut inner_config = fula_client::Config::new(&config.endpoint)
-        .with_timeout(Duration::from_secs(config.timeout_seconds));
-    inner_config.per_chunk_download_timeout =
-        Duration::from_secs(config.per_chunk_download_timeout_seconds);
-    inner_config.buffered_download_max_bytes = config.buffered_download_max_bytes;
-
-    let inner_config = if let Some(token) = config.access_token {
-        inner_config.with_token(token)
-    } else {
-        inner_config
-    };
+    let inner_config = build_inner_config(&config);
 
     // Create encryption config
     let enc_config = if let Some(secret_key) = encryption.secret_key {
@@ -304,6 +315,7 @@ mod tests {
             max_retries: 3,
             per_chunk_download_timeout_seconds: 120,
             buffered_download_max_bytes: 64 * 1024 * 1024,
+            ..FulaConfig::default()
         };
         let handle = create_client(cfg).expect("create_client should succeed");
         let inner_cfg = handle.inner.config();
@@ -332,5 +344,95 @@ mod tests {
             inner_cfg.buffered_download_max_bytes,
             256 * 1024 * 1024,
         );
+    }
+
+    /// Phase 2.x — verify all new fields plumb from FulaConfig
+    /// (Dart-facing) through `build_inner_config` into the underlying
+    /// `fula_client::Config`. Without this test, a future refactor of
+    /// `build_inner_config` could silently drop a field and Dart apps
+    /// would observe Phase 2.x as inert (config flag set, runtime
+    /// flag still false).
+    #[test]
+    fn fula_config_plumbs_phase_2_x_health_gate_fields() {
+        let cfg = FulaConfig {
+            health_gate_enabled: true,
+            health_gate_ttl_seconds: 45,
+            ..FulaConfig::default()
+        };
+        let handle = create_client(cfg).expect("create_client");
+        let inner = handle.inner.config();
+        assert!(inner.health_gate_enabled, "health_gate_enabled must plumb");
+        assert_eq!(inner.health_gate_ttl, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn fula_config_plumbs_phase_2_x_block_cache_fields() {
+        // Use a path that won't actually open (we only assert the
+        // config plumbs; the cache opens lazily on first use).
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache_path = temp.path().join("cache.redb");
+
+        let cfg = FulaConfig {
+            block_cache_enabled: true,
+            block_cache_path: cache_path.to_string_lossy().into_owned(),
+            block_cache_max_bytes: 64 * 1024 * 1024,
+            ..FulaConfig::default()
+        };
+        let handle = create_client(cfg).expect("create_client");
+        let inner = handle.inner.config();
+        assert!(inner.block_cache_enabled);
+        assert_eq!(inner.block_cache_path, Some(cache_path));
+        assert_eq!(inner.block_cache_max_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn fula_config_empty_block_cache_path_means_use_platform_default() {
+        // The Dart-facing field is `String` (FFI doesn't carry
+        // `Option`); empty string is the documented "use default" form.
+        // The bridge must translate to `None` so the SDK's `dirs`-based
+        // default kicks in.
+        let cfg = FulaConfig {
+            block_cache_enabled: true,
+            block_cache_path: String::new(),
+            ..FulaConfig::default()
+        };
+        let handle = create_client(cfg).expect("create_client");
+        let inner = handle.inner.config();
+        assert_eq!(inner.block_cache_path, None,
+            "empty block_cache_path string must translate to None so the SDK uses the platform default");
+    }
+
+    #[test]
+    fn fula_config_plumbs_phase_2_x_gateway_fields() {
+        let cfg = FulaConfig {
+            gateway_fallback_enabled: true,
+            gateway_fallback_urls: vec![
+                "https://custom1.example/ipfs/{cid}".into(),
+                "https://custom2.example/ipfs/{cid}".into(),
+            ],
+            gateway_race_concurrency: 5,
+            ..FulaConfig::default()
+        };
+        let handle = create_client(cfg).expect("create_client");
+        let inner = handle.inner.config();
+        assert!(inner.gateway_fallback_enabled);
+        assert_eq!(inner.gateway_fallback_urls.len(), 2);
+        assert_eq!(inner.gateway_fallback_urls[0], "https://custom1.example/ipfs/{cid}");
+        assert_eq!(inner.gateway_race_concurrency, 5);
+    }
+
+    #[test]
+    fn fula_config_default_phase_2_x_fields_are_off() {
+        // Backward-compat invariant: default-constructed Dart config
+        // produces a default-constructed Rust config. Apps that don't
+        // touch the new fields see byte-identical pre-Phase-2.x behavior.
+        let cfg = FulaConfig::default();
+        let handle = create_client(cfg).expect("create_client");
+        let inner = handle.inner.config();
+        assert!(!inner.health_gate_enabled);
+        assert!(!inner.block_cache_enabled);
+        assert!(!inner.gateway_fallback_enabled);
+        assert_eq!(inner.gateway_fallback_urls.len(), 0);
+        assert_eq!(inner.gateway_race_concurrency, 3);
     }
 }

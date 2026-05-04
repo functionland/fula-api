@@ -57,6 +57,11 @@ wasm-bindgen-test = "0.3"
 # time APIs aren't re-introduced into the migration path.
 web-time = "1"
 
+# Native-only dev-deps (Phase 2.x config plumbing tests construct
+# tempdirs to verify block_cache_path round-trips through the bridge).
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 default = []
 

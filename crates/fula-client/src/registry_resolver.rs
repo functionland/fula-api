@@ -1,0 +1,1785 @@
+//! Phase 3.3 — hybrid IPNS-primary + chain-fallback resolver for
+//! the master-published global users-index CID.
+//!
+//! Cold-start flow (per plan §3.3 step 5):
+//!
+//! 1. **IPNS path (primary).** Race a small fan-out of IPNS-aware
+//!    public gateways for `/ipns/<configured-name>`. Each gateway
+//!    resolves the IPNS NAME server-side and returns the underlying
+//!    dag-cbor bytes. We parse those bytes as
+//!    [`GlobalUsersIndex`], read the in-payload `sequence`, and
+//!    accept the first response whose sequence is ≥ the SDK's
+//!    process-wide `highest_seen_sequence` (replay defense).
+//!    Budget: 10 s, sequential; no per-gateway dynamic-priority
+//!    state (the cold-start path is one-shot — the warm-device
+//!    pool's state machine isn't a fit).
+//!
+//! 2. **Chain path (fallback).** If the IPNS path fails or times
+//!    out, fire one `eth_call` against the configured RPC URL for
+//!    `FulaUsersIndexAnchor.latest()`. The 96-byte ABI response is
+//!    `(bytes32 cid_digest, uint64 sequence, uint64 timestamp)`.
+//!    Reconstruct a CIDv1 (codec=dag-cbor 0x71, multihash=sha2-256
+//!    0x12 + the digest bytes), then iterate the same gateway list
+//!    fetching `/ipfs/<cid>` until one body content-addresses to
+//!    that CID via [`verify_cid_against_bytes`]. Parse the body as
+//!    [`GlobalUsersIndex`]; verify the in-payload `sequence`
+//!    matches the on-chain `sequence` and is ≥ `highest_seen_sequence`.
+//!
+//! 3. **Single sequence stream.** There is one monotonic `sequence`
+//!    field, embedded inside the CBOR payload itself. Both IPNS and
+//!    chain paths read it from the bytes — never from IPNS DHT
+//!    metadata or the chain-call return — so a compromised gateway
+//!    (or RPC node, or operator) can publish a fresh-but-malicious
+//!    *higher* sequence (closing that requires user wallets and is
+//!    out of scope), but **cannot regress** to a stale one.
+//!
+//! ## Native-only
+//!
+//! The resolver is gated to `cfg(not(target_arch = "wasm32"))` for
+//! the same reason as `block_cache.rs` and `gateway_fetch.rs`: it
+//! depends on `tokio::time::timeout`, on the `parking_lot::Mutex`
+//! used internally by gateway-side code, and on
+//! `verify_cid_against_bytes` (which itself is native-only because
+//! it lives in `gateway_fetch.rs`). Cold-start on browser/wasm
+//! surfaces [`ClientError::UsersIndexResolutionFailed`] until a
+//! browser-friendly resolver lands as a follow-up.
+
+#![cfg(not(target_arch = "wasm32"))]
+
+use crate::error::ClientError;
+use crate::gateway_fetch::verify_cid_against_bytes;
+use bytes::Bytes;
+use cid::multihash::Multihash;
+use cid::Cid;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+// ============================================================
+// Public types
+// ============================================================
+
+/// Master's published global users-index CBOR payload. Mirrors the
+/// `GlobalUsersIndex` struct in `fula-cli`'s
+/// `handlers::users_index_publisher`. The two definitions must stay
+/// in lockstep — see plan §3.2.a for the producer side.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GlobalUsersIndex {
+    pub v: u32,
+    pub sequence: u64,
+    pub updated_at_unix: u64,
+    /// `userKey_hex` (32 hex chars) → bucketsIndexCid (string).
+    /// The SDK looks up its own `userKey` here on cold-start.
+    pub users: BTreeMap<String, String>,
+}
+
+/// Master's per-user `bucketsIndex` CBOR — one per user per snapshot
+/// when their state changed. Mirrors the `UserBucketsIndex` struct
+/// in `fula-cli`'s `handlers::users_index_publisher` (the producer
+/// side; see plan §3.2.a). The two definitions must stay in lockstep.
+///
+/// Map keys are either:
+///   - 32-hex BLAKE3-derived `bucketLookupH` (Phase 1.2 blinded form)
+///   - plaintext bucket name (Phase 1.2 lazy-migration legacy form)
+///
+/// `legacy=true` distinguishes the latter so the cold-start dispatch
+/// can fall back from `index[blinded_hex]` to `index[bucket_name]`
+/// for users who haven't yet uploaded with a Phase-1.2-aware client.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct UserBucketsIndex {
+    pub v: u32,
+    pub buckets: BTreeMap<String, BucketEntry>,
+    pub updated_at_unix: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BucketEntry {
+    /// CIDv1 string of the user's per-bucket forest manifest.
+    pub manifest: String,
+    /// `true` ⇔ map key is the plaintext `bucket_name` (legacy
+    /// fallback). The cold-start lookup tries blinded first; on
+    /// miss it tries the plaintext name and accepts only entries
+    /// where `legacy = true`.
+    pub legacy: bool,
+}
+
+/// Result of a successful [`UsersIndexResolver::resolve`].
+#[derive(Clone, Debug)]
+pub struct ResolvedUsersIndex {
+    /// Which channel actually served the payload. Surfaced to apps
+    /// (and to Phase 19's `ReadFreshness`) so users can be told
+    /// "served from chain backup; expected staleness ≤ 12h".
+    pub source: ResolutionSource,
+    /// CID of the parsed payload. For the chain path this is the
+    /// reconstructed-and-verified CID. For the IPNS path it is
+    /// `Cid::new_v1(0x71, sha2-256(bytes))` — synthesized from the
+    /// returned bytes (the IPNS path has no externally-asserted CID
+    /// to verify against; the gateway does the IPNS-record
+    /// resolution upstream).
+    pub cid: Cid,
+    /// Decoded payload. Apps walk `payload.users` to find their own
+    /// `userKey` → bucketsIndexCid.
+    pub payload: GlobalUsersIndex,
+    /// Raw CBOR bytes — kept so callers can persist them (Phase
+    /// 3.3.5 hot-start cache) without re-fetching.
+    pub bytes: Bytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolutionSource {
+    Ipns,
+    Chain,
+    /// Phase 3.3.5 — served from the on-disk hot-start cache (the
+    /// resolver short-circuited IPNS + chain because the cached
+    /// `(cid, sequence)` was within `soft_ttl`). Apps/Phase 19's
+    /// `ReadFreshness` can surface this as "served from a recent
+    /// snapshot — last refreshed N seconds ago".
+    HotStartCache,
+}
+
+/// Resolver configuration. Construct via [`UsersIndexResolver::new`].
+#[derive(Clone, Debug)]
+pub struct ResolverConfig {
+    /// IPNS-aware gateway URL templates (each must contain `{name}`).
+    /// Empty = use the SDK-shipped default subset
+    /// ([`default_ipns_gateway_urls`]).
+    pub ipns_gateways: Vec<String>,
+    /// `/ipfs/{cid}` gateway URL templates for the chain path's
+    /// CID-fetch step. Empty = use the SDK-shipped default six.
+    pub ipfs_gateways: Vec<String>,
+    /// JSON-RPC URL for the chain anchor. Required.
+    pub chain_rpc_url: String,
+    /// `FulaUsersIndexAnchor.sol` proxy address (20 bytes hex,
+    /// optionally `0x`-prefixed). Required.
+    pub anchor_address: String,
+    /// IPNS NAME (libp2p public-key hash, e.g. `k51qzi5...`).
+    /// Required.
+    pub ipns_name: String,
+    /// Hard ceiling on the IPNS race; fall through to chain after.
+    /// Default 10 s per plan §3.3 step 5a.
+    pub ipns_race_timeout: Duration,
+    /// Per-gateway timeout for individual fetches (both IPNS and the
+    /// chain path's CID-fetch step).
+    pub per_request_timeout: Duration,
+
+    /// Phase 3.3.5 — soft TTL for the on-disk hot-start cache.
+    /// When the resolver was successfully run within this window
+    /// (per the cached `observed_at_unix`), `resolve()` returns the
+    /// cached state directly without touching IPNS or chain.
+    /// Beyond this, the resolver opportunistically re-runs.
+    /// Default: 5 minutes per plan §3.3.5 — matches the expected
+    /// IPNS publish cadence.
+    pub soft_ttl: Duration,
+}
+
+impl ResolverConfig {
+    /// Default config for a given chain RPC URL, IPNS NAME, and
+    /// anchor address. All other fields take audit-recommended
+    /// defaults.
+    pub fn new(
+        chain_rpc_url: impl Into<String>,
+        anchor_address: impl Into<String>,
+        ipns_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            ipns_gateways: Vec::new(),
+            ipfs_gateways: Vec::new(),
+            chain_rpc_url: chain_rpc_url.into(),
+            anchor_address: anchor_address.into(),
+            ipns_name: ipns_name.into(),
+            ipns_race_timeout: Duration::from_secs(10),
+            per_request_timeout: Duration::from_secs(8),
+            soft_ttl: Duration::from_secs(300), // 5 min, matches IPNS publish cadence
+        }
+    }
+}
+
+/// Derive the SDK-side `userKey` from a user's email address.
+///
+/// Replicates the master-side identity derivation chain in
+/// `fula-cli/src/state.rs::hash_user_id`:
+///
+/// 1. `userId   = sha256(lower(email))`               — 32 bytes
+/// 2. `userIdHex = hex::encode(userId)`               — 64 ASCII hex chars
+/// 3. `userKey  = BLAKE3("fula:user_id:" || userIdHex)[..16]` — 16 bytes
+/// 4. Return `hex::encode(userKey)`                   — 32 ASCII hex chars
+///
+/// The 32-hex output matches `BucketMetadata.owner_id` on master
+/// (see `fula-cli/src/state.rs:15-22`). The SDK passes this string
+/// in `Config::users_index_user_key` so the cold-start path can
+/// look itself up in the published `GlobalUsersIndex.users` map.
+///
+/// This is a **free function**, not a method, so JS / Flutter
+/// bindings can compute the user_key without holding a client.
+/// Domain separator + double hashing + lowercase normalization MUST
+/// stay in lockstep with the master's `hash_user_id`; the
+/// `derive_user_key_matches_master_state_rs_algorithm` test below
+/// reproduces the master algorithm step-by-step and asserts equality.
+pub fn derive_user_key_from_email(email: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let user_id_digest = Sha256::digest(email.to_lowercase().as_bytes());
+    let user_id_hex = hex::encode(user_id_digest);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fula:user_id:");
+    hasher.update(user_id_hex.as_bytes());
+    hex::encode(&hasher.finalize().as_bytes()[..16])
+}
+
+/// Default IPNS-aware gateway list. Excludes
+/// `trustless-gateway.link` (only serves `/ipfs/`, not `/ipns/`).
+pub fn default_ipns_gateway_urls() -> Vec<String> {
+    vec![
+        "https://cloudflare-ipfs.com/ipns/{name}".into(),
+        "https://dweb.link/ipns/{name}".into(),
+        "https://ipfs.io/ipns/{name}".into(),
+        "https://4everland.io/ipns/{name}".into(),
+        "https://gateway.pinata.cloud/ipns/{name}".into(),
+    ]
+}
+
+/// Fetch a CID's bytes via simple sequential iteration over the
+/// configured IPFS-gateway list, verifying content-addressing on
+/// each successful response. Returns the first body whose
+/// `verify_cid_against_bytes` passes; surfaces
+/// `UsersIndexResolutionFailed` if all gateways exhaust.
+///
+/// Intentionally simpler than `GatewayPool::fetch_verified` (Phase
+/// 2.3's dynamic-priority race orchestrator). Cold-start is one-shot
+/// — the per-gateway state machine pays no benefit here, and keeping
+/// the resolver self-contained means cold-start doesn't require
+/// Phase 2.2/2.4 to be enabled.
+pub async fn fetch_cid_via_gateways(
+    cid: &Cid,
+    gateways: &[String],
+    http: &reqwest::Client,
+    per_request_timeout: Duration,
+) -> Result<Bytes, ClientError> {
+    if gateways.is_empty() {
+        return Err(ClientError::UsersIndexResolutionFailed {
+            reason: format!("no IPFS gateways configured to fetch {}", cid),
+        });
+    }
+    let cid_str = cid.to_string();
+    let mut last_err: Option<String> = None;
+    for tmpl in gateways {
+        let url = tmpl.replace("{cid}", &cid_str);
+        let resp = match tokio::time::timeout(per_request_timeout, http.get(&url).send()).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                last_err = Some(format!("{} transport: {}", url, e));
+                continue;
+            }
+            Err(_) => {
+                last_err = Some(format!("{} timeout", url));
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_err = Some(format!("{} HTTP {}", url, resp.status()));
+            continue;
+        }
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                last_err = Some(format!("{} body: {}", url, e));
+                continue;
+            }
+        };
+        if let Err(e) = verify_cid_against_bytes(cid, &bytes) {
+            last_err = Some(format!("{} verify: {}", url, e));
+            continue;
+        }
+        return Ok(bytes);
+    }
+    Err(ClientError::UsersIndexResolutionFailed {
+        reason: format!(
+            "CID {} unreachable across {} gateways: {}",
+            cid,
+            gateways.len(),
+            last_err.unwrap_or_else(|| "no gateways tried".into())
+        ),
+    })
+}
+
+/// Decode dag-cbor bytes as a per-user `UserBucketsIndex`. Wraps the
+/// dagcbor crate's error so callers see a single ClientError shape.
+pub fn decode_user_buckets_index(bytes: &[u8]) -> Result<UserBucketsIndex, ClientError> {
+    serde_ipld_dagcbor::from_slice(bytes).map_err(|e| {
+        ClientError::UsersIndexResolutionFailed {
+            reason: format!("UserBucketsIndex CBOR decode: {}", e),
+        }
+    })
+}
+
+/// Default `/ipfs/{cid}` gateway list — same six as the warm-device
+/// pool ships in `gateway_fetch::default_gateway_urls`. Re-declared
+/// here so the resolver's chain path doesn't need to depend on the
+/// pool's state machine.
+pub fn default_ipfs_gateway_urls() -> Vec<String> {
+    vec![
+        "https://cloudflare-ipfs.com/ipfs/{cid}".into(),
+        "https://dweb.link/ipfs/{cid}".into(),
+        "https://ipfs.io/ipfs/{cid}".into(),
+        "https://trustless-gateway.link/ipfs/{cid}".into(),
+        "https://4everland.io/ipfs/{cid}".into(),
+        "https://gateway.pinata.cloud/ipfs/{cid}".into(),
+    ]
+}
+
+// ============================================================
+// Resolver
+// ============================================================
+
+#[derive(Debug)]
+pub struct UsersIndexResolver {
+    config: ResolverConfig,
+    http: reqwest::Client,
+    /// Process-wide replay defense — only ever increases. SDK callers
+    /// can seed it from a persisted hot-start cache (Phase 3.3.5) at
+    /// construction time via [`UsersIndexResolver::new_with_cache`];
+    /// every successful `resolve` then bumps it.
+    highest_seen_sequence: AtomicU64,
+    /// Pre-validated 20-byte anchor address. Cached so each `resolve`
+    /// doesn't re-parse the hex.
+    anchor_address_bytes: [u8; 20],
+    /// Phase 3.3.5 — optional hot-start persistence layer. When set,
+    /// `resolve()` reads cached `(cid, sequence, observed_at_unix)`
+    /// from the cache's METADATA table on the first call AND writes
+    /// the freshly-resolved state on every successful resolve. This
+    /// makes the replay-defense floor survive SDK restarts AND lets
+    /// the resolver short-circuit IPNS+chain when within `soft_ttl`.
+    cache: Option<Arc<crate::block_cache::BlockCache>>,
+}
+
+impl UsersIndexResolver {
+    /// Build a resolver. Validates `anchor_address` is 20 bytes hex
+    /// up-front so misconfiguration fails at construction time, not
+    /// on the first cold-start.
+    pub fn new(config: ResolverConfig) -> Result<Self, ClientError> {
+        if config.chain_rpc_url.is_empty() {
+            return Err(ClientError::Config(
+                "registry resolver: chain_rpc_url is empty".into(),
+            ));
+        }
+        if config.ipns_name.is_empty() {
+            return Err(ClientError::Config(
+                "registry resolver: ipns_name is empty".into(),
+            ));
+        }
+        let anchor_address_bytes = parse_anchor_address(&config.anchor_address)?;
+        Ok(Self {
+            config,
+            http: reqwest::Client::new(),
+            highest_seen_sequence: AtomicU64::new(0),
+            anchor_address_bytes,
+            cache: None,
+        })
+    }
+
+    /// Phase 3.3.5 — construct a resolver wired to a persistent
+    /// hot-start cache. On construction the resolver:
+    ///   1. Reads `(cid, sequence, observed_at_unix)` from the
+    ///      cache's METADATA table.
+    ///   2. Seeds the replay-defense floor from the cached
+    ///      sequence — a malicious gateway cannot regress to a
+    ///      stale payload across SDK restarts.
+    ///
+    /// On every successful `resolve` the resolver:
+    ///   1. Writes the new `(cid, sequence, now)` to METADATA.
+    ///   2. Inserts the bytes into BLOCKS (so a future hot-start
+    ///      can serve the payload entirely from disk).
+    ///
+    /// The cache load/store paths are **best-effort**: failures
+    /// log at `warn!` and don't propagate, so a corrupted or
+    /// unwriteable cache never blocks SDK functionality. (The
+    /// resolver still works, just without hot-start.)
+    pub fn new_with_cache(
+        config: ResolverConfig,
+        cache: Arc<crate::block_cache::BlockCache>,
+    ) -> Result<Self, ClientError> {
+        let mut resolver = Self::new(config)?;
+        // Seed the floor from cached state, if any. Best-effort —
+        // a corrupt or empty cache gives us the default floor (0).
+        match cache.load_users_index_state() {
+            Ok(Some((_cid, sequence, _observed))) => {
+                resolver.bump_seen_sequence(sequence);
+                tracing::debug!(
+                    seeded_sequence = sequence,
+                    "registry_resolver: hot-start floor seeded from cache"
+                );
+            }
+            Ok(None) => {
+                tracing::debug!("registry_resolver: no hot-start state cached (fresh)");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "registry_resolver: hot-start cache load failed; floor stays at 0 (best-effort)"
+                );
+            }
+        }
+        resolver.cache = Some(cache);
+        Ok(resolver)
+    }
+
+    /// Test/integration hook — production callers update via
+    /// `resolve()`'s side-effect of calling `bump_seen_sequence`.
+    /// Marked `pub(crate)` so tests can seed the floor without a
+    /// stable public API.
+    #[cfg(test)]
+    pub(crate) fn set_highest_seen_sequence(&self, seq: u64) {
+        self.bump_seen_sequence(seq);
+    }
+
+    /// Read the current replay-defense floor.
+    pub fn highest_seen_sequence(&self) -> u64 {
+        self.highest_seen_sequence.load(Ordering::Acquire)
+    }
+
+    /// Read-only access to the resolver's HTTP client. The cold-start
+    /// path on `EncryptedClient` reuses this client for the
+    /// bucketsIndex + manifest fetches so connection pooling stays
+    /// intact across all of the cold-start request burst.
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// Read-only access to the resolver's per-request timeout —
+    /// reused by the cold-start path's gateway fetches for the
+    /// bucketsIndex CBOR and the forest manifest, so a single config
+    /// knob governs all of cold-start.
+    pub fn per_request_timeout(&self) -> Duration {
+        self.config.per_request_timeout
+    }
+
+    /// Read-only access to the IPFS gateway list. Cold-start uses
+    /// this same list (rather than the warm-device pool's) so it
+    /// stays self-contained and works without Phase 2.2/2.4 enabled.
+    pub fn ipfs_gateways(&self) -> Vec<String> {
+        if self.config.ipfs_gateways.is_empty() {
+            default_ipfs_gateway_urls()
+        } else {
+            self.config.ipfs_gateways.clone()
+        }
+    }
+
+    /// Atomic monotonic-max — only ever increases. Lock-free CAS loop.
+    fn bump_seen_sequence(&self, seq: u64) {
+        let mut current = self.highest_seen_sequence.load(Ordering::Acquire);
+        while seq > current {
+            match self.highest_seen_sequence.compare_exchange_weak(
+                current,
+                seq,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Hybrid resolve.
+    ///
+    /// Order of operations:
+    ///   0. **Hot-start short-circuit (Phase 3.3.5).** If a cache is
+    ///      configured AND has a `(cid, sequence, observed_at)` row
+    ///      AND `now - observed_at < soft_ttl`, return the cached
+    ///      state directly. Bytes come from BLOCKS if cached,
+    ///      otherwise via gateway race for the cached cid. Sequence
+    ///      is re-checked against the in-memory floor for defense.
+    ///   1. Try IPNS for `ipns_race_timeout`.
+    ///   2. Fall through to chain on timeout / all-gateway failure
+    ///      / replay-rejection.
+    ///   3. On success (any path), write `(cid, sequence, now)` to
+    ///      METADATA and the bytes to BLOCKS — best-effort, so a
+    ///      cache write failure never aborts the resolve.
+    pub async fn resolve(&self) -> Result<ResolvedUsersIndex, ClientError> {
+        // Step 0 — hot-start short-circuit.
+        if let Some(resolved) = self.try_hot_start().await {
+            return Ok(resolved);
+        }
+
+        // Steps 1-2 — IPNS-then-chain.
+        let resolved = self.resolve_via_network().await?;
+
+        // Step 3 — write-back. Best-effort, synchronous-from-async
+        // so the next call observes the freshly-written cache without
+        // racing a spawned background task. Cold-start is a once-
+        // per-session event; the few hundred microseconds for the
+        // redb txns are negligible vs. the IPNS+chain budget we just
+        // paid.
+        self.persist_to_cache(&resolved).await;
+
+        Ok(resolved)
+    }
+
+    /// Phase 3.3.5 — try to serve from the persistent cache without
+    /// touching the network. Returns `Some(ResolvedUsersIndex)` when
+    /// a fresh-enough cached state exists AND the bytes are
+    /// available (BLOCKS hit OR a fast gateway-race fetch for the
+    /// cached cid succeeds). Returns `None` to indicate "fall
+    /// through to full IPNS+chain resolve."
+    ///
+    /// A `None` return is silent — the network path takes over.
+    async fn try_hot_start(&self) -> Option<ResolvedUsersIndex> {
+        let cache = self.cache.as_ref()?;
+        let (cached_cid, cached_seq, observed_at) = match cache.load_users_index_state() {
+            Ok(Some(triple)) => triple,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(error = %e, "hot-start: cache load failed");
+                return None;
+            }
+        };
+
+        // TTL check. Use wall-clock (matches what the writer used).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now.saturating_sub(observed_at) >= self.config.soft_ttl.as_secs() {
+            tracing::debug!(
+                age_secs = now.saturating_sub(observed_at),
+                ttl_secs = self.config.soft_ttl.as_secs(),
+                "hot-start: cache entry beyond TTL; re-resolving"
+            );
+            return None;
+        }
+
+        // Replay-defense check on the cached sequence itself —
+        // defends against a corrupt/tampered METADATA row.
+        let seen = self.highest_seen_sequence();
+        if cached_seq < seen {
+            tracing::warn!(
+                cached = cached_seq,
+                seen,
+                "hot-start: cached sequence < in-memory floor; ignoring (corrupt or rolled-back cache)"
+            );
+            return None;
+        }
+
+        // Fetch bytes — BLOCKS first, then gateway race for the
+        // cached cid as a network fallback.
+        let bytes = match cache.get(&cached_cid) {
+            Ok(Some(b)) => {
+                tracing::debug!(cid = %cached_cid, "hot-start: BLOCKS hit");
+                b
+            }
+            Ok(None) => {
+                // BLOCKS miss: cached metadata says "we know the
+                // CID" but we don't have the bytes (LRU evicted, or
+                // the prior resolve failed mid-write). Fetch via
+                // gateway race for the cached cid; cheaper than the
+                // full IPNS dance because we skip the DHT lookup.
+                let gateways = self.ipfs_gateways();
+                match fetch_cid_via_gateways(
+                    &cached_cid,
+                    &gateways,
+                    &self.http,
+                    self.config.per_request_timeout,
+                )
+                .await
+                {
+                    Ok(b) => {
+                        tracing::debug!(cid = %cached_cid, "hot-start: BLOCKS miss → gateway race");
+                        // Repopulate BLOCKS for the next read.
+                        if let Err(e) = cache.put(&cached_cid, &b).await {
+                            tracing::debug!(error = %e, "hot-start: BLOCKS put failed (best-effort)");
+                        }
+                        b
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "hot-start: BLOCKS miss AND gateway fetch failed; falling through"
+                        );
+                        return None;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "hot-start: BLOCKS lookup failed");
+                return None;
+            }
+        };
+
+        // Decode + cross-check sequence. The bytes content-address
+        // to `cached_cid` (BLOCKS hit) or were verified by the
+        // gateway-fetch (CID match guaranteed by
+        // `verify_cid_against_bytes`). Decode failure here is
+        // silent — fall through to network path so a fresh resolve
+        // can heal a poisoned cache.
+        let payload = match decode_users_index_cbor(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "hot-start: cached CBOR parse failed; re-resolving");
+                return None;
+            }
+        };
+        if payload.sequence != cached_seq {
+            tracing::warn!(
+                payload_seq = payload.sequence,
+                metadata_seq = cached_seq,
+                "hot-start: payload sequence != metadata sequence; cache inconsistent, re-resolving"
+            );
+            return None;
+        }
+
+        // All checks passed. Bump the in-memory floor to match
+        // (no-op if already >= cached_seq) and return.
+        self.bump_seen_sequence(payload.sequence);
+        Some(ResolvedUsersIndex {
+            source: ResolutionSource::HotStartCache,
+            cid: cached_cid,
+            payload,
+            bytes,
+        })
+    }
+
+    /// Network resolve path (IPNS-then-chain). Extracted from the
+    /// old `resolve()` body so the hot-start short-circuit can fall
+    /// through to it cleanly.
+    async fn resolve_via_network(&self) -> Result<ResolvedUsersIndex, ClientError> {
+        let ipns_outcome = tokio::time::timeout(
+            self.config.ipns_race_timeout,
+            self.try_ipns(),
+        )
+        .await;
+
+        match ipns_outcome {
+            Ok(Ok(resolved)) => {
+                self.bump_seen_sequence(resolved.payload.sequence);
+                return Ok(resolved);
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    error = %e,
+                    "registry_resolver: IPNS path exhausted; falling back to chain"
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    timeout_secs = self.config.ipns_race_timeout.as_secs(),
+                    "registry_resolver: IPNS timed out; falling back to chain"
+                );
+            }
+        }
+
+        match self.try_chain().await {
+            Ok(resolved) => {
+                self.bump_seen_sequence(resolved.payload.sequence);
+                Ok(resolved)
+            }
+            Err(e) => Err(ClientError::UsersIndexResolutionFailed {
+                reason: format!("IPNS exhausted; chain: {}", e),
+            }),
+        }
+    }
+
+    /// Phase 3.3.5 — best-effort write of the just-resolved state to
+    /// the METADATA table + BLOCKS. Failures log and proceed; the
+    /// caller already has the resolved value, so cache hiccups never
+    /// block SDK functionality.
+    ///
+    /// Synchronous-from-async (no `tokio::spawn`) so the next
+    /// `resolve()` call observes the freshly-written cache without
+    /// racing a background task — important because tests using
+    /// `Mock::expect(N)` would otherwise be flaky on slow CI hosts.
+    /// Cost is hundreds of microseconds for the two redb txns;
+    /// negligible vs. the network budget the caller just spent.
+    async fn persist_to_cache(&self, resolved: &ResolvedUsersIndex) {
+        let Some(cache) = self.cache.as_ref() else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Err(e) = cache.store_users_index_state(&resolved.cid, resolved.payload.sequence, now)
+        {
+            tracing::warn!(
+                error = %e,
+                "registry_resolver: hot-start metadata write failed (best-effort)"
+            );
+        }
+        if let Err(e) = cache.put(&resolved.cid, &resolved.bytes).await {
+            // BlockTooLarge is the expected failure for huge global
+            // CBORs (>cache budget); log at debug, not warn.
+            tracing::debug!(
+                error = %e,
+                "registry_resolver: hot-start BLOCKS put failed (best-effort)"
+            );
+        }
+    }
+
+    /// IPNS leg — sequential per-gateway fan-out. The first gateway
+    /// whose body parses + sequence-passes wins. We don't run them
+    /// in parallel because:
+    ///   - cold-start is rare (once per fresh-device sign-in),
+    ///   - five HEAD-of-line requests waste the user's bandwidth,
+    ///   - the outer 10-s budget bounds the worst case anyway.
+    async fn try_ipns(&self) -> Result<ResolvedUsersIndex, ClientError> {
+        let gateways: Vec<String> = if self.config.ipns_gateways.is_empty() {
+            default_ipns_gateway_urls()
+        } else {
+            self.config.ipns_gateways.clone()
+        };
+
+        let mut last_err: Option<String> = None;
+        for tmpl in &gateways {
+            let url = tmpl.replace("{name}", &self.config.ipns_name);
+            match self.fetch_with_timeout(&url).await {
+                Ok(bytes) => match self.parse_and_validate(bytes, ResolutionSource::Ipns) {
+                    Ok(resolved) => return Ok(resolved),
+                    Err(e) => {
+                        // Replay-rejected or parse-failed bodies are
+                        // not a fatal error; another gateway might
+                        // serve a fresher record.
+                        tracing::debug!(
+                            url = %url, error = %e,
+                            "registry_resolver: IPNS body rejected; trying next gateway"
+                        );
+                        last_err = Some(e.to_string());
+                    }
+                },
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    tracing::debug!(url = %url, error = %e, "registry_resolver: IPNS fetch failed");
+                }
+            }
+        }
+        Err(ClientError::UsersIndexResolutionFailed {
+            reason: format!(
+                "IPNS exhausted across {} gateways: {}",
+                gateways.len(),
+                last_err.unwrap_or_else(|| "no gateways tried".into())
+            ),
+        })
+    }
+
+    /// Chain leg — single eth_call to `latest()`, then iterate IPFS
+    /// gateways for the resulting CID.
+    async fn try_chain(&self) -> Result<ResolvedUsersIndex, ClientError> {
+        // Step 1 — eth_call.
+        let (cid_digest, on_chain_seq) = self.eth_call_latest().await?;
+        if on_chain_seq < self.highest_seen_sequence() {
+            return Err(ClientError::SequenceRegression {
+                observed: on_chain_seq,
+                highest_seen: self.highest_seen_sequence(),
+                channel: "chain.latest()".into(),
+            });
+        }
+
+        // Step 2 — reconstruct CID. dag-cbor codec (0x71) +
+        // sha2-256 multihash (0x12) + the on-chain digest.
+        let mh = Multihash::<64>::wrap(MULTIHASH_SHA2_256, &cid_digest).map_err(|e| {
+            ClientError::UsersIndexResolutionFailed {
+                reason: format!("invalid chain CID digest: {}", e),
+            }
+        })?;
+        let cid = Cid::new_v1(CODEC_DAG_CBOR, mh);
+
+        // Step 3 — iterate IPFS gateways until one body
+        // content-addresses to `cid`.
+        let gateways: Vec<String> = if self.config.ipfs_gateways.is_empty() {
+            default_ipfs_gateway_urls()
+        } else {
+            self.config.ipfs_gateways.clone()
+        };
+        let mut last_err: Option<String> = None;
+        for tmpl in &gateways {
+            let url = tmpl.replace("{cid}", &cid.to_string());
+            let bytes = match self.fetch_with_timeout(&url).await {
+                Ok(b) => b,
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    continue;
+                }
+            };
+            if let Err(e) = verify_cid_against_bytes(&cid, &bytes) {
+                last_err = Some(format!("verify failed at {}: {}", url, e));
+                continue;
+            }
+            // Step 4 — parse + cross-validate sequence.
+            let payload = decode_users_index_cbor(&bytes).map_err(|e| {
+                ClientError::UsersIndexResolutionFailed {
+                    reason: format!("chain-fetched payload parse: {}", e),
+                }
+            })?;
+            if payload.sequence != on_chain_seq {
+                return Err(ClientError::UsersIndexResolutionFailed {
+                    reason: format!(
+                        "in-CBOR sequence {} != on-chain sequence {} (anomaly: tamper or RPC inconsistency)",
+                        payload.sequence, on_chain_seq
+                    ),
+                });
+            }
+            return Ok(ResolvedUsersIndex {
+                source: ResolutionSource::Chain,
+                cid,
+                payload,
+                bytes,
+            });
+        }
+        Err(ClientError::UsersIndexResolutionFailed {
+            reason: format!(
+                "chain CID {} unreachable across {} gateways: {}",
+                cid,
+                gateways.len(),
+                last_err.unwrap_or_else(|| "no gateways tried".into())
+            ),
+        })
+    }
+
+    /// Issue the `latest()` eth_call and parse the 96-byte response.
+    /// Self-contained: assembles the JSON-RPC envelope manually, no
+    /// dependency on a full ethers-rs client.
+    async fn eth_call_latest(&self) -> Result<([u8; 32], u64), ClientError> {
+        let calldata = format!("0x{}", hex::encode(SELECTOR_LATEST));
+        let to_addr = format!("0x{}", hex::encode(self.anchor_address_bytes));
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{ "to": to_addr, "data": calldata }, "latest"],
+            "id": 1,
+        });
+
+        let resp = tokio::time::timeout(
+            self.config.per_request_timeout,
+            self.http
+                .post(&self.config.chain_rpc_url)
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| ClientError::UsersIndexResolutionFailed {
+            reason: format!(
+                "chain RPC timeout after {}s",
+                self.config.per_request_timeout.as_secs()
+            ),
+        })?
+        .map_err(|e| ClientError::UsersIndexResolutionFailed {
+            reason: format!("chain RPC transport: {}", e),
+        })?;
+
+        if !resp.status().is_success() {
+            return Err(ClientError::UsersIndexResolutionFailed {
+                reason: format!("chain RPC HTTP {}", resp.status()),
+            });
+        }
+        let json: serde_json::Value =
+            resp.json().await.map_err(|e| ClientError::UsersIndexResolutionFailed {
+                reason: format!("chain RPC response parse: {}", e),
+            })?;
+        if let Some(err) = json.get("error") {
+            return Err(ClientError::UsersIndexResolutionFailed {
+                reason: format!("chain RPC error: {}", err),
+            });
+        }
+        let result_hex = json
+            .get("result")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ClientError::UsersIndexResolutionFailed {
+                reason: "chain RPC: missing result".into(),
+            })?;
+        let result_hex = result_hex.strip_prefix("0x").unwrap_or(result_hex);
+        let raw =
+            hex::decode(result_hex).map_err(|e| ClientError::UsersIndexResolutionFailed {
+                reason: format!("chain RPC: hex decode result: {}", e),
+            })?;
+        parse_latest_response(&raw)
+    }
+
+    /// Single-gateway HTTP GET with `per_request_timeout`. Returns
+    /// raw body on 2xx, error otherwise. Doesn't touch the gateway-
+    /// pool's dynamic-priority state machine — this is one-shot
+    /// cold-start, not the ongoing warm-device hot path.
+    async fn fetch_with_timeout(&self, url: &str) -> Result<Bytes, ClientError> {
+        let resp = tokio::time::timeout(
+            self.config.per_request_timeout,
+            self.http.get(url).send(),
+        )
+        .await
+        .map_err(|_| ClientError::UsersIndexResolutionFailed {
+            reason: format!("HTTP timeout: {}", url),
+        })?
+        .map_err(|e| ClientError::UsersIndexResolutionFailed {
+            reason: format!("HTTP transport ({}): {}", url, e),
+        })?;
+        if !resp.status().is_success() {
+            return Err(ClientError::UsersIndexResolutionFailed {
+                reason: format!("HTTP {} from {}", resp.status(), url),
+            });
+        }
+        resp.bytes()
+            .await
+            .map_err(|e| ClientError::UsersIndexResolutionFailed {
+                reason: format!("HTTP body read ({}): {}", url, e),
+            })
+    }
+
+    /// Parse + validate IPNS-fetched bytes. Synthesizes the CID
+    /// from the bytes (no external CID to verify against on the
+    /// IPNS path; the gateway did the IPNS-record resolution
+    /// upstream — the security boundary here is the in-CBOR
+    /// `sequence` field, not the bytes-to-CID hash).
+    fn parse_and_validate(
+        &self,
+        bytes: Bytes,
+        source: ResolutionSource,
+    ) -> Result<ResolvedUsersIndex, ClientError> {
+        let payload = decode_users_index_cbor(&bytes).map_err(|e| {
+            ClientError::UsersIndexResolutionFailed {
+                reason: format!("CBOR decode: {}", e),
+            }
+        })?;
+        let seen = self.highest_seen_sequence();
+        if payload.sequence < seen {
+            return Err(ClientError::SequenceRegression {
+                observed: payload.sequence,
+                highest_seen: seen,
+                channel: format!("{:?}", source),
+            });
+        }
+        let cid = synthesize_cid_from_bytes(&bytes);
+        Ok(ResolvedUsersIndex {
+            source,
+            cid,
+            payload,
+            bytes,
+        })
+    }
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+
+/// Multihash code for sha2-256 (0x12).
+const MULTIHASH_SHA2_256: u64 = 0x12;
+/// IPLD codec for dag-cbor (0x71).
+const CODEC_DAG_CBOR: u64 = 0x71;
+
+/// `keccak256("latest()")[..4]`. Hardcoded so the production build
+/// has zero crypto dependency for this constant.
+///
+/// MUST stay in sync with `tests::abi_selector_latest_matches_keccak256`
+/// — that test is the **source of truth**, this constant is just the
+/// cache. Do not delete the test "because it's redundant"; without it,
+/// a typo here goes unnoticed until the SDK silently calls the wrong
+/// 4-byte selector on the deployed `FulaUsersIndexAnchor`.
+const SELECTOR_LATEST: [u8; 4] = [0x52, 0xbf, 0xe7, 0x89];
+
+/// Parse a 0x-prefixed-or-not 40-char hex address into 20 bytes.
+fn parse_anchor_address(s: &str) -> Result<[u8; 20], ClientError> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).map_err(|e| {
+        ClientError::Config(format!("registry resolver: invalid anchor_address hex: {}", e))
+    })?;
+    if bytes.len() != 20 {
+        return Err(ClientError::Config(format!(
+            "registry resolver: anchor_address must be 20 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Parse the 96-byte ABI-encoded return of `latest()`.
+/// Layout (Solidity packs `uint64` right-aligned within a 32-byte slot):
+///   bytes[0..32]    = cid_digest (full 32 bytes)
+///   bytes[32..64]   = sequence  (u64 BE in last 8 bytes)
+///   bytes[64..96]   = updatedAt (u64 BE in last 8 bytes) — **dropped**
+///
+/// We deliberately drop `updatedAt` here: nothing in the SDK's
+/// security model depends on it (sequence is the security boundary,
+/// and `block.timestamp` is miner-influenceable on EVM chains anyway).
+/// Returning a richer tuple would invite callers to make decisions on
+/// it; keeping the parser narrow forces the right shape.
+fn parse_latest_response(raw: &[u8]) -> Result<([u8; 32], u64), ClientError> {
+    if raw.len() < 96 {
+        return Err(ClientError::UsersIndexResolutionFailed {
+            reason: format!(
+                "chain `latest()` returned {} bytes (expected ≥ 96)",
+                raw.len()
+            ),
+        });
+    }
+    let mut cid_digest = [0u8; 32];
+    cid_digest.copy_from_slice(&raw[0..32]);
+    // u64 lives in the last 8 bytes of the 32-byte slot.
+    let mut seq_be = [0u8; 8];
+    seq_be.copy_from_slice(&raw[32 + 24..32 + 32]);
+    let sequence = u64::from_be_bytes(seq_be);
+    Ok((cid_digest, sequence))
+}
+
+/// Decode dag-cbor bytes as a `GlobalUsersIndex`. Wraps the
+/// ipld-dagcbor crate's error in our own typed error.
+fn decode_users_index_cbor(bytes: &[u8]) -> Result<GlobalUsersIndex, String> {
+    serde_ipld_dagcbor::from_slice(bytes).map_err(|e| e.to_string())
+}
+
+/// Synthesize a CIDv1 (dag-cbor + sha2-256) from a body. Used for
+/// the IPNS path's reported `ResolvedUsersIndex.cid` so callers can
+/// use it as a cache key. NOT a security claim — IPNS bytes are
+/// trusted via the in-payload `sequence`, not via this hash.
+fn synthesize_cid_from_bytes(bytes: &[u8]) -> Cid {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    // wrap() can only fail if digest is wrong size; sha2-256 is
+    // always exactly 32 bytes so unwrap is safe.
+    let mh = Multihash::<64>::wrap(MULTIHASH_SHA2_256, &digest).expect("32-byte sha2 digest");
+    Cid::new_v1(CODEC_DAG_CBOR, mh)
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha3::{Digest, Keccak256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The hardcoded `SELECTOR_LATEST` MUST equal the canonical
+    /// `keccak256("latest()")[..4]`. If a future refactor renames the
+    /// solidity function and someone forgets to update the constant,
+    /// this test catches it before the SDK silently calls the wrong
+    /// selector against the deployed contract.
+    #[test]
+    fn abi_selector_latest_matches_keccak256() {
+        let mut hasher = Keccak256::new();
+        hasher.update(b"latest()");
+        let full = hasher.finalize();
+        let expected: [u8; 4] = [full[0], full[1], full[2], full[3]];
+        assert_eq!(
+            SELECTOR_LATEST, expected,
+            "SELECTOR_LATEST drifted from keccak256(\"latest()\")[..4]: \
+             expected 0x{:02x}{:02x}{:02x}{:02x}, got 0x{:02x}{:02x}{:02x}{:02x}",
+            expected[0], expected[1], expected[2], expected[3],
+            SELECTOR_LATEST[0], SELECTOR_LATEST[1], SELECTOR_LATEST[2], SELECTOR_LATEST[3]
+        );
+    }
+
+    /// Build a syntactically-valid CBOR-encoded payload for tests.
+    fn make_payload_cbor(sequence: u64) -> (Bytes, GlobalUsersIndex) {
+        let payload = GlobalUsersIndex {
+            v: 1,
+            sequence,
+            updated_at_unix: 1_700_000_000,
+            users: BTreeMap::new(),
+        };
+        let bytes = serde_ipld_dagcbor::to_vec(&payload).expect("encode");
+        (Bytes::from(bytes), payload)
+    }
+
+    fn fixture_address() -> String {
+        // 20-byte zero address with 0x prefix. parse_anchor_address
+        // accepts both forms.
+        "0x0000000000000000000000000000000000000001".to_string()
+    }
+
+    fn fixture_ipns_name() -> String {
+        // Real-shape libp2p public key hash (b58btc-encoded ed25519);
+        // resolver doesn't validate the key format, just substitutes.
+        "k51qzi5uqu5dh-test".to_string()
+    }
+
+    #[test]
+    fn parse_anchor_address_accepts_with_or_without_0x() {
+        let with_prefix = parse_anchor_address("0x0000000000000000000000000000000000000001")
+            .expect("with 0x");
+        let without = parse_anchor_address("0000000000000000000000000000000000000001")
+            .expect("without 0x");
+        assert_eq!(with_prefix, without);
+        assert_eq!(with_prefix[19], 1);
+        for &b in &with_prefix[..19] {
+            assert_eq!(b, 0);
+        }
+    }
+
+    #[test]
+    fn parse_anchor_address_rejects_wrong_length() {
+        assert!(parse_anchor_address("0xdeadbeef").is_err());
+        assert!(parse_anchor_address("0x").is_err());
+        assert!(parse_anchor_address("not-hex").is_err());
+    }
+
+    #[test]
+    fn parse_latest_response_extracts_correct_fields() {
+        // Build a 96-byte response: digest = 0xff*32, sequence = 42, ts = 100.
+        let mut raw = vec![0u8; 96];
+        for i in 0..32 {
+            raw[i] = 0xff;
+        }
+        raw[32 + 24..32 + 32].copy_from_slice(&42u64.to_be_bytes());
+        raw[64 + 24..64 + 32].copy_from_slice(&100u64.to_be_bytes());
+
+        let (digest, seq) = parse_latest_response(&raw).expect("parse");
+        assert_eq!(digest, [0xff; 32]);
+        assert_eq!(seq, 42);
+    }
+
+    #[test]
+    fn parse_latest_response_rejects_short_input() {
+        let short = vec![0u8; 95];
+        assert!(parse_latest_response(&short).is_err());
+    }
+
+    #[test]
+    fn synthesize_cid_is_deterministic_and_dagcbor_sha256() {
+        let bytes = b"some payload bytes";
+        let c1 = synthesize_cid_from_bytes(bytes);
+        let c2 = synthesize_cid_from_bytes(bytes);
+        assert_eq!(c1, c2, "synthesis is deterministic");
+        assert_eq!(c1.codec(), CODEC_DAG_CBOR);
+        assert_eq!(c1.hash().code(), MULTIHASH_SHA2_256);
+        assert_eq!(c1.hash().digest().len(), 32);
+    }
+
+    #[test]
+    fn resolver_new_rejects_empty_rpc_url() {
+        let mut cfg = ResolverConfig::new("", fixture_address(), fixture_ipns_name());
+        let err = UsersIndexResolver::new(cfg.clone()).unwrap_err();
+        assert!(matches!(err, ClientError::Config(_)));
+        cfg.chain_rpc_url = "https://rpc.example".into();
+        cfg.ipns_name = "".into();
+        let err = UsersIndexResolver::new(cfg).unwrap_err();
+        assert!(matches!(err, ClientError::Config(_)));
+    }
+
+    #[test]
+    fn resolver_new_rejects_bad_anchor_address() {
+        let cfg = ResolverConfig::new(
+            "https://rpc.example",
+            "0xdeadbeef", // too short
+            fixture_ipns_name(),
+        );
+        let err = UsersIndexResolver::new(cfg).unwrap_err();
+        assert!(matches!(err, ClientError::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn resolve_via_ipns_succeeds_when_first_gateway_serves_valid_payload() {
+        let (cbor, _) = make_payload_cbor(7);
+        let mock = MockServer::start().await;
+        let url_path = format!("/ipns/{}", fixture_ipns_name());
+        Mock::given(method("GET"))
+            .and(path(url_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(cbor.as_ref()))
+            .mount(&mock)
+            .await;
+
+        let mut cfg = ResolverConfig::new(
+            "https://chain.example/rpc", // never called on success
+            fixture_address(),
+            fixture_ipns_name(),
+        );
+        cfg.ipns_gateways = vec![format!("{}/ipns/{{name}}", mock.uri())];
+        cfg.ipns_race_timeout = Duration::from_secs(5);
+        cfg.per_request_timeout = Duration::from_secs(2);
+
+        let resolver = UsersIndexResolver::new(cfg).expect("new");
+        let r = resolver.resolve().await.expect("resolve");
+        assert_eq!(r.source, ResolutionSource::Ipns);
+        assert_eq!(r.payload.sequence, 7);
+        assert_eq!(resolver.highest_seen_sequence(), 7);
+    }
+
+    #[tokio::test]
+    async fn resolve_falls_through_to_chain_when_ipns_rejected_for_sequence_regression() {
+        // Setup: IPNS returns seq=3, but the resolver's floor is
+        // already at 5 (apps seeded it from a hot-start cache). The
+        // IPNS payload is replay-rejected. Chain returns seq=10,
+        // which is accepted. Resolver returns the chain payload.
+        let (ipns_cbor, _) = make_payload_cbor(3);
+        let (chain_cbor, _) = make_payload_cbor(10);
+
+        let ipns = MockServer::start().await;
+        let chain_rpc = MockServer::start().await;
+        let chain_gw = MockServer::start().await;
+
+        // IPNS gateway → seq=3 body (will be rejected as regression).
+        Mock::given(method("GET"))
+            .and(path(format!("/ipns/{}", fixture_ipns_name())))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(ipns_cbor.as_ref()))
+            .mount(&ipns)
+            .await;
+
+        // Compute the chain CID from the chain_cbor bytes so we can
+        // mock the gateway response correctly. The eth_call returns
+        // the digest; the gateway serves bytes that hash to it.
+        let chain_cid = synthesize_cid_from_bytes(&chain_cbor);
+        let chain_digest = chain_cid.hash().digest();
+
+        // Chain RPC mock — return the digest + seq=10 + ts=anything.
+        let mut raw = vec![0u8; 96];
+        raw[0..32].copy_from_slice(chain_digest);
+        raw[32 + 24..32 + 32].copy_from_slice(&10u64.to_be_bytes());
+        raw[64 + 24..64 + 32].copy_from_slice(&12345u64.to_be_bytes());
+        let result_hex = format!("0x{}", hex::encode(&raw));
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": result_hex,
+                })),
+            )
+            .mount(&chain_rpc)
+            .await;
+
+        // IPFS gateway for the chain CID → return chain_cbor bytes.
+        let cid_str = chain_cid.to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/ipfs/{}", cid_str)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(chain_cbor.as_ref()))
+            .mount(&chain_gw)
+            .await;
+
+        let mut cfg = ResolverConfig::new(
+            chain_rpc.uri(),
+            fixture_address(),
+            fixture_ipns_name(),
+        );
+        cfg.ipns_gateways = vec![format!("{}/ipns/{{name}}", ipns.uri())];
+        cfg.ipfs_gateways = vec![format!("{}/ipfs/{{cid}}", chain_gw.uri())];
+        cfg.ipns_race_timeout = Duration::from_secs(2);
+        cfg.per_request_timeout = Duration::from_secs(2);
+
+        let resolver = UsersIndexResolver::new(cfg).expect("new");
+        // Seed the floor to 5 so the IPNS seq=3 is rejected.
+        resolver.set_highest_seen_sequence(5);
+
+        let r = resolver.resolve().await.expect("resolve");
+        assert_eq!(r.source, ResolutionSource::Chain);
+        assert_eq!(r.payload.sequence, 10);
+        assert_eq!(resolver.highest_seen_sequence(), 10);
+    }
+
+    #[tokio::test]
+    async fn resolve_returns_error_when_both_paths_fail() {
+        // IPNS gateway returns 503; chain RPC returns malformed JSON.
+        // Resolver surfaces UsersIndexResolutionFailed.
+        let ipns = MockServer::start().await;
+        let chain_rpc = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&ipns)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("not json"))
+            .mount(&chain_rpc)
+            .await;
+
+        let mut cfg = ResolverConfig::new(
+            chain_rpc.uri(),
+            fixture_address(),
+            fixture_ipns_name(),
+        );
+        cfg.ipns_gateways = vec![format!("{}/ipns/{{name}}", ipns.uri())];
+        cfg.ipns_race_timeout = Duration::from_secs(2);
+        cfg.per_request_timeout = Duration::from_secs(2);
+
+        let resolver = UsersIndexResolver::new(cfg).expect("new");
+        let err = resolver.resolve().await.expect_err("both fail");
+        assert!(
+            matches!(err, ClientError::UsersIndexResolutionFailed { .. }),
+            "expected UsersIndexResolutionFailed, got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_path_rejects_cid_digest_mismatch() {
+        // The chain returns digest D, but the gateway serves bytes
+        // whose sha2-256 != D. verify_cid_against_bytes fails and
+        // the resolver should NOT accept the payload — surfaces an
+        // UsersIndexResolutionFailed mentioning verify failure.
+        let (cbor_legit, _) = make_payload_cbor(10);
+        let cbor_tampered = Bytes::from_static(b"this is not the real CBOR payload");
+
+        let ipns = MockServer::start().await;
+        let chain_rpc = MockServer::start().await;
+        let chain_gw = MockServer::start().await;
+
+        // IPNS gateway serves nothing useful → resolver must use chain.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&ipns)
+            .await;
+
+        // Chain RPC says "real CID is X with seq=10".
+        let real_cid = synthesize_cid_from_bytes(&cbor_legit);
+        let real_digest = real_cid.hash().digest();
+        let mut raw = vec![0u8; 96];
+        raw[0..32].copy_from_slice(real_digest);
+        raw[32 + 24..32 + 32].copy_from_slice(&10u64.to_be_bytes());
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": format!("0x{}", hex::encode(&raw)),
+                })),
+            )
+            .mount(&chain_rpc)
+            .await;
+
+        // Gateway serves DIFFERENT bytes — verify_cid_against_bytes
+        // must reject.
+        Mock::given(method("GET"))
+            .and(path(format!("/ipfs/{}", real_cid)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(cbor_tampered.as_ref()))
+            .mount(&chain_gw)
+            .await;
+
+        let mut cfg = ResolverConfig::new(
+            chain_rpc.uri(),
+            fixture_address(),
+            fixture_ipns_name(),
+        );
+        cfg.ipns_gateways = vec![format!("{}/ipns/{{name}}", ipns.uri())];
+        cfg.ipfs_gateways = vec![format!("{}/ipfs/{{cid}}", chain_gw.uri())];
+        cfg.ipns_race_timeout = Duration::from_secs(2);
+        cfg.per_request_timeout = Duration::from_secs(2);
+
+        let resolver = UsersIndexResolver::new(cfg).expect("new");
+        let err = resolver.resolve().await.expect_err("verify fails");
+        assert!(matches!(err, ClientError::UsersIndexResolutionFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_path_rejects_in_cbor_seq_mismatch() {
+        // Chain says seq=10 but the bytes-fetched payload has seq=11.
+        // Defensive: resolver must surface this as a tamper / RPC-
+        // inconsistency anomaly, NOT silently use either side.
+        let (cbor_seq_11, _) = make_payload_cbor(11);
+
+        let ipns = MockServer::start().await;
+        let chain_rpc = MockServer::start().await;
+        let chain_gw = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&ipns)
+            .await;
+
+        // Chain says seq=10, digest of cbor_seq_11.
+        let cid = synthesize_cid_from_bytes(&cbor_seq_11);
+        let mut raw = vec![0u8; 96];
+        raw[0..32].copy_from_slice(cid.hash().digest());
+        raw[32 + 24..32 + 32].copy_from_slice(&10u64.to_be_bytes());
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": format!("0x{}", hex::encode(&raw)),
+                })),
+            )
+            .mount(&chain_rpc)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/ipfs/{}", cid)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(cbor_seq_11.as_ref()))
+            .mount(&chain_gw)
+            .await;
+
+        let mut cfg = ResolverConfig::new(
+            chain_rpc.uri(),
+            fixture_address(),
+            fixture_ipns_name(),
+        );
+        cfg.ipns_gateways = vec![format!("{}/ipns/{{name}}", ipns.uri())];
+        cfg.ipfs_gateways = vec![format!("{}/ipfs/{{cid}}", chain_gw.uri())];
+        cfg.ipns_race_timeout = Duration::from_secs(2);
+        cfg.per_request_timeout = Duration::from_secs(2);
+
+        let resolver = UsersIndexResolver::new(cfg).expect("new");
+        let err = resolver.resolve().await.expect_err("seq mismatch");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("sequence")
+                || msg.contains("anomaly")
+                || matches!(err, ClientError::UsersIndexResolutionFailed { .. }),
+            "expected sequence-mismatch error, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_defense_rejects_chain_regression() {
+        // Floor is 100; chain returns seq=50. Resolver MUST reject
+        // even though the bytes verify and parse correctly. This
+        // is the chain-side replay-defense path.
+        let (cbor, _) = make_payload_cbor(50);
+        let cid = synthesize_cid_from_bytes(&cbor);
+
+        let ipns = MockServer::start().await;
+        let chain_rpc = MockServer::start().await;
+        let chain_gw = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&ipns)
+            .await;
+
+        let mut raw = vec![0u8; 96];
+        raw[0..32].copy_from_slice(cid.hash().digest());
+        raw[32 + 24..32 + 32].copy_from_slice(&50u64.to_be_bytes());
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": format!("0x{}", hex::encode(&raw)),
+                })),
+            )
+            .mount(&chain_rpc)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/ipfs/{}", cid)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(cbor.as_ref()))
+            .mount(&chain_gw)
+            .await;
+
+        let mut cfg = ResolverConfig::new(
+            chain_rpc.uri(),
+            fixture_address(),
+            fixture_ipns_name(),
+        );
+        cfg.ipns_gateways = vec![format!("{}/ipns/{{name}}", ipns.uri())];
+        cfg.ipfs_gateways = vec![format!("{}/ipfs/{{cid}}", chain_gw.uri())];
+        cfg.ipns_race_timeout = Duration::from_secs(2);
+        cfg.per_request_timeout = Duration::from_secs(2);
+
+        let resolver = UsersIndexResolver::new(cfg).expect("new");
+        resolver.set_highest_seen_sequence(100);
+        let err = resolver.resolve().await.expect_err("regression rejected");
+        // Either UsersIndexResolutionFailed (wrapper) or
+        // SequenceRegression directly is acceptable; both signal
+        // "do not accept" to the caller.
+        match err {
+            ClientError::SequenceRegression { observed, highest_seen, channel } => {
+                assert_eq!(observed, 50);
+                assert_eq!(highest_seen, 100);
+                assert!(!channel.is_empty(), "channel label should be set");
+            }
+            ClientError::UsersIndexResolutionFailed { .. } => { /* also fine */ }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    /// `derive_user_key_from_email` MUST produce a 32-hex-char output
+    /// matching what `fula-cli/src/state.rs::hash_user_id` would
+    /// produce against the same `userId` (= sha256-hex of
+    /// lower(email)). Reproduces the master algorithm step-by-step
+    /// here so the two stay in lockstep — without this test, a
+    /// future master-side refactor could silently desync the SDK
+    /// from the published global users-index keys.
+    #[test]
+    fn derive_user_key_matches_master_state_rs_algorithm() {
+        use sha2::{Digest, Sha256};
+
+        // Reference inputs.
+        let email = "User@Example.COM";
+        let email_lower = "user@example.com";
+
+        // SDK derives directly from email.
+        let sdk_key = derive_user_key_from_email(email);
+
+        // Reproduce master's chain: lower(email) → sha256 → hex → blake3 → first 16 bytes hex.
+        let user_id_digest = Sha256::digest(email_lower.as_bytes());
+        let user_id_hex = hex::encode(user_id_digest);
+        // master state.rs: hash_user_id(user_id_str) =
+        //   blake3::Hasher::new()
+        //     .update(b"fula:user_id:")
+        //     .update(user_id_str.as_bytes())
+        //     .finalize()[..16] hex
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"fula:user_id:");
+        hasher.update(user_id_hex.as_bytes());
+        let master_key = hex::encode(&hasher.finalize().as_bytes()[..16]);
+
+        assert_eq!(
+            sdk_key, master_key,
+            "SDK derive_user_key_from_email diverged from master state.rs::hash_user_id; \
+             email={}, sdk={}, master={}",
+            email, sdk_key, master_key
+        );
+        assert_eq!(sdk_key.len(), 32, "userKey must be 32 hex chars (16 bytes)");
+    }
+
+    #[test]
+    fn derive_user_key_normalizes_email_case() {
+        // Email is case-insensitive (per RFC 5321 local-part is, in practice,
+        // a courtesy and master normalizes too). Same email different case
+        // MUST yield the same userKey, otherwise users would lose access
+        // when their app capitalizes differently than master.
+        let a = derive_user_key_from_email("alice@example.com");
+        let b = derive_user_key_from_email("ALICE@EXAMPLE.COM");
+        let c = derive_user_key_from_email("Alice@Example.com");
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn derive_user_key_distinguishes_different_users() {
+        let a = derive_user_key_from_email("alice@example.com");
+        let b = derive_user_key_from_email("bob@example.com");
+        assert_ne!(a, b);
+    }
+
+    // ============================================================
+    // Phase 3.3.5 — hot-start cache reuse tests (advisor-mandated 4)
+    // ============================================================
+    //
+    // Each test constructs both a network-mock universe (wiremock)
+    // and a real on-disk BlockCache (TempDir + redb). The cache
+    // survives across resolver constructions (simulating SDK
+    // restart) so we can verify replay-defense persistence and the
+    // soft-TTL short-circuit behavior.
+
+    use crate::block_cache::BlockCache;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn make_payload_with_seq(sequence: u64) -> (Bytes, GlobalUsersIndex) {
+        let payload = GlobalUsersIndex {
+            v: 1,
+            sequence,
+            updated_at_unix: 1_700_000_000,
+            users: BTreeMap::new(),
+        };
+        let bytes = serde_ipld_dagcbor::to_vec(&payload).expect("encode");
+        (Bytes::from(bytes), payload)
+    }
+
+    fn fixture_resolver_config_with_ipns(ipns_url: &str) -> ResolverConfig {
+        let mut cfg = ResolverConfig::new(
+            "http://chain-rpc.unused/", // never called on hot-start path
+            fixture_address(),
+            fixture_ipns_name(),
+        );
+        cfg.ipns_gateways = vec![format!("{}/ipns/{{name}}", ipns_url)];
+        cfg.ipns_race_timeout = Duration::from_secs(2);
+        cfg.per_request_timeout = Duration::from_secs(2);
+        cfg.soft_ttl = Duration::from_secs(60);
+        cfg
+    }
+
+    /// Test 1 — replay-defense floor survives SDK restart.
+    /// Round-trip through the cache: resolve seq=42 → drop resolver
+    /// → reopen against same cache → highest_seen_sequence == 42.
+    #[tokio::test]
+    async fn hot_start_seeds_floor_across_restart() {
+        let dir = TempDir::new().unwrap();
+        let cache_path: PathBuf = dir.path().join("cache.redb");
+
+        // Open cache, manually plant a (cid, seq) row — simulates
+        // a prior successful resolve. (Avoids the full wiremock
+        // setup since this test is about restart semantics, not
+        // resolve mechanics.)
+        {
+            let cache = BlockCache::open(&cache_path, 1024 * 1024).expect("open");
+            let cid = synthesize_cid_from_bytes(b"some payload");
+            cache
+                .store_users_index_state(&cid, 42, 1_700_000_000)
+                .expect("store");
+        } // cache dropped → file lock released
+
+        // Re-open cache + construct resolver via new_with_cache.
+        let cache = Arc::new(BlockCache::open(&cache_path, 1024 * 1024).expect("re-open"));
+        let cfg = ResolverConfig::new(
+            "http://rpc.unused/",
+            fixture_address(),
+            fixture_ipns_name(),
+        );
+        let resolver = UsersIndexResolver::new_with_cache(cfg, cache).expect("new_with_cache");
+
+        assert_eq!(
+            resolver.highest_seen_sequence(),
+            42,
+            "replay-defense floor MUST survive restart and seed from persisted state"
+        );
+    }
+
+    /// Test 2 — replay regression after restart is rejected.
+    /// Restart with floor=99; IPNS returns seq=50; resolver MUST
+    /// reject (not silently serve the stale payload).
+    #[tokio::test]
+    async fn hot_start_rejects_regression_after_restart() {
+        let dir = TempDir::new().unwrap();
+        let cache_path: PathBuf = dir.path().join("cache.redb");
+
+        // Plant a high floor (seq=99).
+        {
+            let cache = BlockCache::open(&cache_path, 1024 * 1024).expect("open");
+            let placeholder = synthesize_cid_from_bytes(b"placeholder");
+            cache
+                .store_users_index_state(&placeholder, 99, 0)
+                .expect("plant");
+        }
+
+        // wiremock IPNS serves seq=50 (regression).
+        let ipns = MockServer::start().await;
+        let (regress_bytes, _) = make_payload_with_seq(50);
+        Mock::given(method("GET"))
+            .and(path(format!("/ipns/{}", fixture_ipns_name())))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(regress_bytes.as_ref()))
+            .mount(&ipns)
+            .await;
+
+        let cache = Arc::new(BlockCache::open(&cache_path, 1024 * 1024).expect("re-open"));
+        // observed_at = 0 → way past TTL → hot-start short-circuit
+        // should NOT fire; resolver falls through to network.
+        let mut cfg = fixture_resolver_config_with_ipns(&ipns.uri());
+        cfg.soft_ttl = Duration::from_secs(60); // bigger than 0-vs-now gap doesn't matter; observed_at=0
+        let resolver = UsersIndexResolver::new_with_cache(cfg, cache).expect("new_with_cache");
+
+        assert_eq!(resolver.highest_seen_sequence(), 99, "floor seeded");
+
+        // resolve() → IPNS returns seq=50; replay-defense rejects.
+        // Falls through to chain (also fails since RPC URL is
+        // unused). Final error: UsersIndexResolutionFailed wrapping
+        // the IPNS exhaustion (the resolver internally rejected the
+        // regression and treated it as "IPNS failed").
+        let err = resolver.resolve().await.expect_err("must reject");
+        // The regression is observed inside try_ipns and surfaces
+        // as UsersIndexResolutionFailed — the chain leg also can't
+        // help (RPC URL unused), so the wrapper combines them.
+        assert!(
+            matches!(err, ClientError::UsersIndexResolutionFailed { .. }),
+            "expected resolution failure, got: {:?}",
+            err
+        );
+
+        // Floor unchanged — 99 still holds.
+        assert_eq!(
+            resolver.highest_seen_sequence(),
+            99,
+            "regression payload must NOT advance the floor"
+        );
+    }
+
+    /// Test 3 — hot-start within TTL serves cached state without
+    /// touching the network. Uses `Mock::expect(1)` on the IPNS
+    /// mock: the second resolve() call MUST hit the cache. If the
+    /// short-circuit is broken, IPNS would be called twice, and
+    /// wiremock would panic in its `Drop` impl on test exit.
+    #[tokio::test]
+    async fn hot_start_within_ttl_skips_network() {
+        let dir = TempDir::new().unwrap();
+        let cache_path: PathBuf = dir.path().join("cache.redb");
+        let cache = Arc::new(BlockCache::open(&cache_path, 1024 * 1024).expect("open"));
+
+        let ipns = MockServer::start().await;
+        let (cbor, _) = make_payload_with_seq(7);
+        Mock::given(method("GET"))
+            .and(path(format!("/ipns/{}", fixture_ipns_name())))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(cbor.as_ref()))
+            .expect(1) // IPNS hit at most ONCE; second resolve MUST be cached
+            .mount(&ipns)
+            .await;
+
+        let cfg = fixture_resolver_config_with_ipns(&ipns.uri());
+        let resolver =
+            UsersIndexResolver::new_with_cache(cfg, Arc::clone(&cache)).expect("new_with_cache");
+
+        // First resolve: hits IPNS, populates cache. `persist_to_cache`
+        // is synchronous-from-async (no spawned background task), so
+        // when `resolve` returns the METADATA + BLOCKS rows are
+        // already on disk. The second resolve will see them.
+        let r1 = resolver.resolve().await.expect("first resolve");
+        assert_eq!(r1.source, ResolutionSource::Ipns);
+        assert_eq!(r1.payload.sequence, 7);
+
+        // Second resolve: should be served from cache. wiremock
+        // panics on Drop if IPNS was called more than `expect(1)`.
+        let r2 = resolver.resolve().await.expect("second resolve");
+        assert_eq!(
+            r2.source,
+            ResolutionSource::HotStartCache,
+            "second resolve must be served from hot-start cache (not the network)"
+        );
+        assert_eq!(r2.payload.sequence, 7);
+    }
+
+    /// Test 4 — hot-start beyond TTL re-resolves. Configure a
+    /// 1-second `soft_ttl`; resolve once; sleep 2 seconds; resolve
+    /// again. The second resolve MUST re-hit IPNS (so the mock is
+    /// expected to fire twice).
+    #[tokio::test]
+    async fn hot_start_beyond_ttl_re_resolves() {
+        let dir = TempDir::new().unwrap();
+        let cache_path: PathBuf = dir.path().join("cache.redb");
+        let cache = Arc::new(BlockCache::open(&cache_path, 1024 * 1024).expect("open"));
+
+        let ipns = MockServer::start().await;
+        let (cbor, _) = make_payload_with_seq(11);
+        Mock::given(method("GET"))
+            .and(path(format!("/ipns/{}", fixture_ipns_name())))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(cbor.as_ref()))
+            .expect(2) // both resolves must hit IPNS — TTL elapsed between them
+            .mount(&ipns)
+            .await;
+
+        let mut cfg = fixture_resolver_config_with_ipns(&ipns.uri());
+        cfg.soft_ttl = Duration::from_secs(1); // tight TTL for the test
+        let resolver =
+            UsersIndexResolver::new_with_cache(cfg, Arc::clone(&cache)).expect("new_with_cache");
+
+        let r1 = resolver.resolve().await.expect("first resolve");
+        assert_eq!(r1.source, ResolutionSource::Ipns);
+
+        // Wait past the TTL.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let r2 = resolver.resolve().await.expect("second resolve");
+        assert_eq!(
+            r2.source,
+            ResolutionSource::Ipns,
+            "after TTL elapse, resolver must re-fetch from IPNS rather than serve stale cache"
+        );
+    }
+
+    // ============================================================
+    // Pre-existing tests below (Phase 3.3 sub-step A)
+    // ============================================================
+
+    #[test]
+    fn highest_seen_sequence_is_monotonic() {
+        let cfg = ResolverConfig::new(
+            "https://rpc.example",
+            fixture_address(),
+            fixture_ipns_name(),
+        );
+        let resolver = UsersIndexResolver::new(cfg).expect("new");
+        assert_eq!(resolver.highest_seen_sequence(), 0);
+        resolver.bump_seen_sequence(5);
+        assert_eq!(resolver.highest_seen_sequence(), 5);
+        // Lower value MUST NOT lower the floor.
+        resolver.bump_seen_sequence(3);
+        assert_eq!(resolver.highest_seen_sequence(), 5);
+        // Equal value is also a no-op.
+        resolver.bump_seen_sequence(5);
+        assert_eq!(resolver.highest_seen_sequence(), 5);
+        // Higher value advances.
+        resolver.bump_seen_sequence(7);
+        assert_eq!(resolver.highest_seen_sequence(), 7);
+    }
+}

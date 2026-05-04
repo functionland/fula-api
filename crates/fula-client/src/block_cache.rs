@@ -56,6 +56,40 @@ use tokio::sync::Mutex;
 const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blocks");
 const META: TableDefinition<&[u8], u64> = TableDefinition::new("meta");
 
+/// Phase 2.4 lookup table: maps `(bucket, key)` (hashed with a
+/// domain separator) → CID bytes. Used by the offline-fallback path
+/// to translate an S3-key request into the IPFS CID it can fetch via
+/// the gateway race. Populated as a side-effect of master-up reads
+/// in `FulaClient::get_object_with_offline_fallback`.
+///
+/// Key format: `BLAKE3("fula:block-cache:key-to-cid:v1" || bucket || 0x00 || key)[..32]`
+/// — fixed 32 bytes, collision-resistant, fast B-tree lookup. Value:
+/// raw CID bytes (the same encoding used as the BLOCKS table key, so
+/// a `KEY_TO_CID` lookup directly gives the bytes needed to query
+/// BLOCKS or to construct a `Cid` for the gateway race).
+const KEY_TO_CID: TableDefinition<&[u8], &[u8]> = TableDefinition::new("key_to_cid");
+
+/// Phase 3.3.5 small-key-value metadata table. Stores resolver
+/// hot-start state across SDK restarts:
+///   - `users_index/cid`              → CID bytes (cid.to_bytes())
+///   - `users_index/sequence`         → u64 BE
+///   - `users_index/observed_at_unix` → u64 BE
+///
+/// Three rows, ~80 bytes total. The cached `(cid, sequence)` seeds
+/// the resolver's replay-defense floor on construction; a fresh
+/// `observed_at` lets the resolver short-circuit IPNS+chain when
+/// the entry is within `ResolverConfig::soft_ttl`.
+///
+/// Schema versioning: deliberately omitted in 3.3.5 (advisor cut).
+/// When a v2 schema lands, add a `metadata.schema_id` constant +
+/// drop-on-mismatch logic together with the real migration story.
+const METADATA: TableDefinition<&[u8], &[u8]> = TableDefinition::new("metadata");
+
+/// Metadata row keys (string literals stored as `&[u8]`).
+const META_USERS_INDEX_CID: &[u8] = b"users_index/cid";
+const META_USERS_INDEX_SEQUENCE: &[u8] = b"users_index/sequence";
+const META_USERS_INDEX_OBSERVED_AT: &[u8] = b"users_index/observed_at_unix";
+
 /// Eviction low-watermark: when triggered, free space until usage is at
 /// or below this fraction of `max_bytes`. 80 % is the industry-standard
 /// "evict-once-amortize-many-puts" point.
@@ -142,7 +176,7 @@ impl From<redb::CommitError> for BlockCacheError {
 ///
 /// Cheap-clone via `Arc`: clones share the same database, so a `put`
 /// observed by one clone is immediately visible to all others.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BlockCache {
     inner: Arc<BlockCacheInner>,
 }
@@ -157,6 +191,19 @@ struct BlockCacheInner {
     /// Serializes eviction passes so concurrent over-budget puts don't
     /// each run their own eviction.
     evict_lock: Mutex<()>,
+}
+
+// `redb::Database` doesn't implement `Debug`, so we hand-roll a
+// minimal `Debug` for `BlockCacheInner` that prints just the
+// observable knobs. Required because `UsersIndexResolver` derives
+// `Debug` and now holds an `Option<Arc<BlockCache>>`.
+impl std::fmt::Debug for BlockCacheInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockCacheInner")
+            .field("max_bytes", &self.max_bytes)
+            .field("current_bytes", &self.current_bytes.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
 }
 
 impl BlockCache {
@@ -194,6 +241,14 @@ impl BlockCache {
         {
             let _ = init_txn.open_table(BLOCKS)?;
             let _ = init_txn.open_table(META)?;
+            // Phase 2.4 — additive table. An older redb file written
+            // before Phase 2.4 will not have it; opening it here
+            // creates it lazily without touching BLOCKS / META data.
+            let _ = init_txn.open_table(KEY_TO_CID)?;
+            // Phase 3.3.5 — resolver hot-start metadata. Same
+            // additive-on-open pattern; older Phase 2.x cache files
+            // gain it transparently on next open.
+            let _ = init_txn.open_table(METADATA)?;
         }
         init_txn.commit()?;
 
@@ -221,7 +276,18 @@ impl BlockCache {
         })
     }
 
+    // The three accessors below — `max_bytes`, `current_bytes`,
+    // `entry_count` — are public monitoring API for SDK consumers
+    // (apps that want to surface "cache 240 / 256 MiB used" UI, or
+    // for ops dashboards). The fula-client crate itself doesn't call
+    // them internally, hence the `#[allow(dead_code)]` to silence
+    // the workspace-default warning. Phase 19 (`HealthCallback` /
+    // `ReadFreshness`) will likely expose these via a typed status
+    // struct rather than direct field access; keep the accessors
+    // public until then so app integrators have a stable surface.
+
     /// Configured budget in bytes.
+    #[allow(dead_code)]
     pub fn max_bytes(&self) -> u64 {
         self.inner.max_bytes
     }
@@ -229,12 +295,14 @@ impl BlockCache {
     /// Approximate current byte usage. Eventually consistent under
     /// concurrent writes (the next read after all writes settle is
     /// exact).
+    #[allow(dead_code)]
     pub fn current_bytes(&self) -> u64 {
         self.inner.current_bytes.load(Ordering::Acquire)
     }
 
     /// Number of cached blocks. O(1) approximation via the underlying
     /// table length.
+    #[allow(dead_code)]
     pub fn entry_count(&self) -> Result<u64, BlockCacheError> {
         let read = self.inner.db.begin_read()?;
         let table = read.open_table(BLOCKS)?;
@@ -336,6 +404,139 @@ impl BlockCache {
         Ok(())
     }
 
+    /// Phase 2.4 — record an `(bucket, key) → cid` mapping observed
+    /// during a successful master-up read. Lets the offline-fallback
+    /// path translate a future S3-key request into the IPFS CID it
+    /// can fetch via the gateway race.
+    ///
+    /// Idempotent on repeated calls with the same arguments. The
+    /// underlying redb table grows unbounded today (one entry per
+    /// distinct `(bucket, key)` tuple ever observed). At expected
+    /// scale (a few thousand objects per device) this is fine; if
+    /// growth becomes an issue, eviction can be added at the same
+    /// point as block-cache LRU eviction in a future iteration.
+    /// Note that the mapping is small (~40 bytes per entry vs.
+    /// kilobytes for typical block payloads), so the BLOCKS table's
+    /// LRU pressure dominates space concerns by orders of magnitude.
+    pub fn record_key_cid(
+        &self,
+        bucket: &str,
+        key: &str,
+        cid: &Cid,
+    ) -> Result<(), BlockCacheError> {
+        let lookup_key = derive_key_cid_lookup(bucket, key);
+        let cid_bytes = cid.to_bytes();
+        let txn = self.inner.db.begin_write()?;
+        {
+            let mut table = txn.open_table(KEY_TO_CID)?;
+            table.insert(lookup_key.as_slice(), cid_bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Phase 2.4 — look up a previously-observed CID for `(bucket, key)`.
+    /// Returns `None` if the SDK has not seen this object during a
+    /// master-up read yet (the cold-start case, which the wrapper
+    /// surfaces as `MasterUnreachable` so Phase 3.3 can take over).
+    pub fn lookup_cid(&self, bucket: &str, key: &str) -> Result<Option<Cid>, BlockCacheError> {
+        let lookup_key = derive_key_cid_lookup(bucket, key);
+        let read = self.inner.db.begin_read()?;
+        let table = read.open_table(KEY_TO_CID)?;
+        match table.get(lookup_key.as_slice())? {
+            Some(v) => {
+                let bytes = v.value();
+                // Round-trip through Cid to validate; corrupt entries
+                // are rare (would mean redb bit-flip) but failing
+                // closed is safer than serving a malformed CID to the
+                // gateway race.
+                Cid::try_from(bytes)
+                    .map(Some)
+                    .map_err(|e| BlockCacheError::Corrupt(format!("invalid CID in KEY_TO_CID: {}", e)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Phase 3.3.5 — persist the resolver's last successful resolve
+    /// so a future SDK process can skip the IPNS+chain dance when
+    /// it's still fresh AND seed the replay-defense floor across
+    /// restarts.
+    ///
+    /// Single redb write transaction (atomic across the three rows).
+    /// Crate-private: apps must not plant resolver state directly.
+    pub(crate) fn store_users_index_state(
+        &self,
+        cid: &Cid,
+        sequence: u64,
+        observed_at_unix: u64,
+    ) -> Result<(), BlockCacheError> {
+        let cid_bytes = cid.to_bytes();
+        let txn = self.inner.db.begin_write()?;
+        {
+            let mut table = txn.open_table(METADATA)?;
+            table.insert(META_USERS_INDEX_CID, cid_bytes.as_slice())?;
+            table.insert(META_USERS_INDEX_SEQUENCE, sequence.to_be_bytes().as_slice())?;
+            table.insert(
+                META_USERS_INDEX_OBSERVED_AT,
+                observed_at_unix.to_be_bytes().as_slice(),
+            )?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Phase 3.3.5 — load the resolver hot-start state. Returns
+    /// `None` if any of the three rows is missing or malformed
+    /// (treats partial writes as if the cache were empty — the
+    /// resolver then falls through to a full IPNS+chain resolve).
+    pub(crate) fn load_users_index_state(
+        &self,
+    ) -> Result<Option<(Cid, u64, u64)>, BlockCacheError> {
+        let read = self.inner.db.begin_read()?;
+        let table = read.open_table(METADATA)?;
+
+        let cid_bytes = match table.get(META_USERS_INDEX_CID)? {
+            Some(v) => v.value().to_vec(),
+            None => return Ok(None),
+        };
+        let cid = match Cid::try_from(cid_bytes.as_slice()) {
+            Ok(c) => c,
+            // Malformed → treat as no state (defensive). Don't
+            // surface as Corrupt — that would block all hot-start
+            // reads on a single bad row instead of degrading to a
+            // fresh resolve.
+            Err(e) => {
+                tracing::warn!(error = %e, "users-index metadata: invalid CID; treating as empty");
+                return Ok(None);
+            }
+        };
+
+        let seq_bytes = match table.get(META_USERS_INDEX_SEQUENCE)? {
+            Some(v) => v.value().to_vec(),
+            None => return Ok(None),
+        };
+        let observed_bytes = match table.get(META_USERS_INDEX_OBSERVED_AT)? {
+            Some(v) => v.value().to_vec(),
+            None => return Ok(None),
+        };
+        if seq_bytes.len() != 8 || observed_bytes.len() != 8 {
+            tracing::warn!("users-index metadata: malformed length; treating as empty");
+            return Ok(None);
+        }
+
+        let mut seq = [0u8; 8];
+        seq.copy_from_slice(&seq_bytes);
+        let mut obs = [0u8; 8];
+        obs.copy_from_slice(&observed_bytes);
+
+        Ok(Some((
+            cid,
+            u64::from_be_bytes(seq),
+            u64::from_be_bytes(obs),
+        )))
+    }
+
     /// Evict LRU entries until `current_bytes <= target_bytes`. Caller
     /// must hold `evict_lock`. Atomic via a single redb write txn.
     fn evict_to(&self, target_bytes: u64) -> Result<(), BlockCacheError> {
@@ -394,6 +595,26 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Phase 2.4 — derive the redb-key for the KEY_TO_CID table.
+///
+/// `BLAKE3("fula:block-cache:key-to-cid:v1" || bucket || 0x00 || key)[..32]`.
+/// Domain separator pins the namespace; the embedded `0x00` between
+/// bucket and key forecloses any ambiguity from S3 keys that contain
+/// `/` (a single concatenation without separator could collide
+/// `bucket=foo, key=bar` with `bucket=foo/bar, key=`). 32-byte output
+/// is fixed-length for fast B-tree lookups.
+fn derive_key_cid_lookup(bucket: &str, key: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fula:block-cache:key-to-cid:v1");
+    hasher.update(bucket.as_bytes());
+    hasher.update(&[0u8]);
+    hasher.update(key.as_bytes());
+    let h = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.as_bytes());
+    out
 }
 
 #[cfg(test)]
@@ -624,5 +845,233 @@ mod tests {
             // current_bytes should equal data sizes accumulated across rounds.
             assert!(cache.current_bytes() >= 256);
         }
+    }
+
+    // ============================================================
+    // Phase 2.4 — KEY_TO_CID lookup table tests
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_record_and_lookup_key_cid_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let cache = open_cache(&dir, 1024 * 1024);
+
+        let cid = test_cid(123);
+        cache
+            .record_key_cid("photos", "vacation/dsc_001.jpg", &cid)
+            .expect("record");
+
+        let got = cache
+            .lookup_cid("photos", "vacation/dsc_001.jpg")
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(got, cid, "round-trip yields the exact CID");
+    }
+
+    #[tokio::test]
+    async fn test_lookup_missing_key_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let cache = open_cache(&dir, 1024 * 1024);
+        let got = cache.lookup_cid("photos", "never-seen.jpg").expect("lookup");
+        assert!(got.is_none(), "cold-start must return None, not error");
+    }
+
+    #[tokio::test]
+    async fn test_record_idempotent_on_repeat() {
+        // Re-recording the same (bucket, key, cid) triple must not error,
+        // and the lookup must continue returning the same CID. This is
+        // load-bearing: the offline-fallback wrapper records on every
+        // master-up read, so the same object will be re-recorded on each
+        // refetch.
+        let dir = TempDir::new().unwrap();
+        let cache = open_cache(&dir, 1024 * 1024);
+
+        let cid = test_cid(7);
+        for _ in 0..5 {
+            cache.record_key_cid("docs", "tax/2024.pdf", &cid).expect("record");
+        }
+        let got = cache.lookup_cid("docs", "tax/2024.pdf").expect("lookup").expect("hit");
+        assert_eq!(got, cid);
+    }
+
+    #[tokio::test]
+    async fn test_record_overwrites_when_cid_changes() {
+        // After an object is updated on master, the etag (= CID)
+        // changes. The next master-up read records the NEW CID under
+        // the same `(bucket, key)` — and the old CID entry is replaced.
+        // Otherwise offline reads would serve a stale block forever.
+        let dir = TempDir::new().unwrap();
+        let cache = open_cache(&dir, 1024 * 1024);
+
+        let cid_v1 = test_cid(1);
+        let cid_v2 = test_cid(2);
+
+        cache.record_key_cid("photos", "live.jpg", &cid_v1).expect("v1");
+        cache.record_key_cid("photos", "live.jpg", &cid_v2).expect("v2");
+
+        let got = cache.lookup_cid("photos", "live.jpg").expect("lookup").expect("hit");
+        assert_eq!(got, cid_v2, "must reflect the latest recorded CID");
+        assert_ne!(got, cid_v1);
+    }
+
+    #[tokio::test]
+    async fn test_distinct_buckets_dont_collide() {
+        // Same key in different buckets must map to distinct CIDs. The
+        // BLAKE3 domain-separated lookup-key derivation guarantees this;
+        // a regression here would mean two users seeing each other's data
+        // via the offline path.
+        let dir = TempDir::new().unwrap();
+        let cache = open_cache(&dir, 1024 * 1024);
+
+        let cid_a = test_cid(10);
+        let cid_b = test_cid(11);
+
+        cache.record_key_cid("alice-bucket", "shared.txt", &cid_a).expect("a");
+        cache.record_key_cid("bob-bucket", "shared.txt", &cid_b).expect("b");
+
+        let got_a = cache
+            .lookup_cid("alice-bucket", "shared.txt")
+            .expect("lookup")
+            .expect("hit");
+        let got_b = cache
+            .lookup_cid("bob-bucket", "shared.txt")
+            .expect("lookup")
+            .expect("hit");
+        assert_eq!(got_a, cid_a);
+        assert_eq!(got_b, cid_b);
+        assert_ne!(got_a, got_b, "isolation between buckets is mandatory");
+    }
+
+    #[tokio::test]
+    async fn test_key_to_cid_survives_restart() {
+        // Same persistence contract as the BLOCKS table: lookups must
+        // survive SDK process restart. Without this, every SDK launch
+        // would degrade to "cold start until the cache repopulates",
+        // which defeats the warm-device offline guarantee.
+        let dir = TempDir::new().unwrap();
+        let cid = test_cid(99);
+
+        {
+            let cache = open_cache(&dir, 1024 * 1024);
+            cache
+                .record_key_cid("persist-bucket", "important.bin", &cid)
+                .expect("record");
+        }
+        {
+            let cache = open_cache(&dir, 1024 * 1024);
+            let got = cache
+                .lookup_cid("persist-bucket", "important.bin")
+                .expect("lookup")
+                .expect("hit after restart");
+            assert_eq!(got, cid);
+        }
+    }
+
+    #[test]
+    fn test_derive_key_cid_lookup_is_deterministic() {
+        // Same inputs → same hash. Required for repeated record/lookup
+        // to land in the same redb key.
+        let h1 = derive_key_cid_lookup("foo", "bar");
+        let h2 = derive_key_cid_lookup("foo", "bar");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_derive_key_cid_lookup_separator_prevents_concat_collision() {
+        // The 0x00 byte between bucket and key is load-bearing.
+        // Without it, ("foo/bar", "") and ("foo", "/bar") would collide.
+        // With it, they hash differently because the null byte is
+        // disambiguating.
+        let h1 = derive_key_cid_lookup("foo/bar", "");
+        let h2 = derive_key_cid_lookup("foo", "/bar");
+        assert_ne!(h1, h2, "domain separator must prevent concat-collision");
+    }
+
+    #[test]
+    fn test_derive_key_cid_lookup_outputs_32_bytes() {
+        let h = derive_key_cid_lookup("any-bucket", "any-key");
+        assert_eq!(h.len(), 32, "BLAKE3 output is exactly 32 bytes");
+    }
+
+    // ============================================================
+    // Phase 3.3.5 — METADATA table tests
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_load_users_index_state_returns_none_on_fresh_cache() {
+        let dir = TempDir::new().unwrap();
+        let cache = open_cache(&dir, 1024 * 1024);
+        let got = cache.load_users_index_state().expect("load");
+        assert!(
+            got.is_none(),
+            "fresh cache must have no resolver state — full IPNS+chain resolve required on first run"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_and_load_users_index_state_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let cache = open_cache(&dir, 1024 * 1024);
+        let cid = test_cid(0xab);
+
+        cache
+            .store_users_index_state(&cid, 42, 1_700_000_000)
+            .expect("store");
+
+        let (got_cid, got_seq, got_observed) = cache
+            .load_users_index_state()
+            .expect("load")
+            .expect("present");
+        assert_eq!(got_cid, cid);
+        assert_eq!(got_seq, 42);
+        assert_eq!(got_observed, 1_700_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_users_index_state_survives_restart() {
+        // Replay-defense critical: the `(cid, sequence)` floor MUST
+        // persist across SDK restarts so a malicious gateway can't
+        // serve a stale-but-valid payload to a fresh process.
+        let dir = TempDir::new().unwrap();
+        let cid = test_cid(0xee);
+
+        {
+            let cache = open_cache(&dir, 1024 * 1024);
+            cache
+                .store_users_index_state(&cid, 99, 1_700_000_999)
+                .expect("store");
+        }
+        {
+            let cache = open_cache(&dir, 1024 * 1024);
+            let (got_cid, got_seq, got_obs) = cache
+                .load_users_index_state()
+                .expect("load")
+                .expect("survived");
+            assert_eq!(got_cid, cid);
+            assert_eq!(got_seq, 99);
+            assert_eq!(got_obs, 1_700_000_999);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_users_index_state_overwrites() {
+        // Each successful resolver run writes the latest `(cid, seq, ts)`.
+        // A subsequent write must overwrite the prior row, not stack.
+        let dir = TempDir::new().unwrap();
+        let cache = open_cache(&dir, 1024 * 1024);
+
+        let cid_v1 = test_cid(1);
+        cache.store_users_index_state(&cid_v1, 5, 100).expect("v1");
+
+        let cid_v2 = test_cid(2);
+        cache.store_users_index_state(&cid_v2, 10, 200).expect("v2");
+
+        let (got_cid, got_seq, got_obs) = cache
+            .load_users_index_state()
+            .expect("load")
+            .expect("hit");
+        assert_eq!(got_cid, cid_v2);
+        assert_eq!(got_seq, 10);
+        assert_eq!(got_obs, 200);
     }
 }

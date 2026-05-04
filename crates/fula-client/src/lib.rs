@@ -47,6 +47,8 @@ mod error;
 mod gateway_fetch;
 mod health_gate;
 mod multipart;
+#[cfg(not(target_arch = "wasm32"))]
+mod registry_resolver;
 mod types;
 #[cfg(not(target_arch = "wasm32"))]
 mod orphan_queue;
@@ -76,6 +78,25 @@ pub mod test_faults {
 pub use error::{ClientError, Result};
 pub use multipart::{MultipartUpload, UploadProgress, ProgressCallback, upload_large_file, MultipartAbortGuard};
 pub use types::*;
+
+/// Phase 19 — transparency surfaces. `HealthCallback` is the closure
+/// type apps wire via `Config::with_health_callback` to observe master
+/// reachability transitions. `MasterHealthEvent` is the variant the
+/// callback receives. Re-exported here so app-level code can construct
+/// callbacks without depending on internal module paths.
+pub use health_gate::{HealthCallback, MasterHealthEvent};
+
+/// Phase 3.3 — cold-start hybrid resolver public API. Native-only;
+/// the resolver itself is gated to `cfg(not(target_arch = "wasm32"))`.
+/// The free helper `derive_user_key_from_email` is also re-exported
+/// so JS / Flutter bindings can compute the user_key without holding
+/// a client.
+#[cfg(not(target_arch = "wasm32"))]
+pub use registry_resolver::{
+    decode_user_buckets_index, default_ipfs_gateway_urls, default_ipns_gateway_urls,
+    derive_user_key_from_email, fetch_cid_via_gateways, BucketEntry, GlobalUsersIndex,
+    ResolutionSource, ResolvedUsersIndex, ResolverConfig, UserBucketsIndex, UsersIndexResolver,
+};
 
 /// Process-wide count of WAL append failures (F11).
 ///

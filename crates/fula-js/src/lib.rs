@@ -54,9 +54,80 @@ pub struct JsFulaConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
+
+    // ============================================================
+    // Phase 2.1 — master-down detection (functional on wasm/web)
+    // ============================================================
+    /// Enable the SDK's master health gate. Off by default
+    /// (backward-compat). When on, two consecutive failed master
+    /// requests trip the gate and short-circuit subsequent reads
+    /// with a `MASTER_UNREACHABLE` error. **Functional on wasm/web.**
+    #[serde(default)]
+    pub health_gate_enabled: bool,
+
+    /// TTL of the `Down` state when `healthGateEnabled = true`.
+    /// After this duration elapses, the next request is allowed
+    /// through as a probe. Default: 30 seconds.
+    #[serde(default = "default_health_gate_ttl")]
+    pub health_gate_ttl_seconds: u64,
+
+    // ============================================================
+    // Phase 2.2 / 2.3 / 2.4 — block cache + gateway race
+    // ============================================================
+    //
+    // These fields are NATIVE-ONLY at runtime. The underlying
+    // `fula_client::Config` carries them across all builds, but on
+    // the wasm32 target the SDK gates out the `redb`-backed cache
+    // and the parking_lot-based gateway pool, so setting these
+    // flags has no effect in browsers.
+    //
+    // We expose them anyway for **API symmetry** with `fula-flutter`:
+    // a TypeScript app sharing config types between mobile and web
+    // builds can construct one config object and have it accepted
+    // by both. On web the offline path silently no-ops; on native
+    // (Tauri / Electron-with-Rust / Node-via-N-API integrations) the
+    // path activates as documented for fula-flutter.
+
+    /// Enable the on-disk LRU block cache. **Native-only at runtime.**
+    /// On wasm/web this flag is silently inert.
+    #[serde(default)]
+    pub block_cache_enabled: bool,
+
+    /// Filesystem path for the block-cache redb database. Empty
+    /// string = use platform default. **Native-only at runtime.**
+    #[serde(default)]
+    pub block_cache_path: String,
+
+    /// Maximum on-disk bytes for the block cache. Default: 256 MiB.
+    /// **Native-only at runtime.**
+    #[serde(default = "default_block_cache_max_bytes")]
+    pub block_cache_max_bytes: u64,
+
+    /// Enable falling back to public IPFS gateways when master is
+    /// unreachable. **Native-only at runtime.** Requires
+    /// `blockCacheEnabled = true` to populate the `(bucket,key) → cid`
+    /// lookup table the offline race needs.
+    #[serde(default)]
+    pub gateway_fallback_enabled: bool,
+
+    /// Custom gateway URL templates. Each must contain the literal
+    /// `{cid}` token. Empty Vec = use the SDK-shipped default list
+    /// of six gateways (Cloudflare, dweb.link, ipfs.io,
+    /// trustless-gateway.link, 4everland.io, gateway.pinata.cloud).
+    /// **Native-only at runtime.**
+    #[serde(default)]
+    pub gateway_fallback_urls: Vec<String>,
+
+    /// Number of gateways the SDK races in parallel. Default: 3.
+    /// **Native-only at runtime.**
+    #[serde(default = "default_gateway_race_concurrency")]
+    pub gateway_race_concurrency: u32,
 }
 
 fn default_timeout() -> u64 { 30 }
+fn default_health_gate_ttl() -> u64 { 30 }
+fn default_block_cache_max_bytes() -> u64 { 256 * 1024 * 1024 }
+fn default_gateway_race_concurrency() -> u32 { 3 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -173,12 +244,7 @@ pub async fn create_encrypted_client(
         .map_err(|e| JsError::new(&format!("Invalid encryption config: {}", e)))?;
 
     // Build client config
-    let mut client_config = fula_client::Config::new(&config.endpoint)
-        .with_timeout(std::time::Duration::from_secs(config.timeout_seconds));
-
-    if let Some(token) = config.access_token {
-        client_config = client_config.with_token(token);
-    }
+    let client_config = build_inner_config(config);
 
     // Build encryption config
     let enc_config = if let Some(secret_key) = encryption.secret_key {
@@ -204,11 +270,121 @@ pub async fn create_encrypted_client(
     };
 
     let client = fula_client::EncryptedClient::new(client_config, enc_config)
-        .map_err(|e| JsError::new(&format!("Failed to create client: {}", e)))?;
+        .map_err(|e| client_error_to_js_error("create_client_failed", e))?;
 
     Ok(EncryptedClient {
         inner: Arc::new(Mutex::new(client)),
     })
+}
+
+// ============================================================================
+// Phase 2.x helpers
+// ============================================================================
+
+/// Translate a Dart-flavoured `JsFulaConfig` into the underlying
+/// `fula_client::Config`, plumbing every Phase 1.2 / 2.x field
+/// through. Used by every JS client constructor — adding a new field
+/// means changing this function only.
+///
+/// Note on wasm32: the block_cache + gateway_fallback fields are
+/// silently ignored at runtime (the underlying SDK gates out the
+/// redb-backed cache and parking_lot-based pool). They're still
+/// plumbed through so that a single shared config struct works
+/// across native + web targets.
+fn build_inner_config(config: JsFulaConfig) -> fula_client::Config {
+    let mut inner = fula_client::Config::new(&config.endpoint)
+        .with_timeout(std::time::Duration::from_secs(config.timeout_seconds));
+
+    if let Some(token) = config.access_token {
+        inner = inner.with_token(token);
+    }
+
+    // Phase 2.1 — health gate (functional on wasm).
+    inner.health_gate_enabled = config.health_gate_enabled;
+    inner.health_gate_ttl =
+        std::time::Duration::from_secs(config.health_gate_ttl_seconds);
+
+    // Phase 2.2 — block cache (native-only at runtime; plumbed for symmetry).
+    inner.block_cache_enabled = config.block_cache_enabled;
+    inner.block_cache_path = if config.block_cache_path.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(config.block_cache_path))
+    };
+    inner.block_cache_max_bytes = config.block_cache_max_bytes;
+
+    // Phase 2.3 / 2.4 — gateway race (native-only at runtime).
+    inner.gateway_fallback_enabled = config.gateway_fallback_enabled;
+    inner.gateway_fallback_urls = config.gateway_fallback_urls;
+    inner.gateway_race_concurrency = config.gateway_race_concurrency as usize;
+
+    inner
+}
+
+/// Convert a `fula_client::ClientError` into a `JsError` whose
+/// message is a JSON object carrying a stable error `code` plus
+/// any structured fields. JS callers can `JSON.parse(err.message)`
+/// to dispatch on the code and surface it to UI logic — e.g.,
+/// "show offline indicator" on `MASTER_UNREACHABLE` rather than
+/// just a generic "download failed".
+///
+/// The set of codes is stable across native and wasm so apps can
+/// share an error-handling layer.
+fn client_error_to_js_error(operation: &str, e: fula_client::ClientError) -> JsError {
+    use fula_client::ClientError;
+
+    // Compose stable code + human-readable message.
+    let (code, structured) = match &e {
+        ClientError::MasterUnreachable { down_for_secs } => (
+            "MASTER_UNREACHABLE",
+            serde_json::json!({ "downForSecs": down_for_secs }),
+        ),
+        ClientError::BlockTooLarge { size, budget } => (
+            "BLOCK_TOO_LARGE",
+            serde_json::json!({ "size": size, "budget": budget }),
+        ),
+        ClientError::BlockCache(_) => ("BLOCK_CACHE_ERROR", serde_json::json!(null)),
+        ClientError::UsersIndexResolutionFailed { reason } => (
+            "USERS_INDEX_RESOLUTION_FAILED",
+            serde_json::json!({ "reason": reason }),
+        ),
+        ClientError::SequenceRegression { observed, highest_seen, channel } => (
+            "SEQUENCE_REGRESSION",
+            serde_json::json!({
+                "observed": observed,
+                "highestSeen": highest_seen,
+                "channel": channel,
+            }),
+        ),
+        ClientError::NotFound { bucket, key } => (
+            "NOT_FOUND",
+            serde_json::json!({ "bucket": bucket, "key": key }),
+        ),
+        ClientError::BucketNotFound(name) => (
+            "BUCKET_NOT_FOUND",
+            serde_json::json!({ "name": name }),
+        ),
+        ClientError::AccessDenied(_) => ("ACCESS_DENIED", serde_json::json!(null)),
+        ClientError::ConcurrentModification(_)
+        | ClientError::ConcurrentModificationExhausted { .. } => {
+            ("CONCURRENT_MODIFICATION", serde_json::json!(null))
+        }
+        ClientError::MigrationLockHeld { bucket, expires_at } => (
+            "MIGRATION_LOCK_HELD",
+            serde_json::json!({ "bucket": bucket, "expiresAt": expires_at }),
+        ),
+        ClientError::Encryption(_) => ("ENCRYPTION", serde_json::json!(null)),
+        ClientError::Http(_) => ("HTTP", serde_json::json!(null)),
+        _ => ("INTERNAL", serde_json::json!(null)),
+    };
+
+    let payload = serde_json::json!({
+        "code": code,
+        "operation": operation,
+        "message": e.to_string(),
+        "data": structured,
+    });
+    JsError::new(&payload.to_string())
 }
 
 // ============================================================================
@@ -270,6 +446,14 @@ pub async fn put_encrypted_with_type(
 /// @param bucket - Bucket name
 /// @param key - Original object key (path)
 /// @returns Decrypted data as Uint8Array
+///
+/// Errors surface as `JsError` whose `message` is a JSON-encoded
+/// `{ code, operation, message, data }` object — `code` is one of
+/// the stable codes documented on `client_error_to_js_error`. Apps
+/// should `JSON.parse(err.message)` to dispatch on `code` (e.g.,
+/// `"MASTER_UNREACHABLE"` is the Phase 2.1 signal that the SDK's
+/// health gate has tripped — surface an offline UI rather than a
+/// generic "download failed").
 #[wasm_bindgen(js_name = getDecrypted)]
 pub async fn get_decrypted(
     client: &EncryptedClient,
@@ -279,11 +463,13 @@ pub async fn get_decrypted(
     let guard = client.inner.lock().await;
     let data = guard.get_object_decrypted(bucket, key)
         .await
-        .map_err(|e| JsError::new(&format!("Download failed: {}", e)))?;
+        .map_err(|e| client_error_to_js_error("get_decrypted", e))?;
     Ok(data.to_vec())
 }
 
 /// Download and decrypt data by storage key
+///
+/// Same structured-error contract as `getDecrypted`.
 #[wasm_bindgen(js_name = getDecryptedByStorageKey)]
 pub async fn get_decrypted_by_storage_key(
     client: &EncryptedClient,
@@ -293,7 +479,7 @@ pub async fn get_decrypted_by_storage_key(
     let guard = client.inner.lock().await;
     let data = guard.get_object_decrypted_by_storage_key(bucket, storage_key)
         .await
-        .map_err(|e| JsError::new(&format!("Download failed: {}", e)))?;
+        .map_err(|e| client_error_to_js_error("get_decrypted_by_storage_key", e))?;
     Ok(data.to_vec())
 }
 

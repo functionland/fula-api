@@ -45,6 +45,67 @@ pub struct FulaConfig {
     /// buffered path returns an error instead of allocating the buffer.
     /// Default: 256 MiB.
     pub buffered_download_max_bytes: u64,
+
+    // ============================================================
+    // Phase 2.1 — master-down detection (health gate)
+    // ============================================================
+    /// Enable the SDK's master health gate. Off by default
+    /// (backward-compat). When on, the SDK observes request outcomes
+    /// and short-circuits with `Network`/`MasterUnreachable` error
+    /// after two consecutive failures, instead of paying the per-read
+    /// timeout. Works on every platform fula-flutter ships against.
+    pub health_gate_enabled: bool,
+
+    /// TTL of the `Down` state when `health_gate_enabled = true`.
+    /// After this duration elapses, the next request is allowed
+    /// through as a probe. Default: 30 seconds.
+    pub health_gate_ttl_seconds: u64,
+
+    // ============================================================
+    // Phase 2.2 — persistent block cache
+    // ============================================================
+    /// Enable the on-disk LRU block cache.
+    ///
+    /// **Native-only.** The cache is `redb`-backed and not available
+    /// in browser-targeted builds. Setting `true` on a wasm32 target
+    /// is silently inert — the underlying SDK skips construction and
+    /// the offline path stays unavailable in the browser. On
+    /// Android/iOS/Ubuntu/Windows the field activates Phase 2.2.
+    pub block_cache_enabled: bool,
+
+    /// Filesystem path for the block-cache redb database. Empty
+    /// string = use the platform default (`dirs::data_local_dir()/
+    /// fula/cache/blocks.redb`). Native-only; ignored on wasm32.
+    pub block_cache_path: String,
+
+    /// Maximum on-disk bytes for the block cache. Default: 256 MiB.
+    /// The cache evicts to 80 % of this watermark when a `put` would
+    /// push it past `max_bytes`. Native-only; ignored on wasm32.
+    pub block_cache_max_bytes: u64,
+
+    // ============================================================
+    // Phase 2.3 / 2.4 — IPFS gateway race + offline GET fallback
+    // ============================================================
+    /// Enable falling back to public IPFS gateways when master is
+    /// unreachable AND the SDK has previously cached the requested
+    /// object's CID via Phase 2.2's KEY_TO_CID table.
+    ///
+    /// Requires `block_cache_enabled = true` (the cache holds the
+    /// `(bucket, key) → cid` map the gateway race needs). Native-only;
+    /// ignored on wasm32.
+    pub gateway_fallback_enabled: bool,
+
+    /// Custom gateway URL templates. Each must contain the literal
+    /// `{cid}` token, which the SDK substitutes per fetch. Empty Vec
+    /// means "use the SDK-shipped default list of six gateways"
+    /// (Cloudflare, dweb.link, ipfs.io, trustless-gateway.link,
+    /// 4everland.io, gateway.pinata.cloud). Native-only.
+    pub gateway_fallback_urls: Vec<String>,
+
+    /// Number of gateways the SDK races in parallel for any single
+    /// CID. Default: 3. Capped at the gateway-pool length.
+    /// Native-only.
+    pub gateway_race_concurrency: u32,
 }
 
 impl Default for FulaConfig {
@@ -56,6 +117,17 @@ impl Default for FulaConfig {
             max_retries: 3,
             per_chunk_download_timeout_seconds: 300,
             buffered_download_max_bytes: 256 * 1024 * 1024,
+            // Phase 2.x — all flags off by default (backward-compat).
+            // Apps must opt in explicitly; existing Dart code sees
+            // byte-identical behavior to pre-Phase-2.x builds.
+            health_gate_enabled: false,
+            health_gate_ttl_seconds: 30,
+            block_cache_enabled: false,
+            block_cache_path: String::new(),
+            block_cache_max_bytes: 256 * 1024 * 1024,
+            gateway_fallback_enabled: false,
+            gateway_fallback_urls: Vec::new(),
+            gateway_race_concurrency: 3,
         }
     }
 }

@@ -29,7 +29,44 @@
 //!   read" into "fast-fail with `MasterUnreachable`" when Down.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Phase 19 transparency surface — events the SDK emits when its
+/// view of master-server reachability changes. Apps wire a
+/// [`HealthCallback`] via [`Config::health_callback`] and surface
+/// the transitions to users (e.g., "you're offline; reading from
+/// IPFS gateway"). The default behavior with no callback set is
+/// byte-identical to pre-Phase-19 builds — the gate still works,
+/// just silently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MasterHealthEvent {
+    /// Master S3 is reachable; reads use the fast path.
+    Online,
+
+    /// Master S3 is unreachable; SDK is falling back to IPFS
+    /// gateways (Phase 2.4) or cold-start resolver (Phase 3.3).
+    /// `reason` is human-readable for logging — not for end-user
+    /// display (use a localized string from your UI layer).
+    OfflineFallbackActive { reason: String },
+
+    /// Both master S3 AND the chain RPC are unreachable. Cold-
+    /// start reads will fail; warm reads (via cached `(bucket,
+    /// key) → cid`) still work via gateways. Apps should disable
+    /// "open new bucket" / "first-read" UI affordances when this
+    /// fires. **Emitted only from the cold-start failure path**
+    /// (the resolver), NOT from periodic health-gate observation —
+    /// the SDK can't authoritatively detect "both down" without
+    /// trying.
+    SeverelyDegraded { reason: String },
+}
+
+/// A callback the SDK invokes on every `MasterHealthEvent`
+/// transition. `Arc<dyn Fn + Send + Sync>` so the closure can be
+/// shared across all clones of `FulaClient` and called from any
+/// task. Transitions are deduplicated — a single Down→Up flip fires
+/// exactly one `Online` event, not one per request.
+pub type HealthCallback = Arc<dyn Fn(MasterHealthEvent) + Send + Sync + 'static>;
 
 /// Threshold for flipping from `Up` to `Down`. One transient 5xx on a single
 /// bucket isn't the same as "master is unreachable" — only two consecutive
@@ -47,15 +84,35 @@ pub struct HealthGate {
     state_ms: AtomicU64,
     consecutive_failures: AtomicU32,
     ttl: Duration,
+    /// Phase 19 — optional transparency callback. `Some` when
+    /// `Config::health_callback` was set on `FulaClient::new`.
+    /// Fires `Online` / `OfflineFallbackActive` on Up↔Down state
+    /// transitions, with deduplication so back-to-back events
+    /// don't double-fire.
+    callback: Option<HealthCallback>,
 }
 
 impl HealthGate {
     /// Create a new gate with the given TTL. Starts in the `Up` state.
+    /// No callback registered.
     pub fn new(ttl: Duration) -> Self {
         Self {
             state_ms: AtomicU64::new(0),
             consecutive_failures: AtomicU32::new(0),
             ttl,
+            callback: None,
+        }
+    }
+
+    /// Phase 19 — construct a gate with a transparency callback.
+    /// The callback fires once on each Up↔Down transition; consecutive
+    /// failures within an already-Down state do NOT re-fire.
+    pub fn with_callback(ttl: Duration, callback: HealthCallback) -> Self {
+        Self {
+            state_ms: AtomicU64::new(0),
+            consecutive_failures: AtomicU32::new(0),
+            ttl,
+            callback: Some(callback),
         }
     }
 
@@ -86,9 +143,15 @@ impl HealthGate {
 
     /// Record a successful master interaction. Resets the failure counter
     /// and clears the `Down` timestamp (gate returns to `Up`).
+    ///
+    /// Phase 19: fires `MasterHealthEvent::Online` exactly when the gate
+    /// flips from Down→Up. A success while already Up is a no-op.
     pub fn record_success(&self) {
         self.consecutive_failures.store(0, Ordering::Release);
-        self.state_ms.store(0, Ordering::Release);
+        let was_down = self.state_ms.swap(0, Ordering::AcqRel) != 0;
+        if was_down {
+            self.fire_event(MasterHealthEvent::Online);
+        }
     }
 
     /// Record a master-side failure (connection refused / RST / 5xx /
@@ -97,18 +160,51 @@ impl HealthGate {
     ///
     /// 4xx responses are NOT failures for gate purposes — they're
     /// request-level issues, not master-down signals.
+    ///
+    /// Phase 19: fires `MasterHealthEvent::OfflineFallbackActive` exactly
+    /// once on the Up→Down transition. Subsequent failures while already
+    /// Down do NOT re-fire (the `compare_exchange` filters duplicates).
     pub fn record_failure(&self) {
         let prior = self.consecutive_failures.fetch_add(1, Ordering::AcqRel);
         if prior + 1 >= CONSECUTIVE_FAILURE_THRESHOLD {
             // Threshold crossed (or exceeded). Flip to `Down` if not already.
             // Only update timestamp on the first transition this window so
             // that repeated failures don't keep extending the TTL.
-            let _ = self.state_ms.compare_exchange(
-                0,
-                now_ms(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            let now = now_ms();
+            let prev = self
+                .state_ms
+                .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+            // `Ok(_)` means we successfully transitioned Up→Down — fire
+            // the event once. `Err(_)` means already Down (timestamp
+            // non-zero), no transition.
+            if prev.is_ok() {
+                self.fire_event(MasterHealthEvent::OfflineFallbackActive {
+                    reason: format!(
+                        "{} consecutive master failures observed",
+                        prior + 1
+                    ),
+                });
+            }
+        }
+    }
+
+    /// Phase 19 helper — invoke the registered callback if present.
+    /// Swallows panics inside the callback so a buggy app handler
+    /// can't crash the SDK request path.
+    fn fire_event(&self, event: MasterHealthEvent) {
+        if let Some(cb) = self.callback.as_ref() {
+            let cb = Arc::clone(cb);
+            // Clone the event for the closure; original is dropped after.
+            let event_clone = event.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                cb(event_clone);
+            }));
+            if result.is_err() {
+                tracing::warn!(
+                    event = ?event,
+                    "health_callback panicked; SDK proceeding (callback panics are swallowed by design)"
+                );
+            }
         }
     }
 }
@@ -236,5 +332,130 @@ mod tests {
         }
         // 8 failures > threshold(2), so gate must be Down.
         assert!(matches!(gate.decide(), GateDecision::ShortCircuit { .. }));
+    }
+
+    // ============================================================
+    // Phase 19 — transparency callback wiring
+    // ============================================================
+
+    /// Helper: build a callback that pushes events into a Mutex<Vec>.
+    /// Returns the callback Arc + a clone of the same Vec for assertions.
+    fn capturing_callback() -> (
+        HealthCallback,
+        std::sync::Arc<std::sync::Mutex<Vec<MasterHealthEvent>>>,
+    ) {
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<MasterHealthEvent>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_cb = std::sync::Arc::clone(&captured);
+        let cb: HealthCallback = std::sync::Arc::new(move |ev| {
+            captured_for_cb.lock().unwrap().push(ev);
+        });
+        (cb, captured)
+    }
+
+    #[test]
+    fn test_phase19_two_failures_fire_offline_event_single_failure_silent() {
+        // Advisor-mandated test #1: a single failure must NOT fire the
+        // callback (the gate stays Up). The second failure that crosses
+        // the threshold fires `OfflineFallbackActive` exactly once.
+        let (cb, captured) = capturing_callback();
+        let gate = HealthGate::with_callback(Duration::from_secs(30), cb);
+
+        gate.record_failure();
+        // After one failure: gate still Up, no callback fired.
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            0,
+            "single failure must not fire callback"
+        );
+
+        gate.record_failure();
+        // After two failures: gate flipped Down, exactly one event fired.
+        let events = captured.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "expected exactly one event, got: {:?}", events);
+        match &events[0] {
+            MasterHealthEvent::OfflineFallbackActive { reason } => {
+                assert!(
+                    reason.contains("2 consecutive"),
+                    "reason should mention failure count: {}",
+                    reason
+                );
+            }
+            other => panic!("expected OfflineFallbackActive, got {:?}", other),
+        }
+
+        // Further failures while already Down must NOT re-fire the event
+        // (compare_exchange filters the no-transition case).
+        gate.record_failure();
+        gate.record_failure();
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            1,
+            "additional failures while Down must not re-fire OfflineFallbackActive"
+        );
+    }
+
+    #[test]
+    fn test_phase19_success_after_down_fires_online() {
+        // Advisor-mandated test #2: when the gate is Down and a probe
+        // succeeds, the callback observes `Online` exactly once.
+        let (cb, captured) = capturing_callback();
+        let gate = HealthGate::with_callback(Duration::from_secs(30), cb);
+
+        // Trip the gate.
+        gate.record_failure();
+        gate.record_failure();
+        // One OfflineFallbackActive event so far.
+        assert_eq!(captured.lock().unwrap().len(), 1);
+
+        // Success — flips Down→Up; fires Online.
+        gate.record_success();
+        let events = captured.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "expected OfflineFallbackActive + Online");
+        assert!(matches!(events[1], MasterHealthEvent::Online));
+
+        // A second success while already Up must NOT re-fire Online.
+        gate.record_success();
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            2,
+            "redundant success while Up must not re-fire Online"
+        );
+    }
+
+    #[test]
+    fn test_phase19_callback_panic_does_not_crash_caller() {
+        // A buggy app callback that panics must NOT crash the SDK.
+        // `fire_event` wraps the call in `catch_unwind` and proceeds.
+        let cb: HealthCallback = std::sync::Arc::new(|_ev| {
+            panic!("simulated app-level panic");
+        });
+        let gate = HealthGate::with_callback(Duration::from_secs(30), cb);
+
+        // These calls would propagate the panic if catch_unwind weren't
+        // wrapping the callback. The test passes by NOT panicking.
+        gate.record_failure();
+        gate.record_failure();
+        gate.record_success();
+
+        // And the gate state itself remains correct: a success after a
+        // Down state returns to Up.
+        assert_eq!(gate.decide(), GateDecision::Allow);
+    }
+
+    #[test]
+    fn test_phase19_no_callback_means_silent() {
+        // A gate constructed via `new` (no callback) must work
+        // identically to pre-Phase-19 builds: state machine works,
+        // no events are produced anywhere.
+        let gate = HealthGate::new(Duration::from_secs(30));
+        gate.record_failure();
+        gate.record_failure();
+        gate.record_success();
+        // No assertion on event capture — there's no captured Vec.
+        // The fact that we constructed the gate with `new` (no
+        // callback wiring) and reached this line proves the silent
+        // path works. Verify final state is sane.
+        assert_eq!(gate.decide(), GateDecision::Allow);
     }
 }
