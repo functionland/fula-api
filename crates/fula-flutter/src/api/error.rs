@@ -69,6 +69,42 @@ pub enum FulaError {
     #[error("Forest error: {0}")]
     ForestError(String),
 
+    /// Phase 2.2 of master-independent reads: a single block exceeds
+    /// the configured `block_cache_max_bytes` budget. Surface to the
+    /// user with guidance to raise the cache size or skip the cache.
+    /// Native-only signal in practice (BlockCache is compiled out on
+    /// wasm32) but defined unconditionally so the Dart binding always
+    /// has the same enum shape across Android, iOS, Ubuntu, Windows,
+    /// and web (flutter-js + wasm).
+    #[error("Cache budget exceeded: size={size}, budget={budget}")]
+    CacheBudgetExceeded { size: u64, budget: u64 },
+
+    /// Phase 2.2 of master-independent reads: catch-all for the
+    /// persistent block cache's I/O / storage / commit errors.
+    /// Stringified at the FFI boundary; Dart code doesn't depend on
+    /// any Rust storage-engine specifics. Native-only in practice.
+    #[error("Cache error: {0}")]
+    CacheError(String),
+
+    /// Phase 3.3 — cold-start hybrid resolver could not resolve the
+    /// master-published global users-index CID via IPNS or chain.
+    /// Surface to Dart apps as "offline mode unavailable for this
+    /// device until master is reachable again" — distinct from
+    /// `Network` (which is a transient master-side glitch).
+    #[error("Users-index resolution failed: {0}")]
+    UsersIndexResolutionFailed(String),
+
+    /// Phase 3.3 — replay defense: a payload's embedded sequence
+    /// regressed below what the SDK has seen before. Dart apps
+    /// should NOT silently retry; surface as a clear "stale-state"
+    /// signal (possibly with a retry-after-N-minutes hint).
+    #[error("Sequence regression in {channel}: observed={observed}, highest seen={highest_seen}")]
+    SequenceRegression {
+        observed: u64,
+        highest_seen: u64,
+        channel: String,
+    },
+
     /// Internal error
     #[error("Internal error: {0}")]
     Internal(String),
@@ -123,6 +159,30 @@ impl From<fula_client::ClientError> for FulaError {
             ClientError::MigrationLockHeld { bucket, expires_at } => FulaError::InvalidResponse(
                 format!("migration lock held for bucket {} (expires at {} ms)", bucket, expires_at),
             ),
+            // Phase 2.1 of master-independent reads: surface as a Network
+            // error to existing Flutter callers — the closest existing
+            // category, since the master is effectively unreachable.
+            // Phase 2.4 catches this variant earlier and falls back to the
+            // gateway race before reaching this conversion.
+            ClientError::MasterUnreachable { down_for_secs } => FulaError::Network(
+                format!("master unreachable (health gate; down for ~{}s)", down_for_secs),
+            ),
+            // Phase 2.2 — block cache surface. Map to first-class
+            // FulaError variants so Dart code can pattern-match without
+            // string parsing. Identical shape on every target (native +
+            // wasm) so flutter-js / web builds compile against the same
+            // enum.
+            ClientError::BlockTooLarge { size, budget } => {
+                FulaError::CacheBudgetExceeded { size, budget }
+            }
+            ClientError::BlockCache(msg) => FulaError::CacheError(msg),
+            // Phase 3.3 cold-start hybrid resolver.
+            ClientError::UsersIndexResolutionFailed { reason } => {
+                FulaError::UsersIndexResolutionFailed(reason)
+            }
+            ClientError::SequenceRegression { observed, highest_seen, channel } => {
+                FulaError::SequenceRegression { observed, highest_seen, channel }
+            }
         }
     }
 }
@@ -186,7 +246,29 @@ impl FulaError {
             FulaError::ShareError(_) => "SHARE_ERROR",
             FulaError::RotationError(_) => "ROTATION_ERROR",
             FulaError::ForestError(_) => "FOREST_ERROR",
+            FulaError::CacheBudgetExceeded { .. } => "CACHE_BUDGET_EXCEEDED",
+            FulaError::CacheError(_) => "CACHE_ERROR",
+            FulaError::UsersIndexResolutionFailed(_) => "USERS_INDEX_RESOLUTION_FAILED",
+            FulaError::SequenceRegression { .. } => "SEQUENCE_REGRESSION",
             FulaError::Internal(_) => "INTERNAL",
         }
+    }
+
+    /// Phase 2.2 helper: detect block-cache-related errors so app code
+    /// can offer a "retry without cache" or "raise budget" prompt
+    /// without string-parsing the underlying message.
+    pub fn is_cache_error(&self) -> bool {
+        matches!(self, FulaError::CacheBudgetExceeded { .. } | FulaError::CacheError(_))
+    }
+
+    /// Phase 3.3 helper: detect cold-start resolution errors. Apps
+    /// should surface this as "offline mode unavailable" instead of
+    /// a generic "download failed" — the file is fine; we just can't
+    /// learn its CID without master.
+    pub fn is_users_index_error(&self) -> bool {
+        matches!(
+            self,
+            FulaError::UsersIndexResolutionFailed(_) | FulaError::SequenceRegression { .. }
+        )
     }
 }

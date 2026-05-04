@@ -1002,6 +1002,44 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
             .collect()
     }
 
+    /// Populate `BucketMetadata.bucket_lookup_h` for a user-scoped bucket
+    /// **only if currently `None`**. Idempotent — never overwrites an
+    /// existing value. Sets the dirty flag on success; the caller is
+    /// responsible for triggering registry persistence (typically via the
+    /// existing `persist_registry_with_token` call in the put_object handler).
+    ///
+    /// This is called by master's PUT handler when the SDK includes the
+    /// `x-amz-meta-fula-bucket-lookup-h` control header on a Phase 2
+    /// manifest root PUT (the moment of forest commit).
+    ///
+    /// Returns `Ok(true)` if the field was newly populated, `Ok(false)` if it
+    /// was already set. `Err(BucketNotFound)` if the bucket doesn't exist.
+    pub fn populate_lookup_h_if_missing(
+        &self,
+        user_id: &str,
+        bucket_name: &str,
+        lookup_h: [u8; 16],
+    ) -> Result<bool> {
+        let internal_key = Self::scoped_bucket_key(user_id, bucket_name);
+
+        // Mutate within a sync block; DashMap shard guard never crosses an
+        // await. Persistence is intentionally NOT triggered here — the put
+        // handler already calls `persist_registry_with_token` post-flush,
+        // which picks up the new value via the dirty flag.
+        match self.buckets.get_mut(&internal_key) {
+            Some(mut entry) => {
+                if entry.bucket_lookup_h.is_some() {
+                    Ok(false)
+                } else {
+                    entry.bucket_lookup_h = Some(lookup_h);
+                    self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(true)
+                }
+            }
+            None => Err(CoreError::BucketNotFound(bucket_name.to_string())),
+        }
+    }
+
     /// Find a bucket by display name that contains a specific object key
     ///
     /// Uses the secondary name index for O(1) lookup of matching buckets
@@ -1516,5 +1554,328 @@ mod tests {
             "expected exactly {} persisted keys after reload",
             N
         );
+    }
+
+    // ============================================================
+    // Phase 1.2 (master-independent reads) — populate_lookup_h_if_missing
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_populate_lookup_h_if_missing_happy_path() {
+        // First-ever populate on a freshly-created bucket: sets the field,
+        // returns Ok(true), and marks the manager dirty so the next
+        // persist_registry call serializes the new value.
+        let store = Arc::new(MemoryBlockStore::new());
+        let manager = BucketManager::new(store);
+        let user_id = "userA";
+        let bucket_name = "photos";
+        let owner = Owner::new(user_id);
+
+        manager
+            .create_bucket_for_user(user_id, bucket_name.to_string(), owner)
+            .await
+            .expect("create_bucket_for_user");
+
+        // Pre-condition: bucket exists, lookup_h is None.
+        let pre = manager
+            .get_bucket_metadata_for_user(user_id, bucket_name)
+            .expect("metadata exists");
+        assert_eq!(pre.bucket_lookup_h, None);
+
+        // create_bucket_for_user calls persist_registry which clears dirty;
+        // populate should re-set it.
+        manager
+            .dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let h: [u8; 16] = [
+            0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a,
+            0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55,
+        ];
+        let changed = manager
+            .populate_lookup_h_if_missing(user_id, bucket_name, h)
+            .expect("populate ok");
+        assert!(changed, "first call must report changed=true");
+
+        // Post-condition: field is now Some(h), dirty flag is set.
+        let post = manager
+            .get_bucket_metadata_for_user(user_id, bucket_name)
+            .expect("metadata exists");
+        assert_eq!(post.bucket_lookup_h, Some(h));
+        assert!(
+            manager.dirty.load(std::sync::atomic::Ordering::Relaxed),
+            "dirty flag must be set after a real write"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_populate_lookup_h_if_missing_idempotent() {
+        // Second call with a DIFFERENT value must NOT overwrite. Returns
+        // Ok(false) and preserves the original. Dirty flag isn't set on
+        // the no-op (so we don't churn the registry on every PUT for an
+        // already-migrated bucket).
+        let store = Arc::new(MemoryBlockStore::new());
+        let manager = BucketManager::new(store);
+        let user_id = "userB";
+        let bucket_name = "documents";
+        let owner = Owner::new(user_id);
+
+        manager
+            .create_bucket_for_user(user_id, bucket_name.to_string(), owner)
+            .await
+            .expect("create_bucket_for_user");
+
+        let original_h: [u8; 16] = [1u8; 16];
+        let other_h: [u8; 16] = [2u8; 16];
+
+        // First populate → sets the field.
+        let changed = manager
+            .populate_lookup_h_if_missing(user_id, bucket_name, original_h)
+            .expect("populate ok");
+        assert!(changed);
+
+        // Reset dirty so we can detect whether the no-op call sets it again.
+        manager
+            .dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // Second populate with a different value → idempotent skip.
+        let changed = manager
+            .populate_lookup_h_if_missing(user_id, bucket_name, other_h)
+            .expect("populate idempotent");
+        assert!(!changed, "second call must report changed=false");
+
+        // Original value preserved; dirty flag NOT set by the no-op.
+        let post = manager
+            .get_bucket_metadata_for_user(user_id, bucket_name)
+            .expect("metadata exists");
+        assert_eq!(
+            post.bucket_lookup_h,
+            Some(original_h),
+            "idempotent: original value must NOT be overwritten"
+        );
+        assert!(
+            !manager.dirty.load(std::sync::atomic::Ordering::Relaxed),
+            "no-op call must not set dirty flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_populate_lookup_h_bucket_not_found() {
+        // Calling on a bucket that doesn't exist returns BucketNotFound.
+        // Master's handler treats this as a non-fatal warn, but the API
+        // contract here is: explicit error, not silent success.
+        let store = Arc::new(MemoryBlockStore::new());
+        let manager = BucketManager::new(store);
+
+        let h: [u8; 16] = [0u8; 16];
+        let result = manager.populate_lookup_h_if_missing("ghost-user", "ghost-bucket", h);
+
+        assert!(matches!(result, Err(CoreError::BucketNotFound(ref n)) if n == "ghost-bucket"));
+    }
+
+    #[tokio::test]
+    async fn test_legacy_bucket_lazy_migrates_when_new_client_sends_header() {
+        // SCENARIO 2 from the rollout matrix:
+        //   - Bucket was created BEFORE Phase 1.2 ships (old data; old client
+        //     SDK; no `bucket_lookup_h` field in the persisted CBOR — i.e.
+        //     deserialized as None via #[serde(default)]).
+        //   - User upgrades their fula-client SDK and writes again.
+        //   - New SDK sends `x-amz-meta-fula-bucket-lookup-h` on the Phase 2
+        //     manifest root PUT. Master's handler calls populate.
+        //   - Bucket's `bucket_lookup_h` lazy-migrates from None → Some(_)
+        //     and persists. Subsequent reads (incl. Phase 3.2 chain
+        //     publication) see the blinded key.
+        //
+        // This test simulates that journey end-to-end through the master's
+        // BucketManager: persist + reload to mimic server restart between
+        // the old and new client uploads.
+        let tmp = std::env::temp_dir().join(format!(
+            "fula-phase12-legacy-{}.cid",
+            std::process::id()
+        ));
+        let store = Arc::new(MemoryBlockStore::new());
+        let user_id = "userL"; // L = Legacy
+        let bucket_name = "fula-metadata";
+        let owner = Owner::new(user_id);
+
+        // (1) Old client created the bucket pre-Phase-1.2.
+        {
+            let manager = BucketManager::with_persistence(store.clone(), &tmp);
+            manager
+                .create_bucket_for_user(user_id, bucket_name.to_string(), owner)
+                .await
+                .expect("legacy create");
+            // Old code never set bucket_lookup_h. Verify.
+            let pre = manager
+                .get_bucket_metadata_for_user(user_id, bucket_name)
+                .expect("metadata");
+            assert_eq!(
+                pre.bucket_lookup_h, None,
+                "legacy bucket must start with no lookup_h"
+            );
+            manager.persist_registry().await.expect("legacy persist");
+        }
+
+        // (2) Server restarts. New code loads the legacy CBOR.
+        let new_manager = BucketManager::with_persistence(store, &tmp);
+        let count = new_manager.load_registry().await.expect("reload");
+        assert_eq!(count, 1);
+        let after_reload = new_manager
+            .get_bucket_metadata_for_user(user_id, bucket_name)
+            .expect("metadata after reload");
+        assert_eq!(
+            after_reload.bucket_lookup_h, None,
+            "legacy CBOR must round-trip with lookup_h=None"
+        );
+
+        // (3) New client uploads. Master receives the header → populates.
+        let h: [u8; 16] = [
+            0x7c, 0x68, 0xbe, 0x81, 0x43, 0xaf, 0x5b, 0xa2,
+            0x12, 0xa3, 0x6f, 0x81, 0x23, 0x20, 0x37, 0xf5,
+        ];
+        let changed = new_manager
+            .populate_lookup_h_if_missing(user_id, bucket_name, h)
+            .expect("lazy populate");
+        assert!(changed, "first populate on a legacy bucket must change");
+
+        let after_populate = new_manager
+            .get_bucket_metadata_for_user(user_id, bucket_name)
+            .expect("metadata after populate");
+        assert_eq!(after_populate.bucket_lookup_h, Some(h));
+
+        // (4) Persist the migration → durable.
+        new_manager
+            .persist_registry()
+            .await
+            .expect("post-migration persist");
+
+        // (5) The next time the same client (or any other) writes, populate
+        // is a no-op (idempotent — never overwrites).
+        let other_h: [u8; 16] = [9u8; 16];
+        let changed = new_manager
+            .populate_lookup_h_if_missing(user_id, bucket_name, other_h)
+            .expect("idempotent");
+        assert!(!changed);
+        let still = new_manager
+            .get_bucket_metadata_for_user(user_id, bucket_name)
+            .expect("metadata still present");
+        assert_eq!(still.bucket_lookup_h, Some(h), "must NOT overwrite migrated value");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("cid.bak"));
+    }
+
+    #[tokio::test]
+    async fn test_old_client_without_header_leaves_bucket_intact() {
+        // SCENARIO 1 from the rollout matrix:
+        //   - Existing user with old fula-client SDK, post-server-update.
+        //   - Old SDK does NOT send `x-amz-meta-fula-bucket-lookup-h`.
+        //   - Master's handler: header absent → populate never called.
+        //   - Bucket continues to function normally; `bucket_lookup_h`
+        //     stays None.
+        //   - Phase 3.2 publisher will emit this bucket with `legacy=true`
+        //     + plaintext bucket name; SDK cold-start falls back to plain
+        //     bucket-name lookup.
+        //
+        // This test verifies the BucketManager side: a bucket without a
+        // populate call still works for all read/list/persist operations,
+        // and stays in the legacy (None) state across persist + reload.
+        let tmp = std::env::temp_dir().join(format!(
+            "fula-phase12-oldclient-{}.cid",
+            std::process::id()
+        ));
+        let store = Arc::new(MemoryBlockStore::new());
+        let user_id = "userO"; // O = Old client
+        let bucket_name = "videos";
+        let owner = Owner::new(user_id);
+
+        let manager = BucketManager::with_persistence(store.clone(), &tmp);
+        manager
+            .create_bucket_for_user(user_id, bucket_name.to_string(), owner)
+            .await
+            .expect("create");
+
+        // Simulate many writes from an old client — no populate call ever
+        // runs. The bucket continues to function; lookup_h stays None.
+        for _ in 0..3 {
+            // (in production, each iteration would be a put_object handler
+            // call without the header — here we just persist to mimic the
+            // post-flush registry update that handler normally triggers.)
+            manager.persist_registry().await.expect("persist");
+        }
+
+        let pre_reload = manager
+            .get_bucket_metadata_for_user(user_id, bucket_name)
+            .expect("metadata");
+        assert_eq!(pre_reload.bucket_lookup_h, None);
+
+        // Reload simulates server restart with old-client data still in flight.
+        let reloaded = BucketManager::with_persistence(store, &tmp);
+        reloaded.load_registry().await.expect("reload");
+        let post_reload = reloaded
+            .get_bucket_metadata_for_user(user_id, bucket_name)
+            .expect("metadata after reload");
+        assert_eq!(
+            post_reload.bucket_lookup_h, None,
+            "old-client buckets stay in legacy state until upgraded"
+        );
+        assert_eq!(post_reload.name, bucket_name);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("cid.bak"));
+    }
+
+    #[tokio::test]
+    async fn test_populate_lookup_h_persists_through_registry_roundtrip() {
+        // The lookup_h must survive: populate → persist_registry → reload
+        // from IPFS → still Some(h). This is the end-to-end backward-compat
+        // safety: a Phase-1.2-populated bucket round-trips through master
+        // restart correctly.
+        let tmp = std::env::temp_dir().join(format!(
+            "fula-phase12-{}.cid",
+            std::process::id()
+        ));
+        let store = Arc::new(MemoryBlockStore::new());
+        let manager = BucketManager::with_persistence(store.clone(), &tmp);
+        let user_id = "userC";
+        let bucket_name = "videos";
+        let owner = Owner::new(user_id);
+
+        manager
+            .create_bucket_for_user(user_id, bucket_name.to_string(), owner)
+            .await
+            .expect("create");
+
+        let h: [u8; 16] = [
+            0x9d, 0xfb, 0x19, 0x47, 0xe5, 0x31, 0x5e, 0x62,
+            0xc1, 0x1f, 0x2c, 0xe4, 0x77, 0xc2, 0x80, 0x97,
+        ];
+        manager
+            .populate_lookup_h_if_missing(user_id, bucket_name, h)
+            .expect("populate");
+
+        // Persist (CID file written via with_persistence).
+        manager.persist_registry().await.expect("persist");
+
+        // Reload into a fresh manager.
+        let reloaded = BucketManager::with_persistence(store, &tmp);
+        let count = reloaded.load_registry().await.expect("reload");
+        assert_eq!(count, 1);
+
+        let restored = reloaded
+            .get_bucket_metadata_for_user(user_id, bucket_name)
+            .expect("metadata after reload");
+        assert_eq!(
+            restored.bucket_lookup_h,
+            Some(h),
+            "lookup_h must survive registry persist + reload"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("cid.bak"));
     }
 }

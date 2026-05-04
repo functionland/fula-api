@@ -104,14 +104,45 @@ application/wasm
 ### Configuration Types
 
 #### FulaConfig
+
 ```dart
 class FulaConfig {
-  final String endpoint;        // Gateway URL (e.g., "http://localhost:9000")
-  final String? accessToken;    // JWT authentication token
-  final int timeoutSeconds;     // Request timeout (default: 30)
-  final int maxRetries;         // Retry attempts (default: 3)
+  // Connection
+  final String endpoint;                     // Gateway URL (e.g., "http://localhost:9000")
+  final String? accessToken;                 // JWT authentication token
+  final int timeoutSeconds;                  // Request timeout (default: 30)
+  final int maxRetries;                      // Retry attempts (default: 3)
+  final int perChunkDownloadTimeoutSeconds;  // F10: per-chunk timeout (default: 300)
+  final int bufferedDownloadMaxBytes;        // F8: buffered download cap (default: 256 MiB)
+
+  // Phase 2.1 — master-down detection (functional on every target)
+  final bool healthGateEnabled;              // default: false
+  final int healthGateTtlSeconds;            // default: 30
+
+  // Phase 2.2 — persistent block cache (native-only at runtime; flags
+  // accepted on web for config symmetry, silently inert in browsers)
+  final bool blockCacheEnabled;              // default: false
+  final String blockCachePath;               // default: "" → platform default
+  final int blockCacheMaxBytes;              // default: 256 MiB
+
+  // Phase 2.3 / 2.4 — IPFS gateway race + warm-device offline GET
+  final bool gatewayFallbackEnabled;         // default: false (requires blockCacheEnabled)
+  final List<String> gatewayFallbackUrls;    // default: [] → ships 6 public gateways
+  final int gatewayRaceConcurrency;          // default: 3
+
+  // Phase 3.3 — cold-start hybrid resolver (native-only at runtime).
+  // The resolver activates iff ALL four required fields are populated;
+  // empty values disable cold-start (the warm-device path still works).
+  final String usersIndexChainRpcUrl;        // operator-supplied (Base/SKALE)
+  final String usersIndexAnchorAddress;      // operator-supplied
+  final String usersIndexIpnsName;           // operator-supplied (k51qzi5...)
+  final String usersIndexUserKey;            // app-derived via deriveUserKeyFromEmail
+  final List<String> usersIndexIpnsGatewayUrls; // default: [] → SDK defaults
+  final List<String> usersIndexIpfsGatewayUrls; // default: [] → SDK defaults
 }
 ```
+
+All flags default OFF — apps that don't opt in see byte-identical behavior to pre-Phase-2.x builds.
 
 #### EncryptionConfig
 ```dart
@@ -372,6 +403,111 @@ final restoredClient = await createEncryptedClient(
 );
 ```
 
+## Offline Reads (Phase 2 + 3)
+
+When the master gateway is unreachable, the SDK can transparently fall back to public IPFS gateways AND, on a fresh device install, cold-start by resolving a globally-published users-index from IPNS or the chain anchor — no client wallet, no fresh master required.
+
+### Two-tier offline read
+
+| Scenario | Path |
+|---|---|
+| **Warm device** (signed in before, has block cache) | Phase 2.x — gateway race using cached `(bucket, key) → cid` |
+| **Fresh install** (no cache) | Phase 3.3 — cold-start resolver fetches global users-index via IPNS or chain, then walks per-user manifest |
+| **Master up** | Direct master read (fast path, byte-identical to today) |
+
+### Step 1 — Enable warm-device offline reads
+
+```dart
+final config = FulaConfig(
+  endpoint: 'https://your-fula-gateway.com:9000',
+  accessToken: jwt,
+  // Phase 2.1 — detect master-down without per-read timeout tax
+  healthGateEnabled: true,
+  // Phase 2.2 — persistent block cache (gateway hits land here)
+  blockCacheEnabled: true,
+  // Phase 2.4 — fall back to public gateways when master is down
+  gatewayFallbackEnabled: true,
+);
+```
+
+### Step 2 — (Optional) Enable cold-start for fresh installs
+
+In addition to the Phase 2.x flags, pass the four operator-supplied resolver fields and the per-user `userKey` derived from the user's email:
+
+```dart
+import 'package:fula_client/fula_client.dart';
+
+// Compute userKey once at sign-in. Email is hashed locally;
+// the SDK never sees the plaintext on the wire.
+final userKey = deriveUserKeyFromEmail(userEmail);
+
+final config = FulaConfig(
+  endpoint: 'https://your-fula-gateway.com:9000',
+  accessToken: jwt,
+  healthGateEnabled: true,
+  blockCacheEnabled: true,
+  gatewayFallbackEnabled: true,
+  // Phase 3.3 — cold-start hybrid resolver
+  usersIndexChainRpcUrl: 'https://mainnet.base.org',  // or SKALE
+  usersIndexAnchorAddress: '0x...FulaUsersIndexAnchor...',
+  usersIndexIpnsName: 'k51qzi5uqu5dh...',  // operator's published IPNS NAME
+  usersIndexUserKey: userKey,
+);
+```
+
+### Step 3 — Read with transparency fields
+
+```dart
+final result = await getObjectWithOfflineFallback(client, 'my-bucket', 'photos/cat.jpg');
+final bytes = result.inner.data;
+
+// Surface "you're offline" UI
+switch (result.source) {
+  case FulaReadSource.master:
+    // fast path — master served the bytes directly
+    break;
+  case FulaReadSource.localCache:
+    // BLOCKS hit — no network round-trip at all
+    showToast('Reading from cache (offline)');
+    break;
+  case FulaReadSource.gateway:
+    // gateway race served the bytes; result.source.url has the gateway URL
+    showToast('Reading via public IPFS (master is down)');
+    break;
+}
+```
+
+### Step 4 — Subscribe to master health transitions
+
+Two patterns are exposed; pick whichever fits your app:
+
+```dart
+// Pattern A: drain events on a timer / on UI rebuild
+final events = pollMasterHealthEvents(client);
+for (final event in events) {
+  switch (event) {
+    case MasterHealthEvent.online:
+      setState(() => isOffline = false);
+      break;
+    case MasterHealthEvent.offlineFallbackActive:
+      setState(() => isOffline = true);
+      break;
+    case MasterHealthEvent.severelyDegraded:
+      // both master AND chain unreachable — disable "create new bucket" UI
+      setState(() => canStartFresh = false);
+      break;
+  }
+}
+
+// Pattern B: read latest event on mount (no buffer drain)
+final last = getLastMasterHealthEvent(client);
+if (last is MasterHealthEvent.offlineFallbackActive) {
+  // app started while master is down
+}
+```
+
+The `EncryptedClient` has corresponding `pollMasterHealthEventsEncrypted` and `getLastMasterHealthEventEncrypted` variants.
+
 ## Error Handling
 
 All operations can throw `FulaError` with specific error types:
@@ -388,10 +524,38 @@ try {
       print('Access denied: ${e.message}');
       break;
     case FulaError.network:
+      // includes Phase 2.1 MasterUnreachable
       print('Network error: ${e.message}');
       break;
     case FulaError.encryption:
       print('Encryption error: ${e.message}');
+      break;
+    // Phase 2.x cache errors
+    case FulaError.cacheBudgetExceeded:
+      // Phase 2.2: block too large for the cache budget; not fatal —
+      // the read still succeeded, just not cached.
+      print('Cache budget exceeded for ${e.size} bytes (budget: ${e.budget})');
+      break;
+    case FulaError.cacheError:
+      // Phase 2.2: redb open / read / write failure; offline path
+      // disabled for this session.
+      print('Block cache unavailable: ${e.message}');
+      break;
+    // Phase 3.3 cold-start errors
+    case FulaError.usersIndexResolutionFailed:
+      // Both IPNS and chain channels failed — cold-start unavailable.
+      // Surface to user as "can't reach storage; please try again later".
+      print('Cold-start resolver exhausted: ${e.reason}');
+      break;
+    case FulaError.sequenceRegression:
+      // Replay-defense rejection — the resolver observed a sequence
+      // older than what it has previously seen. Either a stale gateway
+      // response or (rarely) a tampered payload. SDK retries the
+      // alternate channel automatically; this surface is for logging.
+      print(
+        'Sequence regression on ${e.channel}: '
+        'observed=${e.observed}, highestSeen=${e.highestSeen}',
+      );
       break;
     default:
       print('Error: $e');

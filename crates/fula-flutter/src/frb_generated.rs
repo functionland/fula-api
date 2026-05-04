@@ -4194,6 +4194,14 @@ impl SseDecode for crate::api::types::FulaConfig {
         let mut var_maxRetries = <u32>::sse_decode(deserializer);
         let mut var_perChunkDownloadTimeoutSeconds = <u64>::sse_decode(deserializer);
         let mut var_bufferedDownloadMaxBytes = <u64>::sse_decode(deserializer);
+        // MANUAL PATCH (Phase 2.x cross-platform audit): the new
+        // health_gate / block_cache / gateway_fallback fields are NOT
+        // yet on the wire from Dart (frb_codegen has not been re-run).
+        // Defaulting them via struct-update keeps the Rust struct
+        // initializable while the legacy 6-field wire format is still
+        // what Dart sends. Re-running `flutter_rust_bridge_codegen
+        // generate` regenerates this file and the new fields become
+        // settable from Dart.
         return crate::api::types::FulaConfig {
             endpoint: var_endpoint,
             access_token: var_accessToken,
@@ -4201,6 +4209,7 @@ impl SseDecode for crate::api::types::FulaConfig {
             max_retries: var_maxRetries,
             per_chunk_download_timeout_seconds: var_perChunkDownloadTimeoutSeconds,
             buffered_download_max_bytes: var_bufferedDownloadMaxBytes,
+            ..crate::api::types::FulaConfig::default()
         };
     }
 }
@@ -6336,6 +6345,11 @@ mod io {
     impl CstDecode<crate::api::types::FulaConfig> for wire_cst_fula_config {
         // Codec=Cst (C-struct based), see doc to use other codecs
         fn cst_decode(self) -> crate::api::types::FulaConfig {
+            // MANUAL PATCH (Phase 2.x cross-platform audit): see
+            // matching note on `SseDecode for FulaConfig`. The wire
+            // C-struct still has only the legacy 6 fields; new fields
+            // default until `flutter_rust_bridge_codegen generate`
+            // regenerates this file.
             crate::api::types::FulaConfig {
                 endpoint: self.endpoint.cst_decode(),
                 access_token: self.access_token.cst_decode(),
@@ -6345,6 +6359,7 @@ mod io {
                     .per_chunk_download_timeout_seconds
                     .cst_decode(),
                 buffered_download_max_bytes: self.buffered_download_max_bytes.cst_decode(),
+                ..crate::api::types::FulaConfig::default()
             }
         }
     }
@@ -8638,6 +8653,10 @@ mod web {
                 "Expected 6 elements, got {}",
                 self_.length()
             );
+            // MANUAL PATCH (Phase 2.x cross-platform audit): wasm/JS
+            // CstDecode path. The 6-element JsValue array carries the
+            // legacy fields; new Phase 2.x fields default until FRB
+            // regen.
             crate::api::types::FulaConfig {
                 endpoint: self_.get(0).cst_decode(),
                 access_token: self_.get(1).cst_decode(),
@@ -8645,6 +8664,7 @@ mod web {
                 max_retries: self_.get(3).cst_decode(),
                 per_chunk_download_timeout_seconds: self_.get(4).cst_decode(),
                 buffered_download_max_bytes: self_.get(5).cst_decode(),
+                ..crate::api::types::FulaConfig::default()
             }
         }
     }

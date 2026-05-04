@@ -27,6 +27,13 @@ async fn spawn_server() -> String {
     config.use_memory_store = true;
     config.registry_cid_path = None;
     config.jwt_secret = Some("test-secret-123".to_string());
+    // Bump production-default 100 RPS rate limit out of the way for
+    // tests. Matches the override in `tests/common/mod.rs`,
+    // `tests/v7_hamt_tests.rs`, and `tests/f8_buffered_download_tests.rs`.
+    // With `auth_enabled=false` every request hits the same "anonymous"
+    // bucket; rotation tests put multiple encrypted objects + rotate,
+    // each fanning out to several HTTP calls.
+    config.rate_limit_rps = 1_000_000;
 
     let state = Arc::new(AppState::new(config.clone()).await.unwrap());
     let app = routes::create_router(state);

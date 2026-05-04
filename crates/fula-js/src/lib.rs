@@ -54,9 +54,127 @@ pub struct JsFulaConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
+
+    // ============================================================
+    // Phase 2.1 — master-down detection (functional on wasm/web)
+    // ============================================================
+    /// Enable the SDK's master health gate. Off by default
+    /// (backward-compat). When on, two consecutive failed master
+    /// requests trip the gate and short-circuit subsequent reads
+    /// with a `MASTER_UNREACHABLE` error. **Functional on wasm/web.**
+    #[serde(default)]
+    pub health_gate_enabled: bool,
+
+    /// TTL of the `Down` state when `healthGateEnabled = true`.
+    /// After this duration elapses, the next request is allowed
+    /// through as a probe. Default: 30 seconds.
+    #[serde(default = "default_health_gate_ttl")]
+    pub health_gate_ttl_seconds: u64,
+
+    // ============================================================
+    // Phase 2.2 / 2.3 / 2.4 — block cache + gateway race
+    // ============================================================
+    //
+    // These fields are NATIVE-ONLY at runtime. The underlying
+    // `fula_client::Config` carries them across all builds, but on
+    // the wasm32 target the SDK gates out the `redb`-backed cache
+    // and the parking_lot-based gateway pool, so setting these
+    // flags has no effect in browsers.
+    //
+    // We expose them anyway for **API symmetry** with `fula-flutter`:
+    // a TypeScript app sharing config types between mobile and web
+    // builds can construct one config object and have it accepted
+    // by both. On web the offline path silently no-ops; on native
+    // (Tauri / Electron-with-Rust / Node-via-N-API integrations) the
+    // path activates as documented for fula-flutter.
+
+    /// Enable the on-disk LRU block cache. **Native-only at runtime.**
+    /// On wasm/web this flag is silently inert.
+    #[serde(default)]
+    pub block_cache_enabled: bool,
+
+    /// Filesystem path for the block-cache redb database. Empty
+    /// string = use platform default. **Native-only at runtime.**
+    #[serde(default)]
+    pub block_cache_path: String,
+
+    /// Maximum on-disk bytes for the block cache. Default: 256 MiB.
+    /// **Native-only at runtime.**
+    #[serde(default = "default_block_cache_max_bytes")]
+    pub block_cache_max_bytes: u64,
+
+    /// Enable falling back to public IPFS gateways when master is
+    /// unreachable. **Native-only at runtime.** Requires
+    /// `blockCacheEnabled = true` to populate the `(bucket,key) → cid`
+    /// lookup table the offline race needs.
+    #[serde(default)]
+    pub gateway_fallback_enabled: bool,
+
+    /// Custom gateway URL templates. Each must contain the literal
+    /// `{cid}` token. Empty Vec = use the SDK-shipped default list
+    /// of six gateways (Cloudflare, dweb.link, ipfs.io,
+    /// trustless-gateway.link, 4everland.io, gateway.pinata.cloud).
+    /// **Native-only at runtime.**
+    #[serde(default)]
+    pub gateway_fallback_urls: Vec<String>,
+
+    /// Number of gateways the SDK races in parallel. Default: 3.
+    /// **Native-only at runtime.**
+    #[serde(default = "default_gateway_race_concurrency")]
+    pub gateway_race_concurrency: u32,
+
+    // ============================================================
+    // Phase 3.3 — cold-start hybrid resolver (native-only at runtime)
+    // ============================================================
+    //
+    // The cold-start resolver itself is gated to native targets in
+    // `fula-client` (the JSON-RPC eth_call + IPNS gateway race rely
+    // on `reqwest` + `parking_lot` paths that aren't compiled on
+    // wasm32). These fields are accepted on wasm for **API symmetry**
+    // — a TS app sharing a config object across mobile + web can
+    // pass them through unconditionally; the wasm build silently
+    // disables cold-start. Apps that need offline reads on the web
+    // still get Phase 2.1 (health gate + typed `MASTER_UNREACHABLE`
+    // error); cold-start cross-device support is mobile-only today.
+
+    /// JSON-RPC URL for the chain anchor (Base or SKALE). Empty =
+    /// disabled. **Native-only at runtime.**
+    #[serde(default)]
+    pub users_index_chain_rpc_url: String,
+
+    /// `FulaUsersIndexAnchor.sol` proxy address (20 bytes hex,
+    /// optionally `0x`-prefixed). Empty = disabled. **Native-only
+    /// at runtime.**
+    #[serde(default)]
+    pub users_index_anchor_address: String,
+
+    /// IPNS NAME (libp2p public-key hash, e.g. `k51qzi5...`).
+    /// Empty = disabled. **Native-only at runtime.**
+    #[serde(default)]
+    pub users_index_ipns_name: String,
+
+    /// 32-hex-char `userKey` derived from the user's email via
+    /// [`derive_user_key_from_email`]. Empty = disabled.
+    /// **Native-only at runtime.**
+    #[serde(default)]
+    pub users_index_user_key: String,
+
+    /// IPNS-aware gateway URL templates (each must contain `{name}`).
+    /// Empty Vec = use SDK-shipped defaults. **Native-only at runtime.**
+    #[serde(default)]
+    pub users_index_ipns_gateway_urls: Vec<String>,
+
+    /// `/ipfs/{cid}` gateway URL templates (each must contain `{cid}`).
+    /// Empty Vec = use SDK-shipped 6-gateway default. **Native-only
+    /// at runtime.**
+    #[serde(default)]
+    pub users_index_ipfs_gateway_urls: Vec<String>,
 }
 
 fn default_timeout() -> u64 { 30 }
+fn default_health_gate_ttl() -> u64 { 30 }
+fn default_block_cache_max_bytes() -> u64 { 256 * 1024 * 1024 }
+fn default_gateway_race_concurrency() -> u32 { 3 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -138,13 +256,190 @@ pub struct JsSharePermissions {
 }
 
 // ============================================================================
+// Phase 19 — transparency types
+// ============================================================================
+//
+// All three are `serde`-tagged enums / structs so JS sees an idiomatic
+// shape:
+//   ReadSource:   { kind: "Master" }
+//                 { kind: "LocalCache" }
+//                 { kind: "Gateway", url: "https://ipfs.io/ipfs/{cid}" }
+//   ReadFreshness: { kind: "Live" }
+//                  { kind: "Cached", observedAt: 1234567890 }
+//                  { kind: "StaleByDesign", snapshotAgeSecs: 60 }
+//                  { kind: "StaleByOutage", snapshotAgeSecs: 7200 }
+//   MasterHealthEvent: same `kind` discriminant
+// Apps `switch` on `result.source.kind` to drive UI.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum JsReadSource {
+    Master,
+    LocalCache,
+    Gateway { url: String },
+}
+
+impl From<fula_client::ReadSource> for JsReadSource {
+    fn from(s: fula_client::ReadSource) -> Self {
+        match s {
+            fula_client::ReadSource::Master => JsReadSource::Master,
+            fula_client::ReadSource::LocalCache => JsReadSource::LocalCache,
+            fula_client::ReadSource::Gateway(url) => JsReadSource::Gateway { url },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum JsReadFreshness {
+    Live,
+    #[serde(rename_all = "camelCase")]
+    Cached { observed_at: u64 },
+    #[serde(rename_all = "camelCase")]
+    StaleByDesign { snapshot_age_secs: u64 },
+    #[serde(rename_all = "camelCase")]
+    StaleByOutage { snapshot_age_secs: u64 },
+}
+
+impl From<fula_client::ReadFreshness> for JsReadFreshness {
+    fn from(f: fula_client::ReadFreshness) -> Self {
+        match f {
+            fula_client::ReadFreshness::Live => JsReadFreshness::Live,
+            fula_client::ReadFreshness::Cached { observed_at } => {
+                JsReadFreshness::Cached { observed_at }
+            }
+            fula_client::ReadFreshness::StaleByDesign { snapshot_age_secs } => {
+                JsReadFreshness::StaleByDesign { snapshot_age_secs }
+            }
+            fula_client::ReadFreshness::StaleByOutage { snapshot_age_secs } => {
+                JsReadFreshness::StaleByOutage { snapshot_age_secs }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JsOfflineGetResult {
+    /// Object data (bytes).
+    pub data: Vec<u8>,
+    /// ETag (CID string when bytes came from gateway race / cache;
+    /// master-issued ETag when bytes came from master).
+    pub etag: String,
+    /// Content type if known (always `None` on offline-fallback paths
+    /// today; master-served reads carry the response Content-Type).
+    pub content_type: Option<String>,
+    /// Object size in bytes.
+    pub size: u64,
+    /// Last-modified timestamp (Unix epoch seconds) if master served
+    /// the bytes; 0 on offline-fallback paths.
+    pub last_modified: i64,
+    /// Where the bytes ultimately came from.
+    pub source: JsReadSource,
+    /// How fresh the bytes are.
+    pub freshness: JsReadFreshness,
+}
+
+impl From<fula_client::OfflineGetResult> for JsOfflineGetResult {
+    fn from(r: fula_client::OfflineGetResult) -> Self {
+        let inner = r.inner;
+        Self {
+            data: inner.data.to_vec(),
+            etag: inner.etag,
+            content_type: inner.content_type,
+            size: inner.content_length,
+            last_modified: inner.last_modified.map(|d| d.timestamp()).unwrap_or(0),
+            source: r.source.into(),
+            freshness: r.freshness.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum JsMasterHealthEvent {
+    Online,
+    OfflineFallbackActive { reason: String },
+    SeverelyDegraded { reason: String },
+}
+
+impl From<fula_client::MasterHealthEvent> for JsMasterHealthEvent {
+    fn from(e: fula_client::MasterHealthEvent) -> Self {
+        match e {
+            fula_client::MasterHealthEvent::Online => JsMasterHealthEvent::Online,
+            fula_client::MasterHealthEvent::OfflineFallbackActive { reason } => {
+                JsMasterHealthEvent::OfflineFallbackActive { reason }
+            }
+            fula_client::MasterHealthEvent::SeverelyDegraded { reason } => {
+                JsMasterHealthEvent::SeverelyDegraded { reason }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Client Handles (opaque types exposed to JS)
 // ============================================================================
+
+/// Phase 19 — wasm dispatcher capturing `MasterHealthEvent`
+/// transitions for polling consumers. The Rust callback set on the
+/// inner `Config::health_callback` pushes events here; JS apps drain
+/// via `pollMasterHealthEvents` or read latest via
+/// `getLastMasterHealthEvent`.
+///
+/// Buffer is bounded at 64 entries — apps that fall further behind
+/// drop the oldest events (latest state is what UI cares about).
+struct WasmHealthEventDispatcher {
+    buffer: std::sync::Mutex<std::collections::VecDeque<JsMasterHealthEvent>>,
+    last_event: std::sync::Mutex<Option<JsMasterHealthEvent>>,
+}
+
+const WASM_MAX_BUFFERED_EVENTS: usize = 64;
+
+impl WasmHealthEventDispatcher {
+    fn new() -> Self {
+        Self {
+            buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            last_event: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Called from the `health_callback` set on the inner Config.
+    /// Captures the event for both polling drain + latest-state read.
+    fn dispatch(&self, event: fula_client::MasterHealthEvent) {
+        let app_event: JsMasterHealthEvent = event.into();
+        if let Ok(mut last) = self.last_event.lock() {
+            *last = Some(app_event.clone());
+        }
+        if let Ok(mut buf) = self.buffer.lock() {
+            if buf.len() >= WASM_MAX_BUFFERED_EVENTS {
+                buf.pop_front();
+            }
+            buf.push_back(app_event);
+        }
+    }
+
+    fn drain_events(&self) -> Vec<JsMasterHealthEvent> {
+        self.buffer
+            .lock()
+            .map(|mut buf| buf.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    fn last_event(&self) -> Option<JsMasterHealthEvent> {
+        self.last_event.lock().ok().and_then(|guard| guard.clone())
+    }
+}
 
 /// Handle to an encrypted Fula client
 #[wasm_bindgen]
 pub struct EncryptedClient {
     inner: Arc<Mutex<fula_client::EncryptedClient>>,
+    /// Phase 19 — per-client health-event dispatcher. Always present
+    /// so apps can poll regardless of whether they wired
+    /// `healthGateEnabled = true`. When the gate is off, the buffer
+    /// stays empty (no events fire); polling returns `[]`.
+    health_dispatcher: Arc<WasmHealthEventDispatcher>,
 }
 
 /// Handle to an accepted share for accessing shared files
@@ -172,13 +467,11 @@ pub async fn create_encrypted_client(
     let encryption: JsEncryptionConfig = serde_wasm_bindgen::from_value(encryption)
         .map_err(|e| JsError::new(&format!("Invalid encryption config: {}", e)))?;
 
-    // Build client config
-    let mut client_config = fula_client::Config::new(&config.endpoint)
-        .with_timeout(std::time::Duration::from_secs(config.timeout_seconds));
-
-    if let Some(token) = config.access_token {
-        client_config = client_config.with_token(token);
-    }
+    // Phase 19 dispatcher — created per client so events from one
+    // EncryptedClient never leak to another's poll buffer.
+    let dispatcher = Arc::new(WasmHealthEventDispatcher::new());
+    // Build client config (callback wired to dispatcher).
+    let client_config = build_inner_config(config, &dispatcher);
 
     // Build encryption config
     let enc_config = if let Some(secret_key) = encryption.secret_key {
@@ -204,11 +497,155 @@ pub async fn create_encrypted_client(
     };
 
     let client = fula_client::EncryptedClient::new(client_config, enc_config)
-        .map_err(|e| JsError::new(&format!("Failed to create client: {}", e)))?;
+        .map_err(|e| client_error_to_js_error("create_client_failed", e))?;
 
     Ok(EncryptedClient {
         inner: Arc::new(Mutex::new(client)),
+        health_dispatcher: dispatcher,
     })
+}
+
+// ============================================================================
+// Phase 2.x helpers
+// ============================================================================
+
+/// Translate a Dart-flavoured `JsFulaConfig` into the underlying
+/// `fula_client::Config`, plumbing every Phase 1.2 / 2.x / 3.3 / 19
+/// field through. Used by every JS client constructor — adding a new
+/// field means changing this function only.
+///
+/// `dispatcher` is the per-client Phase 19 dispatcher; the callback
+/// wired into `Config::health_callback` forwards each transition to
+/// it so JS apps can poll via `pollMasterHealthEvents`.
+///
+/// Note on wasm32: the block_cache + gateway_fallback + cold-start
+/// resolver fields are silently inert at runtime (the underlying SDK
+/// gates out the redb-backed cache, parking_lot-based pool, and
+/// reqwest-based resolver). They're still plumbed through so a single
+/// shared config struct works across native + web targets.
+fn build_inner_config(
+    config: JsFulaConfig,
+    dispatcher: &Arc<WasmHealthEventDispatcher>,
+) -> fula_client::Config {
+    let mut inner = fula_client::Config::new(&config.endpoint)
+        .with_timeout(std::time::Duration::from_secs(config.timeout_seconds));
+
+    if let Some(token) = config.access_token {
+        inner = inner.with_token(token);
+    }
+
+    // Phase 2.1 — health gate (functional on wasm).
+    inner.health_gate_enabled = config.health_gate_enabled;
+    inner.health_gate_ttl =
+        std::time::Duration::from_secs(config.health_gate_ttl_seconds);
+
+    // Phase 19 — wire forwarding callback into the gate. The callback
+    // is `Arc<dyn Fn>` which lives entirely in Rust; it never crosses
+    // the wasm-bindgen boundary (the wasm boundary is between Rust
+    // and JS — the Arc<dyn Fn> stays inside Rust). HealthGate fires
+    // it from `record_success` / `record_failure` regardless of target.
+    let dispatcher_for_cb = Arc::clone(dispatcher);
+    let cb: fula_client::HealthCallback = Arc::new(move |ev| {
+        dispatcher_for_cb.dispatch(ev);
+    });
+    inner.health_callback = Some(cb);
+
+    // Phase 2.2 — block cache (native-only at runtime; plumbed for symmetry).
+    inner.block_cache_enabled = config.block_cache_enabled;
+    inner.block_cache_path = if config.block_cache_path.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(config.block_cache_path))
+    };
+    inner.block_cache_max_bytes = config.block_cache_max_bytes;
+
+    // Phase 2.3 / 2.4 — gateway race (native-only at runtime).
+    inner.gateway_fallback_enabled = config.gateway_fallback_enabled;
+    inner.gateway_fallback_urls = config.gateway_fallback_urls;
+    inner.gateway_race_concurrency = config.gateway_race_concurrency as usize;
+
+    // Phase 3.3 — cold-start hybrid resolver (native-only at runtime;
+    // plumbed for symmetry). Empty strings → resolver disabled (the
+    // four required fields are all string-empty in JsFulaConfig's
+    // Default impl-equivalent via `#[serde(default)]`).
+    inner.users_index_chain_rpc_url = config.users_index_chain_rpc_url;
+    inner.users_index_anchor_address = config.users_index_anchor_address;
+    inner.users_index_ipns_name = config.users_index_ipns_name;
+    inner.users_index_user_key = if config.users_index_user_key.is_empty() {
+        None
+    } else {
+        Some(config.users_index_user_key)
+    };
+    inner.users_index_ipns_gateway_urls = config.users_index_ipns_gateway_urls;
+    inner.users_index_ipfs_gateway_urls = config.users_index_ipfs_gateway_urls;
+
+    inner
+}
+
+/// Convert a `fula_client::ClientError` into a `JsError` whose
+/// message is a JSON object carrying a stable error `code` plus
+/// any structured fields. JS callers can `JSON.parse(err.message)`
+/// to dispatch on the code and surface it to UI logic — e.g.,
+/// "show offline indicator" on `MASTER_UNREACHABLE` rather than
+/// just a generic "download failed".
+///
+/// The set of codes is stable across native and wasm so apps can
+/// share an error-handling layer.
+fn client_error_to_js_error(operation: &str, e: fula_client::ClientError) -> JsError {
+    use fula_client::ClientError;
+
+    // Compose stable code + human-readable message.
+    let (code, structured) = match &e {
+        ClientError::MasterUnreachable { down_for_secs } => (
+            "MASTER_UNREACHABLE",
+            serde_json::json!({ "downForSecs": down_for_secs }),
+        ),
+        ClientError::BlockTooLarge { size, budget } => (
+            "BLOCK_TOO_LARGE",
+            serde_json::json!({ "size": size, "budget": budget }),
+        ),
+        ClientError::BlockCache(_) => ("BLOCK_CACHE_ERROR", serde_json::json!(null)),
+        ClientError::UsersIndexResolutionFailed { reason } => (
+            "USERS_INDEX_RESOLUTION_FAILED",
+            serde_json::json!({ "reason": reason }),
+        ),
+        ClientError::SequenceRegression { observed, highest_seen, channel } => (
+            "SEQUENCE_REGRESSION",
+            serde_json::json!({
+                "observed": observed,
+                "highestSeen": highest_seen,
+                "channel": channel,
+            }),
+        ),
+        ClientError::NotFound { bucket, key } => (
+            "NOT_FOUND",
+            serde_json::json!({ "bucket": bucket, "key": key }),
+        ),
+        ClientError::BucketNotFound(name) => (
+            "BUCKET_NOT_FOUND",
+            serde_json::json!({ "name": name }),
+        ),
+        ClientError::AccessDenied(_) => ("ACCESS_DENIED", serde_json::json!(null)),
+        ClientError::ConcurrentModification(_)
+        | ClientError::ConcurrentModificationExhausted { .. } => {
+            ("CONCURRENT_MODIFICATION", serde_json::json!(null))
+        }
+        ClientError::MigrationLockHeld { bucket, expires_at } => (
+            "MIGRATION_LOCK_HELD",
+            serde_json::json!({ "bucket": bucket, "expiresAt": expires_at }),
+        ),
+        ClientError::Encryption(_) => ("ENCRYPTION", serde_json::json!(null)),
+        ClientError::Http(_) => ("HTTP", serde_json::json!(null)),
+        _ => ("INTERNAL", serde_json::json!(null)),
+    };
+
+    let payload = serde_json::json!({
+        "code": code,
+        "operation": operation,
+        "message": e.to_string(),
+        "data": structured,
+    });
+    JsError::new(&payload.to_string())
 }
 
 // ============================================================================
@@ -270,6 +707,14 @@ pub async fn put_encrypted_with_type(
 /// @param bucket - Bucket name
 /// @param key - Original object key (path)
 /// @returns Decrypted data as Uint8Array
+///
+/// Errors surface as `JsError` whose `message` is a JSON-encoded
+/// `{ code, operation, message, data }` object — `code` is one of
+/// the stable codes documented on `client_error_to_js_error`. Apps
+/// should `JSON.parse(err.message)` to dispatch on `code` (e.g.,
+/// `"MASTER_UNREACHABLE"` is the Phase 2.1 signal that the SDK's
+/// health gate has tripped — surface an offline UI rather than a
+/// generic "download failed").
 #[wasm_bindgen(js_name = getDecrypted)]
 pub async fn get_decrypted(
     client: &EncryptedClient,
@@ -279,11 +724,13 @@ pub async fn get_decrypted(
     let guard = client.inner.lock().await;
     let data = guard.get_object_decrypted(bucket, key)
         .await
-        .map_err(|e| JsError::new(&format!("Download failed: {}", e)))?;
+        .map_err(|e| client_error_to_js_error("get_decrypted", e))?;
     Ok(data.to_vec())
 }
 
 /// Download and decrypt data by storage key
+///
+/// Same structured-error contract as `getDecrypted`.
 #[wasm_bindgen(js_name = getDecryptedByStorageKey)]
 pub async fn get_decrypted_by_storage_key(
     client: &EncryptedClient,
@@ -293,7 +740,7 @@ pub async fn get_decrypted_by_storage_key(
     let guard = client.inner.lock().await;
     let data = guard.get_object_decrypted_by_storage_key(bucket, storage_key)
         .await
-        .map_err(|e| JsError::new(&format!("Download failed: {}", e)))?;
+        .map_err(|e| client_error_to_js_error("get_decrypted_by_storage_key", e))?;
     Ok(data.to_vec())
 }
 
@@ -605,6 +1052,98 @@ pub fn is_share_valid(share: &AcceptedShare) -> bool {
 pub async fn is_flat_namespace(client: &EncryptedClient) -> bool {
     let guard = client.inner.lock().await;
     guard.is_flat_namespace()
+}
+
+// ============================================================================
+// Phase 3.3 — userKey derivation
+// ============================================================================
+
+/// Compute the canonical fula `userKey` for cold-start config from a
+/// plaintext email. Mirrors `fula_client::derive_user_key_from_email`
+/// — same domain separator + double-hash chain (sha256(lower(email))
+/// → BLAKE3("fula:user_id:" || _).bytes[..16] → hex).
+///
+/// Apps call this once at sign-in (the OAuth flow has plaintext
+/// email), then set `users_index_user_key` on the config object
+/// passed to `createEncryptedClient`. The SDK never persists or
+/// transmits the raw email.
+///
+/// On wasm32 the cold-start RESOLVER itself isn't wired (it depends
+/// on reqwest + parking_lot which aren't compiled for browsers), so
+/// this helper is exposed for API symmetry — apps can compute the
+/// userKey on web for sharing across native + web identity flows.
+#[wasm_bindgen(js_name = deriveUserKeyFromEmail)]
+pub fn derive_user_key_from_email(email: String) -> String {
+    fula_client::derive_user_key_from_email(&email)
+}
+
+// ============================================================================
+// Phase 19 — get_object_with_offline_fallback + transparency polling
+// ============================================================================
+
+/// Phase 19 GET wrapper that returns transparency fields alongside
+/// the bytes. Mirrors `fula-flutter`'s `getObjectWithOfflineFallback`.
+/// On wasm32 the offline fallback infrastructure is gated out (no
+/// block cache, no gateway race), so this delegates to the
+/// master-only `get_object_with_metadata` path; the returned shape
+/// always carries `source = Master, freshness = Live`. Exposed for
+/// API symmetry with the Flutter binding.
+///
+/// @param client - EncryptedClient (the underlying wraps a FulaClient too)
+/// @param bucket - Bucket name
+/// @param key    - Object key
+/// @returns      - JSON object matching `JsOfflineGetResult`
+///                 (`data: number[]`, `etag: string`, `source: {kind: ...}`,
+///                  `freshness: {kind: ...}`, ...)
+#[wasm_bindgen(js_name = getObjectWithOfflineFallback)]
+pub async fn get_object_with_offline_fallback(
+    client: &EncryptedClient,
+    bucket: String,
+    key: String,
+) -> Result<JsValue, JsError> {
+    let guard = client.inner.lock().await;
+    // The `EncryptedClient` doesn't expose `get_object_with_offline_fallback`
+    // directly; it's on the underlying `FulaClient`. Reach in via
+    // `inner()`.
+    let result = guard
+        .inner()
+        .get_object_with_offline_fallback(&bucket, &key)
+        .await
+        .map_err(|e| client_error_to_js_error("get_offline_fallback_failed", e))?;
+    let js_result: JsOfflineGetResult = result.into();
+    serde_wasm_bindgen::to_value(&js_result)
+        .map_err(|e| JsError::new(&format!("serialize OfflineGetResult: {}", e)))
+}
+
+/// Drain every `MasterHealthEvent` observed since the last call to
+/// this function. Returns events in the order they fired (oldest
+/// first); after draining the buffer is empty.
+///
+/// JS apps poll this on a timer (or on UI rebuilds) and update an
+/// online/offline indicator. Internal buffer bounded at 64 entries —
+/// if an app falls behind, oldest events drop first, latest state is
+/// preserved. For latest-only consumers, see `getLastMasterHealthEvent`.
+///
+/// Returned shape: `Array<{kind: 'Online'} | {kind: 'OfflineFallbackActive', reason: string} | {kind: 'SeverelyDegraded', reason: string}>`.
+#[wasm_bindgen(js_name = pollMasterHealthEvents)]
+pub fn poll_master_health_events(client: &EncryptedClient) -> Result<JsValue, JsError> {
+    let events = client.health_dispatcher.drain_events();
+    serde_wasm_bindgen::to_value(&events)
+        .map_err(|e| JsError::new(&format!("serialize health events: {}", e)))
+}
+
+/// Read the most recent `MasterHealthEvent` observed by the SDK
+/// without draining the buffer. Returns `null` if no transition has
+/// happened yet (master has been Up the whole session). Useful for
+/// apps that build UI state from a single field on mount.
+///
+/// Returned shape: same as a single element from `pollMasterHealthEvents`,
+/// or `null`.
+#[wasm_bindgen(js_name = getLastMasterHealthEvent)]
+pub fn get_last_master_health_event(client: &EncryptedClient) -> Result<JsValue, JsError> {
+    let last = client.health_dispatcher.last_event();
+    serde_wasm_bindgen::to_value(&last)
+        .map_err(|e| JsError::new(&format!("serialize last health event: {}", e)))
 }
 
 /// Get SDK version

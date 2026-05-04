@@ -37,12 +37,24 @@
 //! }
 //! ```
 
+#[cfg(not(target_arch = "wasm32"))]
+mod block_cache;
 mod client;
 mod config;
 mod encryption;
 mod error;
+#[cfg(not(target_arch = "wasm32"))]
+mod gateway_fetch;
+mod health_gate;
 mod multipart;
+#[cfg(not(target_arch = "wasm32"))]
+mod registry_resolver;
 mod types;
+/// Phase 3.3 helper module — wasm-friendly userKey derivation
+/// extracted from `registry_resolver.rs` so the wasm-bindgen
+/// binding can expose it. Source-of-truth lives here; the
+/// resolver re-exports it on native.
+mod user_key;
 #[cfg(not(target_arch = "wasm32"))]
 mod orphan_queue;
 #[cfg(not(target_arch = "wasm32"))]
@@ -71,6 +83,33 @@ pub mod test_faults {
 pub use error::{ClientError, Result};
 pub use multipart::{MultipartUpload, UploadProgress, ProgressCallback, upload_large_file, MultipartAbortGuard};
 pub use types::*;
+
+/// Phase 19 — transparency surfaces. `HealthCallback` is the closure
+/// type apps wire via `Config::with_health_callback` to observe master
+/// reachability transitions. `MasterHealthEvent` is the variant the
+/// callback receives. Re-exported here so app-level code can construct
+/// callbacks without depending on internal module paths.
+pub use health_gate::{HealthCallback, MasterHealthEvent};
+
+/// Phase 3.3 — `derive_user_key_from_email` available on EVERY
+/// target (wasm + native). Apps compute the userKey at sign-in
+/// time from the OAuth-provided email and stash it in
+/// `Config::users_index_user_key`. The same function is also
+/// re-exported via `registry_resolver` on native for backward
+/// compatibility with code that imports it from there.
+pub use user_key::derive_user_key_from_email;
+
+/// Phase 3.3 — cold-start hybrid resolver public API. Native-only;
+/// the resolver itself is gated to `cfg(not(target_arch = "wasm32"))`.
+/// `derive_user_key_from_email` is re-exported above (cross-target);
+/// callers using the `fula_client::registry_resolver::derive_user_key_from_email`
+/// path also still resolve through the in-module `pub use`.
+#[cfg(not(target_arch = "wasm32"))]
+pub use registry_resolver::{
+    decode_user_buckets_index, default_ipfs_gateway_urls, default_ipns_gateway_urls,
+    fetch_cid_via_gateways, BucketEntry, GlobalUsersIndex, ResolutionSource,
+    ResolvedUsersIndex, ResolverConfig, UserBucketsIndex, UsersIndexResolver,
+};
 
 /// Process-wide count of WAL append failures (F11).
 ///

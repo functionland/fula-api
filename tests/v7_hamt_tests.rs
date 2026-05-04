@@ -20,6 +20,17 @@ async fn spawn_server() -> String {
     config.use_memory_store = true;
     config.registry_cid_path = None;
     config.jwt_secret = Some("test-secret-v7".to_string());
+    // Bump the production-default 100 RPS keyed rate limit out of the
+    // way for tests. With auth_enabled=false every request hits the
+    // same "anonymous" bucket, and the v7 paginated test seeds 64
+    // files in a tight loop where each `put_object_flat` issues
+    // multiple requests (forest read + blob put + forest persist).
+    // 64×~3 = 192 requests in <1s easily trips the default. Matches
+    // the override already used in `tests/common/mod.rs` and
+    // `tests/f8_buffered_download_tests.rs`. The production rate-
+    // limit semantics are exercised separately in unit tests; this
+    // E2E test only cares about correctness.
+    config.rate_limit_rps = 1_000_000;
 
     let state = Arc::new(AppState::new(config.clone()).await.unwrap());
     let app = routes::create_router(state);

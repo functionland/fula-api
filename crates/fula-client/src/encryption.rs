@@ -342,12 +342,28 @@ impl BlobBackend for S3BlobBackend {
     /// 429/500/502/503/504, S3 `SlowDown`/`InternalError`/`ServiceUnavailable`)
     /// with a fixed 300 ms + 0-100 ms jitter delay, up to 4 attempts total.
     /// Non-transient errors (auth failure, NotFound, etc.) short-circuit.
+    ///
+    /// Phase 2.4: when the SDK has Phase 2.2/2.3 enabled, this dispatches
+    /// through `get_object_with_offline_fallback` so a master-down read
+    /// can transparently fall through to the public-gateway race using
+    /// the cached `(bucket, key) → cid` mapping. When the flags are off
+    /// behavior is byte-identical to pre-Phase-2.4 (single inner call,
+    /// same retry policy).
     async fn get(&self, path: &str) -> fula_crypto::Result<Vec<u8>> {
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            match self.inner.get_object(&self.bucket, path).await {
-                Ok(bytes) => return Ok(bytes.to_vec()),
+            match self
+                .inner
+                .get_object_with_offline_fallback(&self.bucket, path)
+                .await
+            {
+                // Phase 19: get_object_with_offline_fallback now returns
+                // OfflineGetResult; the bytes live on `.inner.data`. The
+                // `source` / `freshness` fields are dropped here — the
+                // crypto blob backend has no plumbing to surface them
+                // and isn't a transparency consumer.
+                Ok(result) => return Ok(result.inner.data.to_vec()),
                 Err(e)
                     if attempt < BLOB_BACKEND_MAX_ATTEMPTS
                         && crate::multipart::is_transient(&e) =>
@@ -409,12 +425,16 @@ impl BlobBackend for S3BlobBackend {
 #[async_trait::async_trait(?Send)]
 impl BlobBackend for S3BlobBackend {
     async fn get(&self, path: &str) -> fula_crypto::Result<Vec<u8>> {
-        let bytes = self
+        // wasm32 has no offline fallback infrastructure (block_cache +
+        // gateway_fetch are gated out). The wrapper is a thin delegate
+        // here so the call site stays identical across targets.
+        let result = self
             .inner
-            .get_object(&self.bucket, path)
+            .get_object_with_offline_fallback(&self.bucket, path)
             .await
             .map_err(client_err_to_crypto)?;
-        Ok(bytes.to_vec())
+        // Phase 19: result is an OfflineGetResult; bytes are on .inner.data.
+        Ok(result.inner.data.to_vec())
     }
 
     async fn put(&self, path: &str, bytes: Vec<u8>) -> fula_crypto::Result<()> {
@@ -2230,8 +2250,23 @@ impl EncryptedClient {
         let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
         let index_key = derive_index_key(&forest_dek, bucket);
 
-        // Try to load from storage
-        match self.inner.get_object_with_metadata(bucket, &index_key).await {
+        // Try to load from storage. Phase 2.4: route through the
+        // offline-fallback wrapper so a master-down read can transparently
+        // fall through to the gateway race using the cached
+        // `(bucket, index_key) → cid` mapping. Phase 3.3 layers cold-start
+        // escalation on top: when the offline-fallback returns
+        // `MasterUnreachable` (master down AND KEY_TO_CID miss for a
+        // fresh device that's never read this manifest before) AND the
+        // resolver is configured, escalate to the IPNS+chain hybrid
+        // resolver to fetch the manifest CID and its bytes via the
+        // public network. Wrapper synthesizes `etag = cid.to_string()`
+        // on the gateway-fetched / cold-start paths so the existing
+        // forest-format detector + sequence-replay guard handle the
+        // result identically (master also uses cid.to_string() as ETag).
+        match self
+            .fetch_manifest_with_cold_start_escalation(bucket, &index_key)
+            .await
+        {
             Ok(result) => {
                 let observed_etag = if result.etag.is_empty() { None } else { Some(result.etag.clone()) };
                 // Capture cache generation before dispatch so we can detect cross-format
@@ -2902,6 +2937,296 @@ impl EncryptedClient {
         Ok(())
     }
 
+    /// Phase 1.2 of master-independent reads: compute the blinded bucket
+    /// lookup key as hex for the `x-amz-meta-fula-bucket-lookup-h` header.
+    ///
+    /// `bucket_lookup_h = BLAKE3(MetadataKey || bucket_name)[..16]`, where
+    /// `MetadataKey = derive_path_key("fula-metadata-v1")`. Hex-encoded
+    /// (32 chars). The 16-byte truncation matches master's `hashed_user_id`
+    /// convention. Master never sees `MetadataKey`.
+    ///
+    /// Attached on every manifest root commit (sharded v7, monolithic v4,
+    /// and the v1→v7 migration path) so master's put_object handler can
+    /// populate `BucketMetadata.bucket_lookup_h` regardless of which forest
+    /// format the SDK is using. Idempotent on master's side.
+    fn compute_bucket_lookup_h_hex(&self, bucket: &str) -> String {
+        let metadata_key = self.encryption.key_manager.derive_path_key("fula-metadata-v1");
+        let mut input = metadata_key.as_bytes().to_vec();
+        input.extend_from_slice(bucket.as_bytes());
+        let hash = blake3::hash(&input);
+        hex::encode(&hash.as_bytes()[..16])
+    }
+
+    /// Phase 3.3 escalation seam — fetch a manifest via the
+    /// offline-fallback wrapper, escalating to cold-start on
+    /// `MasterUnreachable` when the resolver is configured.
+    ///
+    /// Behavior:
+    ///
+    /// | State                                                                  | Result                                            |
+    /// |------------------------------------------------------------------------|---------------------------------------------------|
+    /// | Master up                                                              | normal path through `get_object_with_offline_fallback` |
+    /// | Master down + KEY_TO_CID hit (warm device)                             | gateway race serves bytes (Phase 2.4)             |
+    /// | Master down + KEY_TO_CID miss + resolver enabled (cold device)         | escalates to `cold_start_resolve_manifest`; populates KEY_TO_CID for next warm-cache read |
+    /// | Master down + KEY_TO_CID miss + resolver NOT enabled                   | propagates `MasterUnreachable`                    |
+    ///
+    /// On the cold-start path the synthesized result carries
+    /// `etag = manifest_cid.to_string()` so the existing forest-
+    /// format detector + sequence-replay guard handle the bytes
+    /// identically to a master-served fetch (master also uses
+    /// `cid.to_string()` as the ETag — see `fula-cli/src/handlers/object.rs:103-105`).
+    ///
+    /// Native-only: the cold-start resolver is gated to
+    /// `cfg(not(target_arch = "wasm32"))`. On wasm this method
+    /// degrades to the underlying `get_object_with_offline_fallback`
+    /// (which itself degrades to `get_object_with_metadata`).
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn fetch_manifest_with_cold_start_escalation(
+        &self,
+        bucket: &str,
+        index_key: &str,
+    ) -> Result<GetObjectResult> {
+        match self
+            .inner
+            .get_object_with_offline_fallback(bucket, index_key)
+            .await
+        {
+            // Happy path: master up OR warm-cache hit. Phase 19 wraps
+            // the result in OfflineGetResult; this internal cold-start
+            // path doesn't surface source/freshness to callers, so
+            // unwrap the inner GetObjectResult and propagate.
+            Ok(r) => Ok(r.inner),
+
+            // Master-down + cache miss → try cold-start if resolver is
+            // configured. Identifying which "MasterUnreachable" case
+            // this is doesn't matter — both are "we don't know the
+            // CID locally, fetch from the public network".
+            Err(e) if matches!(e, ClientError::MasterUnreachable { .. }) => {
+                // Resolver-enabled? If not, propagate the original.
+                if self.inner.users_index_resolver().is_none() {
+                    return Err(e);
+                }
+                // Run the cold-start chain.
+                let (manifest_cid, manifest_bytes) =
+                    self.cold_start_resolve_manifest(bucket).await?;
+
+                // Best-effort: populate KEY_TO_CID so the next read
+                // of this manifest (which IS predictable — the
+                // index_key is deterministic from forest_dek) lands
+                // in the warm-device fast path. Failure is fine; we
+                // already have the bytes for THIS read.
+                if let Some(cache) = self.inner.block_cache() {
+                    if let Err(e) = cache.record_key_cid(bucket, index_key, &manifest_cid) {
+                        tracing::debug!(
+                            error = %e,
+                            "cold-start: KEY_TO_CID populate failed (best-effort)"
+                        );
+                    }
+                    // Also seed the BLOCKS cache with the manifest
+                    // bytes — saves the gateway race on the next read
+                    // of this same manifest.
+                    if let Err(e) = cache.put(&manifest_cid, &manifest_bytes).await {
+                        tracing::debug!(
+                            error = %e,
+                            "cold-start: BLOCKS put failed (best-effort)"
+                        );
+                    }
+                }
+
+                Ok(GetObjectResult {
+                    content_length: manifest_bytes.len() as u64,
+                    data: manifest_bytes,
+                    etag: manifest_cid.to_string(),
+                    content_type: None,
+                    last_modified: None,
+                    metadata: std::collections::HashMap::new(),
+                })
+            }
+
+            // Any other error (Http, S3 4xx, encryption, etc.) —
+            // not a master-down condition. Propagate unchanged.
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Wasm fallback: cold-start is native-only, so on wasm we just
+    /// delegate to the existing wrapper. The native and wasm signatures
+    /// are kept identical so call sites don't need cfg gates of their
+    /// own.
+    #[cfg(target_arch = "wasm32")]
+    async fn fetch_manifest_with_cold_start_escalation(
+        &self,
+        bucket: &str,
+        index_key: &str,
+    ) -> Result<GetObjectResult> {
+        // Phase 19: extract `.inner` since get_object_with_offline_fallback
+        // now returns OfflineGetResult on every target.
+        self.inner
+            .get_object_with_offline_fallback(bucket, index_key)
+            .await
+            .map(|r| r.inner)
+    }
+
+    /// Phase 3.3 — cold-start resolution of a bucket's forest manifest
+    /// via the hybrid IPNS+chain resolver.
+    ///
+    /// Invoked from the offline-fallback path (see
+    /// `load_forest_internal`) when the local `KEY_TO_CID` cache
+    /// has no entry for the manifest's storage key AND the resolver
+    /// is configured. Walks the published chain:
+    ///
+    /// 1. Resolver returns the global `users` map (IPNS or chain).
+    /// 2. Look up the configured `userKey` → per-user
+    ///    `bucketsIndexCid`.
+    /// 3. Fetch the bucketsIndex CBOR via gateway race + verify.
+    /// 4. Compute `bucketLookupH = BLAKE3(MetadataKey || bucket)`;
+    ///    fall back to the legacy plaintext-name entry if the
+    ///    blinded key is absent (Phase 1.2 transition path).
+    /// 5. Fetch the manifest's CBOR-pinned-bytes via gateway race
+    ///    + verify.
+    ///
+    /// Returns `(manifest_cid, manifest_bytes)` so the caller writes
+    /// the bytes into the existing forest-format-detect / decrypt
+    /// pipeline without a second network round-trip — saves 5–30 s
+    /// on the first cold-start read. Caller is also responsible for
+    /// writing `(bucket, index_key) → manifest_cid` into KEY_TO_CID
+    /// so subsequent warm-device reads short-circuit.
+    ///
+    /// **Bounded semantics.** Phase 3.3 makes the *manifest* CID
+    /// reachable on a fresh device + master-down. It does **not**
+    /// fix chunk-level fetches in true cold-start (the chunk's
+    /// CID isn't derivable from its storage key without a master
+    /// ping). The user can read manifests, list directories, and
+    /// re-fetch any object whose chunks the warm-cache previously
+    /// observed; never-read-before objects still require master to
+    /// come back briefly. Phase 19+ may close that gap (e.g., by
+    /// embedding chunk CIDs in the forest manifest).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn cold_start_resolve_manifest(
+        &self,
+        bucket: &str,
+    ) -> Result<(cid::Cid, bytes::Bytes)> {
+        // 1. Resolver must be configured + user_key set. Both are
+        //    deferred to construction time, so absence here means
+        //    the operator has the resolver enabled but missed one of
+        //    the four required Config fields.
+        let resolver = self
+            .inner
+            .users_index_resolver()
+            .ok_or_else(|| ClientError::UsersIndexResolutionFailed {
+                reason: "cold-start resolver not configured (Config requires all four fields: \
+                         users_index_chain_rpc_url, users_index_anchor_address, \
+                         users_index_ipns_name, users_index_user_key)".into(),
+            })?
+            .clone();
+        let user_key = self
+            .inner
+            .config()
+            .users_index_user_key
+            .clone()
+            .ok_or_else(|| ClientError::UsersIndexResolutionFailed {
+                reason: "users_index_user_key is not set; compute it via derive_user_key_from_email at sign-in".into(),
+            })?;
+
+        // 2. Resolve the global users-index. Internal replay defense
+        //    in the resolver bumps the seen-sequence floor.
+        //
+        //    Phase 19: when both IPNS and chain paths fail, the
+        //    resolver returns `UsersIndexResolutionFailed`. Fire
+        //    `SeverelyDegraded` (master + cold-start network both
+        //    unreachable) before propagating so apps can disable
+        //    "open new bucket" / "first-read" UI affordances. This
+        //    is the ONLY emission point for `SeverelyDegraded` —
+        //    the health gate alone can't authoritatively detect
+        //    "both down" without trying.
+        let resolved = match resolver.resolve().await {
+            Ok(r) => r,
+            Err(e) => {
+                if matches!(e, ClientError::UsersIndexResolutionFailed { .. }) {
+                    self.inner.fire_health_event(
+                        crate::health_gate::MasterHealthEvent::SeverelyDegraded {
+                            reason: format!("cold-start resolver exhausted: {}", e),
+                        },
+                    );
+                }
+                return Err(e);
+            }
+        };
+
+        // 3. Look up our user_key in the global map.
+        let buckets_index_cid_str = resolved
+            .payload
+            .users
+            .get(&user_key)
+            .cloned()
+            .ok_or_else(|| ClientError::UsersIndexResolutionFailed {
+                reason: format!(
+                    "userKey {} not present in published global users-index (size={}); user has not written yet",
+                    user_key,
+                    resolved.payload.users.len(),
+                ),
+            })?;
+        let buckets_index_cid = buckets_index_cid_str.parse::<cid::Cid>().map_err(|e| {
+            ClientError::UsersIndexResolutionFailed {
+                reason: format!("invalid bucketsIndex CID '{}': {}", buckets_index_cid_str, e),
+            }
+        })?;
+
+        // 4. Fetch + verify + parse bucketsIndex CBOR.
+        let gateways = resolver.ipfs_gateways();
+        let bi_bytes = crate::registry_resolver::fetch_cid_via_gateways(
+            &buckets_index_cid,
+            &gateways,
+            resolver.http_client(),
+            resolver.per_request_timeout(),
+        )
+        .await?;
+        let buckets_index = crate::registry_resolver::decode_user_buckets_index(&bi_bytes)?;
+
+        // 5. Resolve the requested bucket. Try the blinded key
+        //    first (Phase 1.2 migrated state); fall back to the
+        //    plaintext bucket name for legacy entries (the user
+        //    hasn't yet uploaded with a Phase-1.2-aware client
+        //    since the field landed). The legacy fallback only
+        //    accepts entries explicitly marked `legacy = true`,
+        //    closing the loophole where a malicious gateway could
+        //    plant a stronger-looking plaintext-name entry next to
+        //    a real blinded one.
+        let blinded = self.compute_bucket_lookup_h_hex(bucket);
+        let entry = if let Some(e) = buckets_index.buckets.get(&blinded) {
+            e.clone()
+        } else if let Some(e) = buckets_index.buckets.get(bucket) {
+            if !e.legacy {
+                return Err(ClientError::UsersIndexResolutionFailed {
+                    reason: format!(
+                        "bucket {:?} present at plaintext key but legacy=false; refusing as ambiguous",
+                        bucket
+                    ),
+                });
+            }
+            e.clone()
+        } else {
+            return Err(ClientError::BucketNotFound(bucket.to_string()));
+        };
+
+        let manifest_cid = entry.manifest.parse::<cid::Cid>().map_err(|e| {
+            ClientError::UsersIndexResolutionFailed {
+                reason: format!("invalid manifest CID '{}' for bucket {}: {}", entry.manifest, bucket, e),
+            }
+        })?;
+
+        // 6. Fetch + verify manifest bytes.
+        let manifest_bytes = crate::registry_resolver::fetch_cid_via_gateways(
+            &manifest_cid,
+            &gateways,
+            resolver.http_client(),
+            resolver.per_request_timeout(),
+        )
+        .await?;
+
+        Ok((manifest_cid, manifest_bytes))
+    }
+
     /// Save the private forest index for a bucket (monolithic v4 format with AAD+sequence)
     pub async fn save_forest(&self, bucket: &str, forest: &PrivateForest) -> Result<()> {
         let forest_dek = self.encryption.key_manager.derive_path_key(&format!("forest:{}", bucket));
@@ -2924,8 +3249,11 @@ impl EncryptedClient {
         let data = encrypted.to_bytes()
             .map_err(ClientError::Encryption)?;
 
+        // Phase 1.2: monolithic v4 forest is also a manifest-root commit.
+        // Same header semantics as save_sharded_hamt_forest's Phase 2 PUT.
         let metadata = ObjectMetadata::new()
-            .with_content_type("application/octet-stream");
+            .with_content_type("application/octet-stream")
+            .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket));
 
         let put_result = self.inner.put_object_with_metadata_conditional(
             bucket,
@@ -3237,8 +3565,11 @@ impl EncryptedClient {
         let data = encrypted_manifest.to_bytes()
             .map_err(ClientError::Encryption)?;
 
+        // Phase 1.2: sharded HAMT v7 manifest root commit. See
+        // compute_bucket_lookup_h_hex for header semantics.
         let metadata = ObjectMetadata::new()
-            .with_content_type("application/octet-stream");
+            .with_content_type("application/octet-stream")
+            .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket));
 
         let put_result = self.inner.put_object_with_metadata_conditional(
             bucket,
@@ -3956,11 +4287,20 @@ impl EncryptedClient {
         // our HEAD (or GET) and this PUT loses the race — we defer and retry
         // next session. Crucial because the in-process `migration_lock.write()`
         // is NOT held during load-time-triggered migration.
+        //
+        // Phase 1.2: v1→v7 migration is a manifest-root commit. Attach the
+        // bucket-lookup-h header so master can populate `bucket_lookup_h`
+        // here too — otherwise users who migrate to v7 via this path (rather
+        // than save_sharded_hamt_forest) would never get their lookup_h set.
         let put_result = match self.inner.put_object_with_metadata_conditional(
             bucket,
             &index_key,
             Bytes::from(manifest_data),
-            Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
+            Some(
+                ObjectMetadata::new()
+                    .with_content_type("application/octet-stream")
+                    .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket)),
+            ),
             Some(&v1_etag),
             None,
         ).await {
@@ -7940,5 +8280,567 @@ mod tests {
             writer.is_empty(),
             "writer must not be touched when the size guard rejects the manifest"
         );
+    }
+
+    // ============================================================
+    // Phase 3.3 — cold-start integration tests
+    // ============================================================
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod cold_start_phase_3_3 {
+        use super::*;
+        use crate::registry_resolver::{
+            derive_user_key_from_email, BucketEntry, GlobalUsersIndex, UserBucketsIndex,
+        };
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Compute a CIDv1 (codec=dag-cbor 0x71, multihash=sha2-256
+        /// 0x12) from arbitrary bytes — the format master uses for
+        /// dag-cbor IPLD objects (production master's
+        /// `serde_ipld_dagcbor::to_vec → kubo /api/v0/dag/put`
+        /// produces this shape).
+        fn cid_for_dag_cbor_bytes(data: &[u8]) -> cid::Cid {
+            let digest = Sha256::digest(data);
+            let mh = cid::multihash::Multihash::<64>::wrap(0x12, &digest).unwrap();
+            cid::Cid::new_v1(0x71, mh)
+        }
+
+        /// Cold-start happy path against fully-mocked IPNS + IPFS
+        /// gateways. Asserts:
+        ///   - resolver fetches global users-index via IPNS gateway
+        ///   - cold-start looks up our `userKey` → bucketsIndexCid
+        ///   - bucketsIndex CBOR is fetched + verified
+        ///   - blinded `bucketLookupH` lookup succeeds
+        ///   - manifest bytes are returned
+        ///   - returned `Cid` matches what the gateway served
+        ///   - returned `Bytes` are byte-identical to the staged
+        ///     manifest payload
+        ///   - resolver advanced its highest-seen-sequence floor
+        #[tokio::test]
+        async fn cold_start_resolve_manifest_happy_path_via_ipns() {
+            let ipns = MockServer::start().await;
+            let ipfs = MockServer::start().await;
+            let chain_rpc = MockServer::start().await;
+
+            let email = "alice@example.com";
+            let user_key = derive_user_key_from_email(email);
+
+            let bucket = "photos";
+            let manifest_payload =
+                b"placeholder forest-manifest bytes for the cold-start test".to_vec();
+            let manifest_cid = cid_for_dag_cbor_bytes(&manifest_payload);
+
+            let secret = fula_crypto::SecretKey::generate();
+            let enc_cfg = EncryptionConfig::from_secret_key(secret);
+            let metadata_key = enc_cfg.key_manager.derive_path_key("fula-metadata-v1");
+            let mut h_input = metadata_key.as_bytes().to_vec();
+            h_input.extend_from_slice(bucket.as_bytes());
+            let blinded_hex = hex::encode(&blake3::hash(&h_input).as_bytes()[..16]);
+
+            let mut buckets = BTreeMap::new();
+            buckets.insert(
+                blinded_hex,
+                BucketEntry {
+                    manifest: manifest_cid.to_string(),
+                    legacy: false,
+                },
+            );
+            let user_buckets = UserBucketsIndex {
+                v: 2,
+                buckets,
+                updated_at_unix: 1_700_000_000,
+            };
+            let user_buckets_cbor = serde_ipld_dagcbor::to_vec(&user_buckets).expect("ubi");
+            let buckets_index_cid = cid_for_dag_cbor_bytes(&user_buckets_cbor);
+
+            let mut users_map = BTreeMap::new();
+            users_map.insert(user_key.clone(), buckets_index_cid.to_string());
+            let global = GlobalUsersIndex {
+                v: 1,
+                sequence: 42,
+                updated_at_unix: 1_700_000_001,
+                users: users_map,
+            };
+            let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
+
+            let ipns_name = "k51qzi5uqu5dh-cold-start-test".to_string();
+            Mock::given(method("GET"))
+                .and(path(format!("/ipns/{}", ipns_name)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(global_cbor))
+                .mount(&ipns)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/ipfs/{}", buckets_index_cid)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(user_buckets_cbor))
+                .mount(&ipfs)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/ipfs/{}", manifest_cid)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(manifest_payload.clone()))
+                .mount(&ipfs)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&chain_rpc)
+                .await;
+
+            let mut client_cfg = Config::new("http://master.unreachable.invalid");
+            client_cfg.timeout = std::time::Duration::from_secs(2);
+            client_cfg.users_index_chain_rpc_url = chain_rpc.uri();
+            client_cfg.users_index_anchor_address =
+                "0x0000000000000000000000000000000000000001".into();
+            client_cfg.users_index_ipns_name = ipns_name;
+            client_cfg.users_index_user_key = Some(user_key);
+            client_cfg.users_index_ipns_gateway_urls =
+                vec![format!("{}/ipns/{{name}}", ipns.uri())];
+            client_cfg.users_index_ipfs_gateway_urls =
+                vec![format!("{}/ipfs/{{cid}}", ipfs.uri())];
+            client_cfg.block_cache_enabled = false;
+
+            let client = EncryptedClient::new(client_cfg, enc_cfg).expect("client");
+            let (got_cid, got_bytes) = client
+                .cold_start_resolve_manifest(bucket)
+                .await
+                .expect("cold-start resolves");
+
+            assert_eq!(got_cid, manifest_cid, "returned CID matches manifest");
+            assert_eq!(
+                got_bytes.as_ref(),
+                manifest_payload.as_slice(),
+                "returned bytes match staged manifest"
+            );
+
+            let resolver = client
+                .inner
+                .users_index_resolver()
+                .expect("resolver configured")
+                .clone();
+            assert_eq!(
+                resolver.highest_seen_sequence(),
+                42,
+                "resolver bumped sequence floor on success"
+            );
+        }
+
+        /// Typed error when the configured `userKey` isn't present
+        /// in the resolved global users-index.
+        #[tokio::test]
+        async fn cold_start_user_absent_in_global_returns_typed_error() {
+            let ipns = MockServer::start().await;
+            let chain_rpc = MockServer::start().await;
+
+            let our_user_key = derive_user_key_from_email("alice@example.com");
+            let other_user_key = derive_user_key_from_email("bob@example.com");
+
+            let mut users_map = BTreeMap::new();
+            users_map.insert(other_user_key, "bafyabcdef".to_string());
+            let global = GlobalUsersIndex {
+                v: 1,
+                sequence: 5,
+                updated_at_unix: 1_700_000_000,
+                users: users_map,
+            };
+            let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
+
+            let ipns_name = "k51qzi5uqu5dh-no-alice".to_string();
+            Mock::given(method("GET"))
+                .and(path(format!("/ipns/{}", ipns_name)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(global_cbor))
+                .mount(&ipns)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&chain_rpc)
+                .await;
+
+            let secret = fula_crypto::SecretKey::generate();
+            let enc_cfg = EncryptionConfig::from_secret_key(secret);
+
+            let mut client_cfg = Config::new("http://master.unreachable.invalid");
+            client_cfg.timeout = std::time::Duration::from_secs(2);
+            client_cfg.users_index_chain_rpc_url = chain_rpc.uri();
+            client_cfg.users_index_anchor_address =
+                "0x0000000000000000000000000000000000000001".into();
+            client_cfg.users_index_ipns_name = ipns_name;
+            client_cfg.users_index_user_key = Some(our_user_key.clone());
+            client_cfg.users_index_ipns_gateway_urls =
+                vec![format!("{}/ipns/{{name}}", ipns.uri())];
+
+            let client = EncryptedClient::new(client_cfg, enc_cfg).expect("client");
+            let err = client
+                .cold_start_resolve_manifest("photos")
+                .await
+                .expect_err("user absent");
+            match err {
+                ClientError::UsersIndexResolutionFailed { reason } => {
+                    assert!(
+                        reason.contains(&our_user_key),
+                        "expected reason to reference missing userKey, got: {}",
+                        reason
+                    );
+                }
+                other => panic!("expected UsersIndexResolutionFailed, got: {:?}", other),
+            }
+        }
+
+        /// Phase 1.2 lazy-migration: legacy plaintext-keyed entry
+        /// with `legacy = true` is the fallback when the blinded
+        /// entry is absent. SDK accepts it.
+        #[tokio::test]
+        async fn cold_start_legacy_plaintext_fallback() {
+            let ipns = MockServer::start().await;
+            let ipfs = MockServer::start().await;
+            let chain_rpc = MockServer::start().await;
+
+            let user_key = derive_user_key_from_email("legacy@example.com");
+            let bucket = "old-photos";
+            let manifest_payload = b"legacy manifest".to_vec();
+            let manifest_cid = cid_for_dag_cbor_bytes(&manifest_payload);
+
+            let mut buckets = BTreeMap::new();
+            buckets.insert(
+                bucket.to_string(),
+                BucketEntry {
+                    manifest: manifest_cid.to_string(),
+                    legacy: true,
+                },
+            );
+            let user_buckets = UserBucketsIndex {
+                v: 2,
+                buckets,
+                updated_at_unix: 0,
+            };
+            let user_buckets_cbor = serde_ipld_dagcbor::to_vec(&user_buckets).expect("ubi");
+            let buckets_index_cid = cid_for_dag_cbor_bytes(&user_buckets_cbor);
+
+            let mut users_map = BTreeMap::new();
+            users_map.insert(user_key.clone(), buckets_index_cid.to_string());
+            let global = GlobalUsersIndex {
+                v: 1,
+                sequence: 1,
+                updated_at_unix: 0,
+                users: users_map,
+            };
+            let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
+
+            let ipns_name = "k51qzi5uqu5dh-legacy".to_string();
+            Mock::given(method("GET"))
+                .and(path(format!("/ipns/{}", ipns_name)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(global_cbor))
+                .mount(&ipns)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/ipfs/{}", buckets_index_cid)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(user_buckets_cbor))
+                .mount(&ipfs)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/ipfs/{}", manifest_cid)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(manifest_payload.clone()))
+                .mount(&ipfs)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&chain_rpc)
+                .await;
+
+            let secret = fula_crypto::SecretKey::generate();
+            let enc_cfg = EncryptionConfig::from_secret_key(secret);
+
+            let mut client_cfg = Config::new("http://master.unreachable.invalid");
+            client_cfg.timeout = std::time::Duration::from_secs(2);
+            client_cfg.users_index_chain_rpc_url = chain_rpc.uri();
+            client_cfg.users_index_anchor_address =
+                "0x0000000000000000000000000000000000000001".into();
+            client_cfg.users_index_ipns_name = ipns_name;
+            client_cfg.users_index_user_key = Some(user_key);
+            client_cfg.users_index_ipns_gateway_urls =
+                vec![format!("{}/ipns/{{name}}", ipns.uri())];
+            client_cfg.users_index_ipfs_gateway_urls =
+                vec![format!("{}/ipfs/{{cid}}", ipfs.uri())];
+
+            let client = EncryptedClient::new(client_cfg, enc_cfg).expect("client");
+            let (got_cid, got_bytes) = client
+                .cold_start_resolve_manifest(bucket)
+                .await
+                .expect("legacy fallback resolves");
+            assert_eq!(got_cid, manifest_cid);
+            assert_eq!(got_bytes.as_ref(), manifest_payload.as_slice());
+        }
+
+        /// Defense: a plaintext-keyed entry without `legacy = true`
+        /// is rejected. Closes the loophole where a malicious
+        /// gateway plants a stronger-looking plaintext-named entry
+        /// next to the real blinded one to trick the SDK.
+        #[tokio::test]
+        async fn cold_start_rejects_plaintext_entry_without_legacy_flag() {
+            let ipns = MockServer::start().await;
+            let ipfs = MockServer::start().await;
+            let chain_rpc = MockServer::start().await;
+
+            let user_key = derive_user_key_from_email("strict@example.com");
+            let bucket = "test";
+
+            let bogus_cid = cid_for_dag_cbor_bytes(b"forged manifest");
+            let mut buckets = BTreeMap::new();
+            buckets.insert(
+                bucket.to_string(),
+                BucketEntry {
+                    manifest: bogus_cid.to_string(),
+                    legacy: false,
+                },
+            );
+            let user_buckets = UserBucketsIndex {
+                v: 2,
+                buckets,
+                updated_at_unix: 0,
+            };
+            let user_buckets_cbor = serde_ipld_dagcbor::to_vec(&user_buckets).expect("ubi");
+            let buckets_index_cid = cid_for_dag_cbor_bytes(&user_buckets_cbor);
+
+            let mut users_map = BTreeMap::new();
+            users_map.insert(user_key.clone(), buckets_index_cid.to_string());
+            let global = GlobalUsersIndex {
+                v: 1,
+                sequence: 1,
+                updated_at_unix: 0,
+                users: users_map,
+            };
+            let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
+
+            let ipns_name = "k51qzi5uqu5dh-strict".to_string();
+            Mock::given(method("GET"))
+                .and(path(format!("/ipns/{}", ipns_name)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(global_cbor))
+                .mount(&ipns)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/ipfs/{}", buckets_index_cid)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(user_buckets_cbor))
+                .mount(&ipfs)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&chain_rpc)
+                .await;
+
+            let secret = fula_crypto::SecretKey::generate();
+            let enc_cfg = EncryptionConfig::from_secret_key(secret);
+
+            let mut client_cfg = Config::new("http://master.unreachable.invalid");
+            client_cfg.timeout = std::time::Duration::from_secs(2);
+            client_cfg.users_index_chain_rpc_url = chain_rpc.uri();
+            client_cfg.users_index_anchor_address =
+                "0x0000000000000000000000000000000000000001".into();
+            client_cfg.users_index_ipns_name = ipns_name;
+            client_cfg.users_index_user_key = Some(user_key);
+            client_cfg.users_index_ipns_gateway_urls =
+                vec![format!("{}/ipns/{{name}}", ipns.uri())];
+            client_cfg.users_index_ipfs_gateway_urls =
+                vec![format!("{}/ipfs/{{cid}}", ipfs.uri())];
+
+            let client = EncryptedClient::new(client_cfg, enc_cfg).expect("client");
+            let err = client
+                .cold_start_resolve_manifest(bucket)
+                .await
+                .expect_err("must reject");
+            match err {
+                ClientError::UsersIndexResolutionFailed { reason } => {
+                    assert!(
+                        reason.contains("legacy=false"),
+                        "expected legacy-flag rejection, got: {}",
+                        reason
+                    );
+                }
+                other => panic!("expected UsersIndexResolutionFailed, got: {:?}", other),
+            }
+        }
+
+        /// `BucketNotFound` (not a new variant) when bucket is
+        /// absent from the user's bucketsIndex. Reuses the
+        /// established error type per advisor's narrowing.
+        #[tokio::test]
+        async fn cold_start_returns_bucket_not_found_when_bucket_absent() {
+            let ipns = MockServer::start().await;
+            let ipfs = MockServer::start().await;
+            let chain_rpc = MockServer::start().await;
+
+            let user_key = derive_user_key_from_email("user@example.com");
+            let manifest_cid = cid_for_dag_cbor_bytes(b"some manifest");
+            let mut buckets = BTreeMap::new();
+            buckets.insert(
+                "videos".to_string(),
+                BucketEntry {
+                    manifest: manifest_cid.to_string(),
+                    legacy: true,
+                },
+            );
+            let user_buckets = UserBucketsIndex {
+                v: 2,
+                buckets,
+                updated_at_unix: 0,
+            };
+            let user_buckets_cbor = serde_ipld_dagcbor::to_vec(&user_buckets).expect("ubi");
+            let buckets_index_cid = cid_for_dag_cbor_bytes(&user_buckets_cbor);
+
+            let mut users_map = BTreeMap::new();
+            users_map.insert(user_key.clone(), buckets_index_cid.to_string());
+            let global = GlobalUsersIndex {
+                v: 1,
+                sequence: 1,
+                updated_at_unix: 0,
+                users: users_map,
+            };
+            let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
+
+            let ipns_name = "k51qzi5uqu5dh-only-videos".to_string();
+            Mock::given(method("GET"))
+                .and(path(format!("/ipns/{}", ipns_name)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(global_cbor))
+                .mount(&ipns)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/ipfs/{}", buckets_index_cid)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(user_buckets_cbor))
+                .mount(&ipfs)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&chain_rpc)
+                .await;
+
+            let secret = fula_crypto::SecretKey::generate();
+            let enc_cfg = EncryptionConfig::from_secret_key(secret);
+
+            let mut client_cfg = Config::new("http://master.unreachable.invalid");
+            client_cfg.timeout = std::time::Duration::from_secs(2);
+            client_cfg.users_index_chain_rpc_url = chain_rpc.uri();
+            client_cfg.users_index_anchor_address =
+                "0x0000000000000000000000000000000000000001".into();
+            client_cfg.users_index_ipns_name = ipns_name;
+            client_cfg.users_index_user_key = Some(user_key);
+            client_cfg.users_index_ipns_gateway_urls =
+                vec![format!("{}/ipns/{{name}}", ipns.uri())];
+            client_cfg.users_index_ipfs_gateway_urls =
+                vec![format!("{}/ipfs/{{cid}}", ipfs.uri())];
+
+            let client = EncryptedClient::new(client_cfg, enc_cfg).expect("client");
+            let err = client
+                .cold_start_resolve_manifest("photos")
+                .await
+                .expect_err("bucket missing");
+            match err {
+                ClientError::BucketNotFound(name) => assert_eq!(name, "photos"),
+                other => panic!("expected BucketNotFound, got: {:?}", other),
+            }
+        }
+
+        /// Fail-closed when the resolver isn't configured.
+        /// `UsersIndexResolutionFailed` distinguishes "operator
+        /// misconfig" from "everything is down".
+        #[tokio::test]
+        async fn cold_start_without_resolver_returns_resolution_failed() {
+            let secret = fula_crypto::SecretKey::generate();
+            let enc_cfg = EncryptionConfig::from_secret_key(secret);
+
+            let mut client_cfg = Config::new("http://master.unreachable.invalid");
+            client_cfg.timeout = std::time::Duration::from_secs(2);
+            // No resolver fields populated → resolver stays None
+            // (field-presence model). Same effect as the old `=
+            // false` flag.
+            let client = EncryptedClient::new(client_cfg, enc_cfg).expect("client");
+            let err = client
+                .cold_start_resolve_manifest("any")
+                .await
+                .expect_err("not configured");
+            assert!(
+                matches!(err, ClientError::UsersIndexResolutionFailed { .. }),
+                "expected UsersIndexResolutionFailed, got: {:?}",
+                err
+            );
+        }
+
+        /// Phase 19 — when both IPNS and chain channels fail, the
+        /// resolver returns `UsersIndexResolutionFailed`. The
+        /// cold-start path MUST fire `MasterHealthEvent::SeverelyDegraded`
+        /// through the configured callback so apps can disable
+        /// "first-read" UI affordances.
+        #[tokio::test]
+        async fn cold_start_fires_severely_degraded_when_both_channels_fail() {
+            use crate::health_gate::{HealthCallback, MasterHealthEvent};
+
+            // IPNS: 503 on every request → resolver IPNS path fails.
+            let ipns = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&ipns)
+                .await;
+            // Chain RPC: 503 on every request → resolver chain path
+            // fails too. Both channels exhausted → resolver surfaces
+            // UsersIndexResolutionFailed → cold_start fires SeverelyDegraded.
+            let chain_rpc = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&chain_rpc)
+                .await;
+
+            // Capturing callback.
+            let captured: std::sync::Arc<std::sync::Mutex<Vec<MasterHealthEvent>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured_for_cb = std::sync::Arc::clone(&captured);
+            let cb: HealthCallback = std::sync::Arc::new(move |ev| {
+                captured_for_cb.lock().unwrap().push(ev);
+            });
+
+            let secret = fula_crypto::SecretKey::generate();
+            let enc_cfg = EncryptionConfig::from_secret_key(secret);
+
+            let mut client_cfg = Config::new("http://master.unreachable.invalid");
+            client_cfg.timeout = std::time::Duration::from_secs(2);
+            client_cfg.users_index_chain_rpc_url = chain_rpc.uri();
+            client_cfg.users_index_anchor_address =
+                "0x0000000000000000000000000000000000000001".into();
+            client_cfg.users_index_ipns_name = "k51qzi5uqu5dh-test".to_string();
+            client_cfg.users_index_user_key =
+                Some(derive_user_key_from_email("alice@example.com"));
+            client_cfg.users_index_ipns_gateway_urls =
+                vec![format!("{}/ipns/{{name}}", ipns.uri())];
+            client_cfg.health_callback = Some(cb);
+
+            let client = EncryptedClient::new(client_cfg, enc_cfg).expect("client");
+            let err = client
+                .cold_start_resolve_manifest("any-bucket")
+                .await
+                .expect_err("both channels exhausted");
+
+            // Error must be UsersIndexResolutionFailed (the resolver's
+            // signal that both paths failed).
+            assert!(
+                matches!(err, ClientError::UsersIndexResolutionFailed { .. }),
+                "expected UsersIndexResolutionFailed, got: {:?}",
+                err
+            );
+
+            // And the callback must have observed exactly one
+            // SeverelyDegraded event.
+            let events = captured.lock().unwrap().clone();
+            assert_eq!(
+                events.len(),
+                1,
+                "expected exactly one SeverelyDegraded event, got: {:?}",
+                events
+            );
+            assert!(
+                matches!(
+                    events[0],
+                    MasterHealthEvent::SeverelyDegraded { .. }
+                ),
+                "expected SeverelyDegraded, got: {:?}",
+                events[0]
+            );
+        }
     }
 }

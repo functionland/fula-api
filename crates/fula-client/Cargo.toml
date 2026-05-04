@@ -35,6 +35,14 @@ url = "2.5"
 base64 = { workspace = true }
 hex = { workspace = true }
 blake3 = { workspace = true }
+# Phase 3.3 — `derive_user_key_from_email` lives in `src/user_key.rs`
+# and is exposed on every target (wasm + native) so the wasm-bindgen
+# binding can compute the user_key without round-tripping through
+# `fula-crypto::derive_key_argon2id`. sha2 is a pure-Rust dep that
+# builds cleanly on wasm32; was previously gated to native-only when
+# the helper still lived inside the native-gated `registry_resolver`
+# module, but with the helper extracted we need cross-target.
+sha2 = { workspace = true }
 mime_guess = "2.0"
 tokio = { version = "1.42", default-features = false, features = ["sync"] }
 dashmap = { workspace = true }
@@ -48,6 +56,18 @@ reqwest = { workspace = true }
 uuid = { workspace = true }
 fs2 = "0.4"
 dirs = "5"
+# Embedded persistent KV for the BlockCache (Phase 2.2 of master-independent reads).
+# Native-only — wasm builds skip the cache (no persistent storage there anyway).
+redb = { workspace = true }
+cid = { workspace = true }
+# Mutex for per-gateway state in gateway_fetch (Phase 2.3).
+parking_lot = { workspace = true }
+# Phase 3.3 cold-start hybrid resolver — parses the master-published
+# global users-index dag-cbor payload directly (the resolver doesn't
+# go through the full BlockStore trait, so it needs the codec by hand).
+# `serde_json` for the chain-side eth_call request body is already
+# pulled in via the cross-platform top-level deps.
+serde_ipld_dagcbor = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # WASM: disable default features (no tokio), enable wasm feature
@@ -64,6 +84,10 @@ tokio = { workspace = true }
 tokio-test = "0.4"
 wiremock = { workspace = true }
 tempfile = { workspace = true }
+# Phase 3.3 — verifies the hardcoded `latest()` ABI selector matches
+# `Keccak256("latest()")[..4]`. Tests-only; the prod build hardcodes
+# the 4-byte constant to avoid a runtime crypto dep on the hot path.
+sha3 = "0.10"
 
 [features]
 default = []

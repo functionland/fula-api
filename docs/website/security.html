@@ -42,7 +42,7 @@
         <div class="sidebar-header">
             <div class="logo">
                 <h1>Fula API</h1>
-                <span class="version">v0.3.7</span>
+                <span class="version">v0.4.0</span>
             </div>
             <button class="theme-toggle" aria-label="Toggle theme">
                 <span class="icon-sun">☀️</span>
@@ -185,7 +185,7 @@
                         </tbody>
                     </table>
                     <div class="quantum-note">
-                        <strong>Honest status on post-quantum:</strong> The default <code>EncryptedClient</code> wraps per-file DEKs with X25519 HPKE today. The hybrid X25519 + ML-KEM-768 primitive exists in <code>fula-crypto::hybrid_kem</code> and is exported, but it has no callers inside <code>fula-client</code>, <code>fula-flutter</code>, or <code>fula-js</code> as of v0.3.7. Wiring it into the default path is a planned follow-up. Applications that need PQ wrapping today can call <code>hybrid_encapsulate</code> / <code>hybrid_decapsulate</code> directly.
+                        <strong>Honest status on post-quantum:</strong> The default <code>EncryptedClient</code> wraps per-file DEKs with X25519 HPKE today. The hybrid X25519 + ML-KEM-768 primitive exists in <code>fula-crypto::hybrid_kem</code> and is exported, but it has no callers inside <code>fula-client</code>, <code>fula-flutter</code>, or <code>fula-js</code> as of v0.4.0. Wiring it into the default path is a planned follow-up. Applications that need PQ wrapping today can call <code>hybrid_encapsulate</code> / <code>hybrid_decapsulate</code> directly.
                     </div>
                 </div>
             </div>

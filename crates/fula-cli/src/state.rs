@@ -34,6 +34,14 @@ pub struct AppState {
     /// In-memory advisory lock store used to serialize v1 -> v7 forest
     /// migrations across devices. TTL-bounded; process-local only.
     pub lock_store: crate::handlers::locks::LockStore,
+    /// Phase 3.2 master-side users-index publisher. `None` when the
+    /// `FULA_USERS_INDEX_PUBLISHER_ENABLED` env flag is unset (default).
+    /// When `None`, the `/_internal/users-index-state` endpoint
+    /// returns 503; existing S3 handlers behave byte-identically to
+    /// pre-Phase-3 deploys.
+    pub users_index_publisher: Option<
+        Arc<crate::handlers::users_index_publisher::UsersIndexPublisher<FlexibleBlockStore>>,
+    >,
 }
 
 impl AppState {
@@ -118,12 +126,23 @@ impl AppState {
         // after AppState is wrapped in an Arc.
         let lock_store = crate::handlers::locks::LockStore::new();
 
+        // Phase 3.2 users-index publisher — env-flag-gated so day-one
+        // deploys behave byte-identically to pre-Phase-3 builds.
+        // Operators flip `FULA_USERS_INDEX_PUBLISHER_ENABLED=1` after
+        // canary verification.
+        let users_index_publisher = build_users_index_publisher(
+            &config,
+            Arc::clone(&bucket_manager),
+            Arc::clone(&block_store),
+        );
+
         Ok(Self {
             config,
             block_store,
             bucket_manager,
             multipart_manager,
             lock_store,
+            users_index_publisher,
         })
     }
 
@@ -204,6 +223,109 @@ impl UserSession {
     /// Security audit fix A3: Uses hashed user ID for comparison
     pub fn can_access_bucket(&self, bucket_owner_id: &str) -> bool {
         self.hashed_user_id == bucket_owner_id || self.is_admin()
+    }
+}
+
+/// Phase 3.2 users-index publisher constructor — env-flag-gated.
+///
+/// Returns `None` when `FULA_USERS_INDEX_PUBLISHER_ENABLED` is unset
+/// or "0"/"false". When enabled:
+///
+/// | Env var                                     | Default                                                    |
+/// |---------------------------------------------|------------------------------------------------------------|
+/// | `FULA_USERS_INDEX_STATE_PATH`               | `/var/lib/fula-gateway/users_index_state.txt`              |
+/// | `FULA_USERS_INDEX_FLUSH_INTERVAL_SECS`      | 300                                                        |
+/// | `FULA_USERS_INDEX_INTERNAL_TOKEN`           | (none → endpoints fail-closed with 503)                    |
+/// | `FULA_USERS_INDEX_IPNS_KEY_NAME`            | `fula-users-index`                                         |
+/// | `FULA_USERS_INDEX_IPNS_LIFETIME_SECS`       | 129600 (36h)                                               |
+/// | `FULA_USERS_INDEX_IPNS_TTL_SECS`            | 900 (15m)                                                  |
+/// | `FULA_USERS_INDEX_IPNS_DISABLED`            | unset → IPNS enabled                                       |
+/// | `FULA_USERS_INDEX_FIRST_PUBLISH_PINS_PER_S` | 100                                                        |
+fn build_users_index_publisher(
+    config: &GatewayConfig,
+    bucket_manager: Arc<BucketManager<FlexibleBlockStore>>,
+    block_store: Arc<FlexibleBlockStore>,
+) -> Option<Arc<crate::handlers::users_index_publisher::UsersIndexPublisher<FlexibleBlockStore>>> {
+    use crate::handlers::users_index_publisher::{
+        IpnsPublisher, PublisherConfig, UsersIndexPublisher,
+    };
+    use std::time::Duration;
+
+    let enabled = std::env::var("FULA_USERS_INDEX_PUBLISHER_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        info!("users-index publisher: disabled (FULA_USERS_INDEX_PUBLISHER_ENABLED unset)");
+        return None;
+    }
+
+    let state_file_path = std::env::var("FULA_USERS_INDEX_STATE_PATH")
+        .unwrap_or_else(|_| "/var/lib/fula-gateway/users_index_state.txt".to_string())
+        .into();
+    let flush_interval = Duration::from_secs(
+        std::env::var("FULA_USERS_INDEX_FLUSH_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300),
+    );
+    let ipns_lifetime = Duration::from_secs(
+        std::env::var("FULA_USERS_INDEX_IPNS_LIFETIME_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(36 * 3600),
+    );
+    let ipns_ttl = Duration::from_secs(
+        std::env::var("FULA_USERS_INDEX_IPNS_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15 * 60),
+    );
+    let ipns_key_name = std::env::var("FULA_USERS_INDEX_IPNS_KEY_NAME")
+        .unwrap_or_else(|_| "fula-users-index".to_string());
+    let internal_token = std::env::var("FULA_USERS_INDEX_INTERNAL_TOKEN").ok().filter(|s| !s.is_empty());
+    let first_publish_max_pins_per_sec = std::env::var("FULA_USERS_INDEX_FIRST_PUBLISH_PINS_PER_S")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+
+    let pub_config = PublisherConfig {
+        flush_interval,
+        first_publish_max_pins_per_sec,
+        ipns_lifetime,
+        ipns_ttl,
+        ipns_key_name: ipns_key_name.clone(),
+        state_file_path,
+        ipfs_api_url: config.ipfs_url.clone(),
+        internal_token: internal_token.clone(),
+    };
+
+    let ipns_disabled = std::env::var("FULA_USERS_INDEX_IPNS_DISABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let ipns = if ipns_disabled {
+        warn!("users-index publisher: IPNS disabled (FULA_USERS_INDEX_IPNS_DISABLED=1) — chain backup is the only publish channel");
+        None
+    } else {
+        Some(IpnsPublisher::new(config.ipfs_url.clone()))
+    };
+
+    match UsersIndexPublisher::open_with_ipns(pub_config, bucket_manager, block_store, ipns) {
+        Ok(p) => {
+            info!(
+                flush_interval_secs = flush_interval.as_secs(),
+                ipns_key_name = %ipns_key_name,
+                internal_token_set = internal_token.is_some(),
+                "users-index publisher: enabled"
+            );
+            Some(Arc::new(p))
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "users-index publisher: failed to open state file; publisher disabled for this run"
+            );
+            None
+        }
     }
 }
 

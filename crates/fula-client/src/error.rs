@@ -98,6 +98,93 @@ pub enum ClientError {
     /// re-enter the load-time migration path.
     #[error("Migration lock held for bucket {bucket} (expires at {expires_at} ms)")]
     MigrationLockHeld { bucket: String, expires_at: i64 },
+
+    /// Phase 2.1 of master-independent reads: the SDK's health gate
+    /// observed master is unreachable and short-circuited the request.
+    /// Phase 2.4 will catch this variant and trigger the gateway-race
+    /// fallback. Standalone (Phase 2.1 only), this turns "wait 3s for
+    /// timeout" into "fast-fail with a clear signal."
+    #[error("Master unreachable (health gate; down for ~{down_for_secs}s)")]
+    MasterUnreachable { down_for_secs: u64 },
+
+    /// Phase 2.2 of master-independent reads: a single block exceeds the
+    /// configured `block_cache_max_bytes` budget and cannot be cached.
+    ///
+    /// **Native-only signal in practice.** `BlockCache` itself is
+    /// compiled out on `wasm32`; this variant is defined unconditionally
+    /// so the enum shape stays stable across native and web builds, and
+    /// so consumers (fula-flutter, app integrators) can write a single
+    /// exhaustive match arm without `#[cfg]` gates of their own.
+    /// Triggering it on wasm would require a manual construction —
+    /// the SDK never raises it there.
+    ///
+    /// Apps should surface this to the user with guidance to raise the
+    /// `block_cache_max_bytes` config or skip the cache for this object.
+    #[error("Block exceeds cache budget: size={size}, budget={budget}")]
+    BlockTooLarge { size: u64, budget: u64 },
+
+    /// Phase 2.2 of master-independent reads: catch-all for the
+    /// persistent block cache's I/O / storage / commit errors.
+    ///
+    /// Stringified at the SDK boundary so app code doesn't need to depend
+    /// on `redb` or its concrete error type. Native-only in practice
+    /// (same reasoning as `BlockTooLarge` above); kept unconditional for
+    /// enum-shape stability.
+    #[error("Block cache error: {0}")]
+    BlockCache(String),
+
+    /// Phase 3.3 of master-independent reads: cold-start hybrid
+    /// resolver could not resolve the master-published global
+    /// users-index CID through any channel (IPNS exhausted AND
+    /// chain failed / was unreachable / had no entry / sequence-
+    /// regressed). Fresh-device cold-start is unrecoverable until
+    /// at least one channel returns; the app should surface
+    /// "offline mode unavailable for this device yet".
+    ///
+    /// Defined unconditionally so the enum shape stays stable
+    /// across native and wasm. The native resolver lives in
+    /// `registry_resolver.rs`; the wasm cold-start path always
+    /// raises this variant until a browser-friendly resolver lands.
+    #[error("users-index resolution failed: {reason}")]
+    UsersIndexResolutionFailed { reason: String },
+
+    /// Phase 3.3 replay defense: the resolver observed a payload
+    /// whose embedded `sequence` is strictly less than what the SDK
+    /// has previously seen and persisted. A compromised gateway,
+    /// RPC node, or operator could try to serve a stale (but
+    /// otherwise valid-looking) payload to roll back the user's
+    /// view; this variant is the SDK's refusal to honor that.
+    ///
+    /// Apps should NOT retry — every retry from the same source
+    /// would fail identically. Surface as "your master appears to
+    /// be serving stale state; contact support" or equivalent.
+    /// `channel` is a free-form label identifying which path
+    /// observed the regression (e.g. `"chain.latest()"`,
+    /// `"Ipns"`, `"Chain"`). Named `channel` rather than `source`
+    /// because thiserror gives the latter special meaning
+    /// (it expects an `std::error::Error` impl).
+    #[error("sequence regression in {channel}: observed={observed}, highest seen={highest_seen}")]
+    SequenceRegression {
+        observed: u64,
+        highest_seen: u64,
+        channel: String,
+    },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<crate::block_cache::BlockCacheError> for ClientError {
+    fn from(err: crate::block_cache::BlockCacheError) -> Self {
+        use crate::block_cache::BlockCacheError;
+        match err {
+            BlockCacheError::BlockTooLarge { size, budget } => {
+                ClientError::BlockTooLarge { size, budget }
+            }
+            // Catch-all: stringify the rest so app code doesn't have to
+            // pattern-match on redb internals. Adds zero deps to the
+            // public SDK surface.
+            other => ClientError::BlockCache(other.to_string()),
+        }
+    }
 }
 
 impl ClientError {
@@ -134,6 +221,13 @@ impl ClientError {
             || matches!(self, Self::ConcurrentModificationExhausted { .. })
             || matches!(self, Self::S3Error { code, .. }
                 if code == "PreconditionFailed" || code == "HTTP412" || code == "412")
+    }
+
+    /// Check if this is a block-cache error (budget exceeded or storage
+    /// failure). Useful for app integrators that want to retry without
+    /// the cache (e.g., directly via the gateway-race path).
+    pub fn is_cache_error(&self) -> bool {
+        matches!(self, Self::BlockTooLarge { .. } | Self::BlockCache(_))
     }
 }
 
