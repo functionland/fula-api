@@ -1058,20 +1058,38 @@ pub async fn is_flat_namespace(client: &EncryptedClient) -> bool {
 // Phase 3.3 — userKey derivation
 // ============================================================================
 
-/// Compute the canonical fula `userKey` for cold-start config from a
-/// plaintext email. Mirrors `fula_client::derive_user_key_from_email`
-/// — same domain separator + double-hash chain (sha256(lower(email))
-/// → BLAKE3("fula:user_id:" || _).bytes[..16] → hex).
+/// **PREFERRED** — derive the canonical fula `userKey` directly from a
+/// JWT `sub` claim. Mirrors `fula_client::derive_user_key_from_jwt_sub`
+/// and matches master's `state.rs::hash_user_id` byte-for-byte: the
+/// JWT sub bytes feed straight into `BLAKE3.derive_key`, no
+/// transformation.
 ///
-/// Apps call this once at sign-in (the OAuth flow has plaintext
-/// email), then set `users_index_user_key` on the config object
-/// passed to `createEncryptedClient`. The SDK never persists or
-/// transmits the raw email.
+/// Works correctly for BOTH pre-migration-011 users (sub = plaintext
+/// email) and post-migration users (sub = sha256(email).hex()). Apps
+/// should cache the JWT sub at sign-in and pass it here whenever
+/// (re-)setting `users_index_user_key`. The SDK never sees the raw
+/// email.
 ///
-/// On wasm32 the cold-start RESOLVER itself isn't wired (it depends
-/// on reqwest + parking_lot which aren't compiled for browsers), so
-/// this helper is exposed for API symmetry — apps can compute the
-/// userKey on web for sharing across native + web identity flows.
+/// Use this in preference to `deriveUserKeyFromEmail` — the email
+/// variant is broken for pre-migration users.
+#[wasm_bindgen(js_name = deriveUserKeyFromJwtSub)]
+pub fn derive_user_key_from_jwt_sub(jwt_sub: String) -> String {
+    fula_client::derive_user_key_from_jwt_sub(&jwt_sub)
+}
+
+/// **DEPRECATED — broken for pre-migration-011 users.** Use
+/// `deriveUserKeyFromJwtSub` instead.
+///
+/// Computes the userKey by first applying `sha256(email.lowercase())`
+/// before BLAKE3. This happens to match master ONLY for
+/// post-migration users whose JWT sub is itself `sha256(email).hex()`.
+/// For pre-migration users whose JWT sub is plaintext email, master's
+/// derivation skips the sha256 step and the two values diverge —
+/// silent cold-start failure.
+///
+/// On wasm32 the cold-start RESOLVER isn't wired (depends on reqwest
+/// + parking_lot which aren't compiled for browsers), so this helper
+/// remains exposed for API symmetry with the native binding.
 #[wasm_bindgen(js_name = deriveUserKeyFromEmail)]
 pub fn derive_user_key_from_email(email: String) -> String {
     fula_client::derive_user_key_from_email(&email)

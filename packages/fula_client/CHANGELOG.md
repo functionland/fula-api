@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-05-07
+
+**Hotfix release.** Fixes a silent cold-start failure for pre-migration-011 users (legacy users whose JWT `sub` claim is plaintext email rather than `sha256(email).hex()`). Without this fix, those users get a "user has not written yet" error when trying to read their own data offline, even though they have written. Apps should call the new `deriveUserKeyFromJwtSub` function whenever they have access to the JWT (which they do at sign-in).
+
+### Fixed
+
+- **Cold-start userKey derivation now matches master byte-for-byte for ALL users.** Master's `crates/fula-cli/src/state.rs::hash_user_id` does `BLAKE3.derive_key("fula:user_id:", claims.sub.as_bytes())[..16]` — no transformation of the JWT sub. The previous SDK-side `derive_user_key_from_email` always pre-hashed with `sha256(email)` first, which matches master ONLY for post-migration-011 users (whose `claims.sub` already IS `sha256(email).hex()`). For pre-migration users like the production account `ehsan@fx.land` (whose `claims.sub` is the plaintext email), the SDK's `sha256` step diverged from master's. Master stored the user's `bucketsIndexCid` under userKey `4da2c0616b1d39660f9f94e145fbce4f` (BLAKE3 over plaintext email); the SDK looked up `d2df90894e237aa4ef50618e514e0e37` (BLAKE3 over `sha256(email).hex()`). Lookup missed; cold-start failed silently with a misleading "user has not written yet" error.
+- **Fix:** new `derive_user_key_from_jwt_sub(jwt_sub)` in `crates/fula-client/src/user_key.rs` mirrors master's algorithm exactly — feeds the JWT sub into BLAKE3 with no transformation. Apps call it at sign-in (the JWT is right there), passing the sub through unchanged. Works for both pre-migration and post-migration users without branching. The legacy `derive_user_key_from_email` is kept for source compatibility but is now documented as broken for pre-migration users.
+
+### Added
+
+- **`fula_client::derive_user_key_from_jwt_sub` (pure / cross-target)** — preferred userKey derivation. 32-hex output, stable per OAuth identity, matches master.
+- **fula-flutter Dart binding `deriveUserKeyFromJwtSub`** at `crates/fula-flutter/src/api/client.rs` — generated automatically by FRB.
+- **fula-js wasm-bindgen binding `deriveUserKeyFromJwtSub`** at `crates/fula-js/src/lib.rs:1075-1077` — exposed as `deriveUserKeyFromJwtSub` in JS.
+- **Pinned regression tests** in `crates/fula-client/src/user_key.rs::tests`:
+  - `derive_user_key_from_jwt_sub_matches_master_for_plaintext_email_sub` — asserts `derive_user_key_from_jwt_sub("ehsan@fx.land") == "4da2c0616b1d39660f9f94e145fbce4f"` (the actual value in master's published CBOR).
+  - `derive_user_key_from_jwt_sub_matches_legacy_for_sha256_email_sub` — asserts the new function on a sha256-hex sub equals the old function on the original email.
+  - `derive_user_key_from_email_pinned_value` — asserts the legacy function's broken-for-legacy-users return value (`d2df90...`) so future refactors can't silently change the algorithm.
+  - `derive_user_key_from_jwt_sub_empty_does_not_panic` — defense against edge-case input.
+
+### Migration guide for apps
+
+If your app calls `deriveUserKeyFromEmail(email)` today, switch to `deriveUserKeyFromJwtSub(jwt_sub)` where `jwt_sub` is the `sub` claim from the JWT your auth flow already received. Pre-migration users will start being able to cold-start; post-migration users see no behavior change.
+
+JWT sub extraction is one-line in most languages — for Dart, see the example `_extractJwtSub` helper in FxFiles' `fula_api_service.dart`. The fula_client SDK does NOT need the JWT or the email — only the sub string.
+
+If your app cannot get the JWT sub at the call site, keep using `deriveUserKeyFromEmail` with the caveat that pre-migration users won't be able to cold-start. The legacy function is NOT going to be removed.
+
+### Known limitations
+
+- **Already-cached state on device** still has the wrong userKey baked in if the app cached the userKey from a previous session. Apps should clear any cached userKey on first run after upgrading to v0.4.3 OR re-derive on every init (cheap operation). FxFiles re-derives on every `FulaApiService.initialize` call so no special migration is needed there.
+- **Master-side `state.rs::hash_user_id`** still has the underlying inconsistency (task #24 in the master-independent-reads plan). This SDK fix is a workaround that aligns the SDK to master's existing behavior — it does NOT unify the two `hash_user_id` functions inside fula-cli. That cleanup is tracked separately.
+
+### Operational
+
+- **No master changes required.** Strictly an SDK-side fix.
+- **No data migration required.** Cold-start lookups now hit the right key; existing data is preserved untouched.
+- **No coordinated rollout required.** v0.4.2 master + v0.4.3 SDK works. v0.4.3 master (when bumped to match) + v0.4.2 SDK still works for post-migration users; pre-migration users see the same broken behavior they had before until the SDK is upgraded.
+
 ## [0.4.2] - 2026-05-07
 
 **Security release.** Includes a high-severity PII leak fix and an admin sweep tool to remediate already-leaked data. Operators who deployed v0.4.0 or v0.4.1 with the Phase 3.2 users-index publisher enabled (i.e., `FULA_USERS_INDEX_PUBLISHER_ENABLED=1`) MUST follow the runbook in `crates/fula-cli/src/handlers/admin.rs::pii_sweep`. Apps using fula-client 0.4.0/0.4.1 are not affected directly — this is a master-side fix.

@@ -99,13 +99,16 @@ pub use health_gate::{HealthCallback, MasterHealthEvent};
 #[cfg(not(target_arch = "wasm32"))]
 pub use block_cache::{BlockCache, BlockCacheError};
 
-/// Phase 3.3 — `derive_user_key_from_email` available on EVERY
-/// target (wasm + native). Apps compute the userKey at sign-in
-/// time from the OAuth-provided email and stash it in
-/// `Config::users_index_user_key`. The same function is also
-/// re-exported via `registry_resolver` on native for backward
-/// compatibility with code that imports it from there.
-pub use user_key::derive_user_key_from_email;
+/// Phase 3.3 — userKey derivation, available on EVERY target
+/// (wasm + native). See `user_key.rs` module-level docs for which
+/// function to call:
+///
+/// - **`derive_user_key_from_jwt_sub`** (preferred) — matches master
+///   byte-for-byte. Pass the JWT `sub` claim through unchanged.
+/// - **`derive_user_key_from_email`** (legacy) — broken for
+///   pre-migration-011 users whose JWT sub is plaintext email.
+///   Kept for source compatibility with already-shipped apps.
+pub use user_key::{derive_user_key_from_email, derive_user_key_from_jwt_sub};
 
 /// Phase 3.3 — cold-start hybrid resolver public API. Native-only;
 /// the resolver itself is gated to `cfg(not(target_arch = "wasm32"))`.

@@ -224,21 +224,48 @@ pub fn create_encrypted_client_with_pinning(
 }
 
 // ============================================================================
-// Phase 3.3 — derive_user_key_from_email
+// Phase 3.3 — userKey derivation
 // ============================================================================
 
-/// Compute the canonical fula `userKey` for cold-start config from a
-/// plaintext email. Mirrors `fula_client::derive_user_key_from_email`
-/// — same domain separator, same hash chain (sha256(lower(email))
-/// → BLAKE3("fula:user_id:" || _).bytes[..16] → hex-encode).
+/// **PREFERRED** — derive the canonical fula `userKey` directly from a
+/// JWT `sub` claim. Mirrors `fula_client::derive_user_key_from_jwt_sub`.
 ///
-/// Apps call this once at sign-in (the OAuth flow has plaintext
-/// email), then set `FulaConfig::users_index_user_key` to the
-/// returned string. The SDK never sees the raw email.
+/// Use this whenever the app has access to the JWT (which is at every
+/// sign-in — the issued token carries the sub). Works correctly for
+/// BOTH pre-migration-011 users (sub = plaintext email) and modern
+/// users (sub = sha256(email).hex()), because master's
+/// `state.rs::hash_user_id` does not transform the sub before hashing
+/// — and this function does not transform either.
 ///
-/// Native-only — wasm32 surfaces this via the JS-side `deriveKey`
-/// helper because the cold-start resolver (Phase 3.3) itself isn't
-/// wired on wasm.
+/// Apps should cache the JWT sub at sign-in and pass it here whenever
+/// (re-)setting `FulaConfig::users_index_user_key`. The SDK never sees
+/// the raw email.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn derive_user_key_from_jwt_sub(jwt_sub: String) -> String {
+    fula_client::derive_user_key_from_jwt_sub(&jwt_sub)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn derive_user_key_from_jwt_sub(_jwt_sub: String) -> String {
+    // wasm32 doesn't run the cold-start resolver natively; return an
+    // empty key so resolver self-disables. Mirrors the wasm stub for
+    // `derive_user_key_from_email` below.
+    String::new()
+}
+
+/// **DEPRECATED — broken for pre-migration-011 users.** Use
+/// [`derive_user_key_from_jwt_sub`] instead.
+///
+/// Apps that have already shipped using this function continue to
+/// work for post-migration users by accident (the SDK's internal
+/// `sha256(email)` step happens to match what those users' JWT sub
+/// already is). Pre-migration users hit a silent cold-start failure
+/// because their JWT sub is plaintext email and master hashes it
+/// without the sha256 step.
+///
+/// Same wire format and length (32 hex chars) as
+/// `derive_user_key_from_jwt_sub`; switching the call is a one-line
+/// app change.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn derive_user_key_from_email(email: String) -> String {
     fula_client::derive_user_key_from_email(&email)
