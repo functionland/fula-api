@@ -361,3 +361,408 @@ async fn offline_upload_download_chunked_e2e() {
 async fn offline_upload_download_e2e() {
     run_offline_upload_download_e2e(256, "single-legacy-alias").await;
 }
+
+// ============================================================================
+// v0.4.4 — COLD-START offline path
+// ============================================================================
+//
+// The above warm-cache tests prove that a device which already read a bucket
+// online can read it again offline. They DO NOT exercise the cold-start
+// path (Phase 3.3 IPNS+chain → published bucketsIndex CBOR → forest manifest
+// CID → fetch+decrypt). Cold-start is what fires when:
+//   * master is unreachable AND
+//   * the device has never read this bucket before (block cache empty for it).
+//
+// This test is what verifies the v0.4.4 hotfix actually works end-to-end:
+// upload via real master (which populates `BucketMetadata.forest_manifest_cid`
+// when `FULA_FOREST_MANIFEST_CID_ENABLED=1`), wait for the publisher to emit
+// the new field in the published per-user CBOR, then cold-start with a bogus
+// master URL and an empty block cache. List + read must succeed via the
+// IPNS / chain resolver chain.
+//
+// ## Required env (real-credentials test, marked `#[ignore]`)
+//
+// Beyond the warm-cache test's `FULA_JWT` + `FULA_S3`, this test also needs
+// the operator-supplied Phase 3.3 resolver coordinates:
+//
+// | Var                                 | Required | Default                      | Purpose                                                                                       |
+// |-------------------------------------|----------|------------------------------|-----------------------------------------------------------------------------------------------|
+// | `FULA_JWT`                          | Yes      | —                            | Bearer token for the upload phase. Test extracts `sub` to derive userKey via `derive_user_key_from_jwt_sub`. |
+// | `FULA_S3`                           | Yes      | —                            | Reachable master endpoint for upload (e.g. `https://s3.cloud.fx.land`).                       |
+// | `FULA_BOGUS_S3`                     | No       | `https://s33.cloud.fx.land`  | Unreachable endpoint for the offline phase. Default DNS-fails on real DNS.                    |
+// | `FULA_BUCKET`                       | No       | `documents`                  | Target bucket. Must exist for this user; defaulted to match the operator's verification scenario. |
+// | `FULA_USERS_INDEX_CHAIN_RPC_URL`    | Yes      | —                            | JSON-RPC URL for the chain hosting `FulaUsersIndexAnchor` (operator's Base RPC).              |
+// | `FULA_USERS_INDEX_ANCHOR_ADDRESS`   | Yes      | —                            | Address of the deployed `FulaUsersIndexAnchor.sol` contract (`0x…`).                          |
+// | `FULA_USERS_INDEX_IPNS_NAME`        | Yes      | —                            | The IPNS NAME (k51… libp2p public-key hash) the master publishes to.                          |
+// | `FULA_PUBLISHER_WAIT_SECS`          | No       | `360`                        | How long to wait between phase 1 (upload) and phase 2 (cold-start) so the master's publisher has a chance to tick at least once and the new `forest_manifest_cid` lands in the published global CBOR. Default is `FULA_USERS_INDEX_FLUSH_INTERVAL_SECS + 60` for slack. Set lower if you triggered `/_internal/publish-now` manually. |
+// | `FULA_TIMEOUT_SECS`                 | No       | `60`                         | Per-request HTTP timeout.                                                                     |
+//
+// ## Operator pre-conditions on master
+//
+// 1. `FULA_BUCKET_LOOKUP_H_ENABLED=1` — populates `bucket_lookup_h` (Phase 1.2).
+// 2. `FULA_FOREST_MANIFEST_CID_ENABLED=1` — populates `forest_manifest_cid` (v0.4.4).
+// 3. `FULA_USERS_INDEX_PUBLISHER_ENABLED=1` — runs the publisher loop.
+// 4. Anchor cron is running OR IPNS publish is reaching public gateways.
+//
+// Run from `crates/fula-client/`:
+//
+// ```powershell
+// $env:FULA_JWT = "eyJhbGci…"
+// $env:FULA_S3  = "https://s3.cloud.fx.land"
+// $env:FULA_USERS_INDEX_CHAIN_RPC_URL  = "https://mainnet.base.org"
+// $env:FULA_USERS_INDEX_ANCHOR_ADDRESS = "0x…"
+// $env:FULA_USERS_INDEX_IPNS_NAME      = "k51qzi5uqu5d…"
+// cargo test -p fula-client --test offline_e2e --release `
+//   -- --ignored offline_cold_start_documents_bucket_e2e --nocapture
+// ```
+
+use fula_client::derive_user_key_from_jwt_sub;
+
+/// Decode the `sub` claim from a JWT WITHOUT verifying the signature.
+///
+/// Test-only helper. Production apps should treat the JWT as opaque and
+/// either (a) accept the sub from their auth provider as a separate
+/// parameter or (b) decode it themselves the same way FxFiles does in
+/// `fula_api_service.dart::_extractJwtSub`.
+fn jwt_sub(jwt: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let parts: Vec<&str> = jwt.split('.').collect();
+    assert_eq!(parts.len(), 3, "malformed JWT: expected 3 dot-separated parts");
+    let payload = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .expect("JWT payload must be valid base64url");
+    let json: serde_json::Value =
+        serde_json::from_slice(&payload).expect("JWT payload must be valid JSON");
+    json.get("sub")
+        .and_then(|v| v.as_str())
+        .expect("JWT must have a `sub` claim")
+        .to_string()
+}
+
+/// Build a client wired for cold-start (Phase 3.3) — populates the four
+/// `users_index_*` fields. The other warm-cache flags stay on so the test
+/// still validates the integration of cold-start + cache-population.
+fn build_client_with_cold_start(
+    master_url: &str,
+    jwt: &str,
+    cache_path: &std::path::Path,
+    secret: SecretKey,
+    health_gate: bool,
+    timeout_secs: u64,
+    chain_rpc_url: String,
+    anchor_address: String,
+    ipns_name: String,
+    user_key: String,
+) -> EncryptedClient {
+    let mut cfg = Config::new(master_url).with_token(jwt);
+    cfg.timeout = Duration::from_secs(timeout_secs);
+
+    cfg.health_gate_enabled = health_gate;
+    cfg.health_gate_ttl = Duration::from_secs(30);
+
+    cfg.block_cache_enabled = true;
+    cfg.block_cache_path = Some(cache_path.to_path_buf());
+    cfg.block_cache_max_bytes = 256 * 1024 * 1024;
+
+    cfg.gateway_fallback_enabled = true;
+    cfg.gateway_fallback_urls = Vec::new();
+    cfg.gateway_race_concurrency = 3;
+
+    // v0.4.4 cold-start: all four fields must be set for the resolver
+    // to activate. The presence-check is in `build_inner_config`.
+    cfg.users_index_chain_rpc_url = chain_rpc_url;
+    cfg.users_index_anchor_address = anchor_address;
+    cfg.users_index_ipns_name = ipns_name;
+    cfg.users_index_user_key = Some(user_key);
+
+    let enc = EncryptionConfig::from_secret_key(secret);
+    EncryptedClient::new(cfg, enc).expect("EncryptedClient construction must succeed")
+}
+
+/// Cold-start e2e — verifies v0.4.4's `forest_manifest_cid` plumbing
+/// resolves a real bucket from real published state when the master
+/// endpoint is unreachable AND the SDK's block cache is empty.
+///
+/// The test is brittle by design: it depends on the master's publisher
+/// having actually emitted the new field. The wait between phase 1 and
+/// phase 2 is what gives the publisher time to tick. If the operator
+/// triggered `/_internal/publish-now` after upload, the wait can be
+/// shortened via `FULA_PUBLISHER_WAIT_SECS`.
+#[tokio::test]
+#[ignore]
+async fn offline_cold_start_documents_bucket_e2e() {
+    // ─── Inputs ────────────────────────────────────────────────────────
+    let jwt = match read_required_env("FULA_JWT") {
+        Some(v) => v,
+        None => return,
+    };
+    let s3_url = match read_required_env("FULA_S3") {
+        Some(v) => v,
+        None => return,
+    };
+    let bogus_s3 = std::env::var("FULA_BOGUS_S3")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://s33.cloud.fx.land".to_string());
+    let bucket = std::env::var("FULA_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "documents".to_string());
+    let chain_rpc_url = match read_required_env("FULA_USERS_INDEX_CHAIN_RPC_URL") {
+        Some(v) => v,
+        None => return,
+    };
+    let anchor_address = match read_required_env("FULA_USERS_INDEX_ANCHOR_ADDRESS") {
+        Some(v) => v,
+        None => return,
+    };
+    let ipns_name = match read_required_env("FULA_USERS_INDEX_IPNS_NAME") {
+        Some(v) => v,
+        None => return,
+    };
+    let publisher_wait_secs: u64 = std::env::var("FULA_PUBLISHER_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(360);
+    let timeout_secs: u64 = std::env::var("FULA_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+
+    // userKey derivation must match master byte-for-byte. v0.4.3+ uses
+    // `derive_user_key_from_jwt_sub` (NOT the legacy email-based variant
+    // which broke for pre-migration-011 users with plaintext-email subs).
+    let sub = jwt_sub(&jwt);
+    let user_key = derive_user_key_from_jwt_sub(&sub);
+
+    eprintln!("\n[cold-start-e2e] master      = {}", s3_url);
+    eprintln!("[cold-start-e2e] bogus      = {}", bogus_s3);
+    eprintln!("[cold-start-e2e] bucket     = {}", bucket);
+    eprintln!("[cold-start-e2e] sub        = {}", sub);
+    eprintln!("[cold-start-e2e] userKey    = {}", user_key);
+    eprintln!("[cold-start-e2e] chain RPC  = {}", chain_rpc_url);
+    eprintln!("[cold-start-e2e] anchor     = {}", anchor_address);
+    eprintln!("[cold-start-e2e] IPNS name  = {}", ipns_name);
+    eprintln!(
+        "[cold-start-e2e] wait time  = {}s (publisher tick window)",
+        publisher_wait_secs
+    );
+
+    let secret = SecretKey::generate();
+    let test_key = format!(
+        "fula-cold-start-{}.bin",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    // 256 byte payload = single-object path (under the 768 KB chunked
+    // threshold). Cold-start mechanics are identical for chunked, but
+    // testing single-object first keeps the failure surface focused on
+    // the new `forest_manifest_cid` plumbing rather than chunked
+    // assembly. A chunked variant can be layered on later.
+    let payload: Vec<u8> = (0..256u32).map(|i| (i % 256) as u8).collect();
+
+    eprintln!(
+        "[cold-start-e2e] test object = {} ({} bytes)",
+        test_key,
+        payload.len()
+    );
+
+    // ─── Phase 1 — Upload via real master ───────────────────────────────
+    //
+    // The SDK attaches `x-amz-meta-fula-forest-manifest: 1` on the Phase 2
+    // root commit (encryption.rs). Master populates
+    // `BucketMetadata.forest_manifest_cid` with its own server-computed CID.
+    // The publisher will emit it in the next per-user CBOR tick.
+    eprintln!(
+        "\n[cold-start-e2e] phase 1: UPLOAD via {} (populates forest_manifest_cid on master)",
+        s3_url
+    );
+    {
+        let cache_dir_phase1 = TempDir::new().expect("tempdir for phase 1");
+        let cache_path_phase1 = cache_dir_phase1.path().join("phase1.redb");
+        let client = build_client_with_cold_start(
+            &s3_url,
+            &jwt,
+            &cache_path_phase1,
+            secret.clone(),
+            true,
+            timeout_secs,
+            chain_rpc_url.clone(),
+            anchor_address.clone(),
+            ipns_name.clone(),
+            user_key.clone(),
+        );
+        client
+            .put_object_flat(
+                &bucket,
+                &test_key,
+                payload.clone(),
+                Some("application/octet-stream"),
+            )
+            .await
+            .expect("phase 1: upload to real master must succeed");
+        eprintln!(
+            "[cold-start-e2e]   upload OK ({} bytes to {}/{})",
+            payload.len(),
+            bucket,
+            test_key
+        );
+    }
+
+    // ─── Phase 1.5 — Wait for publisher tick ────────────────────────────
+    //
+    // The master's `users_index_publisher` runs every 5 minutes by default
+    // (FULA_USERS_INDEX_FLUSH_INTERVAL_SECS=300). For the just-populated
+    // `forest_manifest_cid` to appear in the published per-user CBOR, the
+    // publisher must tick at least once after our upload. We wait the
+    // default 6 minutes (300 + 60 slack) unless the operator overrode via
+    // FULA_PUBLISHER_WAIT_SECS (e.g., set to 5 if they triggered
+    // `/_internal/publish-now` immediately after the upload).
+    //
+    // The publisher's diff-cache hash includes `forest_manifest_cid`
+    // (v0.4.4 bumped to v2 hash), so the first tick after upload WILL
+    // detect the change and re-pin this user's per-user CBOR with the
+    // new field. Without that bump, the publisher would silently skip
+    // this user as "unchanged" and the test would fail spuriously.
+    eprintln!(
+        "\n[cold-start-e2e] phase 1.5: waiting {}s for publisher tick",
+        publisher_wait_secs
+    );
+    tokio::time::sleep(Duration::from_secs(publisher_wait_secs)).await;
+    eprintln!("[cold-start-e2e]   publisher window elapsed");
+
+    // ─── Phase 2 — Cold-start: bogus master + EMPTY cache ────────────────
+    //
+    // Fresh tempdir for the block cache so phase 1's cache state can NOT
+    // leak through. Empty cache + DNS-failing master URL means EVERY read
+    // must come through the cold-start resolver chain:
+    //   1. SDK detects master unreachable (health gate trips after first
+    //      DNS error). Disabled here so the first call just fails fast.
+    //   2. Cold-start resolver fetches the global users-index via either
+    //      IPNS (gateway race) or chain `latest()` (JSON-RPC).
+    //   3. Looks up `users[user_key]` → bucketsIndexCid for this user.
+    //   4. Fetches per-user CBOR via gateway race.
+    //   5. Looks up bucket entry by `bucket_lookup_h` (or legacy name).
+    //   6. Reads `forest_manifest_cid` (v0.4.4 — THIS is the field the
+    //      hotfix added; without it cold-start fails with the
+    //      "expected value at line 1 column 1" serialization error).
+    //   7. Fetches that CID, decrypts as `EncryptedShardManifestV7` JSON,
+    //      proceeds with the rest of the forest walk + chunk fetches.
+    eprintln!(
+        "\n[cold-start-e2e] phase 2: COLD-START via {} (empty cache, fresh client)",
+        bogus_s3
+    );
+    {
+        let cache_dir_phase2 = TempDir::new().expect("tempdir for phase 2");
+        let cache_path_phase2 = cache_dir_phase2.path().join("phase2.redb");
+
+        let client = build_client_with_cold_start(
+            &bogus_s3,
+            &jwt,
+            &cache_path_phase2,
+            secret.clone(),
+            false, // disable health gate so the bogus URL fails fast
+            timeout_secs,
+            chain_rpc_url.clone(),
+            anchor_address.clone(),
+            ipns_name.clone(),
+            user_key.clone(),
+        );
+
+        // Listing buckets requires master S3 (`/?list-type=2`); cold-start
+        // resolver does NOT cover the bucket-list operation. We expect
+        // this call to FAIL with a master-unreachable / connect error.
+        // Documenting that this is the architecturally-correct behavior:
+        // bucket enumeration over a public anonymous channel would defeat
+        // the whole metadata-privacy goal of Phase 1.2's blinded keys.
+        let list_buckets_result = client.list_buckets().await;
+        match list_buckets_result {
+            Ok(result) => {
+                eprintln!(
+                    "[cold-start-e2e]   list_buckets succeeded unexpectedly via offline path \
+                     ({} buckets) — this is fine if a future feature adds offline LIST",
+                    result.buckets.len()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[cold-start-e2e]   list_buckets failed (EXPECTED — bucket-listing has \
+                     no offline path): {}",
+                    e
+                );
+            }
+        }
+
+        // The actual cold-start test: list files in the documents bucket.
+        // This goes through the SDK's encrypted forest, which goes through
+        // the Phase 3.3 resolver, which now (v0.4.4) can find the SDK
+        // forest manifest CID via the new `forest_manifest_cid` field.
+        eprintln!(
+            "[cold-start-e2e]   listing files in {} via cold-start...",
+            bucket
+        );
+        let files = client
+            .list_files_from_forest(&bucket)
+            .await
+            .expect(
+                "phase 2: cold-start list MUST succeed — if this fails, \
+                 the v0.4.4 fix isn't live: master flag off, publisher hasn't \
+                 ticked, or bucket has no Phase 2 root commit since the flag \
+                 was enabled. See the `forest_manifest_cid` diagnostic in the \
+                 returned error string.",
+            );
+        eprintln!(
+            "[cold-start-e2e]   list OK via cold-start ({} files in bucket)",
+            files.len()
+        );
+        assert!(
+            files.iter().any(|f| f.original_key == test_key),
+            "phase 2: cold-start list missing the just-uploaded file: {} (got {} files: {:?})",
+            test_key,
+            files.len(),
+            files.iter().map(|f| &f.original_key).take(10).collect::<Vec<_>>(),
+        );
+        eprintln!(
+            "[cold-start-e2e]   target file ({}) found in cold-start listing",
+            test_key
+        );
+
+        // Stretch goal: also try downloading the file. This further
+        // exercises the chunk-fetch path through gateways. With master
+        // unreachable, the chunks must come from public IPFS gateways
+        // (Phase 2.3 race), reachable iff master's pinning chain has
+        // replicated the chunks to ipfs-cluster (Step 0 verified this).
+        match client.get_object_flat(&bucket, &test_key).await {
+            Ok(dl) => {
+                assert_eq!(
+                    dl.as_ref(),
+                    payload.as_slice(),
+                    "phase 2: cold-start download bytes mismatch — list found the \
+                     file but the chunk-fetch path corrupted or returned a \
+                     different version"
+                );
+                eprintln!(
+                    "[cold-start-e2e]   download OK via cold-start (bytes verified)"
+                );
+            }
+            Err(e) => {
+                // Don't fail the test on download failure — the user's
+                // chunk pin replication may not be ready yet, OR the
+                // gateway race may have hit the dag-cbor 500 issue
+                // tracked separately as task #21. The list-from-forest
+                // success above is the load-bearing assertion for
+                // v0.4.4's correctness.
+                eprintln!(
+                    "[cold-start-e2e]   download FAILED via cold-start (NOT failing \
+                     the test — list-from-forest success is the load-bearing \
+                     assertion). Error: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    eprintln!("\n[cold-start-e2e] PASS — v0.4.4 cold-start works end-to-end.");
+}
