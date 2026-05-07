@@ -43,7 +43,7 @@
         <div class="sidebar-header">
             <div class="logo">
                 <h1>Fula API</h1>
-                <span class="version">v0.4.0</span>
+                <span class="version">v0.4.1</span>
             </div>
             <button class="theme-toggle" aria-label="Toggle theme">
                 <span class="icon-sun">☀️</span>
@@ -116,7 +116,7 @@
             </ul>
         </div>
         <div class="nav-section">
-            <h3>Master-Independent Reads (v0.4.0)</h3>
+            <h3>Master-Independent Reads (v0.4.0+)</h3>
             <ul>
                 <li><a href="#mir-overview">Overview</a></li>
                 <li><a href="#mir-bucket-lookup-h">Bucket Lookup-H Header</a></li>
@@ -1227,9 +1227,9 @@ curl -I "http://localhost:9000/my-bucket/Qm0bb7a3f40dcd6057bd5abd04d2aa80f68680e
         <section id="mir-overview" class="endpoint">
             <div class="endpoint-content">
                 <div class="description">
-                    <h1>Master-Independent Reads (v0.4.0)</h1>
+                    <h1>Master-Independent Reads (v0.4.0+)</h1>
                     <p>
-                        v0.4.0 adds a coordinated server + SDK story so non-blox clients can read their own files even when the master gateway is offline.
+                        v0.4.0 introduced a coordinated server + SDK story so non-blox clients can read their own files even when the master gateway is offline.
                         The <strong>SDK-side</strong> surfaces (gateway race, block cache, cold-start resolver, transparency types) live in <a href="sdk.html#offline-reads">SDK Examples</a>;
                         this section documents the <strong>HTTP-level</strong> additions on the master server itself.
                     </p>
@@ -1240,6 +1240,14 @@ curl -I "http://localhost:9000/my-bucket/Qm0bb7a3f40dcd6057bd5abd04d2aa80f68680e
                         <li>Bearer-protected <strong>internal admin endpoints</strong> at <code>/_internal/*</code> (master) and <code>/admin/users-index-anchor/trigger</code> (mainnet-rewards-server) so operators can force a publish / chain-submit on demand instead of waiting up to 12&nbsp;hours.</li>
                     </ul>
                     <p>Every new server-side path is gated by an env flag <strong>default OFF</strong>; old fula-clients see byte-identical behavior to pre-v0.4.0 builds.</p>
+                    <p class="note">
+                        <strong>v0.4.1 — SDK-side fixes only; master is unchanged.</strong>
+                        v0.4.1 closes correctness gaps that surfaced when validating v0.4.0's offline-reads end-to-end against a live master:
+                        encrypted offline DOWNLOAD (single-object + chunked &gt;768&nbsp;KB) now works via warm-cache hits and gateway-served chunks, the offline-failure classifier was widened to detect real connection-refused/DNS/network-unreachable errors,
+                        and v7 sharded-HAMT manifest pages + dir-index now route through the offline-fallback wrapper so master-down LIST works for sharded buckets.
+                        Server-side endpoints, env flags, and request shapes are unchanged.
+                        See <a href="https://github.com/functionland/fula-api/blob/main/packages/fula_client/CHANGELOG.md">CHANGELOG</a> for details.
+                    </p>
                 </div>
             </div>
         </section>

@@ -91,6 +91,14 @@ pub use types::*;
 /// callbacks without depending on internal module paths.
 pub use health_gate::{HealthCallback, MasterHealthEvent};
 
+/// Phase 2.2 — the persistent block cache. Exposed publicly so
+/// integration tests + diagnostic tooling can probe cache state
+/// without relying on internal module paths. Apps construct the
+/// cache implicitly via `Config::block_cache_enabled`; direct
+/// construction is uncommon outside tests.
+#[cfg(not(target_arch = "wasm32"))]
+pub use block_cache::{BlockCache, BlockCacheError};
+
 /// Phase 3.3 — `derive_user_key_from_email` available on EVERY
 /// target (wasm + native). Apps compute the userKey at sign-in
 /// time from the OAuth-provided email and stash it in

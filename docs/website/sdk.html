@@ -42,7 +42,7 @@
         <div class="sidebar-header">
             <div class="logo">
                 <h1>Fula API</h1>
-                <span class="version">v0.4.0</span>
+                <span class="version">v0.4.1</span>
             </div>
             <button class="theme-toggle" aria-label="Toggle theme">
                 <span class="icon-sun">☀️</span>
@@ -70,7 +70,7 @@
                 <li><a href="#file-manager">File Manager API</a></li>
                 <li><a href="#secure-sharing">Secure Sharing</a></li>
                 <li><a href="#multipart">Multipart Uploads</a></li>
-                <li><a href="#offline-reads">Offline Reads (v0.4.0)</a></li>
+                <li><a href="#offline-reads">Offline Reads (v0.4.0+)</a></li>
                 <li><a href="#aws-cli">AWS CLI</a></li>
                 <li><a href="#python">Python (boto3)</a></li>
                 <li><a href="#javascript">JavaScript</a></li>
@@ -633,12 +633,15 @@ println!("Complete: {}", final_etag);</code></pre>
         <section id="offline-reads" class="endpoint">
             <div class="endpoint-content">
                 <div class="description">
-                    <h2>📡 Offline Reads (v0.4.0)</h2>
+                    <h2>📡 Offline Reads (v0.4.0+)</h2>
                     <p>
                         When the master gateway is unreachable, the SDK can transparently fall back to public IPFS gateways (warm-device path) and, on a fresh device install, cold-start by resolving a globally-published users-index from IPNS or the chain anchor — no client wallet, no fresh master required.
                     </p>
                     <p>
                         Every flag defaults <strong>OFF</strong> for backward compatibility. Apps that don't opt in see byte-identical behavior to pre-v0.4.0 builds.
+                    </p>
+                    <p class="note">
+                        <strong>v0.4.1 fixes (forward-only).</strong> Encrypted offline DOWNLOAD now works for both single-object and chunked files (>768 KB). The v0.4.1 SDK stashes encryption metadata privately inside the AEAD-encrypted forest blob at upload, so warm-cache and gateway-served chunks decrypt without needing HTTP user-metadata headers. Files uploaded by an SDK older than v0.4.1 still need the master reachable until they're re-uploaded once. The connection-error classifier was also widened to detect real connection-refused / DNS / network-unreachable failures through the reqwest 0.12 + hyper-util chain.
                     </p>
 
                     <h3>Three-tier read path</h3>

@@ -1084,40 +1084,95 @@ impl EncryptedClient {
         bucket: &str,
         storage_key: &str,
     ) -> Result<Bytes> {
-        let result = self.inner.get_object_with_metadata(bucket, storage_key).await?;
-        
-        // Check if object is encrypted
-        let is_encrypted = result.metadata
-            .get("x-fula-encrypted")
-            .map(|v| v == "true")
-            .unwrap_or(false);
+        // Resolve the forest entry FIRST so we can fall back to its
+        // (privacy-preserving, AEAD-protected) `user_metadata` when the
+        // HTTP `x-fula-encryption` header is unavailable — i.e. on the
+        // offline / warm-cache / cold-start paths where the body is
+        // served from the local block cache (no headers preserved) or
+        // a public IPFS gateway (no headers period).
+        //
+        // Security considerations for the forest-entry fallback:
+        //   - The forest blob is AEAD-encrypted with `forest_dek`
+        //     (derived from the user's KEK, never sent to master).
+        //     Only the user can write or read these fields, so the
+        //     metadata cannot be substituted by master or by a gateway.
+        //   - The `wrapped_key` inside the JSON is HPKE-encrypted to
+        //     the user's KEK; useless without it. AEAD AAD on the
+        //     ciphertext is `fula:v4:content:{storage_key}`, binding
+        //     bytes to their key — an attacker who swaps wrapped_key
+        //     bytes for a key they control still cannot produce
+        //     ciphertext that AEAD-verifies under the same AAD.
+        //   - HTTP-header source remains preferred when present (master
+        //     is the canonical source-of-truth). Forest entry is the
+        //     fallback that turns gateway-served bytes into something
+        //     decryptable.
+        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
+
+        // Phase 2.4 — route through the offline-fallback wrapper so a
+        // master-down read (per `is_master_unreachable_error`) lands on
+        // the warm-cache + gateway-race path. Result on the offline
+        // path carries the same ciphertext bytes but an empty
+        // `metadata` map — the lookup helpers below pick up the
+        // metadata from the forest entry instead.
+        let result = self
+            .inner
+            .get_object_with_offline_fallback(bucket, storage_key)
+            .await?
+            .inner;
+
+        // Helper: fetch a metadata key, preferring HTTP headers, falling
+        // back to the (AEAD-protected) forest entry's user_metadata.
+        let get_meta = |k: &str| -> Option<String> {
+            result
+                .metadata
+                .get(k)
+                .cloned()
+                .or_else(|| {
+                    forest_entry
+                        .as_ref()
+                        .and_then(|e| e.user_metadata.get(k).cloned())
+                })
+        };
+
+        // "Is this an encrypted upload?" — answered authoritatively by
+        // the forest entry's `encrypted` boolean (set at upload via
+        // `mark_encrypted`, AEAD-protected on disk). HTTP fallback for
+        // share-token / pre-forest paths where forest_entry is None.
+        let is_encrypted = forest_entry
+            .as_ref()
+            .map(|e| e.encrypted)
+            .unwrap_or(false)
+            || get_meta("x-fula-encrypted").as_deref() == Some("true");
 
         if !is_encrypted {
-            // C-AUDIT-004 / NEW-2.1: refuse plaintext response when forest records
-            // this storage_key as a previously-encrypted upload. Forces a forest
-            // load first so an empty cache cannot be used as a bypass.
-            if self.forest_entry_requires_encryption(bucket, storage_key).await? {
-                return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
-                    "storage backend served plaintext for an encrypted path".to_string()
-                )));
-            }
+            // No forest entry says "must be encrypted" AND no header
+            // says encrypted → genuinely plaintext (legacy unencrypted
+            // upload, or share-token path that takes a different
+            // decrypt branch). Return as-is.
             return Ok(result.data);
         }
 
-        // Check if this is a chunked object
-        let is_chunked = result.metadata
-            .get("x-fula-chunked")
-            .map(|v| v == "true")
-            .unwrap_or(false);
+        // Check if this is a chunked object — same precedence: HTTP →
+        // forest entry. For new uploads, both sources agree; for
+        // legacy uploads (forest_entry.user_metadata empty), HTTP is
+        // the only source; for offline + new uploads, the forest entry
+        // is the only source.
+        let is_chunked = get_meta("x-fula-chunked").as_deref() == Some("true");
 
-        // Parse encryption metadata
-        let enc_metadata_str = result.metadata
-            .get("x-fula-encryption")
-            .ok_or_else(|| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption("Missing encryption metadata".to_string())
-            ))?;
+        // Parse encryption metadata. After the forest-entry fallback,
+        // a missing entry on BOTH sources means we have no way to
+        // decrypt — surface a clear error rather than silently
+        // returning ciphertext or refusing on the wrong axis.
+        let enc_metadata_str = get_meta("x-fula-encryption").ok_or_else(|| {
+            ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                "Missing encryption metadata (HTTP headers absent and forest entry has no \
+                 user_metadata; legacy upload that requires master to be online — re-upload \
+                 once via the new SDK to enable offline reads for this file)"
+                    .to_string(),
+            ))
+        })?;
 
-        let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
+        let enc_metadata: serde_json::Value = serde_json::from_str(&enc_metadata_str)
             .map_err(|e| ClientError::Encryption(
                 fula_crypto::CryptoError::Decryption(e.to_string())
             ))?;
@@ -1132,11 +1187,6 @@ impl EncryptedClient {
         let decryptor = Decryptor::new(self.encryption.key_manager.keypair());
         let dek = decryptor.decrypt_dek(&wrapped_key)
             .map_err(ClientError::Encryption)?;
-
-        // H-1 / H-2: resolve the forest entry once (shared by chunked and
-        // single-block branches) so we can enforce min_version and verify
-        // content_hash on either path.
-        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
 
         if is_chunked {
             // CHUNKED DOWNLOAD: Download and decrypt each chunk
@@ -1349,15 +1399,32 @@ impl EncryptedClient {
                 let client = self.inner.clone();
                 let bucket = bucket.to_string();
                 async move {
+                    // Phase 2.4 — route per-chunk fetches through the
+                    // offline-fallback wrapper. Chunks themselves carry
+                    // no per-chunk metadata: they decrypt with the
+                    // shared DEK (from the index object) plus the
+                    // chunk_index-derived nonce inside `decrypt_and_verify`
+                    // below. So warm-cache hits are sufficient — no
+                    // header round-trip needed. Bao streaming verifier
+                    // catches truncation / tampering regardless of
+                    // which channel served the bytes.
                     #[cfg(not(target_arch = "wasm32"))]
                     let data = fetch_chunk_with_timeout(
-                        client.get_object(&bucket, &chunk_key),
+                        async {
+                            client
+                                .get_object_with_offline_fallback(&bucket, &chunk_key)
+                                .await
+                                .map(|r| r.inner.data)
+                        },
                         chunk_index as u32,
                         per_chunk_timeout,
                     )
                     .await?;
                     #[cfg(target_arch = "wasm32")]
-                    let data = client.get_object(&bucket, &chunk_key).await?;
+                    let data = client
+                        .get_object_with_offline_fallback(&bucket, &chunk_key)
+                        .await
+                        .map(|r| r.inner.data)?;
                     Ok::<(u32, Bytes), ClientError>((chunk_index as u32, data))
                 }
             });
@@ -2566,21 +2633,25 @@ impl EncryptedClient {
                     }
                 }
             }
-            Err(_) => {
-                // New bucket: no forest exists yet. Since v7 is the canonical
-                // current format and the v1 → v7 migration path already exists
-                // for legacy data, new forests are born v7 directly so we never
-                // create a monolithic blob we'll later have to migrate.
-                //
-                // The cache is populated but nothing is written to storage yet
-                // — the first flush creates the manifest at `index_key`. That
-                // matches the v1 behaviour (creation was also deferred to first
-                // flush) and keeps "empty bucket read" cheap.
-                //
-                // Return the standard "forest is sharded" marker so callers
-                // route through the sharded API. The v1 `PrivateForest` return
-                // type doesn't admit a v7 value, and readers that inspect an
-                // empty forest via the v1 API are a non-goal.
+            // Genuinely new bucket — master returned 404 / NoSuchKey /
+            // NoSuchBucket (covers `ClientError::NotFound`,
+            // `BucketNotFound`, and the S3-XML error variants per
+            // `error.rs::is_not_found`). Since v7 is the canonical
+            // current format and the v1 → v7 migration path already
+            // exists for legacy data, new forests are born v7 directly
+            // so we never create a monolithic blob we'll later have to
+            // migrate.
+            //
+            // The cache is populated but nothing is written to storage
+            // yet — the first flush creates the manifest at `index_key`.
+            // That matches the v1 behaviour (creation was also deferred
+            // to first flush) and keeps "empty bucket read" cheap.
+            //
+            // Return the standard "forest is sharded" marker so callers
+            // route through the sharded API. The v1 `PrivateForest`
+            // return type doesn't admit a v7 value, and readers that
+            // inspect an empty forest via the v1 API are a non-goal.
+            Err(e) if e.is_not_found() => {
                 let num_shards = compute_initial_shard_count(0);
                 let manifest = ShardManifestV7::new(num_shards);
                 let v7 = ShardedHamtPrivateForest::from_manifest(
@@ -2601,6 +2672,27 @@ impl EncryptedClient {
                     )
                 ))
             }
+            // Real fetch failure — `MasterUnreachable` (offline + warm-
+            // cache miss + cold-start unavailable), `UsersIndexResolutionFailed`
+            // (cold-start tried but failed), 5xx, network / DNS errors,
+            // SequenceRegression, etc. MUST propagate so callers see the
+            // actual condition; the encrypted SDK's `ensure_forest_loaded`
+            // (line 2732) bubbles this up to apps that can show "offline;
+            // try again later" instead of an empty bucket.
+            //
+            // The previous wildcard `Err(_) =>` on this branch silently
+            // turned every offline failure into a fresh empty forest,
+            // which then served zero files via `list_files_from_forest`
+            // even when the user's data sat in the master's pinning
+            // chain. The narrower `is_not_found()` discriminator above
+            // pins the empty-forest path to genuine NotFound responses.
+            //
+            // Cache state on this branch: no entry inserted (the prior
+            // `forest_cache.remove(bucket)` at the top of this fn ran
+            // before the fetch attempt, so `forest_cache` is empty for
+            // `bucket`). The next call therefore re-attempts the fetch
+            // from scratch — no stale state survives a transient outage.
+            Err(e) => Err(e),
         }
     }
 
@@ -3726,7 +3818,20 @@ impl EncryptedClient {
         let mut pages: std::collections::BTreeMap<PageId, ManifestPage> = std::collections::BTreeMap::new();
         for (page_id, page_ref) in root.page_index.iter() {
             let page_key = derive_manifest_page_key(forest_dek, bucket, &shard_salt, *page_id);
-            let blob = self.inner.get_object(bucket, &page_key).await
+            // Phase 2.4 — route page fetches through the offline-fallback
+            // wrapper so a master-down read transparently lands on the
+            // warm-cache + gateway-race path. The page bytes are an
+            // AEAD-encrypted envelope (`EncryptedManifestPage::from_bytes`
+            // immediately below) decrypted with `forest_dek`; the cache
+            // stores only the ciphertext, content-addressed by the CID
+            // master (or a verified gateway) returned. No plaintext
+            // payload or key material reaches the cache, so the security
+            // model is identical to the manifest-fetch path that already
+            // routes through this wrapper.
+            let blob = self.inner
+                .get_object_with_offline_fallback(bucket, &page_key)
+                .await
+                .map(|r| r.inner.data)
                 .map_err(|e| ClientError::DownloadFailed(format!(
                     "failed to fetch manifest page {} for bucket {}: {}",
                     page_id, bucket, e
@@ -3774,7 +3879,19 @@ impl EncryptedClient {
         expected_seq: Option<u64>,
     ) -> std::result::Result<Option<(DirectoryIndex, u64)>, ClientError> {
         let key = derive_dir_index_key(forest_dek, bucket);
-        let blob = match self.inner.get_object(bucket, &key).await {
+        // Phase 2.4 — route through offline-fallback wrapper. Same
+        // security model as the manifest + page fetches: the dir-index
+        // blob is an AEAD envelope decrypted below with `forest_dek`,
+        // the cache stores only the verified ciphertext content-addressed
+        // by master's CID. NotFound (genuine "no dir-index yet") still
+        // surfaces via `is_not_found()` and triggers rebuild-from-forest,
+        // unchanged from before this fix.
+        let blob = match self
+            .inner
+            .get_object_with_offline_fallback(bucket, &key)
+            .await
+            .map(|r| r.inner.data)
+        {
             Ok(b) => b,
             Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e),
@@ -4509,9 +4626,18 @@ impl EncryptedClient {
         forest_entry.mark_encrypted();
 
         let kek_version = self.encryption.key_manager.version();
+        let is_chunked_upload = should_use_chunked(data.len());
 
-        // Check if we need chunked upload (for IPFS block size limit)
-        let result = if should_use_chunked(data.len()) {
+        // Check if we need chunked upload (for IPFS block size limit).
+        // Both branches return `(PutObjectResult, enc_metadata_json)` so
+        // the post-upload code below can stash the JSON onto the forest
+        // entry's `user_metadata`. That stash is the load-bearing change
+        // for offline / cold-start encrypted reads: the forest blob is
+        // AEAD-encrypted with `forest_dek` (derived from the user's
+        // KEK), so the metadata travels privately, while making the
+        // SDK self-sufficient when HTTP user-metadata headers are
+        // unavailable (gateway path, warm-cache path).
+        let (result, enc_metadata_json): (PutObjectResult, String) = if is_chunked_upload {
             // CHUNKED UPLOAD: Split into chunks under IPFS 1MB limit
             self.put_object_chunked_internal(
                 bucket,
@@ -4541,13 +4667,14 @@ impl EncryptedClient {
                 "obfuscation_mode": "flat",
                 "private_metadata": encrypted_meta.to_json().map_err(ClientError::Encryption)?,
             });
+            let enc_metadata_str = enc_metadata.to_string();
 
             let metadata = ObjectMetadata::new()
                 .with_content_type("application/octet-stream")
                 .with_metadata("x-fula-encrypted", "true")
-                .with_metadata("x-fula-encryption", &enc_metadata.to_string());
+                .with_metadata("x-fula-encryption", &enc_metadata_str);
 
-            if let Some(ref pinning) = self.pinning {
+            let put_result = if let Some(ref pinning) = self.pinning {
                 self.inner.put_object_with_metadata_and_pinning(
                     bucket,
                     &storage_key,
@@ -4563,8 +4690,39 @@ impl EncryptedClient {
                     Bytes::from(ciphertext),
                     Some(metadata),
                 ).await?
-            }
+            };
+            (put_result, enc_metadata_str)
         };
+
+        // Stash the encryption metadata onto the forest entry. The forest
+        // blob is AEAD-encrypted with `forest_dek` (derived from user's
+        // KEK), so the metadata is privacy-preserving — only the user
+        // can decrypt the forest and observe these fields.
+        //
+        // Security model:
+        //   - `wrapped_key` inside the JSON is HPKE-encrypted to the
+        //     user's KEK; useless without it.
+        //   - The download AEAD AAD is `fula:v4:content:{storage_key}`
+        //     which binds ciphertext to its storage_key. An attacker who
+        //     swaps wrapped_key bytes for a key they control cannot
+        //     produce ciphertext that AEAD-verifies under the same AAD.
+        //   - Master continues to receive the same HTTP user-metadata
+        //     headers so its bucket-registry plumbing is unchanged. We
+        //     just additionally record the JSON privately in the forest.
+        forest_entry.user_metadata.insert(
+            "x-fula-encrypted".to_string(),
+            "true".to_string(),
+        );
+        forest_entry.user_metadata.insert(
+            "x-fula-encryption".to_string(),
+            enc_metadata_json,
+        );
+        if is_chunked_upload {
+            forest_entry.user_metadata.insert(
+                "x-fula-chunked".to_string(),
+                "true".to_string(),
+            );
+        }
 
         // Update cache (but don't save to storage yet — mark dirty).
         // Before upsert: capture any old storage_key for the same path so we
@@ -4668,7 +4826,15 @@ impl EncryptedClient {
         Ok(result)
     }
 
-    /// Internal: Upload a large file using chunked encoding
+    /// Internal: Upload a large file using chunked encoding.
+    ///
+    /// Returns `(PutObjectResult, enc_metadata_json_string)`. The
+    /// caller stashes `enc_metadata_json_string` into the forest
+    /// entry's `user_metadata` so the encrypted forest itself is
+    /// self-describing — see `put_object_flat_deferred` for how this
+    /// powers the offline / cold-start decrypt paths without leaking
+    /// any plaintext (the JSON only travels inside the AEAD-encrypted
+    /// forest blob).
     async fn put_object_chunked_internal(
         &self,
         bucket: &str,
@@ -4678,7 +4844,7 @@ impl EncryptedClient {
         wrapped_dek: &EncryptedData,
         encrypted_meta: &EncryptedPrivateMetadata,
         kek_version: u32,
-    ) -> Result<PutObjectResult> {
+    ) -> Result<(PutObjectResult, String)> {
         // Create chunked encoder with AAD binding chunks to storage key
         let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
         let mut encoder = ChunkedEncoder::with_aad(dek.clone(), aad_prefix);
@@ -4810,7 +4976,11 @@ impl EncryptedClient {
             }
         };
 
-        Ok(result)
+        // Return both the upload result AND the JSON metadata the caller
+        // will stash on the forest entry. `index_body` IS the same JSON
+        // we just persisted as the index object's body and HTTP header
+        // — handing it back avoids the caller re-serializing.
+        Ok((result, index_body))
     }
 
     /// Upload an object with resumable chunked encoding.
@@ -5737,7 +5907,21 @@ impl EncryptedClient {
                 content_type: entry.content_type.clone(),
                 created_at: Some(entry.created_at),
                 modified_at: Some(entry.modified_at),
-                user_metadata: entry.user_metadata.clone(),
+                // Strip the SDK's internal x-fula-* plumbing (notably
+                // `x-fula-encryption` carrying the wrapped_key JSON,
+                // populated at upload to enable offline-encrypted reads
+                // — see `put_object_flat_deferred`). These keys are
+                // implementation details; surfacing them to apps would
+                // leak HPKE-encrypted DEK material into UI surfaces
+                // ("Properties" dialogs, custom-tag screens). Apps that
+                // set their own user_metadata still see those keys
+                // unchanged.
+                user_metadata: entry
+                    .user_metadata
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with("x-fula-"))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
                 is_encrypted: true,
             };
             (dir, metadata)
@@ -8840,6 +9024,220 @@ mod tests {
                 ),
                 "expected SeverelyDegraded, got: {:?}",
                 events[0]
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // load_forest_internal — error-discriminator regression suite
+    //
+    // Pins the fix for the silent-empty-forest bug: the outer Err arm in
+    // `load_forest_internal` previously caught every error with a
+    // wildcard `Err(_)` and silently created an empty v7 forest, masking
+    // offline / network / cold-start failures as "new bucket" and
+    // returning 0 files from `list_files_from_forest`. The fix narrows
+    // that branch to `Err(e) if e.is_not_found()` and propagates every
+    // other error. These tests pin both halves of the new contract.
+    //
+    // Coverage:
+    //   1. 404/NoSuchKey  → empty v7 forest cached, "forest is sharded"
+    //                       marker returned (the legitimate "new bucket"
+    //                       happy path; must STILL work after the fix).
+    //   2. 500            → error propagates; cache stays empty so a
+    //                       retry re-attempts the fetch.
+    //   3. Connection     → reqwest::Error → ClientError::Http →
+    //      refused          is_not_found() == false → propagates;
+    //                       cache stays empty. Covers the offline /
+    //                       master-unreachable shape (same code path
+    //                       as MasterUnreachable from the health gate;
+    //                       both surface as `is_not_found() == false`).
+    //
+    // These tests intentionally do NOT depend on knowing the exact
+    // index_key derivation (`derive_index_key(forest_dek, bucket)`) —
+    // wiremock mocks match every GET so the mock fires regardless of
+    // which deterministic path the SDK constructs.
+    // ═══════════════════════════════════════════════════════════════════
+    #[cfg(not(target_arch = "wasm32"))]
+    mod load_forest_offline_propagation_tests {
+        use super::*;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Builds an EncryptedClient pointed at `master_url` with the
+        /// health gate disabled (we drive the master-down signal via
+        /// the mock's status code or a dead address). Encryption config
+        /// is freshly generated — every test gets a unique forest_dek,
+        /// so cross-test bleed via the global redb cache is impossible.
+        fn build_client(master_url: &str) -> EncryptedClient {
+            let mut cfg = Config::new(master_url);
+            cfg.timeout = std::time::Duration::from_secs(2);
+            cfg.health_gate_enabled = false;
+            cfg.block_cache_enabled = false;
+            cfg.gateway_fallback_enabled = false;
+            let enc = EncryptionConfig::new();
+            EncryptedClient::new(cfg, enc).expect("client builds")
+        }
+
+        #[tokio::test]
+        async fn nosuchkey_404_creates_empty_forest_and_returns_sharded_marker() {
+            // Regression: the `is_not_found()` branch of the discriminator
+            // must continue to create an empty v7 forest for genuinely-
+            // new buckets. This is the legitimate happy path that the
+            // wildcard `Err(_)` was originally written for.
+            let master = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(404).set_body_string(
+                    r#"<Error><Code>NoSuchKey</Code><Message>not here</Message></Error>"#,
+                ))
+                .mount(&master)
+                .await;
+
+            let client = build_client(&master.uri());
+
+            let err = client
+                .load_forest("brand-new-bucket")
+                .await
+                .expect_err("v7 marker is returned as Err per existing contract");
+
+            assert!(
+                err.to_string().contains("forest is sharded"),
+                "404 must surface the sharded-API marker, got: {}",
+                err
+            );
+
+            // Empty v7 forest must be cached so subsequent operations on
+            // this bucket route through the sharded API.
+            let entry = client
+                .forest_cache
+                .get("brand-new-bucket")
+                .expect("404 path must populate the cache");
+            assert!(
+                matches!(entry.value(), ForestCacheEntry::ShardedHamt { .. }),
+                "expected ShardedHamt cache entry for new bucket"
+            );
+        }
+
+        #[tokio::test]
+        async fn http_500_propagates_and_does_not_cache_empty_forest() {
+            // The buggy `Err(_)` arm used to swallow this and return
+            // an empty forest. After the fix, a 5xx must propagate so
+            // the caller sees the actual server error, and the cache
+            // stays empty so a retry re-fetches.
+            let master = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(500).set_body_string(
+                    r#"<Error><Code>InternalError</Code><Message>boom</Message></Error>"#,
+                ))
+                .mount(&master)
+                .await;
+
+            let client = build_client(&master.uri());
+
+            let err = client
+                .load_forest("flaky-master-bucket")
+                .await
+                .expect_err("5xx must propagate, not silently create empty forest");
+
+            // Must NOT be the sharded marker — that would mean the bug
+            // is back. Any other error is acceptable; the discriminator
+            // is "is the cache empty after the call".
+            assert!(
+                !err.to_string().contains("forest is sharded"),
+                "5xx must NOT be masked as the sharded-API marker, got: {}",
+                err
+            );
+
+            // Cache stays empty — next call re-fetches.
+            assert!(
+                client.forest_cache.get("flaky-master-bucket").is_none(),
+                "5xx path must NOT populate the forest cache"
+            );
+        }
+
+        #[tokio::test]
+        async fn connection_refused_propagates_and_does_not_cache_empty_forest() {
+            // Models the offline scenario reported by FxFiles: master
+            // unreachable, no warm cache, no cold-start configured →
+            // SDK previously created an empty forest and returned 0
+            // files via `list_files_from_forest`. After the fix, the
+            // error propagates with no cache entry.
+            //
+            // 127.0.0.1:1 is conventionally closed; reqwest fails with
+            // a connect error → ClientError::Http(reqwest::Error) →
+            // is_not_found() == false → propagates per the new arm.
+            let client = build_client("http://127.0.0.1:1");
+
+            let err = client
+                .load_forest("offline-bucket")
+                .await
+                .expect_err("connection refused must propagate");
+
+            assert!(
+                !err.to_string().contains("forest is sharded"),
+                "connection refused must NOT be masked as the sharded-API marker, got: {}",
+                err
+            );
+            assert!(
+                client.forest_cache.get("offline-bucket").is_none(),
+                "connection-refused path must NOT populate the forest cache"
+            );
+        }
+
+        #[tokio::test]
+        async fn retry_after_propagated_error_re_attempts_fetch() {
+            // Pins the "no stale state survives a transient outage"
+            // guarantee. After a 5xx propagates, the next call must hit
+            // the network again — not return whatever was cached on the
+            // previous attempt. Mock returns 500 first, then 404 (so
+            // the second call lands on the new-bucket happy path);
+            // observing the empty-forest cache entry after the second
+            // call proves the fetch was actually re-attempted.
+            let master = MockServer::start().await;
+
+            // First mount: respond with 500 (will be served first). The
+            // up_to_n_times(1) limits this mock to one match.
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(500))
+                .up_to_n_times(1)
+                .mount(&master)
+                .await;
+            // Second mount: 404 with NoSuchKey for any subsequent GET.
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(404).set_body_string(
+                    r#"<Error><Code>NoSuchKey</Code><Message>still no</Message></Error>"#,
+                ))
+                .mount(&master)
+                .await;
+
+            let client = build_client(&master.uri());
+
+            // First call: 500 → propagates, cache empty.
+            let _ = client
+                .load_forest("retry-bucket")
+                .await
+                .expect_err("first call hits 500");
+            assert!(
+                client.forest_cache.get("retry-bucket").is_none(),
+                "5xx must not populate cache"
+            );
+
+            // Second call: 404 → empty v7 forest cached, sharded marker.
+            let err = client
+                .load_forest("retry-bucket")
+                .await
+                .expect_err("v7 marker on second call");
+            assert!(
+                err.to_string().contains("forest is sharded"),
+                "second call should hit 404 path, got: {}",
+                err
+            );
+            let entry = client
+                .forest_cache
+                .get("retry-bucket")
+                .expect("404 path populates cache");
+            assert!(
+                matches!(entry.value(), ForestCacheEntry::ShardedHamt { .. }),
+                "expected ShardedHamt cache entry after 404"
             );
         }
     }

@@ -1134,6 +1134,47 @@ impl FulaClient {
 /// Native-only because the only caller (`try_offline_fallback`) is
 /// gated to `cfg(not(target_arch = "wasm32"))`. Defining it here
 /// without gates would yield a dead-code warning on wasm builds.
+/// Walk an error's source chain looking for an `std::io::Error` whose
+/// `kind` indicates a network-tier transport failure. Used by
+/// [`is_master_unreachable_error`] as a fallback when
+/// `reqwest::Error::is_connect` doesn't see through hyper-util's
+/// wrapper layer (the reqwest-0.12 + hyper-1 chain is
+/// `reqwest::Error → hyper_util::Error → std::io::Error`, not
+/// `reqwest::Error → hyper::Error → std::io::Error`).
+///
+/// Strictly limited to network-tier io kinds. URL-build / body-encoding
+/// errors don't surface a network io::Error in their chain, so this
+/// check preserves the audit-follow-up invariant that bad-input
+/// errors must NOT classify as master-unreachable.
+#[cfg(not(target_arch = "wasm32"))]
+fn source_chain_has_network_io_error<E: std::error::Error + 'static>(err: &E) -> bool {
+    use std::io::ErrorKind;
+    let mut source: Option<&dyn std::error::Error> = err.source();
+    while let Some(s) = source {
+        if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
+            // Only network-tier kinds. Notably excludes:
+            //   - InvalidInput / InvalidData (parse / encode bugs)
+            //   - PermissionDenied / NotFound (filesystem)
+            //   - WouldBlock (non-blocking-io noise)
+            return matches!(
+                io_err.kind(),
+                ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::NotConnected
+                    | ErrorKind::TimedOut
+                    | ErrorKind::AddrNotAvailable
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::HostUnreachable
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::NetworkDown
+            );
+        }
+        source = s.source();
+    }
+    false
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn is_master_unreachable_error(e: &ClientError) -> bool {
     match e {
@@ -1159,7 +1200,23 @@ fn is_master_unreachable_error(e: &ClientError) -> bool {
             #[cfg(target_arch = "wasm32")]
             let is_connect = false;
 
+            // Source-chain fallback: in reqwest 0.12 with hyper-util,
+            // `is_connect()` walks the source chain looking for
+            // `hyper::Error`, but the actual chain on a real failure
+            // is `reqwest::Error → hyper_util::client::legacy::Error
+            // → std::io::Error(ConnectionRefused/TimedOut/etc.)` —
+            // hyper::Error is no longer in the middle. Without this
+            // fallback, real connection-refused / DNS-fail errors
+            // bypass the offline path. Limited to genuinely-network
+            // io kinds; URL-build / redirect-loop / body-encoding
+            // errors don't surface a network-tier io::Error in
+            // their source chain so the audit-follow-up
+            // (`test_master_unreachable_classifier_excludes_request_build_errors`)
+            // still passes.
+            let has_io_connect_error = source_chain_has_network_io_error(re);
+
             is_connect
+                || has_io_connect_error
                 || re.is_timeout()
                 || matches!(re.status(), Some(s) if s.is_server_error())
         }
@@ -1407,6 +1464,33 @@ mod tests {
         assert!(!is_master_unreachable_error(&e));
         let e = ClientError::ConcurrentModification("etag mismatch".into());
         assert!(!is_master_unreachable_error(&e));
+    }
+
+    /// Real connection-refused errors must classify as master-unreachable.
+    /// The reqwest 0.12 + hyper-util chain wraps the underlying
+    /// `std::io::Error(ConnectionRefused)` under
+    /// `hyper_util::client::legacy::Error → ConnectError → io::Error`.
+    /// `reqwest::Error::is_connect()` only walks the chain looking for
+    /// `hyper::Error`, which is no longer in the middle, so we extend
+    /// the classifier with a source-chain `io::Error::kind()` probe
+    /// (`source_chain_has_network_io_error`). Without that fallback,
+    /// real offline scenarios bypass the warm-cache fallback entirely.
+    #[tokio::test]
+    async fn test_master_unreachable_classifier_catches_real_connection_refused() {
+        let http = reqwest::Client::new();
+        // 127.0.0.1:1 is a privileged port; nothing listens.
+        let req_err = http
+            .get("http://127.0.0.1:1/probe")
+            .send()
+            .await
+            .expect_err("connection must be refused");
+        let wrapped = ClientError::Http(req_err);
+        assert!(
+            is_master_unreachable_error(&wrapped),
+            "real connection-refused error MUST classify as master-unreachable; \
+             without this the SDK's warm-cache offline fallback never fires. \
+             Error chain: {wrapped:#?}"
+        );
     }
 
     /// Audit follow-up: request-build errors (URL parsing, malformed

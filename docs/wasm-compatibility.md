@@ -248,9 +248,11 @@ The API surface is identical between native and WASM builds. However:
 2. **Multithreading:** WASM is single-threaded. Async operations use the event loop.
 3. **Timing:** High-resolution timers may be limited in WASM for security reasons.
 
-## Master-Independent Reads (v0.4.0) — what works on wasm
+## Master-Independent Reads (v0.4.0+) — what works on wasm
 
-v0.4.0 adds the offline-read story (Phase 2.1 / 2.2 / 2.3 / 2.4 / 3.3 / 19). The full surface is exposed in **both** `fula-flutter` and `fula-js` bindings for API symmetry, but several layers are **inert at runtime on wasm32** because their dependencies (redb, `parking_lot`-based gateway pool, reqwest-with-tls, `std::time::SystemTime`) don't compile cleanly in browsers.
+v0.4.0 introduced the offline-read story (Phase 2.1 / 2.2 / 2.3 / 2.4 / 3.3 / 19). The full surface is exposed in **both** `fula-flutter` and `fula-js` bindings for API symmetry, but several layers are **inert at runtime on wasm32** because their dependencies (redb, `parking_lot`-based gateway pool, reqwest-with-tls, `std::time::SystemTime`) don't compile cleanly in browsers.
+
+> **v0.4.1 update.** v0.4.1 closes correctness gaps in the same offline-reads stack (encrypted offline DOWNLOAD for single-object + chunked files, widened connection-error classifier, v7 sharded-HAMT manifest pages and dir-index now route through the offline-fallback wrapper). All v0.4.1 changes are **SDK-side only** — no new dependencies, no new wasm-specific gates. The wasm-functional vs. wasm-inert split below is unchanged from v0.4.0; the v0.4.1 fixes apply on whichever platforms the underlying surface was already functional. In practice that means: native targets pick up the encrypted-offline-download fix; wasm targets continue to pass through to master with the same behavior they had in v0.4.0 (block_cache + gateway_fallback are still inert on wasm).
 
 ### Functional on wasm32
 

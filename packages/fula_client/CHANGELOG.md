@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-05-06
+
+Follow-up release that closes correctness gaps found while validating v0.4.0's offline-reads end-to-end against a live master. **Strictly additive at the API level** — no signature changes, no Dart/JS code changes required in apps; just rebuild against the new SDK.
+
+### Fixed
+
+- **Offline path no longer masks failures as empty forests.** `load_forest_internal` previously caught every error via a wildcard `Err(_)` arm and silently created an empty v7 forest, so a master-unreachable read returned 0 files instead of surfacing the outage. Narrowed to `Err(e) if e.is_not_found()` for the genuine "new bucket" path; every other error now propagates correctly. Apps see real errors during outages instead of empty buckets. (`encryption.rs:2569`)
+- **Connection-refused / DNS-failure errors now correctly classify as master-unreachable.** `is_master_unreachable_error` only looked at `reqwest::Error::is_connect()`, which fails to detect connect errors through the reqwest 0.12 + hyper-util wrapper chain. Added a source-chain `std::io::Error` walker that catches `ConnectionRefused / TimedOut / NetworkUnreachable / HostUnreachable / ConnectionReset / ConnectionAborted / NotConnected / AddrNotAvailable / BrokenPipe / NetworkDown`. Without this fix, real offline scenarios bypassed the warm-cache fallback entirely. (`client.rs::source_chain_has_network_io_error`)
+- **v7 sharded-HAMT manifest pages now use the offline-fallback wrapper.** `load_manifest_pages` was fetching every page via raw `get_object`, bypassing the warm cache. Master-down reads of sharded buckets failed even with cache + gateway flags on. Routed through `get_object_with_offline_fallback`. Same security model — page bytes are AEAD envelopes decrypted with `forest_dek` after fetch; cache stores only ciphertext keyed by content-addressed CID. (`encryption.rs:3744-3783`)
+- **v7 directory-index also uses the offline-fallback wrapper.** Same root cause as manifest pages; same fix. `NotFound` short-circuits to "rebuild from forest" unchanged. (`encryption.rs:3807-3856`)
+- **Encrypted offline DOWNLOAD now works for single-object AND chunked files.** The encrypted SDK's read path required HTTP `x-fula-encryption` user-metadata to decrypt — a header that gateways don't preserve and the warm cache didn't capture. The read path (`get_object_decrypted_by_storage_key`) now falls back to the forest entry's `user_metadata` when the HTTP header is absent, and the upload path stashes the encryption-metadata JSON onto `forest_entry.user_metadata` so future reads are self-describing. The forest blob is AEAD-encrypted with `forest_dek` (derived from the user's KEK), so the metadata travels privately. AEAD AAD on every chunk binds bytes to their `storage_key`, defeating key-substitution attacks. Forward-only: existing pre-v0.4.1 uploads still need master to be reachable until they're re-uploaded once. (`encryption.rs:put_object_flat_deferred`, `encryption.rs:get_object_decrypted_by_storage_key`)
+- **Per-chunk fetches in the chunked-download engine route through `get_object_with_offline_fallback`.** Chunks themselves carry no per-chunk metadata (DEK from the index, nonce derived from chunk_index), so warm-cache hits are sufficient. Bao streaming verifier still catches truncation/tampering regardless of which channel served the bytes. Files >768 KB (the chunked threshold) now decrypt fully offline. (`encryption.rs:download_chunks_windowed_to_writer`)
+- **`FulaUsersIndexAnchor` Solidity contract: `initialize` now also accepts an `initialOperator` argument** that's granted `CONTRACT_OPERATOR_ROLE` at deploy with the same `ROLE_CHANGE_DELAY` timelock as owner/admin. Removes the operational dead-time of the day-one AddRole governance round-trip while preserving the multi-sig discipline for every subsequent operator change. Audit-driven; documented in the deploy script.
+
+### Added
+
+- **`BlockCache` and `BlockCacheError` re-exported at `fula_client` crate root** (`pub use block_cache::{BlockCache, BlockCacheError}`), gated to native targets. Lets integration tests and operator diagnostic tooling probe cache state without crossing internal-module-path boundaries. The cache itself stores only AEAD-encrypted ciphertext keyed by content-addressed CID — no plaintext, no encryption keys.
+- **`FileMetadata.userMetadata` is now boundary-filtered** before returning to apps: keys starting with `x-fula-` are stripped. Internal SDK plumbing (notably `x-fula-encryption` carrying the HPKE-wrapped DEK) no longer leaks into UI surfaces like "Properties" dialogs or custom-tag screens. App-set keys are returned unchanged.
+- **End-to-end integration test (`tests/offline_e2e.rs`).** Three variants — single-object (256 B), chunked (1.5 MB straddling the 768 KB threshold), and a legacy alias. Each phase: upload → fresh-client read against real master (populates warm cache) → bogus-master client (proves cache-served decrypt). Gated `#[ignore]`; opt in with `FULA_JWT` + `FULA_S3` env vars. Validates every fix above against live infrastructure.
+
+### Changed
+
+- **`get_object_decrypted_by_storage_key` routes through `get_object_with_offline_fallback`.** Same signature, same master-up behavior; transparently picks up warm-cache offline support. The cache hook on success populates `KEY_TO_CID` + `BLOCKS` for both index objects and chunks.
+- **Forest entries written by v0.4.1 carry encryption metadata in `user_metadata`** (`x-fula-encrypted`, `x-fula-encryption` JSON, optionally `x-fula-chunked`). Same JSON the master gets in HTTP user-metadata, but stored privately inside the AEAD-encrypted forest blob. Apps that want to read these can grep their own forest entries; the boundary filter (above) hides them from the public `FileMetadata.userMetadata` map.
+- **`load_forest_internal` errors are no longer self-healing into empty state.** Combined with the discriminator fix above, transient outages now propagate to the caller instead of silently caching empty. The next call after master returns re-fetches from scratch (cache stays empty on the failure path).
+
+### Bindings
+
+- **No public API changes.** `fula-flutter` and `fula-js` continue to expose the same Dart / TypeScript surfaces as v0.4.0. Apps just need to bump the dependency version and rebuild. The bug fixes above land automatically.
+- **`fula-flutter`**: regenerated `frb_generated.rs` from CI on tag push (no manual codegen needed). The Dart binding `getObjectWithOfflineFallback` now backs encrypted offline reads via the path through `get_object_decrypted_by_storage_key`.
+- **`fula-js`**: same — wasm-bindgen surface unchanged; the upstream Rust fixes apply transparently.
+
+### Operational
+
+- **Master deploy is unchanged.** All v0.4.1 changes are SDK-side. Master operators keep their existing `FULA_BUCKET_LOOKUP_H_ENABLED`, `FULA_USERS_INDEX_PUBLISHER_ENABLED`, etc. settings.
+- **Mixed-version coexistence.** A v0.4.0 master + v0.4.1 client works (master ignores client-side improvements). A v0.4.1 master + v0.4.0 client also works (master changes are forward-compatible with old SDKs).
+
+### Known Limitations
+
+- **Encrypted offline DOWNLOAD is forward-only.** Files uploaded by an SDK older than v0.4.1 don't carry encryption metadata in their forest entries, so reading them while the master is unreachable still fails (clean error: "Missing encryption metadata in headers AND forest entry — re-upload via the new SDK to enable offline reads"). Re-upload migrates lazily; on master-up, every re-upload populates the forest entry. No explicit migration step is required for end users.
+- **Sibling encrypted-read paths not yet routed through offline-fallback.** `get_object_decrypted_to_writer_by_storage_key`, `get_object_decrypted_buffered_to_writer_by_storage_key`, and `get_object_with_private_metadata` still use direct master fetch. FxFiles doesn't call these (uses `getFlat` only) but they're tracked for a follow-up release if other apps need the streaming-decrypt offline path.
+
+### Migration Guide
+
+- **No code changes.** Bump `fula_client` (Dart) / `fula-js` (npm) / `fula-client` (Rust) to `0.4.1`, rebuild, redistribute.
+- **No data migration.** Existing forests, existing buckets, existing chain entries — all readable as-is.
+- **Re-upload existing files** if you want offline-encrypted reads to cover them too. New uploads are self-describing immediately.
+
 ## [0.4.0] - 2026-05-04
 
 ### Added
