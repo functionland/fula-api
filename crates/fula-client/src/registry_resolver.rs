@@ -96,13 +96,48 @@ pub struct UserBucketsIndex {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct BucketEntry {
-    /// CIDv1 string of the user's per-bucket forest manifest.
+    /// **v0.4.4 RENAMED FOR CLARITY** (was the only "manifest" field).
+    /// CID of MASTER's bucket Prolly Tree root (`BucketMetadata.root_cid`),
+    /// stringified. Master's S3-listing index, NOT the SDK's encrypted
+    /// forest manifest. Kept for forward compatibility (operator tooling
+    /// that wants to walk master's tree from the published CBOR can
+    /// still find the root here) and as a fallback for v0.4.4-pre SDKs
+    /// that only know to read this field.
     pub manifest: String,
+    /// **v0.4.4** — CID of the SDK's encrypted forest manifest object
+    /// (`EncryptedShardManifestV7` JSON envelope) stored at
+    /// `derive_index_key(forest_dek, bucket)`. THIS is what cold-start
+    /// must resolve and decrypt. `None` when master has not yet
+    /// observed a v0.4.4+ SDK PUT for this bucket; the resolver falls
+    /// back to `manifest` in that case.
+    ///
+    /// Treat `Some("")` as `None` for defensive parsing — we only fall
+    /// back when neither `Some(non-empty)` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forest_manifest_cid: Option<String>,
     /// `true` ⇔ map key is the plaintext `bucket_name` (legacy
     /// fallback). The cold-start lookup tries blinded first; on
     /// miss it tries the plaintext name and accepts only entries
     /// where `legacy = true`.
     pub legacy: bool,
+}
+
+impl BucketEntry {
+    /// Returns the CID the cold-start resolver should fetch + decrypt
+    /// as the bucket's encrypted forest manifest.
+    ///
+    /// Prefers v0.4.4+ `forest_manifest_cid` (correct: SDK's encrypted
+    /// forest); falls back to legacy `manifest` (master's CBOR Prolly
+    /// Tree, which the SDK cannot decrypt — included only for
+    /// no-regression behavior on pre-v0.4.4-master users). Empty
+    /// strings on either side are treated as absent (defensive against
+    /// any serializer that round-trips `Some("")` for an unset Option).
+    pub fn cold_start_cid(&self) -> &str {
+        match self.forest_manifest_cid.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => &self.manifest,
+        }
+    }
 }
 
 /// Result of a successful [`UsersIndexResolver::resolve`].
@@ -1050,6 +1085,100 @@ mod tests {
     use sha3::{Digest, Keccak256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ============================================================
+    // v0.4.4 — BucketEntry::cold_start_cid fallback semantics
+    // ============================================================
+
+    #[test]
+    fn cold_start_cid_prefers_forest_manifest_cid_when_set() {
+        // Happy path for v0.4.4+: master populated `forest_manifest_cid`.
+        // The accessor must return THAT value, NOT the legacy `manifest`.
+        let entry = BucketEntry {
+            manifest: "bafyreilegacy".to_string(),
+            forest_manifest_cid: Some("bafyreinew".to_string()),
+            legacy: false,
+        };
+        assert_eq!(entry.cold_start_cid(), "bafyreinew");
+    }
+
+    #[test]
+    fn cold_start_cid_falls_back_when_forest_manifest_cid_is_none() {
+        // pre-v0.4.4 master: only the legacy field is populated.
+        let entry = BucketEntry {
+            manifest: "bafyreilegacy".to_string(),
+            forest_manifest_cid: None,
+            legacy: false,
+        };
+        assert_eq!(entry.cold_start_cid(), "bafyreilegacy");
+    }
+
+    #[test]
+    fn cold_start_cid_falls_back_when_forest_manifest_cid_is_empty_string() {
+        // Defensive: some serializers might round-trip Some("") for an
+        // unset Option<String>. The accessor MUST treat empty string as
+        // absent and fall back to the legacy field — otherwise cold-start
+        // would try to parse "" as a CID and produce a confusing error.
+        let entry = BucketEntry {
+            manifest: "bafyreilegacy".to_string(),
+            forest_manifest_cid: Some(String::new()),
+            legacy: false,
+        };
+        assert_eq!(entry.cold_start_cid(), "bafyreilegacy");
+    }
+
+    #[test]
+    fn cold_start_cid_returns_legacy_even_when_legacy_is_also_empty() {
+        // Both fields effectively empty: caller's parse will fail with a
+        // clean error message (not our problem here). We don't panic; we
+        // just return the legacy field, which is "".
+        let entry = BucketEntry {
+            manifest: String::new(),
+            forest_manifest_cid: None,
+            legacy: false,
+        };
+        assert_eq!(entry.cold_start_cid(), "");
+    }
+
+    #[test]
+    fn bucket_entry_serde_round_trip_with_forest_manifest_cid_set() {
+        // Verify CBOR round-trip preserves both fields, and the
+        // skip_serializing_if attribute behaves correctly.
+        let entry = BucketEntry {
+            manifest: "bafyreilegacy".to_string(),
+            forest_manifest_cid: Some("bafyreinew".to_string()),
+            legacy: false,
+        };
+        let bytes = serde_ipld_dagcbor::to_vec(&entry).expect("serialize");
+        let restored: BucketEntry =
+            serde_ipld_dagcbor::from_slice(&bytes).expect("deserialize");
+        assert_eq!(restored.manifest, "bafyreilegacy");
+        assert_eq!(restored.forest_manifest_cid.as_deref(), Some("bafyreinew"));
+        assert!(!restored.legacy);
+    }
+
+    #[test]
+    fn bucket_entry_deserializes_old_cbor_without_forest_manifest_cid() {
+        // Pre-v0.4.4 CBOR: only `manifest` and `legacy` fields. Must
+        // deserialize cleanly with `forest_manifest_cid: None` (via
+        // #[serde(default)]). Apps still on pre-v0.4.4 SDK versions
+        // must not break when reading new CBORs (and vice-versa).
+        #[derive(serde::Serialize)]
+        struct LegacyBucketEntry {
+            manifest: String,
+            legacy: bool,
+        }
+        let legacy = LegacyBucketEntry {
+            manifest: "bafyreilegacy".to_string(),
+            legacy: true,
+        };
+        let bytes = serde_ipld_dagcbor::to_vec(&legacy).expect("serialize legacy");
+        let modern: BucketEntry =
+            serde_ipld_dagcbor::from_slice(&bytes).expect("legacy → modern");
+        assert_eq!(modern.manifest, "bafyreilegacy");
+        assert_eq!(modern.forest_manifest_cid, None);
+        assert!(modern.legacy);
+    }
 
     /// The hardcoded `SELECTOR_LATEST` MUST equal the canonical
     /// `keccak256("latest()")[..4]`. If a future refactor renames the

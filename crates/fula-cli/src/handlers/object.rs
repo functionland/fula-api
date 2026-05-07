@@ -229,6 +229,65 @@ pub async fn put_object(
         }
     }
 
+    // v0.4.4: SDK forest-manifest CID tracking. When the SDK PUTs its
+    // encrypted forest manifest (Phase 2 root commit), it sends the
+    // sentinel header `x-amz-meta-fula-forest-manifest: 1`. Master sees
+    // the sentinel, takes the just-computed `cid` (which is the etag of
+    // the bytes that just went into the bucket Prolly Tree at index_key),
+    // and stores it on the BucketMetadata so the publisher can emit it
+    // as `forest_manifest_cid` in the per-user bucketsIndex CBOR.
+    //
+    // Why a sentinel rather than the CID itself: master computes `cid`
+    // server-side anyway (lines ~95 above) and is the source of truth
+    // for content-addressing. SDK doesn't need to recompute and send it
+    // — that just adds verification overhead. The sentinel says "this
+    // PUT is the forest manifest; please record the CID".
+    //
+    // REPLACE semantics: every Phase 2 root commit produces a fresh CID
+    // (encrypted manifest content includes a new sequence number), so
+    // master always tracks the LATEST. `populate_forest_manifest_cid`
+    // is idempotent on identical input (no extra dirty flag, no extra
+    // registry persist) but DOES replace when the CID changed. Distinct
+    // from `populate_lookup_h_if_missing`'s set-once semantics.
+    //
+    // Env-flag gated (`FULA_FOREST_MANIFEST_CID_ENABLED`) so master can
+    // stage the rollout independently of SDK rollout. Failures are
+    // non-fatal — bad header parsing must not break uploads.
+    let forest_manifest_enabled = std::env::var("FULA_FOREST_MANIFEST_CID_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if forest_manifest_enabled {
+        let sentinel_present = headers
+            .get("x-amz-meta-fula-forest-manifest")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if sentinel_present {
+            // `cid` is the content-addressed CID master computed for this
+            // PUT body (lines ~95 in this handler). It is the SDK's
+            // encrypted forest manifest CID by construction — the SDK
+            // sends the sentinel only on its Phase 2 root-commit PUT.
+            match state.bucket_manager.populate_forest_manifest_cid(
+                &session.hashed_user_id,
+                &bucket_name,
+                cid.to_string(),
+            ) {
+                Ok(true) => tracing::debug!(
+                    bucket = %bucket_name,
+                    cid = %cid,
+                    "Populated forest_manifest_cid (v0.4.4)"
+                ),
+                Ok(false) => { /* identical to existing value; no-op */ }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    bucket = %bucket_name,
+                    user = %session.hashed_user_id,
+                    "populate_forest_manifest_cid failed on a bucket that just accepted a PUT"
+                ),
+            }
+        }
+    }
+
     // Persist the bucket registry so the new root CID survives restarts.
     // This MUST succeed — otherwise the new tree root is lost on restart.
     // Use the user's JWT for pinning service authentication.
@@ -793,7 +852,15 @@ fn parse_etag_list(s: &str) -> impl Iterator<Item = String> + '_ {
 /// persisted as object metadata). The list is `pub(crate)` so it
 /// can be referenced from sibling modules; tests below assert it
 /// stays in lockstep with the handler's filtering.
-pub(crate) const FULA_CONTROL_HEADERS: &[&str] = &["fula-bucket-lookup-h"];
+pub(crate) const FULA_CONTROL_HEADERS: &[&str] = &[
+    "fula-bucket-lookup-h",
+    // v0.4.4: sentinel header that says "this PUT is the SDK's
+    // encrypted forest manifest". Consumed by the put_object handler
+    // to populate `BucketMetadata.forest_manifest_cid`; never stored
+    // as user_metadata on the object itself (would pollute every
+    // forest-manifest object with a meaningless `=1` tag).
+    "fula-forest-manifest",
+];
 
 /// Returns `true` if the given x-amz-meta key (already stripped of
 /// the `x-amz-meta-` prefix) is a Fula control header — meaning it

@@ -239,11 +239,30 @@ pub struct UserBucketsIndex {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketEntry {
-    /// CID of the user's per-bucket forest manifest (Prolly Tree
-    /// root from `BucketMetadata.root_cid`). Stored as string so
-    /// the CBOR doesn't grow IPLD-link semantics that would change
-    /// the recursive-pin walk.
+    /// **MASTER's bucket Prolly Tree root CID** (`BucketMetadata.root_cid`)
+    /// stringified. This is master's S3-listing index, NOT the SDK's
+    /// encrypted forest manifest. Kept for forward compatibility (any
+    /// future operator tooling that wants to walk master's tree from
+    /// the published CBOR can still find the root here) and as a
+    /// fallback for v0.4.4-pre SDKs that only know to read this field.
+    /// String form (not IPLD link) so the CBOR's recursive-pin walk
+    /// doesn't try to traverse it.
     pub manifest: String,
+    /// **v0.4.4** — CID of the SDK's encrypted forest manifest object
+    /// (`EncryptedShardManifestV7` JSON envelope) for this bucket.
+    /// THIS is what v0.4.4+ SDKs read on cold-start to find the
+    /// encrypted forest. Distinct from `manifest` above (master's
+    /// CBOR Prolly Tree).
+    ///
+    /// `None` when master has not yet observed a v0.4.4+ SDK PUT
+    /// carrying the `x-amz-meta-fula-forest-manifest` sentinel for
+    /// this bucket. SDK falls back to `manifest` in that case (which
+    /// is broken for cold-start but no worse than v0.4.3-and-prior).
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// preserves CBOR-shape compatibility with pre-v0.4.4 readers
+    /// that don't know this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forest_manifest_cid: Option<String>,
     /// `true` ⇔ map key is plaintext `bucket_name` (Phase 1.2 hadn't
     /// run for this bucket yet — i.e., user hasn't uploaded with a
     /// Phase-1.2-aware client since the field was introduced). SDK
@@ -301,6 +320,15 @@ pub fn build_user_buckets_index(
             key,
             BucketEntry {
                 manifest: b.root_cid.to_string(),
+                // v0.4.4: emit the SDK's encrypted forest manifest CID
+                // when master has it populated. Treat empty-string-stored
+                // values as None too (defensive against any serializer
+                // that round-trips Some("") for an unset field).
+                forest_manifest_cid: b
+                    .forest_manifest_cid
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .cloned(),
                 legacy,
             },
         );
@@ -344,8 +372,16 @@ pub(crate) fn compute_user_content_hash(buckets: &[BucketMetadata]) -> [u8; 32] 
     let mut sorted: Vec<&BucketMetadata> = buckets.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
 
+    // v2: domain bumped to include `forest_manifest_cid` (v0.4.4). Without
+    // this, master populating a fresh forest_manifest_cid on a bucket
+    // whose other fields didn't change would not advance the diff hash —
+    // the publisher would think "this user is unchanged, reuse the
+    // cached per-user CID" and the new value would never get emitted in
+    // the published CBOR. Bumping the domain forces a full re-pin of every
+    // user's per-user CBOR on the first tick after upgrade; subsequent
+    // ticks revert to differential pinning.
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"fula:users-index-publisher:user-content-hash:v1");
+    hasher.update(b"fula:users-index-publisher:user-content-hash:v2");
     for b in &sorted {
         hasher.update(b.name.as_bytes());
         hasher.update(&[0u8]);
@@ -357,6 +393,20 @@ pub(crate) fn compute_user_content_hash(buckets: &[BucketMetadata]) -> [u8; 32] 
                 hasher.update(&h);
             }
             None => {
+                hasher.update(b"N");
+            }
+        }
+        hasher.update(&[0u8]);
+        // v0.4.4: include forest_manifest_cid in the diff hash. None and
+        // empty-string both encode as "N" so the defensive parsing in
+        // BucketEntry::cold_start_cid stays consistent with what the diff
+        // cache treats as "no fresh forest manifest yet".
+        match b.forest_manifest_cid.as_deref() {
+            Some(s) if !s.is_empty() => {
+                hasher.update(b"F");
+                hasher.update(s.as_bytes());
+            }
+            _ => {
                 hasher.update(b"N");
             }
         }

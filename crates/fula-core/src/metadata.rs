@@ -245,6 +245,25 @@ pub struct BucketMetadata {
     /// deserialize fine without migration.
     #[serde(default)]
     pub bucket_lookup_h: Option<[u8; 16]>,
+
+    /// **v0.4.4** — CID of the SDK's encrypted forest manifest object
+    /// (`EncryptedShardManifestV7` JSON envelope), as a string.
+    ///
+    /// Distinct from `root_cid` (which is master's bucket Prolly Tree
+    /// listing index, used by master internally and pinned for IPFS
+    /// availability). The SDK's cold-start path needs THIS value, not
+    /// `root_cid`, because it deserializes via `serde_json::from_slice`
+    /// expecting the JSON envelope at `derive_index_key(forest_dek, bucket)`.
+    ///
+    /// Populated by `BucketManager::populate_forest_manifest_cid` (REPLACE
+    /// semantics — every Phase 2 root commit produces a fresh CID, master
+    /// must track the latest, unlike `bucket_lookup_h` which is set-once).
+    /// `None` for buckets created before this field was added; lazily
+    /// populated on the next forest flush from a v0.4.4+ SDK that sends
+    /// the `x-amz-meta-fula-forest-manifest` sentinel header.
+    /// `#[serde(default)]` makes existing CBOR blocks deserialize fine.
+    #[serde(default)]
+    pub forest_manifest_cid: Option<String>,
 }
 
 impl BucketMetadata {
@@ -265,6 +284,7 @@ impl BucketMetadata {
             total_size: 0,
             last_modified: now,
             bucket_lookup_h: None,
+            forest_manifest_cid: None,
         }
     }
 
@@ -520,5 +540,42 @@ mod tests {
         // The critical assertion — Phase 1.2's serde(default) preserves
         // the no-migration property for existing CBOR registries.
         assert_eq!(modern.bucket_lookup_h, None);
+        // v0.4.4: same property for the new forest_manifest_cid field.
+        assert_eq!(modern.forest_manifest_cid, None);
+    }
+
+    #[test]
+    fn test_forest_manifest_cid_round_trip_with_lookup_h_set() {
+        // v0.4.4: a fully-populated post-v0.4.4 BucketMetadata with both
+        // bucket_lookup_h AND forest_manifest_cid set must round-trip
+        // through dag-cbor without losing either field. This is the
+        // happy-path serde test for the new field.
+        let cid = fula_blockstore::cid_utils::create_cid(
+            b"root",
+            fula_blockstore::cid_utils::CidCodec::DagCbor,
+        );
+        let mut bucket = BucketMetadata::new(
+            "images".into(),
+            "4da2c0616b1d39660f9f94e145fbce4f".into(),
+            cid,
+        );
+        let h: [u8; 16] = [
+            0xb0, 0x7a, 0x53, 0x23, 0x57, 0xa8, 0x61, 0xb9,
+            0xb6, 0x0d, 0xd6, 0x02, 0xbf, 0xe8, 0x26, 0x7a,
+        ];
+        bucket.bucket_lookup_h = Some(h);
+        bucket.forest_manifest_cid =
+            Some("bafyreihxyfxxjtsqaiyfchqh6mmvhqvlmydbf4dmtsdsvn7rqcnrs6fqnm".into());
+
+        let bytes = serde_ipld_dagcbor::to_vec(&bucket).expect("serialize");
+        let restored: BucketMetadata =
+            serde_ipld_dagcbor::from_slice(&bytes).expect("deserialize");
+
+        assert_eq!(restored.bucket_lookup_h, Some(h));
+        assert_eq!(
+            restored.forest_manifest_cid.as_deref(),
+            Some("bafyreihxyfxxjtsqaiyfchqh6mmvhqvlmydbf4dmtsdsvn7rqcnrs6fqnm"),
+        );
+        assert_eq!(restored.name, "images");
     }
 }

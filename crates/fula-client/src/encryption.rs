@@ -3301,9 +3301,38 @@ impl EncryptedClient {
             return Err(ClientError::BucketNotFound(bucket.to_string()));
         };
 
-        let manifest_cid = entry.manifest.parse::<cid::Cid>().map_err(|e| {
+        // v0.4.4: prefer the new `forest_manifest_cid` field (the SDK's
+        // encrypted forest manifest CID — what we actually need for
+        // cold-start). Fall back to the legacy `manifest` field (master's
+        // CBOR Prolly Tree CID) only when the new field is absent / empty.
+        // The fallback path is broken (CBOR parsed as JSON fails) but is
+        // no worse than v0.4.3-and-prior behavior; users on v0.4.4+ master
+        // get the correct value automatically once they re-PUT.
+        let cold_start_cid_str = entry.cold_start_cid();
+        let manifest_cid = cold_start_cid_str.parse::<cid::Cid>().map_err(|e| {
+            // Diagnostic message that distinguishes the three failure modes
+            // operators are likely to hit:
+            //   - Both fields populated but malformed → real CID parse error
+            //   - forest_manifest_cid empty/None, manifest is a CID →
+            //     v0.4.4 master flag wasn't on for this user's last PUT
+            //     (or user is on a pre-v0.4.4 SDK that never sends the
+            //     fula-forest-manifest sentinel) — the user needs to
+            //     re-flush from a v0.4.4+ SDK against a v0.4.4+ master
+            //     with `FULA_FOREST_MANIFEST_CID_ENABLED=1`.
+            //   - Both fields empty → bucket exists in master's registry
+            //     but no Phase 2 root commit has happened yet.
+            let hint = if entry.forest_manifest_cid.as_deref().unwrap_or("").is_empty() {
+                " — `forest_manifest_cid` was not populated by master; \
+                  re-flush this bucket from a v0.4.4+ SDK against a master \
+                  with `FULA_FOREST_MANIFEST_CID_ENABLED=1`"
+            } else {
+                ""
+            };
             ClientError::UsersIndexResolutionFailed {
-                reason: format!("invalid manifest CID '{}' for bucket {}: {}", entry.manifest, bucket, e),
+                reason: format!(
+                    "invalid manifest CID '{}' for bucket {} (forest_manifest_cid={:?}, manifest={:?}): {}{}",
+                    cold_start_cid_str, bucket, entry.forest_manifest_cid, entry.manifest, e, hint,
+                ),
             }
         })?;
 
@@ -3343,9 +3372,13 @@ impl EncryptedClient {
 
         // Phase 1.2: monolithic v4 forest is also a manifest-root commit.
         // Same header semantics as save_sharded_hamt_forest's Phase 2 PUT.
+        // v0.4.4: includes the forest-manifest sentinel so master tracks
+        // this object's CID for the cold-start path (same as the v7
+        // sharded path's Phase 2 PUT).
         let metadata = ObjectMetadata::new()
             .with_content_type("application/octet-stream")
-            .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket));
+            .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket))
+            .with_metadata("fula-forest-manifest", "1");
 
         let put_result = self.inner.put_object_with_metadata_conditional(
             bucket,
@@ -3671,9 +3704,22 @@ impl EncryptedClient {
         // bucket-scoped `lookup_h_hex` hoisted before Phase 1.5 so we
         // don't re-derive on every flush. See compute_bucket_lookup_h_hex
         // for header semantics.
+        //
+        // v0.4.4: also attach the sentinel header
+        // `x-amz-meta-fula-forest-manifest: 1` so master populates
+        // `BucketMetadata.forest_manifest_cid` with the just-stored
+        // object's CID. This is the encrypted forest manifest CID the
+        // publisher needs to emit in the per-user bucketsIndex CBOR for
+        // cold-start to deserialize correctly. See server-side handler
+        // at handlers/object.rs (`x-amz-meta-fula-forest-manifest`
+        // sentinel block) for the population path. The sentinel is
+        // sent ONLY on this Phase 2 root PUT — never on Phase 1.5 page
+        // PUTs or Phase 1.6 dir-index PUTs (those are intermediate
+        // objects, not the forest manifest root).
         let metadata = ObjectMetadata::new()
             .with_content_type("application/octet-stream")
-            .with_metadata("fula-bucket-lookup-h", &lookup_h_hex);
+            .with_metadata("fula-bucket-lookup-h", &lookup_h_hex)
+            .with_metadata("fula-forest-manifest", "1");
 
         let put_result = self.inner.put_object_with_metadata_conditional(
             bucket,
@@ -4421,6 +4467,9 @@ impl EncryptedClient {
         // bucket-lookup-h header so master can populate `bucket_lookup_h`
         // here too — otherwise users who migrate to v7 via this path (rather
         // than save_sharded_hamt_forest) would never get their lookup_h set.
+        // v0.4.4: also attach the fula-forest-manifest sentinel so master
+        // tracks this v7 manifest's CID; the post-migration cold-start
+        // works seamlessly without waiting for the next regular flush.
         let put_result = match self.inner.put_object_with_metadata_conditional(
             bucket,
             &index_key,
@@ -4428,7 +4477,8 @@ impl EncryptedClient {
             Some(
                 ObjectMetadata::new()
                     .with_content_type("application/octet-stream")
-                    .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket)),
+                    .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket))
+                    .with_metadata("fula-forest-manifest", "1"),
             ),
             Some(&v1_etag),
             None,
@@ -8541,6 +8591,7 @@ mod tests {
                 blinded_hex,
                 BucketEntry {
                     manifest: manifest_cid.to_string(),
+                    forest_manifest_cid: None,
                     legacy: false,
                 },
             );
@@ -8701,6 +8752,7 @@ mod tests {
                 bucket.to_string(),
                 BucketEntry {
                     manifest: manifest_cid.to_string(),
+                    forest_manifest_cid: None,
                     legacy: true,
                 },
             );
@@ -8786,6 +8838,7 @@ mod tests {
                 bucket.to_string(),
                 BucketEntry {
                     manifest: bogus_cid.to_string(),
+                    forest_manifest_cid: None,
                     legacy: false,
                 },
             );
@@ -8871,6 +8924,7 @@ mod tests {
                 "videos".to_string(),
                 BucketEntry {
                     manifest: manifest_cid.to_string(),
+                    forest_manifest_cid: None,
                     legacy: true,
                 },
             );

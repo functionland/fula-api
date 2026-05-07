@@ -1040,6 +1040,49 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
         }
     }
 
+    /// Set the bucket's `forest_manifest_cid` to the given CID.
+    ///
+    /// **DIFFERENT SEMANTICS from `populate_lookup_h_if_missing`** — this is a
+    /// REPLACE-LATEST function, not a set-once function. Every Phase 2 forest
+    /// root commit produces a fresh CID for the encrypted forest manifest;
+    /// master must track the latest, not the first. Idempotent on identical
+    /// input (returns `Ok(false)` and skips the dirty flag) so a no-op call
+    /// doesn't trigger an extra registry persist.
+    ///
+    /// Returns `Ok(true)` if the stored value changed (from `None` or from a
+    /// different CID), `Ok(false)` if the stored value already equaled the
+    /// new value. `Err(BucketNotFound)` if the bucket doesn't exist.
+    ///
+    /// The publisher reads this field when building the per-user `bucketsIndex`
+    /// CBOR's `forest_manifest_cid` column — the value the SDK's cold-start
+    /// resolver decrypts to recover the bucket's encrypted forest. See
+    /// `BucketMetadata::forest_manifest_cid` for the full rationale.
+    pub fn populate_forest_manifest_cid(
+        &self,
+        user_id: &str,
+        bucket_name: &str,
+        cid: String,
+    ) -> Result<bool> {
+        let internal_key = Self::scoped_bucket_key(user_id, bucket_name);
+
+        match self.buckets.get_mut(&internal_key) {
+            Some(mut entry) => {
+                if entry.forest_manifest_cid.as_deref() == Some(cid.as_str()) {
+                    // Identical to existing value; no-op. Avoids unnecessary
+                    // registry-persist churn on retried PUTs that re-derive
+                    // the same forest manifest content (and therefore the
+                    // same content-addressed CID).
+                    Ok(false)
+                } else {
+                    entry.forest_manifest_cid = Some(cid);
+                    self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(true)
+                }
+            }
+            None => Err(CoreError::BucketNotFound(bucket_name.to_string())),
+        }
+    }
+
     /// Find a bucket by display name that contains a specific object key
     ///
     /// Uses the secondary name index for O(1) lookup of matching buckets
@@ -1670,6 +1713,105 @@ mod tests {
 
         let h: [u8; 16] = [0u8; 16];
         let result = manager.populate_lookup_h_if_missing("ghost-user", "ghost-bucket", h);
+
+        assert!(matches!(result, Err(CoreError::BucketNotFound(ref n)) if n == "ghost-bucket"));
+    }
+
+    // ============================================================
+    // v0.4.4 — populate_forest_manifest_cid (REPLACE-LATEST semantics)
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_populate_forest_manifest_cid_replace_semantics() {
+        // The function uses REPLACE-LATEST semantics, NOT set-once like
+        // `populate_lookup_h_if_missing`. Tests the three transitions:
+        //   1. None → Some(A): returns Ok(true), dirty set
+        //   2. Some(A) → Some(A) again (identical): returns Ok(false),
+        //      dirty NOT set (no-op avoids registry-persist churn)
+        //   3. Some(A) → Some(B) (different): returns Ok(true), dirty set,
+        //      stored value updated to B (REPLACE semantics — Phase 2 root
+        //      commits produce fresh CIDs every time, master must track
+        //      the latest)
+        let store = Arc::new(MemoryBlockStore::new());
+        let manager = BucketManager::new(store);
+        let user_id = "userF";
+        let bucket_name = "photos";
+        let owner = Owner::new(user_id);
+
+        manager
+            .create_bucket_for_user(user_id, bucket_name.to_string(), owner)
+            .await
+            .expect("create_bucket_for_user");
+
+        let cid_a = "bafyreihxyfxxjtsqaiyfchqh6mmvhqvlmydbf4dmtsdsvn7rqcnrs6fqnm".to_string();
+        let cid_b = "bafyreidac2bdzcbadfo7totuszpq6kf3f4s5ftzbq2xiaera6krwefmyjq".to_string();
+
+        // Transition 1: None → Some(A)
+        manager
+            .dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let changed = manager
+            .populate_forest_manifest_cid(user_id, bucket_name, cid_a.clone())
+            .expect("populate ok");
+        assert!(changed, "first call must report changed=true");
+        assert!(
+            manager.dirty.load(std::sync::atomic::Ordering::Relaxed),
+            "dirty must be set after a real write"
+        );
+        let post1 = manager
+            .get_bucket_metadata_for_user(user_id, bucket_name)
+            .expect("metadata exists");
+        assert_eq!(post1.forest_manifest_cid.as_ref(), Some(&cid_a));
+
+        // Transition 2: Some(A) → Some(A) — no-op
+        manager
+            .dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let changed = manager
+            .populate_forest_manifest_cid(user_id, bucket_name, cid_a.clone())
+            .expect("populate ok");
+        assert!(!changed, "identical-CID call must report changed=false");
+        assert!(
+            !manager.dirty.load(std::sync::atomic::Ordering::Relaxed),
+            "no-op call must NOT set dirty (avoid registry-persist churn)"
+        );
+        let post2 = manager
+            .get_bucket_metadata_for_user(user_id, bucket_name)
+            .expect("metadata exists");
+        assert_eq!(post2.forest_manifest_cid.as_ref(), Some(&cid_a));
+
+        // Transition 3: Some(A) → Some(B) — REPLACE
+        manager
+            .dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let changed = manager
+            .populate_forest_manifest_cid(user_id, bucket_name, cid_b.clone())
+            .expect("populate ok");
+        assert!(changed, "different-CID call must report changed=true (REPLACE)");
+        assert!(
+            manager.dirty.load(std::sync::atomic::Ordering::Relaxed),
+            "REPLACE must set dirty"
+        );
+        let post3 = manager
+            .get_bucket_metadata_for_user(user_id, bucket_name)
+            .expect("metadata exists");
+        assert_eq!(
+            post3.forest_manifest_cid.as_ref(),
+            Some(&cid_b),
+            "REPLACE: stored value must be the new CID, not the old one"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_populate_forest_manifest_cid_bucket_not_found() {
+        let store = Arc::new(MemoryBlockStore::new());
+        let manager = BucketManager::new(store);
+
+        let result = manager.populate_forest_manifest_cid(
+            "ghost-user",
+            "ghost-bucket",
+            "bafyreidac2bdzcbadfo7totuszpq6kf3f4s5ftzbq2xiaera6krwefmyjq".to_string(),
+        );
 
         assert!(matches!(result, Err(CoreError::BucketNotFound(ref n)) if n == "ghost-bucket"));
     }

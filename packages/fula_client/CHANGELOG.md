@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-05-07
+
+**Hotfix release.** Fixes a fundamental cold-start bug: the publisher was emitting MASTER's bucket Prolly Tree CID (CBOR) as the `manifest` field, but the SDK's cold-start needs the SDK's encrypted forest manifest CID (JSON envelope). Result: cold-start (offline reads on a fresh device or when master is unreachable) failed for ALL users with `serde_json` "expected value at line 1 column 1" — CBOR bytes fed into a JSON parser. Cold-start has actually never worked end-to-end against real published data; the bug only manifested once production users tested offline reads.
+
+### Fixed
+
+- **`bucketsIndex` CBOR's `BucketEntry` now exposes BOTH master's Prolly Tree CID (legacy `manifest` field, kept for forward compatibility) AND the SDK's encrypted forest manifest CID (new `forest_manifest_cid` field).** Cold-start prefers the new field; falls back to the legacy field when the new field is absent (defensive: also treats `Some("")` as absent). Old SDKs reading the new CBOR see an unknown field and ignore it (`#[serde(default, skip_serializing_if = "Option::is_none")]`); old buckets without `forest_manifest_cid` populated continue to fail cold-start (no regression vs. v0.4.3-and-prior). New SDKs reading old CBORs fall back to `manifest` (no regression).
+
+### Added
+
+- **`BucketMetadata.forest_manifest_cid: Option<String>`** — master tracks the latest encrypted forest manifest CID per bucket. Distinct from `root_cid` (master's S3-listing index, used internally by master and pinned for IPFS availability). `#[serde(default)]` ensures pre-v0.4.4 registry CBORs deserialize without migration. Fully populated and unit-tested via `test_forest_manifest_cid_round_trip_with_lookup_h_set` in `crates/fula-core/src/metadata.rs`.
+- **`BucketManager::populate_forest_manifest_cid(user_id, bucket_name, cid)`** at `crates/fula-core/src/bucket.rs` — REPLACE-LATEST semantics (NOT set-once like `populate_lookup_h_if_missing`). Idempotent on identical CID input (no extra registry-persist churn). Sets the dirty flag only when the value actually changes.
+- **Master sentinel header** `x-amz-meta-fula-forest-manifest: 1` on the SDK's Phase 2 manifest root commit (encryption.rs save_sharded_hamt_forest, save_forest, v1→v7 migration). Master sees the sentinel, takes its own server-computed CID for that PUT (the etag), and stores it on `BucketMetadata.forest_manifest_cid`. SDK does NOT need to recompute and send the CID — server is the source of truth for content-addressing.
+- **Master env flag** `FULA_FOREST_MANIFEST_CID_ENABLED=0|1` (default 0) gating header consumption — enables independent rollout of master vs SDK.
+- **`BucketEntry.cold_start_cid()` accessor** in `crates/fula-client/src/registry_resolver.rs` — encapsulates the prefer-new-field-fall-back-to-legacy logic in one place. Empty-string defensive parsing.
+- **`fula-forest-manifest`** added to `FULA_CONTROL_HEADERS` (`crates/fula-cli/src/handlers/object.rs`) so the sentinel is consumed by handler logic and never persisted as object metadata.
+
+### Operational rollout (env-flag-gated, instant rollback)
+
+| Phase | Action | Observable change |
+|---|---|---|
+| **A** | Ship v0.4.4 SDK to apps. SDK starts sending `x-amz-meta-fula-forest-manifest: 1` on Phase 2 root PUTs. Pre-v0.4.4 master ignores the header (it's just an `x-amz-meta-*`). | None observable. |
+| **B** | Deploy v0.4.4 master with `FULA_FOREST_MANIFEST_CID_ENABLED=0` (default). | None observable. |
+| **C** | Operator flips `FULA_FOREST_MANIFEST_CID_ENABLED=1`, restarts gateway. | Master starts populating `BucketMetadata.forest_manifest_cid` on every Phase 2 commit from a v0.4.4+ SDK. Look for log line `"Populated forest_manifest_cid (v0.4.4)"`. Next publisher tick emits the new CID in the per-user CBOR. Cold-start works. |
+| **Rollback** | Set flag to 0, restart. | Next publisher tick re-emits without `forest_manifest_cid`. SDK falls back to `manifest` (broken cold-start, no regression vs. pre-v0.4.4). |
+
+### Compatibility matrix
+
+| SDK | Master | Master flag | Cold-start works? |
+|---|---|---|---|
+| pre-v0.4.4 | pre-v0.4.4 | n/a | No (the original bug). |
+| pre-v0.4.4 | v0.4.4 | OFF | No (no behavior change). |
+| pre-v0.4.4 | v0.4.4 | ON | No (pre-v0.4.4 SDK doesn't send sentinel; `forest_manifest_cid` stays `None`; SDK falls back to broken `manifest`). |
+| v0.4.4 | pre-v0.4.4 | n/a | No (master ignores sentinel; field never populated). Fall back to broken `manifest`. |
+| v0.4.4 | v0.4.4 | OFF | No (master discards sentinel due to env flag). |
+| **v0.4.4** | **v0.4.4** | **ON** | **Yes** ✅ — first regression-free cold-start in fula history. |
+
+### Why the legacy `manifest` field is kept (per operator request)
+
+Master never reads its own published CBOR back for recovery (verified by audit — master uses on-disk `registry_cid_path` only). The legacy `manifest` field thus has exactly one consumer today (the SDK cold-start, which currently fails on it). However, the operator requested keeping it for forward compatibility: if any future tooling wants to walk master's Prolly Tree from the published CBOR (e.g., for disaster-recovery diagnostics, third-party indexing, or audit), the root_cid is still there. The cost is one extra string per bucket per user (~46 bytes); the benefit is zero data corruption risk on rollback.
+
+### Limitations
+
+- **Cold-start works only for users who have done at least ONE Phase 2 root commit AFTER master was upgraded to v0.4.4 with the flag on.** Users who have only pre-v0.4.4 data (legacy bucket forests with no fresh root commit) need to re-PUT or re-flush to populate `forest_manifest_cid`. Same lazy-migration property as Phase 1.2's `bucket_lookup_h`.
+- **Empty-bucket users still can't cold-start** — without a Phase 2 commit, there's nothing to populate. Cold-start fails cleanly with a `UsersIndexResolutionFailed` error referring to the bucket name.
+
 ## [0.4.3] - 2026-05-07
 
 **Hotfix release.** Fixes a silent cold-start failure for pre-migration-011 users (legacy users whose JWT `sub` claim is plaintext email rather than `sha256(email).hex()`). Without this fix, those users get a "user has not written yet" error when trying to read their own data offline, even though they have written. Apps should call the new `deriveUserKeyFromJwtSub` function whenever they have access to the JWT (which they do at sign-in).
