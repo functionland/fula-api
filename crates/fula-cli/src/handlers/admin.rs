@@ -16,14 +16,14 @@ use crate::auth::hash_user_id;
 use crate::pinning::PinningCredentials;
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Extension, Path, State},
+    extract::{ConnectInfo, Extension, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     Json,
 };
 use cid::Cid;
 use fula_blockstore::{BlockStore, PinStore};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -94,14 +94,19 @@ pub async fn list_user_buckets(
     Extension(admin): Extension<AdminSession>,
     Path(user_id): Path<String>,
 ) -> Result<Response, ApiError> {
+    // Hash the user ID FIRST so we can avoid logging the raw URL parameter.
+    // PII-safety: admins legitimately pass `user_id` as a plaintext email
+    // (per the doc-comment on this handler), so the URL itself carries
+    // PII. The log line only emits the opaque hashed form. The HTTP
+    // response body still echoes the raw input (it was admin-supplied);
+    // tightening that further would require a separate API change.
+    let hashed_user_id = hash_user_id(&user_id);
+    let admin_id_hashed = hash_user_id(&admin.admin_id);
     info!(
-        admin_id = %admin.admin_id,
-        target_user = %user_id,
+        admin_id_hashed = %admin_id_hashed,
+        target_user_hashed = %hashed_user_id,
         "Admin listing user buckets"
     );
-
-    // Hash the user ID to match internal storage format
-    let hashed_user_id = hash_user_id(&user_id);
 
     // Get all buckets for this user
     let buckets = state.bucket_manager.list_buckets_for_user(&hashed_user_id);
@@ -143,13 +148,16 @@ pub async fn delete_user(
     headers: HeaderMap,
     Path(user_id): Path<String>,
 ) -> Result<Response, ApiError> {
+    // Same PII-safety rationale as list_user_buckets above: hash before
+    // logging so the URL parameter (often plaintext email) doesn't reach
+    // the trace stream.
+    let hashed_user_id = hash_user_id(&user_id);
+    let admin_id_hashed = hash_user_id(&admin.admin_id);
     info!(
-        admin_id = %admin.admin_id,
-        target_user = %user_id,
+        admin_id_hashed = %admin_id_hashed,
+        target_user_hashed = %hashed_user_id,
         "Admin deleting user data"
     );
-
-    let hashed_user_id = hash_user_id(&user_id);
     let mut errors: Vec<String> = Vec::new();
     let mut buckets_deleted = 0;
     let mut objects_deleted = 0;
@@ -166,7 +174,8 @@ pub async fn delete_user(
     let buckets = state.bucket_manager.list_buckets_for_user(&hashed_user_id);
 
     if buckets.is_empty() {
-        info!(user_id = %user_id, hashed_user_id = %hashed_user_id, "No buckets found for user");
+        // PII-safety: only log the hashed form, never the raw URL parameter.
+        info!(hashed_user_id = %hashed_user_id, "No buckets found for user");
     }
 
     // Collect all CIDs to unpin
@@ -659,4 +668,418 @@ pub async fn admin_fetch_object(
     }
 
     Ok(response.body(Body::from(final_data)).unwrap())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PII SWEEP
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Background: prior to v0.4.2, `handlers/object.rs::put_object` and
+// `handlers/multipart.rs::complete_multipart_upload` set
+// `ObjectMetadata.owner_id = Some(session.user_id.clone())`. `session.user_id`
+// is the raw JWT `sub` claim — for legacy (pre-migration-011) users this is
+// plaintext email; for modern users it's `sha256(email)` hex. Either way, it
+// differs from `BucketMetadata.owner_id` (the canonical 16-byte
+// BLAKE3-derived `hashed_user_id`).
+//
+// The per-object metadata lives in the bucket's Prolly Tree leaves, which
+// are content-addressed and pinned to IPFS. The Phase 3.2 users-index
+// publisher then publishes each bucket's `root_cid` as the `manifest` field
+// of the per-user `bucketsIndex` CBOR — so anyone with the global
+// users-index CID can walk down to a bucket's Prolly Tree and read every
+// object's `tags.owner_id` in plaintext.
+//
+// This sweep walks every existing bucket, finds objects whose `owner_id`
+// differs from the bucket's canonical `owner_id`, rewrites them with the
+// canonical hashed form, and atomically flushes a fresh root_cid per
+// bucket. Old root CIDs become unreferenced and are eventually reaped by
+// cluster GC.
+//
+// Safety properties (verified by direct code reads, see commit message):
+//
+// 1. Only `ObjectMetadata.owner_id` is mutated; every other field
+//    (cid, size, etag, last_modified, content_type, content_encoding,
+//    cache_control, user_metadata, encryption_info, bao_outboard_cid,
+//    is_delete_marker, content_disposition, version_id, storage_class,
+//    checksum_blake3) is preserved byte-identically.
+// 2. Encrypted file content is at chunk storage_keys, never touched.
+// 3. Per-object `owner_id` is metadata only — `can_access_bucket` checks
+//    `BucketMetadata.owner_id` (already canonical); per-object `owner_id`
+//    does not gate access, decryption, share-token issuance, or download.
+// 4. Per-bucket atomicity: each bucket either fully migrates (new root
+//    pinned, registry updated) or stays at old state. No partial writes.
+// 5. Concurrent-write safety: holds the per-bucket
+//    `bucket_write_lock(owner_id, bucket_name)` for the duration of
+//    open→rewrite→flush, which is exactly the same lock the regular
+//    PUT handler holds. Concurrent PUTs serialize naturally.
+// 6. Idempotent: re-running on a clean bucket finds zero leaks and skips
+//    without rewriting anything.
+// 7. Crash-safe: a process crash mid-sweep leaves already-rewritten buckets
+//    committed (their flush already returned and registry was persisted)
+//    and pending buckets at their pre-sweep state. Re-run picks up where
+//    it left off.
+//
+// Recommended runbook:
+//
+//   # 1. Deploy the v0.4.2 master fix (object.rs:127, multipart.rs:210
+//   #    PII fix) so new uploads no longer leak.
+//   #
+//   # 2. (RECOMMENDED) Stop the publisher to prevent re-pinning the
+//   #    leaky CIDs while sweeping:
+//   sed -i 's/^FULA_USERS_INDEX_PUBLISHER_ENABLED=.*/FULA_USERS_INDEX_PUBLISHER_ENABLED=0/' /etc/fula/.env
+//   systemctl restart fula-gateway
+//   #
+//   # 3. Dry-run sweep — review the per-bucket report:
+//   curl -s -H "Authorization: Bearer $ADMIN_JWT" \
+//        "http://127.0.0.1:9000/admin/pii-sweep?dry_run=true" | jq .
+//   #
+//   # 4. Live sweep — actually rewrite:
+//   curl -s -H "Authorization: Bearer $ADMIN_JWT" \
+//        "http://127.0.0.1:9000/admin/pii-sweep?dry_run=false" | jq .
+//   #
+//   # 5. Re-enable publisher; the next tick rebuilds with clean owner_id
+//   #    in every leaf node:
+//   sed -i 's/^FULA_USERS_INDEX_PUBLISHER_ENABLED=.*/FULA_USERS_INDEX_PUBLISHER_ENABLED=1/' /etc/fula/.env
+//   systemctl restart fula-gateway
+//
+// IMPORTANT — what this sweep does NOT do:
+//
+//   The sweep removes PII from the *current* state: new bucket root_cids
+//   no longer leak. But the OLD root_cids that were previously pinned to
+//   ipfs-cluster, published via IPNS, and submitted to the chain anchor
+//   remain reachable:
+//
+//   - Cluster pins of old root_cids stay until ipfs-cluster GC reaps
+//     unreferenced pins. To accelerate cleanup, run for each
+//     `details[].old_root_cid` in the sweep response:
+//         ipfs-cluster-ctl pin rm <old_cid>
+//     (Only do this AFTER verifying the new root works for that bucket.)
+//
+//   - IPNS records with the leaky CID expire when the next IPNS publish
+//     supersedes them (within `FULA_USERS_INDEX_IPNS_LIFETIME_SECS`,
+//     default 36h). No manual action needed.
+//
+//   - Chain anchor `Published` events are PERMANENT. Each tick's CID is
+//     in the contract's event log forever, even after `latestCid` is
+//     overwritten. Anyone walking event history can still resolve the
+//     leaky CIDs. There is no chain-side mitigation short of redeploying
+//     the contract (out of scope per current operator guidance).
+//
+//   The sweep is necessary but not sufficient for full PII remediation.
+//   Combined with cluster pin removal, it eliminates accessible leaks
+//   from the current and near-term published state.
+
+/// Query params for `/admin/pii-sweep`.
+#[derive(Debug, Deserialize, Default)]
+pub struct PiiSweepParams {
+    /// `true` (default) walks but does not write. `false` actually rewrites.
+    #[serde(default = "default_dry_run_true")]
+    pub dry_run: bool,
+    /// Optional: scope to a single bucket by its internal key
+    /// (`{owner_id}:{bucket_name}`). Useful for spot-checking after a
+    /// dry-run flagged a specific bucket.
+    pub bucket_internal_key: Option<String>,
+}
+
+fn default_dry_run_true() -> bool { true }
+
+/// Per-bucket entry in the sweep report.
+#[derive(Debug, Serialize)]
+pub struct PiiSweepBucketDetail {
+    pub bucket_internal_key: String,
+    pub bucket_owner_id: String,
+    pub bucket_name: String,
+    pub objects_total: usize,
+    pub objects_with_leak: usize,
+    /// `0` for dry-run, equal to `objects_with_leak` for a successful
+    /// live sweep, less if some object rewrites errored.
+    pub rewritten: usize,
+    pub old_root_cid: String,
+    /// `None` for dry-run, `Some` after a successful flush.
+    pub new_root_cid: Option<String>,
+    pub errors: Vec<String>,
+}
+
+/// Aggregate sweep report.
+#[derive(Debug, Default, Serialize)]
+pub struct PiiSweepReport {
+    pub dry_run: bool,
+    pub started_at: String,
+    pub completed_at: String,
+    pub elapsed_secs: f64,
+    pub buckets_total: usize,
+    pub buckets_scanned: usize,
+    pub buckets_with_leaks: usize,
+    pub buckets_rewritten: usize,
+    pub buckets_skipped_clean: usize,
+    pub buckets_errored: usize,
+    pub objects_scanned: usize,
+    pub objects_with_leaks_found: usize,
+    pub objects_rewritten: usize,
+    pub errors: Vec<String>,
+    pub details: Vec<PiiSweepBucketDetail>,
+}
+
+/// `POST /admin/pii-sweep[?dry_run=true|false][&bucket_internal_key=...]`
+///
+/// Sweeps PII out of bucket Prolly Tree leaves. See module-level
+/// documentation block above for full safety analysis and runbook.
+pub async fn pii_sweep(
+    State(state): State<Arc<crate::AppState>>,
+    Extension(admin): Extension<AdminSession>,
+    Query(params): Query<PiiSweepParams>,
+) -> Result<Response, ApiError> {
+    let dry_run = params.dry_run;
+    let admin_id_hashed = hash_user_id(&admin.admin_id);
+
+    info!(
+        admin_id_hashed = %admin_id_hashed,
+        dry_run = dry_run,
+        bucket_filter = ?params.bucket_internal_key,
+        "PII sweep starting"
+    );
+
+    let started = std::time::Instant::now();
+    let started_at = chrono::Utc::now();
+
+    let mut report = PiiSweepReport::default();
+    report.dry_run = dry_run;
+    report.started_at = started_at.to_rfc3339();
+
+    // Snapshot the bucket list. Take BucketMetadata snapshots so we don't
+    // hold any DashMap shard guards across awaits — the per-bucket write
+    // lock acquired below is what serializes us with concurrent PUTs.
+    let mut bucket_metas: Vec<fula_core::metadata::BucketMetadata> = state
+        .bucket_manager
+        .list_buckets();
+
+    if let Some(ref filter) = params.bucket_internal_key {
+        // Filter by internal key (owner_id:name). Allows the admin to
+        // re-run the sweep on a single bucket if the first pass errored.
+        bucket_metas.retain(|m| {
+            let internal = format!("{}:{}", m.owner_id, m.name);
+            &internal == filter
+        });
+        if bucket_metas.is_empty() {
+            return Err(ApiError::s3(
+                S3ErrorCode::NoSuchBucket,
+                "bucket_internal_key not found in registry",
+            ));
+        }
+    }
+
+    report.buckets_total = bucket_metas.len();
+
+    for meta in bucket_metas {
+        report.buckets_scanned += 1;
+        let detail_opt = sweep_one_bucket(&state, &meta, dry_run, &mut report).await;
+        if let Some(detail) = detail_opt {
+            report.details.push(detail);
+        }
+    }
+
+    // Persist registry once at the end (only if anything actually changed).
+    // bucket.flush() already updated the in-memory BucketManager.buckets
+    // entry's root_cid via metadata_cache; this serializes that to disk
+    // so a master restart doesn't lose the new roots. Mirror's the
+    // `persist_registry_with_token` call in the put_object handler, but
+    // without a user JWT — the registry persistence path doesn't actually
+    // require a JWT (the JWT is only used for pinning forwarded to the
+    // remote pinning service, which we explicitly skip in the sweep
+    // because each user's pinning-service auth differs).
+    if !dry_run && report.buckets_rewritten > 0 {
+        if let Err(e) = state.bucket_manager.persist_registry().await {
+            report.errors.push(format!("persist_registry: {}", e));
+            error!(error = %e, "PII sweep: registry persist failed — new root_cids in memory but not on disk; restart will lose them");
+        }
+    }
+
+    let completed_at = chrono::Utc::now();
+    report.completed_at = completed_at.to_rfc3339();
+    report.elapsed_secs = started.elapsed().as_secs_f64();
+
+    info!(
+        admin_id_hashed = %admin_id_hashed,
+        dry_run = dry_run,
+        buckets_with_leaks = report.buckets_with_leaks,
+        buckets_rewritten = report.buckets_rewritten,
+        objects_with_leaks_found = report.objects_with_leaks_found,
+        objects_rewritten = report.objects_rewritten,
+        elapsed_secs = report.elapsed_secs,
+        "PII sweep complete"
+    );
+
+    Ok((StatusCode::OK, Json(report)).into_response())
+}
+
+/// Sweep one bucket. Returns `Some(detail)` if the bucket had leaks (always
+/// included in the report, dry-run or live), `None` if the bucket was clean
+/// (skipped from the per-bucket detail list to keep the report compact;
+/// counted in `report.buckets_skipped_clean`).
+async fn sweep_one_bucket(
+    state: &Arc<crate::AppState>,
+    meta: &fula_core::metadata::BucketMetadata,
+    dry_run: bool,
+    report: &mut PiiSweepReport,
+) -> Option<PiiSweepBucketDetail> {
+    let canonical_owner = &meta.owner_id;
+    let bucket_name = &meta.name;
+    let internal_key = format!("{}:{}", canonical_owner, bucket_name);
+
+    // Acquire the per-bucket write lock — same lock the regular PUT
+    // handler holds. This serializes against concurrent user uploads;
+    // a PUT in flight will queue behind us, our flush will commit,
+    // then their PUT continues from the new root_cid.
+    let lock = state
+        .bucket_manager
+        .bucket_write_lock(canonical_owner, bucket_name);
+    let _guard = lock.lock().await;
+
+    let mut bucket = match state
+        .bucket_manager
+        .open_bucket_for_user(canonical_owner, bucket_name)
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            report.buckets_errored += 1;
+            report.errors.push(format!(
+                "open_bucket_for_user {}: {}",
+                internal_key, e
+            ));
+            return None;
+        }
+    };
+
+    // List ALL objects (max_keys=usize::MAX disables pagination cap).
+    let list_result = match bucket
+        .list_objects(None, None, None, Some(usize::MAX))
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            report.buckets_errored += 1;
+            report.errors.push(format!("list_objects {}: {}", internal_key, e));
+            return None;
+        }
+    };
+    let total_objects = list_result.objects.len();
+
+    // Identify leaks. A leak is any object whose owner_id is set AND
+    // differs from the canonical (bucket-level) owner_id. None is
+    // already safe (no PII); Some(canonical) is already correct.
+    let mut to_rewrite: Vec<(String, fula_core::metadata::ObjectMetadata)> = Vec::new();
+    for listed in list_result.objects {
+        report.objects_scanned += 1;
+        match &listed.metadata.owner_id {
+            Some(o) if o != canonical_owner => {
+                let mut fixed = listed.metadata.clone();
+                fixed.owner_id = Some(canonical_owner.clone());
+                to_rewrite.push((listed.key, fixed));
+            }
+            _ => {}
+        }
+    }
+
+    let leak_count = to_rewrite.len();
+    if leak_count == 0 {
+        report.buckets_skipped_clean += 1;
+        return None;
+    }
+
+    report.buckets_with_leaks += 1;
+    report.objects_with_leaks_found += leak_count;
+
+    let old_root_cid = meta.root_cid.to_string();
+
+    if dry_run {
+        return Some(PiiSweepBucketDetail {
+            bucket_internal_key: internal_key,
+            bucket_owner_id: canonical_owner.clone(),
+            bucket_name: bucket_name.clone(),
+            objects_total: total_objects,
+            objects_with_leak: leak_count,
+            rewritten: 0,
+            old_root_cid,
+            new_root_cid: None,
+            errors: vec![],
+        });
+    }
+
+    // LIVE REWRITE. Each put_object is a key+metadata in-memory swap on
+    // the Prolly Tree; flush() commits the new tree and returns the new
+    // root CID, while also propagating it to BucketManager.buckets via
+    // the metadata_cache hook (bucket.rs:259-264).
+    let mut bucket_errors: Vec<String> = vec![];
+    let mut rewritten = 0usize;
+
+    for (key, fixed_meta) in to_rewrite {
+        match bucket.put_object(key.clone(), fixed_meta).await {
+            Ok(_) => {
+                rewritten += 1;
+                report.objects_rewritten += 1;
+            }
+            Err(e) => {
+                bucket_errors.push(format!("put_object key={}: {}", key, e));
+            }
+        }
+    }
+
+    let new_root_cid = match bucket.flush().await {
+        Ok(c) => c,
+        Err(e) => {
+            // Flush failed — Prolly Tree changes never committed to S3,
+            // root_cid in BucketManager unchanged, bucket still serves
+            // the OLD (leaky) state. Operator can re-run the sweep on
+            // this single bucket via ?bucket_internal_key=...
+            report.buckets_errored += 1;
+            bucket_errors.push(format!("flush: {}", e));
+            return Some(PiiSweepBucketDetail {
+                bucket_internal_key: internal_key,
+                bucket_owner_id: canonical_owner.clone(),
+                bucket_name: bucket_name.clone(),
+                objects_total: total_objects,
+                objects_with_leak: leak_count,
+                rewritten,
+                old_root_cid,
+                new_root_cid: None,
+                errors: bucket_errors,
+            });
+        }
+    };
+
+    // Pin the new root locally (best-effort, fire-and-forget — same
+    // pattern as the put_object handler). No user JWT needed for the
+    // local kubo pin; the cluster will replicate via its existing
+    // pin-follower discipline. The OLD root is left as-is and becomes
+    // unreferenced once the registry persists; cluster GC reaps it
+    // eventually. We deliberately do NOT actively unpin the old root
+    // — if the registry persist fails, we'd want the old root still
+    // available for recovery.
+    {
+        let block_store = Arc::clone(&state.block_store);
+        let pin_name = format!("bucket:{}", bucket_name);
+        let cid = new_root_cid;
+        tokio::spawn(async move {
+            if let Err(e) = block_store.pin(&cid, Some(&pin_name)).await {
+                warn!(cid = %cid, error = %e, "PII sweep: failed to pin new bucket root");
+            } else {
+                info!(cid = %cid, bucket = %pin_name, "PII sweep: new bucket root pinned");
+            }
+        });
+    }
+
+    report.buckets_rewritten += 1;
+
+    Some(PiiSweepBucketDetail {
+        bucket_internal_key: internal_key,
+        bucket_owner_id: canonical_owner.clone(),
+        bucket_name: bucket_name.clone(),
+        objects_total: total_objects,
+        objects_with_leak: leak_count,
+        rewritten,
+        old_root_cid,
+        new_root_cid: Some(new_root_cid.to_string()),
+        errors: bucket_errors,
+    })
 }

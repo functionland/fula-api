@@ -166,9 +166,28 @@ impl AppState {
 /// User session information
 #[derive(Clone, Debug)]
 pub struct UserSession {
-    /// User ID (from JWT sub claim)
+    /// **DO NOT PERSIST OR LOG.** Raw JWT `sub` claim, as-is.
+    ///
+    /// For pre-migration-011 users this is plaintext email
+    /// (e.g., `"ehsan@fx.land"`); for post-migration users it's
+    /// `sha256(email)` hex. Either way, treating it as PII is the
+    /// only safe contract — never store this value anywhere
+    /// external (object metadata, registry CBORs, IPFS pins,
+    /// trace logs, metrics, HTTP responses). Use
+    /// [`Self::hashed_user_id`] (the canonical opaque form
+    /// `BLAKE3("fula:user_id:" || user_id)[..16]` hex) for any
+    /// persisted, logged, or externally-observable identifier.
+    /// The only legitimate uses of this raw value are:
+    /// (1) computing `hashed_user_id` at session construction
+    /// (already done in [`Self::new`]), and (2) forwarding the
+    /// JWT itself (via [`Self::jwt_token`]) to the pinning
+    /// service for token-based auth.
     pub user_id: String,
-    /// Hashed user ID for storage (Security audit fix A3)
+    /// Hashed user ID for storage (Security audit fix A3).
+    /// **This is the canonical opaque identifier**: 16-byte
+    /// BLAKE3 over `"fula:user_id:" || user_id`, hex-encoded.
+    /// Use this anywhere a user identifier is persisted, logged,
+    /// returned to a peer, or used as a map/index key.
     pub hashed_user_id: String,
     /// Display name
     pub display_name: Option<String>,

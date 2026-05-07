@@ -50,6 +50,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/admin/users/{user_id}", delete(handlers::delete_user))
         .route("/admin/pins/{cid}", delete(handlers::unpin_cid))
         .route("/admin/gc", post(handlers::trigger_gc))
+        // PII sweep — rewrites bucket Prolly Tree leaves whose
+        // ObjectMetadata.owner_id holds the raw JWT sub (plaintext email
+        // for legacy users) instead of the canonical hashed_user_id. See
+        // handlers::admin::pii_sweep doc-comment block for the runbook
+        // and safety analysis.
+        .route("/admin/pii-sweep", post(handlers::pii_sweep))
         // Fetch object for share recipients (localhost only)
         .route("/admin/fetch/{bucket}/{*key}", get(handlers::admin_fetch_object))
         .layer(axum_middleware::from_fn(middleware::request_id_middleware))

@@ -206,8 +206,12 @@ pub async fn complete_multipart_upload(
         .copied()
         .ok_or_else(|| ApiError::s3(S3ErrorCode::InvalidPart, "No parts uploaded"))?;
 
+    // PII-safety: same rationale as the put_object handler — never persist
+    // `session.user_id` (raw JWT sub, may be plaintext email for legacy
+    // users). Use the hashed form. See handlers/object.rs:127 for the full
+    // explanation; access control is unaffected.
     let mut metadata = ObjectMetadata::new(first_part_cid, total_size, final_etag.clone())
-        .with_owner(&session.user_id);
+        .with_owner(&session.hashed_user_id);
 
     if let Some(ct) = upload.content_type {
         metadata = metadata.with_content_type(ct);

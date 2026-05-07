@@ -9,6 +9,7 @@
 
 use crate::{ApiError, S3ErrorCode, AppState};
 use crate::auth::{extract_token_from_header, validate_token, claims_to_session, dev_session, extract_bearer_token, validate_admin_token};
+use crate::state::hash_user_id;
 use crate::state::{UserSession, AdminSession};
 use chrono::{DateTime, Utc};
 use axum::{
@@ -148,9 +149,13 @@ pub async fn admin_auth_middleware(
         return Err(ApiError::s3(S3ErrorCode::InvalidToken, "Admin token has expired"));
     }
 
-    // Log admin action
+    // Log admin action. PII-safety: hash the admin's JWT sub before logging
+    // so logs don't carry plaintext email for legacy-JWT admins. Same
+    // BLAKE3-derived 16-byte form used elsewhere as the canonical opaque
+    // identifier.
+    let admin_id_hashed = hash_user_id(&claims.sub);
     tracing::info!(
-        admin_id = %claims.sub,
+        admin_id_hashed = %admin_id_hashed,
         path = %request.uri().path(),
         method = %request.method(),
         "Admin API request"
@@ -168,11 +173,15 @@ pub async fn rate_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
-    // Get user ID from session (added by auth middleware)
+    // Get user ID from session (added by auth middleware).
+    // PII-safety: key the rate limiter on the OPAQUE hashed_user_id, not
+    // the raw JWT sub. The map is in-memory only, but if metrics
+    // (Prometheus, etc.) ever expose per-key counters, the raw form would
+    // leak plaintext email for legacy-JWT users.
     let user_id = request
         .extensions()
         .get::<UserSession>()
-        .map(|s| s.user_id.clone())
+        .map(|s| s.hashed_user_id.clone())
         .unwrap_or_else(|| "anonymous".to_string());
 
     // Check rate limit

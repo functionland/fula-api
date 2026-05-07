@@ -123,8 +123,18 @@ pub async fn put_object(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // PII-safety: store the OPAQUE hashed form, never the raw JWT sub.
+    // `session.user_id` is the JWT `sub` as-is — for legacy users it's
+    // a plaintext email; persisting it leaks PII into the bucket's
+    // Prolly Tree leaves, which are content-addressed and pinned to
+    // IPFS via Phase 3.2's users-index publisher. `session.hashed_user_id`
+    // is the canonical 16-byte BLAKE3-derived form used everywhere else
+    // (BucketMetadata.owner_id, can_access_bucket comparisons, the
+    // COPY handler at line 694). Access control is unaffected — bucket-
+    // level access is gated by `BucketMetadata.owner_id` which is
+    // already correctly the hashed form.
     let mut metadata = ObjectMetadata::new(cid, body.len() as u64, etag.clone())
-        .with_owner(&session.user_id);
+        .with_owner(&session.hashed_user_id);
 
     if let Some(ct) = content_type {
         metadata = metadata.with_content_type(ct);
@@ -160,11 +170,15 @@ pub async fn put_object(
         })?;
 
     // Phase 1.2 of master-independent reads: if the SDK included
-    // `x-amz-meta-fula-bucket-lookup-h` (only set on the Phase 2 manifest
-    // root PUT in `save_sharded_hamt_forest`), populate the bucket-level
-    // `bucket_lookup_h` field if currently None. Idempotent — never
-    // overwrites. Gated by env so we can stage the rollout: SDK always
-    // sends the header (cheap); master only consumes it when ready.
+    // `x-amz-meta-fula-bucket-lookup-h` (set by `save_sharded_hamt_forest`
+    // on Phase 1.5 page PUTs, Phase 1.6 dir-index PUT, and Phase 2 root
+    // PUT — i.e. any flush-driven PUT — and by `save_forest` for v1
+    // monolithic), populate the bucket-level `bucket_lookup_h` field if
+    // currently None. Idempotent — never overwrites. Gated by env so we
+    // can stage the rollout: SDK always sends the header (cheap); master
+    // only consumes it when ready. As of v0.4.1+ the SDK attaches it on
+    // page-level writes too, so deferred-upload paths migrate without
+    // needing an explicit `flushForest` to fire Phase 2.
     //
     // Failures are non-fatal — bad/missing headers must not break uploads.
     // Placement: AFTER bucket.flush() (so the flush has already replaced

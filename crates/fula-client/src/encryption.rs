@@ -3464,6 +3464,14 @@ impl EncryptedClient {
         let dirty_pages = manifest_snapshot.take_dirty_pages();
         #[cfg(not(target_arch = "wasm32"))]
         let wal_mac = wal::derive_mac_key(&self.encryption.key_manager, bucket);
+        // Phase 1.2: hoist out of the loop — lookup-h is bucket-scoped, so
+        // it's identical for every page PUT and the dir-index PUT below.
+        // Attaching it on Phase 1.5 / 1.6 PUTs (not just the Phase 2 root
+        // PUT) lets master populate `bucket_lookup_h` on the first chunked
+        // upload, even before flush_forest commits the root. Closes the
+        // migration gap where deferred-upload paths leave a bucket on
+        // legacy=true plaintext until the next root commit.
+        let lookup_h_hex = self.compute_bucket_lookup_h_hex(bucket);
         for page_id in dirty_pages.iter().copied() {
             let page = manifest_snapshot.pages.get_mut(&page_id)
                 .ok_or_else(|| ClientError::Encryption(
@@ -3492,7 +3500,8 @@ impl EncryptedClient {
             let blob = envelope.to_bytes().map_err(ClientError::Encryption)?;
             let page_key = derive_manifest_page_key(&forest_dek, bucket, &shard_salt, page_id);
             let metadata = ObjectMetadata::new()
-                .with_content_type("application/octet-stream");
+                .with_content_type("application/octet-stream")
+                .with_metadata("fula-bucket-lookup-h", &lookup_h_hex);
             // Conditional PUT on the page so a concurrent writer (that
             // bumped this same page between our load and this PUT) can't
             // be silently overwritten — its content would otherwise clobber
@@ -3584,7 +3593,8 @@ impl EncryptedClient {
             let blob = envelope.to_bytes().map_err(ClientError::Encryption)?;
             let dir_key = derive_dir_index_key(&forest_dek, bucket);
             let metadata = ObjectMetadata::new()
-                .with_content_type("application/octet-stream");
+                .with_content_type("application/octet-stream")
+                .with_metadata("fula-bucket-lookup-h", &lookup_h_hex);
             let put = match self.inner.put_object_with_metadata_conditional(
                 bucket,
                 &dir_key,
@@ -3657,11 +3667,13 @@ impl EncryptedClient {
         let data = encrypted_manifest.to_bytes()
             .map_err(ClientError::Encryption)?;
 
-        // Phase 1.2: sharded HAMT v7 manifest root commit. See
-        // compute_bucket_lookup_h_hex for header semantics.
+        // Phase 1.2: sharded HAMT v7 manifest root commit. Reuses the
+        // bucket-scoped `lookup_h_hex` hoisted before Phase 1.5 so we
+        // don't re-derive on every flush. See compute_bucket_lookup_h_hex
+        // for header semantics.
         let metadata = ObjectMetadata::new()
             .with_content_type("application/octet-stream")
-            .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket));
+            .with_metadata("fula-bucket-lookup-h", &lookup_h_hex);
 
         let put_result = self.inner.put_object_with_metadata_conditional(
             bucket,
