@@ -3900,10 +3900,17 @@ impl EncryptedClient {
             // server is reachable. Pages that have never been flushed
             // (`page_ref.etag = None`) fall back to the no-hint wrapper;
             // those pages have no on-IPFS bytes to fetch anyway.
-            let cid_hint = page_ref
+            //
+            // Native-only: the `cid` crate is gated to non-wasm targets
+            // and the CID-hint method itself is too. On wasm we just
+            // route through the no-hint wrapper, which already handles
+            // master-up (the only fetch path supported on wasm anyway).
+            #[cfg(not(target_arch = "wasm32"))]
+            let cid_hint: Option<cid::Cid> = page_ref
                 .etag
                 .as_deref()
                 .and_then(|s| s.parse::<cid::Cid>().ok());
+            #[cfg(not(target_arch = "wasm32"))]
             let blob = match cid_hint {
                 Some(cid) => self
                     .inner
@@ -3922,6 +3929,18 @@ impl EncryptedClient {
                     page_id, bucket, e
                 ))
             })?;
+            #[cfg(target_arch = "wasm32")]
+            let blob = self
+                .inner
+                .get_object_with_offline_fallback(bucket, &page_key)
+                .await
+                .map(|r| r.inner.data)
+                .map_err(|e| {
+                    ClientError::DownloadFailed(format!(
+                        "failed to fetch manifest page {} for bucket {}: {}",
+                        page_id, bucket, e
+                    ))
+                })?;
             let envelope = EncryptedManifestPage::from_bytes(&blob)
                 .map_err(ClientError::Encryption)?;
             if envelope.page_id != *page_id {
@@ -3978,7 +3997,14 @@ impl EncryptedClient {
         // CID-hint variant so a fresh device with no KEY_TO_CID
         // warm-cache mapping can still race the gateway pool. The
         // master-up path is identical regardless of hint.
-        let cid_hint = expected_etag.and_then(|s| s.parse::<cid::Cid>().ok());
+        //
+        // Native-only: `cid` crate + the CID-hint method are gated to
+        // non-wasm targets. wasm builds keep the no-hint wrapper
+        // (master-only path).
+        #[cfg(not(target_arch = "wasm32"))]
+        let cid_hint: Option<cid::Cid> =
+            expected_etag.and_then(|s| s.parse::<cid::Cid>().ok());
+        #[cfg(not(target_arch = "wasm32"))]
         let blob = match cid_hint {
             Some(cid) => match self
                 .inner
@@ -4000,6 +4026,17 @@ impl EncryptedClient {
                 Err(e) if e.is_not_found() => return Ok(None),
                 Err(e) => return Err(e),
             },
+        };
+        #[cfg(target_arch = "wasm32")]
+        let blob = match self
+            .inner
+            .get_object_with_offline_fallback(bucket, &key)
+            .await
+            .map(|r| r.inner.data)
+        {
+            Ok(b) => b,
+            Err(e) if e.is_not_found() => return Ok(None),
+            Err(e) => return Err(e),
         };
         // `get_object` discards the HEAD ETag so we cannot cross-check
         // `expected_etag` here directly; it stays threaded for future refactors

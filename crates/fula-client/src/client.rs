@@ -1014,24 +1014,6 @@ impl FulaClient {
         }
     }
 
-    /// Wasm version: no offline fallback infrastructure on browsers.
-    /// Delegate to the standard master fetch so call sites can use one
-    /// name across targets without `cfg` gates of their own.
-    #[cfg(target_arch = "wasm32")]
-    pub async fn get_object_with_offline_fallback_known_cid(
-        &self,
-        bucket: &str,
-        key: &str,
-        _cid_hint: &cid::Cid,
-    ) -> Result<OfflineGetResult> {
-        let inner = self.get_object_with_metadata(bucket, key).await?;
-        Ok(OfflineGetResult {
-            inner,
-            source: ReadSource::Master,
-            freshness: ReadFreshness::Live,
-        })
-    }
-
     /// Check if an object exists
     #[instrument(skip(self))]
     pub async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool> {
