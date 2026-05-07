@@ -720,6 +720,81 @@ impl FulaClient {
         })
     }
 
+    /// Cold-cache cold-start variant of [`get_object_with_offline_fallback`].
+    ///
+    /// Same master-up fast path — when master responds, this method is
+    /// byte-identical in latency and behavior. The CID hint is consulted
+    /// only on the master-down branch, so a healthy deployment pays
+    /// nothing for it. The hint lets a freshly-installed device fetch
+    /// objects whose CID it just learned from a parent structure (e.g.,
+    /// a manifest root just decrypted from IPNS) without the prior
+    /// master-up read that warm-cache fallback requires.
+    ///
+    /// Privacy: the hint is a content-addressed CID; it leaves the
+    /// device only as part of the gateway race for that exact CID, the
+    /// same shape of network traffic that's already part of the
+    /// warm-cache offline path. No new identifier or PII reaches the
+    /// network, and the AEAD ciphertext stored at the CID is unchanged.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[instrument(skip(self, cid_hint))]
+    pub async fn get_object_with_offline_fallback_known_cid(
+        &self,
+        bucket: &str,
+        key: &str,
+        cid_hint: &cid::Cid,
+    ) -> Result<OfflineGetResult> {
+        // Fast path mirror of get_object_with_offline_fallback — flags
+        // off means no hint consumption, identical latency.
+        if self.block_cache.is_none() && self.gateway_pool.is_none() {
+            let inner = self.get_object_with_metadata(bucket, key).await?;
+            return Ok(OfflineGetResult {
+                inner,
+                source: ReadSource::Master,
+                freshness: ReadFreshness::Live,
+            });
+        }
+
+        let cache = self.block_cache.clone();
+
+        match self.get_object_with_metadata(bucket, key).await {
+            Ok(result) => {
+                // Master-up success: populate KEY_TO_CID + BLOCKS so
+                // the next read of this object can skip the network
+                // entirely. Identical bookkeeping to the no-hint
+                // wrapper above; the hint isn't needed when master
+                // responded.
+                if let Some(cache) = &cache {
+                    if !result.etag.is_empty() {
+                        if let Ok(cid) = result.etag.parse::<cid::Cid>() {
+                            if let Err(e) = cache.record_key_cid(bucket, key, &cid) {
+                                debug!(
+                                    error = %e,
+                                    "block_cache: record_key_cid failed (best-effort; master fetch already succeeded)"
+                                );
+                            }
+                            if let Err(e) = cache.put(&cid, &result.data).await {
+                                debug!(
+                                    error = %e,
+                                    "block_cache: put failed (best-effort)"
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(OfflineGetResult {
+                    inner: result,
+                    source: ReadSource::Master,
+                    freshness: ReadFreshness::Live,
+                })
+            }
+            Err(e) if is_master_unreachable_error(&e) => {
+                self.try_offline_fallback_with_cid_hint(bucket, key, cid_hint, e)
+                    .await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Phase 2.4 fallback step. Looks up the cached CID for the
     /// requested `(bucket, key)`; if absent, returns the original
     /// `MasterUnreachable` error (cold-start case — Phase 3.3 catches
@@ -829,6 +904,132 @@ impl FulaClient {
                 Err(master_error)
             }
         }
+    }
+
+    /// Cold-cache variant of [`try_offline_fallback`]. The caller has
+    /// already learned the object's CID (typically by decrypting a
+    /// just-fetched manifest root that points at it) and supplies it
+    /// directly, skipping the KEY_TO_CID lookup that the warm-cache
+    /// path depends on. BLOCKS-hit short-circuit and gateway-race
+    /// verification are otherwise identical, and the post-fetch cache
+    /// populate restores the warm-cache invariant for subsequent reads.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn try_offline_fallback_with_cid_hint(
+        &self,
+        bucket: &str,
+        key: &str,
+        cid: &cid::Cid,
+        master_error: ClientError,
+    ) -> Result<OfflineGetResult> {
+        let (cache, pool) = match (&self.block_cache, &self.gateway_pool) {
+            (Some(c), Some(p)) => (c.clone(), p.clone()),
+            _ => return Err(master_error),
+        };
+
+        // BLOCKS hit — same short-circuit as warm-cache fallback. A
+        // prior cold-start that raced this exact CID populated the
+        // cache, so a follow-up read serves with no network at all.
+        if let Ok(Some(bytes)) = cache.get(cid) {
+            debug!(cid = %cid, "offline fallback (cid-hint): BLOCKS hit");
+            // Best-effort warm-cache backfill: if this is the first
+            // time we've seen this `(bucket, key)`, record the mapping
+            // so the next read can use the no-hint warm path too.
+            if let Err(e) = cache.record_key_cid(bucket, key, cid) {
+                debug!(
+                    error = %e,
+                    "block_cache: record_key_cid failed (best-effort)"
+                );
+            }
+            let observed_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            return Ok(OfflineGetResult {
+                inner: GetObjectResult {
+                    content_length: bytes.len() as u64,
+                    data: bytes,
+                    etag: cid.to_string(),
+                    content_type: None,
+                    last_modified: None,
+                    metadata: HashMap::new(),
+                },
+                source: ReadSource::LocalCache,
+                freshness: ReadFreshness::Cached { observed_at },
+            });
+        }
+
+        // Gateway race using the supplied CID. fetch_verified verifies
+        // the bytes content-address to the requested CID, so a
+        // malicious or buggy gateway cannot inject foreign bytes
+        // here any more than it can on the warm-cache path.
+        match pool.fetch_verified_with_source(cid, &self.http).await {
+            Ok((bytes, gateway_url)) => {
+                debug!(
+                    cid = %cid,
+                    gateway = %gateway_url,
+                    "offline fallback (cid-hint): gateway race succeeded"
+                );
+                // Populate BLOCKS so subsequent reads skip the network.
+                if let Err(e) = cache.put(cid, &bytes).await {
+                    debug!(
+                        error = %e,
+                        "block_cache: put failed (best-effort)"
+                    );
+                }
+                // Populate KEY_TO_CID so the standard warm-cache path
+                // (which doesn't have a hint) also serves this object
+                // on the next read. Best-effort: a redb error doesn't
+                // break this fetch.
+                if let Err(e) = cache.record_key_cid(bucket, key, cid) {
+                    debug!(
+                        error = %e,
+                        "block_cache: record_key_cid failed (best-effort)"
+                    );
+                }
+                let observed_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                Ok(OfflineGetResult {
+                    inner: GetObjectResult {
+                        content_length: bytes.len() as u64,
+                        data: bytes,
+                        etag: cid.to_string(),
+                        content_type: None,
+                        last_modified: None,
+                        metadata: HashMap::new(),
+                    },
+                    source: ReadSource::Gateway(gateway_url),
+                    freshness: ReadFreshness::Cached { observed_at },
+                })
+            }
+            Err(e) => {
+                warn!(
+                    cid = %cid,
+                    error = %e,
+                    "offline fallback (cid-hint): gateway race failed"
+                );
+                Err(master_error)
+            }
+        }
+    }
+
+    /// Wasm version: no offline fallback infrastructure on browsers.
+    /// Delegate to the standard master fetch so call sites can use one
+    /// name across targets without `cfg` gates of their own.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn get_object_with_offline_fallback_known_cid(
+        &self,
+        bucket: &str,
+        key: &str,
+        _cid_hint: &cid::Cid,
+    ) -> Result<OfflineGetResult> {
+        let inner = self.get_object_with_metadata(bucket, key).await?;
+        Ok(OfflineGetResult {
+            inner,
+            source: ReadSource::Master,
+            freshness: ReadFreshness::Live,
+        })
     }
 
     /// Check if an object exists
@@ -1149,14 +1350,23 @@ impl FulaClient {
 #[cfg(not(target_arch = "wasm32"))]
 fn source_chain_has_network_io_error<E: std::error::Error + 'static>(err: &E) -> bool {
     use std::io::ErrorKind;
+    // First pass: typed ErrorKind matches on any io::Error in the chain.
+    // Cheap and platform-agnostic — covers the named transport variants.
     let mut source: Option<&dyn std::error::Error> = err.source();
+    let mut chain_text = String::new();
     while let Some(s) = source {
+        // Accumulate the chain's Display strings for the second-pass
+        // pattern check below. One walk, no rebuild.
+        if !chain_text.is_empty() {
+            chain_text.push_str(" :: ");
+        }
+        chain_text.push_str(&s.to_string());
         if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
             // Only network-tier kinds. Notably excludes:
             //   - InvalidInput / InvalidData (parse / encode bugs)
             //   - PermissionDenied / NotFound (filesystem)
             //   - WouldBlock (non-blocking-io noise)
-            return matches!(
+            if matches!(
                 io_err.kind(),
                 ErrorKind::ConnectionRefused
                     | ErrorKind::ConnectionReset
@@ -1168,15 +1378,25 @@ fn source_chain_has_network_io_error<E: std::error::Error + 'static>(err: &E) ->
                     | ErrorKind::HostUnreachable
                     | ErrorKind::NetworkUnreachable
                     | ErrorKind::NetworkDown
-            );
+            ) {
+                return true;
+            }
         }
         source = s.source();
     }
-    false
+
+    // Cross-platform DNS-resolution failure: io::Error::kind() is
+    // `Uncategorized` (Windows GetAddrInfo OS code 11001 / 11002 / 11003 /
+    // 11004) or `Other` (some libc-backed Linux paths), with no
+    // ErrorKind variant for "host not found". hyper_util's wrapper
+    // adds the literal text "dns error" before the underlying io
+    // failure — gate on that string so we don't over-classify
+    // unrelated `Uncategorized` io errors as master-unreachable.
+    chain_text.contains("dns error")
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn is_master_unreachable_error(e: &ClientError) -> bool {
+pub(crate) fn is_master_unreachable_error(e: &ClientError) -> bool {
     match e {
         ClientError::MasterUnreachable { .. } => true,
         // reqwest::Error: cover the common transport failures. We
@@ -1493,6 +1713,34 @@ mod tests {
         );
     }
 
+    /// Cold-start cold-cache regression test: a DNS-failing master URL
+    /// (the operator's "I'm offline" simulation in the e2e test) must
+    /// classify as master-unreachable so the gateway-race fallback runs.
+    /// On Windows the DNS error surfaces as `io::ErrorKind::Uncategorized`
+    /// with no typed variant — without the chain-string check we'd miss it.
+    #[tokio::test]
+    async fn test_master_unreachable_classifier_catches_dns_resolution_failure() {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        // A guaranteed-nonexistent hostname forces DNS resolution to fail
+        // on every platform. `.invalid` is the IETF-reserved TLD for
+        // tests that must never resolve (RFC 6761).
+        let req_err = http
+            .get("https://this-host-does-not-exist.invalid/probe")
+            .send()
+            .await
+            .expect_err("DNS lookup must fail");
+        let wrapped = ClientError::Http(req_err);
+        assert!(
+            is_master_unreachable_error(&wrapped),
+            "DNS-failing hostname MUST classify as master-unreachable; \
+             without this the cold-cache cold-start path can't reach \
+             the gateway-race fallback. Error chain: {wrapped:#?}"
+        );
+    }
+
     /// Audit follow-up: request-build errors (URL parsing, malformed
     /// headers, body-encoding) must NOT classify as master-unreachable.
     /// Including `re.is_request()` would mask "I gave the SDK a bad
@@ -1572,7 +1820,6 @@ mod phase_2_4_offline_tests {
     use cid::Cid;
     use cid::multihash::Multihash;
     use sha2::Digest;
-    use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
     use wiremock::matchers::{method, path};
@@ -1944,5 +2191,219 @@ mod phase_2_4_offline_tests {
             }
             other => panic!("expected ReadFreshness::Cached, got {:?}", other),
         }
+    }
+
+    // ============================================================
+    // #31 — cold-cache cold-start CID-hint variant
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_cid_hint_master_up_path_unchanged() {
+        // The master-up branch must be byte-identical to the no-hint
+        // wrapper: master responds, we serve master bytes, populate
+        // KEY_TO_CID + BLOCKS as side effects, never touch the gateway.
+        let master = MockServer::start().await;
+        let body = b"served by master";
+        let cid = cid_for_bytes(body);
+        Mock::given(method("GET"))
+            .and(path("/bucket/file.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", format!("\"{}\"", cid))
+                    .set_body_bytes(body.as_slice()),
+            )
+            .expect(1)
+            .mount(&master)
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let cache_path = dir.path().join("cache.redb");
+        let client = build_client(
+            &master.uri(),
+            &cache_path,
+            "http://must-not-be-called.invalid/ipfs/{cid}",
+        );
+
+        let r = client
+            .get_object_with_offline_fallback_known_cid("bucket", "file.bin", &cid)
+            .await
+            .expect("master-up read");
+        assert_eq!(r.inner.data.as_ref(), body);
+        assert_eq!(r.source, ReadSource::Master);
+        assert_eq!(r.freshness, ReadFreshness::Live);
+
+        drop(client);
+        let cache = BlockCache::open(&cache_path, 1024 * 1024).expect("re-open");
+        let looked_up = cache.lookup_cid("bucket", "file.bin").expect("lookup").expect("hit");
+        assert_eq!(looked_up, cid, "master-up path still populates KEY_TO_CID");
+        let bytes = cache.get(&cid).expect("get").expect("BLOCKS hit");
+        assert_eq!(bytes.as_ref(), body, "BLOCKS populated from master read");
+    }
+
+    #[tokio::test]
+    async fn test_cid_hint_cold_cache_master_down_serves_from_gateway() {
+        // The actual cold-start regression test: cache is empty, master
+        // is down, but the SDK has just decrypted a manifest root that
+        // points at this CID. The hint variant must race the gateway
+        // and return the verified bytes.
+        let master = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bucket/page.bin"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&master)
+            .await;
+
+        let gateway = MockServer::start().await;
+        let body = b"manifest page bytes from gateway";
+        let cid = cid_for_bytes(body);
+        Mock::given(method("GET"))
+            .and(path(format!("/ipfs/{}", cid)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_slice()))
+            .mount(&gateway)
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let cache_path = dir.path().join("cache.redb");
+        let gateway_template = format!("{}/ipfs/{{cid}}", gateway.uri());
+        let client = build_client(&master.uri(), &cache_path, &gateway_template);
+
+        // CRITICAL: no prior master-up read for this (bucket, key) —
+        // KEY_TO_CID is empty. Without the hint variant this would
+        // surface MasterUnreachable.
+        let r = client
+            .get_object_with_offline_fallback_known_cid("bucket", "page.bin", &cid)
+            .await
+            .expect("cold-cache cold-start succeeds with hint");
+        assert_eq!(r.inner.data.as_ref(), body);
+        assert_eq!(r.inner.etag, cid.to_string());
+        match &r.source {
+            ReadSource::Gateway(url) => {
+                assert_eq!(url, &gateway_template, "served from gateway template");
+            }
+            other => panic!("expected Gateway source, got {:?}", other),
+        }
+        match r.freshness {
+            ReadFreshness::Cached { observed_at } => {
+                assert!(observed_at > 0);
+            }
+            other => panic!("expected Cached freshness, got {:?}", other),
+        }
+
+        // Cache is now warm — the next read can use either path.
+        drop(client);
+        let cache = BlockCache::open(&cache_path, 1024 * 1024).expect("re-open");
+        let looked_up = cache.lookup_cid("bucket", "page.bin").expect("lookup").expect("hit");
+        assert_eq!(looked_up, cid, "warm-cache invariant restored after cold-start");
+        let bytes = cache.get(&cid).expect("get").expect("BLOCKS hit");
+        assert_eq!(bytes.as_ref(), body, "BLOCKS populated from gateway");
+    }
+
+    #[tokio::test]
+    async fn test_cid_hint_blocks_hit_short_circuits_network() {
+        // BLOCKS already holds the bytes — no gateway round-trip.
+        let master = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bucket/page.bin"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&master)
+            .await;
+
+        let body = b"already cached";
+        let cid = cid_for_bytes(body);
+
+        let dir = TempDir::new().unwrap();
+        let cache_path = dir.path().join("cache.redb");
+        let cache = BlockCache::open(&cache_path, 1024 * 1024).expect("open cache");
+        cache.put(&cid, body).await.expect("seed BLOCKS");
+        drop(cache);
+
+        let gateway_template = "http://must-not-be-called.invalid/ipfs/{cid}";
+        let client = build_client(&master.uri(), &cache_path, gateway_template);
+
+        let r = client
+            .get_object_with_offline_fallback_known_cid("bucket", "page.bin", &cid)
+            .await
+            .expect("BLOCKS hit serves bytes");
+        assert_eq!(r.inner.data.as_ref(), body);
+        assert_eq!(r.source, ReadSource::LocalCache);
+
+        // Best-effort KEY_TO_CID backfill: the BLOCKS-hit path also
+        // records the mapping so the no-hint warm-cache path serves on
+        // subsequent reads.
+        drop(client);
+        let cache = BlockCache::open(&cache_path, 1024 * 1024).expect("re-open");
+        let looked_up = cache.lookup_cid("bucket", "page.bin").expect("lookup").expect("hit");
+        assert_eq!(looked_up, cid, "BLOCKS-hit path backfills KEY_TO_CID");
+    }
+
+    #[tokio::test]
+    async fn test_cid_hint_gateway_failure_propagates_master_error() {
+        // Master 503 + every gateway 500 → original master-down error
+        // surfaces, mirroring the no-hint wrapper's behavior.
+        let master = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bucket/page.bin"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&master)
+            .await;
+
+        let gateway = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&gateway)
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let cache_path = dir.path().join("cache.redb");
+        let gateway_template = format!("{}/ipfs/{{cid}}", gateway.uri());
+        let client = build_client(&master.uri(), &cache_path, &gateway_template);
+
+        let body = b"would have been served";
+        let cid = cid_for_bytes(body);
+        let err = client
+            .get_object_with_offline_fallback_known_cid("bucket", "page.bin", &cid)
+            .await
+            .expect_err("both channels failed");
+        assert!(
+            is_master_unreachable_error(&err),
+            "must surface master-unreachable, not a gateway-specific error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cid_hint_master_4xx_propagates_without_fallback() {
+        // 4xx propagates unchanged — same invariant as the no-hint
+        // wrapper. We must never hide a NoSuchKey behind a gateway
+        // race success.
+        let master = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bucket/missing.bin"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_string(r#"<Error><Code>NoSuchKey</Code><Message>not here</Message></Error>"#),
+            )
+            .mount(&master)
+            .await;
+
+        let body = b"if this were served, we'd be hiding a real bug";
+        let cid = cid_for_bytes(body);
+
+        let dir = TempDir::new().unwrap();
+        let cache_path = dir.path().join("cache.redb");
+        let client = build_client(
+            &master.uri(),
+            &cache_path,
+            "http://must-not-be-called.invalid/ipfs/{cid}",
+        );
+
+        let err = client
+            .get_object_with_offline_fallback_known_cid("bucket", "missing.bin", &cid)
+            .await
+            .expect_err("404 propagates");
+        assert!(err.is_not_found(), "expected NotFound, got: {:?}", err);
+        assert!(
+            !is_master_unreachable_error(&err),
+            "4xx must NOT classify as master-unreachable"
+        );
     }
 }

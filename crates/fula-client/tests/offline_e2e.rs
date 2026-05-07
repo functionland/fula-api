@@ -81,7 +81,7 @@
 //! path that backs FxFiles' offline reads. Cold-start (Phase 3.3 IPNS
 //! + chain) is a separate, harder test and is not exercised here.
 
-use fula_client::{Config, EncryptedClient, EncryptionConfig};
+use fula_client::{ClientError, Config, EncryptedClient, EncryptionConfig};
 use fula_crypto::keys::SecretKey;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -442,6 +442,14 @@ fn jwt_sub(jwt: &str) -> String {
 /// Build a client wired for cold-start (Phase 3.3) — populates the four
 /// `users_index_*` fields. The other warm-cache flags stay on so the test
 /// still validates the integration of cold-start + cache-population.
+///
+/// `ipns_gateway_urls`: when non-empty, OVERRIDES the SDK's default
+/// 5-gateway list. Useful in tests to point at a specific gateway that's
+/// guaranteed to have the latest IPNS record (e.g., the master's local
+/// kubo gateway, or a fast subdomain gateway like `dget.top` that
+/// resolves IPNS faster than the public DHT-walking gateways). When
+/// empty, the SDK uses its built-in 5-gateway list (production default).
+#[allow(clippy::too_many_arguments)]
 fn build_client_with_cold_start(
     master_url: &str,
     jwt: &str,
@@ -453,6 +461,8 @@ fn build_client_with_cold_start(
     anchor_address: String,
     ipns_name: String,
     user_key: String,
+    ipns_gateway_urls: Vec<String>,
+    block_gateway_urls: Vec<String>,
 ) -> EncryptedClient {
     let mut cfg = Config::new(master_url).with_token(jwt);
     cfg.timeout = Duration::from_secs(timeout_secs);
@@ -465,7 +475,12 @@ fn build_client_with_cold_start(
     cfg.block_cache_max_bytes = 256 * 1024 * 1024;
 
     cfg.gateway_fallback_enabled = true;
-    cfg.gateway_fallback_urls = Vec::new();
+    // Use SDK defaults (6-gateway list) when override is empty. Tests
+    // running against a fresh-upload scenario may set
+    // FULA_BLOCK_GATEWAY_URLS to point at master's own kubo gateway,
+    // because public IPFS gateways need a DHT-propagation window before
+    // they can serve newly-pinned CIDs.
+    cfg.gateway_fallback_urls = block_gateway_urls;
     cfg.gateway_race_concurrency = 3;
 
     // v0.4.4 cold-start: all four fields must be set for the resolver
@@ -474,6 +489,7 @@ fn build_client_with_cold_start(
     cfg.users_index_anchor_address = anchor_address;
     cfg.users_index_ipns_name = ipns_name;
     cfg.users_index_user_key = Some(user_key);
+    cfg.users_index_ipns_gateway_urls = ipns_gateway_urls;
 
     let enc = EncryptionConfig::from_secret_key(secret);
     EncryptedClient::new(cfg, enc).expect("EncryptedClient construction must succeed")
@@ -529,6 +545,41 @@ async fn offline_cold_start_documents_bucket_e2e() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
 
+    // Optional IPNS gateway override. Comma-separated. When set, the
+    // SDK's default 5-gateway list is REPLACED, so the test pulls
+    // exclusively from the gateways the operator pinned for this run.
+    // Use this to skirt the 30+min IPNS DHT-propagation delay during
+    // testing — point at a gateway you know is current (e.g. master's
+    // local kubo or a fast subdomain gateway like `dget.top`).
+    //
+    // Format details: each URL may use `{name}` placeholder which the
+    // SDK substitutes with `users_index_ipns_name`. URLs WITHOUT
+    // `{name}` are used as-is — useful for subdomain-style gateways
+    // where the IPNS name is already in the host part. Example:
+    //   `https://k51qzi5...ipns.dget.top/`  (subdomain, no placeholder)
+    //   `https://ipfs.io/ipns/{name}`        (path, with placeholder)
+    let ipns_gateway_urls: Vec<String> = std::env::var("FULA_USERS_INDEX_IPNS_GATEWAY_URLS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect())
+        .unwrap_or_default();
+
+    // Optional block-fetch gateway override. Comma-separated. Used by
+    // the cold-cache cold-start path (#31) to fetch encrypted manifest
+    // pages / dir-index / chunks via a gateway when master is offline.
+    // Public IPFS gateways need 30+ minutes of DHT propagation before
+    // they can serve a freshly-pinned CID — set this to master's own
+    // kubo gateway (e.g. `https://ipfs.cloud.fx.land/gateway/{cid}`)
+    // so the test doesn't have to wait for DHT propagation.
+    //
+    // Format: `{cid}` placeholder is substituted with the CID being
+    // fetched. URLs without `{cid}` are appended as `<url>/<cid>`.
+    let block_gateway_urls: Vec<String> = std::env::var("FULA_BLOCK_GATEWAY_URLS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect())
+        .unwrap_or_default();
+
     // userKey derivation must match master byte-for-byte. v0.4.3+ uses
     // `derive_user_key_from_jwt_sub` (NOT the legacy email-based variant
     // which broke for pre-migration-011 users with plaintext-email subs).
@@ -547,8 +598,77 @@ async fn offline_cold_start_documents_bucket_e2e() {
         "[cold-start-e2e] wait time  = {}s (publisher tick window)",
         publisher_wait_secs
     );
+    if !ipns_gateway_urls.is_empty() {
+        eprintln!(
+            "[cold-start-e2e] IPNS gw    = OVERRIDDEN ({} url{}): {:?}",
+            ipns_gateway_urls.len(),
+            if ipns_gateway_urls.len() == 1 { "" } else { "s" },
+            ipns_gateway_urls,
+        );
+    } else {
+        eprintln!("[cold-start-e2e] IPNS gw    = SDK default 5-gateway list");
+    }
+    if !block_gateway_urls.is_empty() {
+        eprintln!(
+            "[cold-start-e2e] block gw   = OVERRIDDEN ({} url{}): {:?}",
+            block_gateway_urls.len(),
+            if block_gateway_urls.len() == 1 { "" } else { "s" },
+            block_gateway_urls,
+        );
+    } else {
+        eprintln!("[cold-start-e2e] block gw   = SDK default 6-gateway list (DHT propagation may take >30min)");
+    }
 
-    let secret = SecretKey::generate();
+    // Secret derivation: FxFiles uses Argon2id over
+    // `"{provider}:{rawOAuthSub}:{email}"` and stores the resulting
+    // 32-byte key in SecureStorage (auth_service.dart:512-550). The
+    // bucket_lookup_h on master is bound to whichever secret was
+    // active at upload time. To test against an EXISTING bucket
+    // populated by a real FxFiles session, we need that exact
+    // secret. Three ways to supply it, in priority order:
+    //
+    //   1. FULA_TEST_SECRET=<base64 32 bytes>          ← export from
+    //      FxFiles SecureStorage. Mirrors the real-user flow exactly.
+    //   2. FULA_TEST_OAUTH_INPUT="<provider>:<sub>:<email>"
+    //      ← Argon2id-derive locally if you know all three pieces.
+    //   3. fall through to a JWT-deterministic secret (skip-upload
+    //      mode only — proves cold-start RESOLVES the published
+    //      structure, but the lookup_h won't match a bucket
+    //      populated by a different secret).
+    let secret = if let Ok(b64) = std::env::var("FULA_TEST_SECRET") {
+        use base64::Engine as _;
+        let trimmed = b64.trim();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(trimmed)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
+            .expect("FULA_TEST_SECRET must be base64 (standard, URL-safe, or URL-safe-no-pad)");
+        SecretKey::from_bytes(&bytes).expect("32-byte secret")
+    } else if let Ok(input) = std::env::var("FULA_TEST_OAUTH_INPUT") {
+        // Mirror FxFiles' Argon2id parameters
+        // (hashing.rs:228-257 in fula-crypto): context = "fula-files-v1",
+        // 64 MiB, 3 iters, 1 parallelism, 32-byte output. NEVER
+        // materialize raw OAuth sub or email outside this test process.
+        let derived =
+            fula_crypto::hashing::derive_key_argon2id("fula-files-v1", input.as_bytes());
+        SecretKey::from_bytes(&derived).expect("32-byte secret")
+    } else {
+        let mut hasher = blake3::Hasher::new_derive_key("fula-test/offline-e2e/secret/v1");
+        hasher.update(jwt.as_bytes());
+        let bytes = hasher.finalize();
+        SecretKey::from_bytes(&bytes.as_bytes()[..32]).expect("32-byte secret")
+    };
+
+    // FULA_SKIP_UPLOAD=1 lets the operator run a two-step flow:
+    //   step A — run normally (upload + publish-now externally + verify)
+    //   step B — re-run with FULA_SKIP_UPLOAD=1 to verify cold-start
+    //            against the already-published state, without burning
+    //            another publisher tick. Asserts cold-start RESOLVES
+    //            and decrypts (file count is irrelevant when skipping).
+    let skip_upload = std::env::var("FULA_SKIP_UPLOAD")
+        .ok()
+        .filter(|s| !s.is_empty() && s != "0")
+        .is_some();
     let test_key = format!(
         "fula-cold-start-{}.bin",
         std::time::SystemTime::now()
@@ -575,11 +695,16 @@ async fn offline_cold_start_documents_bucket_e2e() {
     // root commit (encryption.rs). Master populates
     // `BucketMetadata.forest_manifest_cid` with its own server-computed CID.
     // The publisher will emit it in the next per-user CBOR tick.
-    eprintln!(
-        "\n[cold-start-e2e] phase 1: UPLOAD via {} (populates forest_manifest_cid on master)",
-        s3_url
-    );
-    {
+    if skip_upload {
+        eprintln!(
+            "\n[cold-start-e2e] phase 1: SKIPPED (FULA_SKIP_UPLOAD=1) — \
+             cold-start will read whatever was last published for this user/bucket"
+        );
+    } else {
+        eprintln!(
+            "\n[cold-start-e2e] phase 1: UPLOAD via {} (populates forest_manifest_cid on master)",
+            s3_url
+        );
         let cache_dir_phase1 = TempDir::new().expect("tempdir for phase 1");
         let cache_path_phase1 = cache_dir_phase1.path().join("phase1.redb");
         let client = build_client_with_cold_start(
@@ -593,6 +718,8 @@ async fn offline_cold_start_documents_bucket_e2e() {
             anchor_address.clone(),
             ipns_name.clone(),
             user_key.clone(),
+            ipns_gateway_urls.clone(),
+            block_gateway_urls.clone(),
         );
         client
             .put_object_flat(
@@ -626,12 +753,18 @@ async fn offline_cold_start_documents_bucket_e2e() {
     // detect the change and re-pin this user's per-user CBOR with the
     // new field. Without that bump, the publisher would silently skip
     // this user as "unchanged" and the test would fail spuriously.
-    eprintln!(
-        "\n[cold-start-e2e] phase 1.5: waiting {}s for publisher tick",
-        publisher_wait_secs
-    );
-    tokio::time::sleep(Duration::from_secs(publisher_wait_secs)).await;
-    eprintln!("[cold-start-e2e]   publisher window elapsed");
+    if skip_upload {
+        eprintln!(
+            "\n[cold-start-e2e] phase 1.5: SKIPPED (no upload, no need to wait for publisher)"
+        );
+    } else {
+        eprintln!(
+            "\n[cold-start-e2e] phase 1.5: waiting {}s for publisher tick",
+            publisher_wait_secs
+        );
+        tokio::time::sleep(Duration::from_secs(publisher_wait_secs)).await;
+        eprintln!("[cold-start-e2e]   publisher window elapsed");
+    }
 
     // ─── Phase 2 — Cold-start: bogus master + EMPTY cache ────────────────
     //
@@ -669,6 +802,8 @@ async fn offline_cold_start_documents_bucket_e2e() {
             anchor_address.clone(),
             ipns_name.clone(),
             user_key.clone(),
+            ipns_gateway_urls.clone(),
+            block_gateway_urls.clone(),
         );
 
         // Listing buckets requires master S3 (`/?list-type=2`); cold-start
@@ -699,6 +834,91 @@ async fn offline_cold_start_documents_bucket_e2e() {
         // This goes through the SDK's encrypted forest, which goes through
         // the Phase 3.3 resolver, which now (v0.4.4) can find the SDK
         // forest manifest CID via the new `forest_manifest_cid` field.
+        //
+        // Skip-upload mode: assert only that `cold_start_resolve_manifest`
+        // SUCCEEDS (fetches the CBOR, returns the manifest CID + bytes).
+        // The full `list_files_from_forest` would also try to decrypt
+        // the manifest with the test's secret, which won't match data
+        // uploaded under prior random secrets — so we'd see a decrypt
+        // failure even though cold-start worked. The resolver-level
+        // assertion isolates the v0.4.4 plumbing being tested here.
+        if skip_upload {
+            eprintln!(
+                "[cold-start-e2e]   resolver-only check (skip_upload): \
+                 cold_start_resolve_manifest({}) ...",
+                bucket
+            );
+            // FxFiles user expectation: cold-start MUST locate the
+            // bucket and return its forest_manifest_cid + bytes,
+            // ready to decrypt with the user's secret. BucketNotFound
+            // means the published bucketsIndex doesn't have an entry
+            // under THIS run's MetadataKey-derived lookup_h — which
+            // means the secret doesn't match what FxFiles uploaded
+            // with. Print a precise diagnostic so the operator knows
+            // exactly which input to fix.
+            let (manifest_cid, manifest_bytes) = match client
+                .cold_start_resolve_manifest(&bucket)
+                .await
+            {
+                Ok(v) => v,
+                Err(ClientError::BucketNotFound(name)) => {
+                    panic!(
+                        "BucketNotFound({:?}): cold-start fetched the published \
+                         users-index + bucketsIndex but no entry maps to this \
+                         test's MetadataKey-derived lookup_h. The test secret \
+                         doesn't match the secret FxFiles used at upload time. \
+                         Fix: set FULA_TEST_SECRET to the base64-encoded \
+                         encryption_key from FxFiles SecureStorage \
+                         (auth_service.dart:546 stores it under key \
+                         \"encryption_key\"). Alternatively set \
+                         FULA_TEST_OAUTH_INPUT=\"<provider>:<rawOAuthSub>:<email>\" \
+                         and the test will Argon2id-derive locally.",
+                        name,
+                    );
+                }
+                Err(e) => panic!(
+                    "phase 2 (skip_upload): cold-start MUST resolve. \
+                     UsersIndexResolutionFailed / CidVerificationFailed / \
+                     network-tier errors mean the plumbing is broken. Got: {:?}",
+                    e
+                ),
+            };
+            eprintln!(
+                "[cold-start-e2e]   resolver OK: manifest_cid={} bytes={} bucket={}",
+                manifest_cid,
+                manifest_bytes.len(),
+                bucket
+            );
+
+            // Now exercise the full path FxFiles users hit on cold-start:
+            // list_files_from_forest decrypts the manifest, walks the
+            // forest, and returns the user's actual files. This is the
+            // assertion that proves cold-start works for the user's
+            // FxFiles login → see buckets → see files flow.
+            eprintln!(
+                "[cold-start-e2e]   listing files in {} via cold-start (decrypts with FxFiles secret)...",
+                bucket
+            );
+            let files = client.list_files_from_forest(&bucket).await.expect(
+                "phase 2 (skip_upload): cold-start list MUST succeed for an \
+                 FxFiles user. If decryption failed, FULA_TEST_SECRET doesn't \
+                 match the encryption_key FxFiles stored. If a network error, \
+                 the gateway race for the manifest pages exhausted — extend \
+                 FULA_BLOCK_GATEWAY_URLS or wait for DHT propagation.",
+            );
+            eprintln!(
+                "[cold-start-e2e]   list OK via cold-start ({} files in bucket)",
+                files.len()
+            );
+            for f in files.iter().take(20) {
+                eprintln!("[cold-start-e2e]     - {}", f.original_key);
+            }
+            eprintln!(
+                "\n[cold-start-e2e] PASS — FxFiles user can list this bucket master-independent."
+            );
+            return;
+        }
+
         eprintln!(
             "[cold-start-e2e]   listing files in {} via cold-start...",
             bucket

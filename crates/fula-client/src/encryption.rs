@@ -3092,8 +3092,11 @@ impl EncryptedClient {
             // Master-down + cache miss → try cold-start if resolver is
             // configured. Identifying which "MasterUnreachable" case
             // this is doesn't matter — both are "we don't know the
-            // CID locally, fetch from the public network".
-            Err(e) if matches!(e, ClientError::MasterUnreachable { .. }) => {
+            // CID locally, fetch from the public network". The
+            // classifier covers DNS errors / connect refused / 5xx /
+            // explicit MasterUnreachable, which is what the wrapper
+            // propagates when its fallback can't serve the bytes.
+            Err(e) if crate::client::is_master_unreachable_error(&e) => {
                 // Resolver-enabled? If not, propagate the original.
                 if self.inner.users_index_resolver().is_none() {
                     return Err(e);
@@ -3886,14 +3889,39 @@ impl EncryptedClient {
             // payload or key material reaches the cache, so the security
             // model is identical to the manifest-fetch path that already
             // routes through this wrapper.
-            let blob = self.inner
-                .get_object_with_offline_fallback(bucket, &page_key)
-                .await
-                .map(|r| r.inner.data)
-                .map_err(|e| ClientError::DownloadFailed(format!(
+            //
+            // Cold-cache cold-start (#31): when the just-decrypted root
+            // pins this page's CID via `page_ref.etag`, prefer the
+            // CID-hint variant so a fresh device — which has no
+            // KEY_TO_CID warm-cache mapping for this page yet — can
+            // still race the gateway pool with the exact CID. Master-up
+            // path is unchanged (the wrapper hits master first
+            // regardless of hint), so there is no slowness when the
+            // server is reachable. Pages that have never been flushed
+            // (`page_ref.etag = None`) fall back to the no-hint wrapper;
+            // those pages have no on-IPFS bytes to fetch anyway.
+            let cid_hint = page_ref
+                .etag
+                .as_deref()
+                .and_then(|s| s.parse::<cid::Cid>().ok());
+            let blob = match cid_hint {
+                Some(cid) => self
+                    .inner
+                    .get_object_with_offline_fallback_known_cid(bucket, &page_key, &cid)
+                    .await,
+                None => {
+                    self.inner
+                        .get_object_with_offline_fallback(bucket, &page_key)
+                        .await
+                }
+            }
+            .map(|r| r.inner.data)
+            .map_err(|e| {
+                ClientError::DownloadFailed(format!(
                     "failed to fetch manifest page {} for bucket {}: {}",
                     page_id, bucket, e
-                )))?;
+                ))
+            })?;
             let envelope = EncryptedManifestPage::from_bytes(&blob)
                 .map_err(ClientError::Encryption)?;
             if envelope.page_id != *page_id {
@@ -3944,15 +3972,34 @@ impl EncryptedClient {
         // by master's CID. NotFound (genuine "no dir-index yet") still
         // surfaces via `is_not_found()` and triggers rebuild-from-forest,
         // unchanged from before this fix.
-        let blob = match self
-            .inner
-            .get_object_with_offline_fallback(bucket, &key)
-            .await
-            .map(|r| r.inner.data)
-        {
-            Ok(b) => b,
-            Err(e) if e.is_not_found() => return Ok(None),
-            Err(e) => return Err(e),
+        //
+        // Cold-cache cold-start (#31): when the just-decrypted root
+        // pins the dir-index CID via `expected_etag`, prefer the
+        // CID-hint variant so a fresh device with no KEY_TO_CID
+        // warm-cache mapping can still race the gateway pool. The
+        // master-up path is identical regardless of hint.
+        let cid_hint = expected_etag.and_then(|s| s.parse::<cid::Cid>().ok());
+        let blob = match cid_hint {
+            Some(cid) => match self
+                .inner
+                .get_object_with_offline_fallback_known_cid(bucket, &key, &cid)
+                .await
+                .map(|r| r.inner.data)
+            {
+                Ok(b) => b,
+                Err(e) if e.is_not_found() => return Ok(None),
+                Err(e) => return Err(e),
+            },
+            None => match self
+                .inner
+                .get_object_with_offline_fallback(bucket, &key)
+                .await
+                .map(|r| r.inner.data)
+            {
+                Ok(b) => b,
+                Err(e) if e.is_not_found() => return Ok(None),
+                Err(e) => return Err(e),
+            },
         };
         // `get_object` discards the HEAD ETag so we cannot cross-check
         // `expected_etag` here directly; it stays threaded for future refactors
