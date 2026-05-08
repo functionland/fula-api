@@ -53,11 +53,21 @@ set -euo pipefail
 DRY_RUN_ONLY=0
 ASSUME_YES=0
 CLEANUP_CLUSTER=0
+PER_BUCKET=0
+PER_BUCKET_TIMEOUT="${PER_BUCKET_TIMEOUT:-120}"
 for arg in "$@"; do
     case "$arg" in
         --dry-run-only)    DRY_RUN_ONLY=1 ;;
         --yes|-y)          ASSUME_YES=1 ;;
         --cleanup-cluster) CLEANUP_CLUSTER=1 ;;
+        --per-bucket)
+            # Iterate the dry-run's affected buckets one at a time,
+            # using the handler's bucket_internal_key query parameter.
+            # Each bucket is its own request → if one hangs, the rest
+            # still get processed. Set PER_BUCKET_TIMEOUT (default 120s)
+            # to bound how long any single bucket can wedge the script.
+            PER_BUCKET=1
+            ;;
         -h|--help)
             sed -n '2,/^set -/p' "$0" | sed 's/^# \{0,1\}//;/^set -/d'
             exit 0
@@ -144,25 +154,88 @@ fi
 # nearing its 5-minute expiry if the operator paused at the prompt).
 echo "" >&2
 echo "===== PII sweep: live =====" >&2
-JWT=$(mint_jwt)
-LIVE_RESP=$(curl -fsS -X POST --max-time "$TIMEOUT" \
-    -H "Authorization: Bearer $JWT" \
-    "$BASE/admin/pii-sweep?dry_run=false")
+if [[ "$PER_BUCKET" == "1" ]]; then
+    # Per-bucket mode: enumerate the dry-run's affected buckets and
+    # call the handler once per bucket via ?bucket_internal_key=. Each
+    # bucket gets its own bounded request so a single wedged bucket
+    # doesn't tie up the rest of the sweep. Aggregate results into a
+    # single response shape so downstream code (old_root_cids capture +
+    # error reporting) keeps working unchanged.
+    BUCKETS_TO_PROCESS=$(echo "$DRY_RESP" | jq -r '(.details // []) | .[] | .bucket_internal_key')
+    BUCKETS_COUNT=$(echo "$BUCKETS_TO_PROCESS" | grep -c . || true)
+    echo "Per-bucket mode: ${BUCKETS_COUNT} bucket(s), ${PER_BUCKET_TIMEOUT}s timeout each" >&2
+    LIVE_RESP='{"details":[]}'
+    DONE=0
+    while IFS= read -r bk; do
+        [[ -z "$bk" ]] && continue
+        DONE=$((DONE + 1))
+        # urlencode the colon and any @ in the bucket key
+        BK_ENC=$(printf '%s' "$bk" | sed 's/:/%3A/g; s/@/%40/g')
+        echo "  [${DONE}/${BUCKETS_COUNT}] $bk" >&2
+        JWT=$(mint_jwt)
+        ONE_RESP=$(curl -sS -X POST \
+            --max-time "$PER_BUCKET_TIMEOUT" \
+            -H "Authorization: Bearer $JWT" \
+            "$BASE/admin/pii-sweep?dry_run=false&bucket_internal_key=$BK_ENC" \
+            2>/dev/null || true)
+        if [[ -z "$ONE_RESP" ]] || ! echo "$ONE_RESP" | jq -e '.details' >/dev/null 2>&1; then
+            # Timeout, network error, or non-JSON response — fabricate
+            # a synthetic detail entry so the operator sees the bucket
+            # in the WARNING list at the end and can investigate it.
+            echo "    TIMEOUT or ERROR — bucket marked as needs-investigation" >&2
+            ONE_RESP=$(jq -nc --arg k "$bk" \
+                '{details:[{bucket_internal_key:$k,bucket_owner_id:"",bucket_name:"",objects_total:0,objects_with_leak:0,rewritten:0,old_root_cid:"",new_root_cid:null,errors:["per-bucket request timed out or failed; check master logs"]}]}')
+        fi
+        # Merge ONE_RESP.details into LIVE_RESP.details
+        LIVE_RESP=$(jq -nc --argjson a "$LIVE_RESP" --argjson b "$ONE_RESP" \
+            '{details: (($a.details // []) + ($b.details // []))}')
+    done <<< "$BUCKETS_TO_PROCESS"
+    echo "" >&2
+    echo "Per-bucket sweep complete; aggregated response below:" >&2
+else
+    JWT=$(mint_jwt)
+    LIVE_RESP=$(curl -fsS -X POST --max-time "$TIMEOUT" \
+        -H "Authorization: Bearer $JWT" \
+        "$BASE/admin/pii-sweep?dry_run=false")
+fi
 
 echo "$LIVE_RESP" | jq .
 
-# Capture old_root_cids for cluster cleanup. The endpoint emits one entry
-# per affected bucket under `details[]` — the schema may be either
-# `{ old_root_cid, new_root_cid, ... }` or a `{ before, after }` shape;
-# tolerate both via jq's `// .alt`.
-echo "$LIVE_RESP" \
-    | jq -r '(.details // []) | .[] | (.old_root_cid // .before.root_cid // empty)' \
-    | grep -v '^$' \
-    | sort -u > "$OLD_ROOTS_FILE"
-
+# Capture old_root_cids for cluster cleanup, but ONLY for buckets that
+# successfully migrated (new_root_cid is non-null AND errors is empty).
+# A bucket whose live migration errored is still pointing at its
+# old_root_cid; unpinning that from cluster would orphan its metadata.
+# The filter `.errors == [] and .new_root_cid != null` is the precise
+# signal that the bucket fully transitioned and the old root is safe to
+# unpin. Errored buckets are reported separately so the operator can
+# inspect them.
+SAFE_OLDS_JSON=$(echo "$LIVE_RESP" \
+    | jq '[(.details // [])[]
+           | select((.errors == null or .errors == [])
+                    and (.new_root_cid != null and .new_root_cid != ""))
+           | .old_root_cid]
+          | unique')
+echo "$SAFE_OLDS_JSON" | jq -r '.[]' > "$OLD_ROOTS_FILE"
 OLD_COUNT=$(wc -l < "$OLD_ROOTS_FILE" | tr -d ' ')
+
+# Surface errored buckets so the operator knows to investigate before
+# any manual cleanup.
+ERR_BUCKETS=$(echo "$LIVE_RESP" \
+    | jq -r '[(.details // [])[]
+              | select((.errors // []) | length > 0)
+              | "\(.bucket_internal_key) — \(.errors | join("; "))"]
+             | .[]')
+
 echo "" >&2
 echo "Wrote ${OLD_COUNT} unique old_root_cid(s) to $OLD_ROOTS_FILE" >&2
+echo "  (only buckets where migration fully succeeded — old root is safe to unpin)" >&2
+if [[ -n "$ERR_BUCKETS" ]]; then
+    echo "" >&2
+    echo "WARNING: the following buckets had errors and were NOT included in $OLD_ROOTS_FILE:" >&2
+    echo "$ERR_BUCKETS" | sed 's/^/  - /' >&2
+    echo "Their old_root_cid is still authoritative — DO NOT unpin manually." >&2
+    echo "Investigate, fix, and re-run the live sweep; idempotency makes this safe." >&2
+fi
 
 if [[ "$OLD_COUNT" == "0" ]]; then
     echo "No old root CIDs to clean up. Done." >&2
