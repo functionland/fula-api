@@ -106,7 +106,7 @@ echo "===== PII sweep: dry-run preview =====" >&2
 echo "endpoint = $BASE" >&2
 echo "" >&2
 JWT=$(mint_jwt)
-DRY_RESP=$(curl -fsS --max-time "$TIMEOUT" \
+DRY_RESP=$(curl -fsS -X POST --max-time "$TIMEOUT" \
     -H "Authorization: Bearer $JWT" \
     "$BASE/admin/pii-sweep?dry_run=true")
 
@@ -145,7 +145,7 @@ fi
 echo "" >&2
 echo "===== PII sweep: live =====" >&2
 JWT=$(mint_jwt)
-LIVE_RESP=$(curl -fsS --max-time "$TIMEOUT" \
+LIVE_RESP=$(curl -fsS -X POST --max-time "$TIMEOUT" \
     -H "Authorization: Bearer $JWT" \
     "$BASE/admin/pii-sweep?dry_run=false")
 
