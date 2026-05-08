@@ -12,7 +12,12 @@
 
 use crate::{AppState, ApiError, S3ErrorCode};
 use crate::state::AdminSession;
-use crate::auth::hash_user_id;
+// Use the same `hash_user_id` everything else in the gateway uses to key
+// `BucketMetadata.owner_id` (BLAKE3 with `"fula:user_id:"` domain separator,
+// 16 raw bytes / 32 hex chars). The `auth.rs` variant — domain-separator-less,
+// only 8 bytes — produced silent "0 buckets" on every admin lookup because
+// the resulting string never matched what was stored.
+use crate::state::hash_user_id;
 use crate::pinning::PinningCredentials;
 use axum::{
     body::Body,
@@ -39,6 +44,21 @@ pub struct AdminBucketInfo {
     pub name: String,
     pub object_count: u64,
     pub root_cid: String,
+    /// Phase 1.2: hex-encoded BLAKE3(MetadataKey || name)[..16] when the
+    /// SDK has flushed at least once with the lookup-h header, else None.
+    /// Surfaced to make duplicate-bucket diagnosis tractable: the
+    /// publisher emits each BucketMetadata as either `legacy=true,
+    /// key=name` (None) or `legacy=false, key=hex(lookup_h)` (Some). If
+    /// you see two entries that should be one bucket, this field tells
+    /// you which is which.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket_lookup_h_hex: Option<String>,
+    /// v0.4.4 SDK-side encrypted forest manifest CID. None until the
+    /// SDK's first Phase 2 root-commit PUT after master flipped the
+    /// `FULA_FOREST_MANIFEST_CID_ENABLED` flag on. Returned so the
+    /// operator can sanity-check what the publisher will emit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forest_manifest_cid: Option<String>,
 }
 
 /// Response for GET /admin/users/{user_id}/buckets
@@ -117,6 +137,8 @@ pub async fn list_user_buckets(
             name: b.name.clone(),
             object_count: b.object_count,
             root_cid: b.root_cid.to_string(),
+            bucket_lookup_h_hex: b.bucket_lookup_h.map(hex::encode),
+            forest_manifest_cid: b.forest_manifest_cid.clone(),
         })
         .collect();
 

@@ -398,13 +398,6 @@ pub fn validate_admin_token(token: &str, secret: &str) -> Result<AdminClaims, Ap
     Ok(claims)
 }
 
-/// Hash a user ID for storage (privacy)
-pub fn hash_user_id(user_id: &str) -> String {
-    use fula_crypto::hashing::hash;
-    let h = hash(user_id.as_bytes());
-    h.to_hex()[..16].to_string()
-}
-
 /// Generate an anonymous user ID for unauthenticated requests
 pub fn anonymous_user_id() -> String {
     "anonymous".to_string()
@@ -507,17 +500,6 @@ mod tests {
             Some("abc123")
         );
         assert_eq!(extract_bearer_token("Basic xyz"), None);
-    }
-
-    #[test]
-    fn test_hash_user_id() {
-        let hash1 = hash_user_id("user123");
-        let hash2 = hash_user_id("user123");
-        let hash3 = hash_user_id("user456");
-
-        assert_eq!(hash1, hash2);
-        assert_ne!(hash1, hash3);
-        assert_eq!(hash1.len(), 16);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════
