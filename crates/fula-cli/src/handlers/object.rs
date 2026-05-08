@@ -205,12 +205,20 @@ pub async fn put_object(
     // `x-amz-meta-fula-bucket-lookup-h` (set by `save_sharded_hamt_forest`
     // on Phase 1.5 page PUTs, Phase 1.6 dir-index PUT, and Phase 2 root
     // PUT — i.e. any flush-driven PUT — and by `save_forest` for v1
-    // monolithic), populate the bucket-level `bucket_lookup_h` field if
-    // currently None. Idempotent — never overwrites. Gated by env so we
-    // can stage the rollout: SDK always sends the header (cheap); master
-    // only consumes it when ready. As of v0.4.1+ the SDK attaches it on
-    // page-level writes too, so deferred-upload paths migrate without
-    // needing an explicit `flushForest` to fire Phase 2.
+    // monolithic), populate-or-update the bucket-level `bucket_lookup_h`
+    // field. REPLACE-ON-CHANGE — a user reinstalling FxFiles, signing in
+    // on a second device with subtly different derivation inputs, or any
+    // other legitimate session change updates the lookup_h on their next
+    // PUT. The original Phase 1.2 set-once design left such users
+    // permanently locked out of cold-start; replace-on-change self-heals.
+    // Bucket ownership is enforced by the JWT auth on this PUT path, so
+    // only the legitimate owner can write a different value here.
+    //
+    // Gated by env so we can stage the rollout: SDK always sends the
+    // header (cheap); master only consumes it when ready. As of v0.4.1+
+    // the SDK attaches it on page-level writes too, so deferred-upload
+    // paths migrate without needing an explicit `flushForest` to fire
+    // Phase 2.
     //
     // Failures are non-fatal — bad/missing headers must not break uploads.
     // Placement: AFTER bucket.flush() (so the flush has already replaced
@@ -227,16 +235,16 @@ pub async fn put_object(
         {
             match parse_bucket_lookup_h_header(hex_str) {
                 Ok(lookup_h) => {
-                    match state.bucket_manager.populate_lookup_h_if_missing(
+                    match state.bucket_manager.populate_bucket_lookup_h(
                         &session.hashed_user_id,
                         &bucket_name,
                         lookup_h,
                     ) {
                         Ok(true) => tracing::debug!(
                             bucket = %bucket_name,
-                            "Populated bucket_lookup_h (Phase 1.2)"
+                            "Populated/updated bucket_lookup_h (Phase 1.2)"
                         ),
-                        Ok(false) => { /* already set; idempotent skip */ }
+                        Ok(false) => { /* identical value already stored; no-op */ }
                         // BucketNotFound on a successful PUT to a real bucket
                         // is an internal-consistency violation — promote to
                         // error level so operators notice the signal.
@@ -244,7 +252,7 @@ pub async fn put_object(
                             error = %e,
                             bucket = %bucket_name,
                             user = %session.hashed_user_id,
-                            "populate_lookup_h_if_missing failed on a bucket that just accepted a PUT"
+                            "populate_bucket_lookup_h failed on a bucket that just accepted a PUT"
                         ),
                     }
                 }
@@ -279,8 +287,8 @@ pub async fn put_object(
     // (encrypted manifest content includes a new sequence number), so
     // master always tracks the LATEST. `populate_forest_manifest_cid`
     // is idempotent on identical input (no extra dirty flag, no extra
-    // registry persist) but DOES replace when the CID changed. Distinct
-    // from `populate_lookup_h_if_missing`'s set-once semantics.
+    // registry persist) but DOES replace when the CID changed —
+    // structurally identical to `populate_bucket_lookup_h` above.
     //
     // Env-flag gated (`FULA_FOREST_MANIFEST_CID_ENABLED`) so master can
     // stage the rollout independently of SDK rollout. Failures are
@@ -948,7 +956,7 @@ impl From<hex::FromHexError> for BucketLookupHError {
 /// 16-byte fixed array. Pure: no I/O, no allocations beyond the
 /// transient hex::decode buffer. Used by `put_object` to convert
 /// the wire-format string into the format
-/// `BucketManager::populate_lookup_h_if_missing` expects.
+/// `BucketManager::populate_bucket_lookup_h` expects.
 pub(crate) fn parse_bucket_lookup_h_header(
     hex_str: &str,
 ) -> Result<[u8; 16], BucketLookupHError> {
@@ -967,7 +975,7 @@ mod phase_1_2_wire_tests {
     //! `users_index_publisher::test_run_tick_legacy_to_blinded_replaces_entry`
     //! test does NOT cover: the HTTP-layer header extraction +
     //! parsing logic that sits between an SDK request and a
-    //! `populate_lookup_h_if_missing` call.
+    //! `populate_bucket_lookup_h` call.
 
     use super::*;
     use axum::http::{HeaderMap, HeaderName, HeaderValue};

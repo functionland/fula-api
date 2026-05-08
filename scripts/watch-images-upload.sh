@@ -3,9 +3,9 @@
 # gateway log filtered to lines that pinpoint where Phase 1.2 / v0.4.9
 # migration is succeeding or failing for the user's `images` bucket:
 #
-#   * "Populated bucket_lookup_h"    — Phase 1.2 ran (good — should appear once per first-flush)
+#   * "Populated/updated bucket_lookup_h" — Phase 1.2 ran (good — appears on first-flush AND on key-rotation flushes)
 #   * "Populated forest_manifest_cid" — v0.4.9 ran (good — should appear on every Phase 2 root commit)
-#   * "populate_lookup_h_if_missing failed"
+#   * "populate_bucket_lookup_h failed"
 #   * "populate_forest_manifest_cid failed"
 #   * "Failed to flush bucket"
 #   * "Failed to persist bucket registry"

@@ -240,7 +240,9 @@ pub struct BucketMetadata {
     /// `BLAKE3(MetadataKey || bucket_name)` truncated to 16 bytes (matches
     /// `hashed_user_id`'s 128-bit convention). `None` for buckets created
     /// before this field was added; populated lazily on the next forest
-    /// flush via `BucketManager::populate_lookup_h_if_missing`.
+    /// flush via `BucketManager::populate_bucket_lookup_h`. Replace-on-change
+    /// — a user reinstalling, signing in on a second device, or otherwise
+    /// rotating their derivation gets the new lookup_h on their next PUT.
     /// `#[serde(default)]` makes existing `fula-bucket-registry` CBOR blocks
     /// deserialize fine without migration.
     #[serde(default)]

@@ -1011,19 +1011,41 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
             .collect()
     }
 
-    /// Populate `BucketMetadata.bucket_lookup_h` for a user-scoped bucket
-    /// **only if currently `None`**. Idempotent — never overwrites an
-    /// existing value. Sets the dirty flag on success; the caller is
-    /// responsible for triggering registry persistence (typically via the
-    /// existing `persist_registry_with_token` call in the put_object handler).
+    /// Populate or update `BucketMetadata.bucket_lookup_h` for a
+    /// user-scoped bucket. **REPLACE-ON-CHANGE semantics**, structurally
+    /// identical to `populate_forest_manifest_cid` (see below). Idempotent
+    /// on identical input (returns `Ok(false)` and skips the dirty flag) so
+    /// a retried PUT that re-derives the same lookup_h doesn't trigger an
+    /// extra registry persist.
     ///
-    /// This is called by master's PUT handler when the SDK includes the
+    /// Phase 1.2's original design was set-once-forever. That broke users
+    /// in legitimate scenarios — reinstalling FxFiles, signing in on a
+    /// second device with subtly different derivation inputs, or a dev/test
+    /// script touching a bucket once — because the first writer's lookup_h
+    /// then locked the bucket out of cold-start resolution forever. None of
+    /// those things should break the bucket; they're things that happen.
+    /// Replace-on-change makes the bucket self-heal on the user's next PUT.
+    ///
+    /// This is safe because:
+    ///   - The PUT handler enforces bucket ownership via JWT auth, so only
+    ///     the legitimate owner can update lookup_h on their own bucket.
+    ///   - The SDK derives lookup_h deterministically from the user's
+    ///     secret + bucket name; any value the legitimate owner sends is by
+    ///     definition the right one for their current session.
+    ///   - The publisher's diff cache (users_index_publisher) detects the
+    ///     lookup_h change on its next tick and republishes the bucket
+    ///     under the corrected blinded key. SDK cold-start then resolves it.
+    ///
+    /// Transitions:
+    ///   - `None`         → `Some(h)`:  set,     dirty=true,   `Ok(true)`
+    ///   - `Some(h)`      → `Some(h)`:  no-op   (identical),   `Ok(false)`
+    ///   - `Some(other)`  → `Some(h)`:  REPLACE, dirty=true,   `Ok(true)`
+    ///   - bucket missing:                                      `Err(BucketNotFound)`
+    ///
+    /// Called by master's PUT handler when the SDK includes the
     /// `x-amz-meta-fula-bucket-lookup-h` control header on a Phase 2
-    /// manifest root PUT (the moment of forest commit).
-    ///
-    /// Returns `Ok(true)` if the field was newly populated, `Ok(false)` if it
-    /// was already set. `Err(BucketNotFound)` if the bucket doesn't exist.
-    pub fn populate_lookup_h_if_missing(
+    /// manifest root PUT.
+    pub fn populate_bucket_lookup_h(
         &self,
         user_id: &str,
         bucket_name: &str,
@@ -1037,7 +1059,11 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
         // which picks up the new value via the dirty flag.
         match self.buckets.get_mut(&internal_key) {
             Some(mut entry) => {
-                if entry.bucket_lookup_h.is_some() {
+                if entry.bucket_lookup_h == Some(lookup_h) {
+                    // Identical to existing value; no-op. Avoids unnecessary
+                    // registry-persist churn on retried PUTs that re-derive
+                    // the same MetadataKey + bucket name (and therefore the
+                    // same lookup_h).
                     Ok(false)
                 } else {
                     entry.bucket_lookup_h = Some(lookup_h);
@@ -1051,12 +1077,12 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
 
     /// Set the bucket's `forest_manifest_cid` to the given CID.
     ///
-    /// **DIFFERENT SEMANTICS from `populate_lookup_h_if_missing`** — this is a
-    /// REPLACE-LATEST function, not a set-once function. Every Phase 2 forest
-    /// root commit produces a fresh CID for the encrypted forest manifest;
-    /// master must track the latest, not the first. Idempotent on identical
-    /// input (returns `Ok(false)` and skips the dirty flag) so a no-op call
-    /// doesn't trigger an extra registry persist.
+    /// REPLACE-LATEST semantics, structurally identical to
+    /// `populate_bucket_lookup_h`. Every Phase 2 forest root commit
+    /// produces a fresh CID for the encrypted forest manifest; master
+    /// must track the latest, not the first. Idempotent on identical
+    /// input (returns `Ok(false)` and skips the dirty flag) so a no-op
+    /// call doesn't trigger an extra registry persist.
     ///
     /// Returns `Ok(true)` if the stored value changed (from `None` or from a
     /// different CID), `Ok(false)` if the stored value already equaled the
@@ -1609,11 +1635,11 @@ mod tests {
     }
 
     // ============================================================
-    // Phase 1.2 (master-independent reads) — populate_lookup_h_if_missing
+    // Phase 1.2 (master-independent reads) — populate_bucket_lookup_h
     // ============================================================
 
     #[tokio::test]
-    async fn test_populate_lookup_h_if_missing_happy_path() {
+    async fn test_populate_bucket_lookup_h_first_set() {
         // First-ever populate on a freshly-created bucket: sets the field,
         // returns Ok(true), and marks the manager dirty so the next
         // persist_registry call serializes the new value.
@@ -1645,7 +1671,7 @@ mod tests {
             0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55,
         ];
         let changed = manager
-            .populate_lookup_h_if_missing(user_id, bucket_name, h)
+            .populate_bucket_lookup_h(user_id, bucket_name, h)
             .expect("populate ok");
         assert!(changed, "first call must report changed=true");
 
@@ -1661,11 +1687,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_populate_lookup_h_if_missing_idempotent() {
-        // Second call with a DIFFERENT value must NOT overwrite. Returns
-        // Ok(false) and preserves the original. Dirty flag isn't set on
-        // the no-op (so we don't churn the registry on every PUT for an
-        // already-migrated bucket).
+    async fn test_populate_bucket_lookup_h_replace_on_change() {
+        // Three transitions covered:
+        //   1. None         → Some(h):     Ok(true),  dirty set
+        //   2. Some(h)      → Some(h):     Ok(false), dirty NOT set (no-op,
+        //                                              avoids registry churn)
+        //   3. Some(h)      → Some(other): Ok(true),  dirty set, REPLACED
+        // Transition 3 is the self-heal: when a user's derivation legitimately
+        // rotates (reinstall, new device, OAuth re-derivation), the next PUT
+        // must update master's stored lookup_h or cold-start breaks for them
+        // permanently. Earlier set-once design was a bug, not a feature.
         let store = Arc::new(MemoryBlockStore::new());
         let manager = BucketManager::new(store);
         let user_id = "userB";
@@ -1680,40 +1711,53 @@ mod tests {
         let original_h: [u8; 16] = [1u8; 16];
         let other_h: [u8; 16] = [2u8; 16];
 
-        // First populate → sets the field.
+        // (1) None → Some(original): sets the field, dirty=true.
         let changed = manager
-            .populate_lookup_h_if_missing(user_id, bucket_name, original_h)
-            .expect("populate ok");
-        assert!(changed);
+            .populate_bucket_lookup_h(user_id, bucket_name, original_h)
+            .expect("first populate ok");
+        assert!(changed, "transition None→Some must report changed=true");
 
-        // Reset dirty so we can detect whether the no-op call sets it again.
+        // Reset dirty so we can isolate the next call's effect on it.
         manager
             .dirty
             .store(false, std::sync::atomic::Ordering::Relaxed);
 
-        // Second populate with a different value → idempotent skip.
+        // (2) Some(original) → Some(original): identical input, no-op, dirty
+        // NOT set. Avoids unnecessary registry-persist churn on retried PUTs.
         let changed = manager
-            .populate_lookup_h_if_missing(user_id, bucket_name, other_h)
-            .expect("populate idempotent");
-        assert!(!changed, "second call must report changed=false");
+            .populate_bucket_lookup_h(user_id, bucket_name, original_h)
+            .expect("idempotent on identical input");
+        assert!(!changed, "identical-input call must report changed=false");
+        let mid = manager
+            .get_bucket_metadata_for_user(user_id, bucket_name)
+            .expect("metadata exists");
+        assert_eq!(mid.bucket_lookup_h, Some(original_h));
+        assert!(
+            !manager.dirty.load(std::sync::atomic::Ordering::Relaxed),
+            "no-op call must not set dirty flag"
+        );
 
-        // Original value preserved; dirty flag NOT set by the no-op.
+        // (3) Some(original) → Some(other): REPLACE, dirty=true.
+        let changed = manager
+            .populate_bucket_lookup_h(user_id, bucket_name, other_h)
+            .expect("replace on change ok");
+        assert!(changed, "different-value call must report changed=true");
         let post = manager
             .get_bucket_metadata_for_user(user_id, bucket_name)
             .expect("metadata exists");
         assert_eq!(
             post.bucket_lookup_h,
-            Some(original_h),
-            "idempotent: original value must NOT be overwritten"
+            Some(other_h),
+            "self-heal: legitimate session change must replace stale lookup_h"
         );
         assert!(
-            !manager.dirty.load(std::sync::atomic::Ordering::Relaxed),
-            "no-op call must not set dirty flag"
+            manager.dirty.load(std::sync::atomic::Ordering::Relaxed),
+            "dirty flag must be set after a value change"
         );
     }
 
     #[tokio::test]
-    async fn test_populate_lookup_h_bucket_not_found() {
+    async fn test_populate_bucket_lookup_h_bucket_not_found() {
         // Calling on a bucket that doesn't exist returns BucketNotFound.
         // Master's handler treats this as a non-fatal warn, but the API
         // contract here is: explicit error, not silent success.
@@ -1721,7 +1765,7 @@ mod tests {
         let manager = BucketManager::new(store);
 
         let h: [u8; 16] = [0u8; 16];
-        let result = manager.populate_lookup_h_if_missing("ghost-user", "ghost-bucket", h);
+        let result = manager.populate_bucket_lookup_h("ghost-user", "ghost-bucket", h);
 
         assert!(matches!(result, Err(CoreError::BucketNotFound(ref n)) if n == "ghost-bucket"));
     }
@@ -1886,7 +1930,7 @@ mod tests {
             0x12, 0xa3, 0x6f, 0x81, 0x23, 0x20, 0x37, 0xf5,
         ];
         let changed = new_manager
-            .populate_lookup_h_if_missing(user_id, bucket_name, h)
+            .populate_bucket_lookup_h(user_id, bucket_name, h)
             .expect("lazy populate");
         assert!(changed, "first populate on a legacy bucket must change");
 
@@ -1901,17 +1945,24 @@ mod tests {
             .await
             .expect("post-migration persist");
 
-        // (5) The next time the same client (or any other) writes, populate
-        // is a no-op (idempotent — never overwrites).
+        // (5) Self-heal: if the same user later signs in on a fresh device or
+        // re-derives under different inputs (legitimate scenarios — reinstall,
+        // OAuth re-derivation), their next PUT carries a different lookup_h.
+        // Replace-on-change semantics let the bucket's lookup_h follow the
+        // current owner's session so cold-start keeps resolving.
         let other_h: [u8; 16] = [9u8; 16];
         let changed = new_manager
-            .populate_lookup_h_if_missing(user_id, bucket_name, other_h)
-            .expect("idempotent");
-        assert!(!changed);
+            .populate_bucket_lookup_h(user_id, bucket_name, other_h)
+            .expect("replace on change");
+        assert!(changed, "different-value PUT must replace, returning Ok(true)");
         let still = new_manager
             .get_bucket_metadata_for_user(user_id, bucket_name)
             .expect("metadata still present");
-        assert_eq!(still.bucket_lookup_h, Some(h), "must NOT overwrite migrated value");
+        assert_eq!(
+            still.bucket_lookup_h,
+            Some(other_h),
+            "self-heal: legitimate key rotation must update lookup_h"
+        );
 
         // Cleanup
         let _ = std::fs::remove_file(&tmp);
@@ -2005,7 +2056,7 @@ mod tests {
             0xc1, 0x1f, 0x2c, 0xe4, 0x77, 0xc2, 0x80, 0x97,
         ];
         manager
-            .populate_lookup_h_if_missing(user_id, bucket_name, h)
+            .populate_bucket_lookup_h(user_id, bucket_name, h)
             .expect("populate");
 
         // Persist (CID file written via with_persistence).

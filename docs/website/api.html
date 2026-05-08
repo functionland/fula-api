@@ -1263,10 +1263,10 @@ curl -I "http://localhost:9000/my-bucket/Qm0bb7a3f40dcd6057bd5abd04d2aa80f68680e
                     </p>
                     <h3>Format</h3>
                     <pre><code>x-amz-meta-fula-bucket-lookup-h: &lt;32 hex chars&gt;</code></pre>
-                    <p>32 lowercase hex chars (16 bytes). Master-side handler at <code>fula-cli/src/handlers/object.rs</code> calls <code>BucketManager::populate_lookup_h_if_missing</code> after the flush.</p>
+                    <p>32 lowercase hex chars (16 bytes). Master-side handler at <code>fula-cli/src/handlers/object.rs</code> calls <code>BucketManager::populate_bucket_lookup_h</code> after the flush.</p>
                     <h3>Behavior</h3>
                     <ul>
-                        <li><strong>Idempotent</strong> — once populated for a bucket, the field is never overwritten on subsequent PUTs.</li>
+                        <li><strong>Replace-on-change</strong> — the bucket-level field is set on first PUT and updated whenever an authenticated owner&rsquo;s subsequent PUT carries a different value (e.g.&nbsp;reinstall or multi-device key rotation). Idempotent on identical input (no registry-persist churn).</li>
                         <li><strong>Non-fatal</strong> — a malformed or missing header is logged at <code>warn!</code> level; the PUT response is unchanged.</li>
                         <li><strong>Env-gated</strong> — master ignores the header unless <code>FULA_BUCKET_LOOKUP_H_ENABLED=1</code>.</li>
                         <li><strong>Backward-compat</strong> — old clients (no header) work unchanged. Buckets created without the header are emitted in the published CBOR with <code>legacy: true</code> and a plaintext-name key, so cold-start can still find them.</li>

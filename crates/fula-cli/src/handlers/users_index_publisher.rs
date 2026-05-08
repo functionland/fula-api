@@ -1532,7 +1532,7 @@ mod tests {
     // ============================================================
     //
     // run_tick tests use the real `create_bucket_for_user` /
-    // `delete_bucket_for_user` / `populate_lookup_h_if_missing` API
+    // `delete_bucket_for_user` / `populate_bucket_lookup_h` API
     // to seed `BucketManager` — no private-field reach-in. Root CIDs
     // are whatever the freshly-built forest produces; tests assert
     // *behavior* (sequence advance, pin/unpin, diff-cache state),
@@ -1754,7 +1754,7 @@ mod tests {
         // when a Phase-1.2-aware client uploads).
         let h = [0x77u8; 16];
         let changed = manager
-            .populate_lookup_h_if_missing("alice", "photos", h)
+            .populate_bucket_lookup_h("alice", "photos", h)
             .expect("populate ok");
         assert!(changed, "must transition None → Some");
 
