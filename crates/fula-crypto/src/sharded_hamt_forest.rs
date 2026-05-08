@@ -472,12 +472,29 @@ impl ShardedHamtPrivateForest {
     /// still carries the pre-crash etag. The post-PUT WAL record supplies
     /// the real etag S3 now serves, letting the next flush's Phase 1.5
     /// `If-Match` succeed instead of looping on 412.
+    ///
+    /// **Seq guard (task #29).** A WAL entry that is older than the loaded
+    /// manifest's `page_index[page_id].seq` reflects a state already
+    /// superseded by a later root commit (likely from a different device
+    /// or session that won a Phase-2 race). Applying it would clobber the
+    /// freshly-loaded etag with a stale one and cause permanent 412 loops
+    /// on Phase 1.5 — the exact symptom reported in the FxFiles `images`
+    /// regression. Only accept WAL entries that are strictly newer than
+    /// the loaded slot. Same-seq is a no-op even if applied (any non-trivial
+    /// rewrite within a seq would violate the page-write protocol), so
+    /// rejecting it costs nothing and keeps the `manifest > WAL` invariant
+    /// when seqs collide.
     pub fn reconcile_page_etag(
         &mut self,
         page_id: crate::private_forest::PageId,
         seq: u64,
         etag: Option<String>,
     ) {
+        if let Some(existing) = self.manifest.root.page_index.get(&page_id) {
+            if seq <= existing.seq {
+                return;
+            }
+        }
         self.manifest.root.page_index.insert(
             page_id,
             crate::private_forest::PageRef { etag, seq },
@@ -491,7 +508,17 @@ impl ShardedHamtPrivateForest {
     /// installed from the envelope's seq by the load path; this method
     /// only patches the root-side pins so the next flush's conditional
     /// PUT matches S3.
+    ///
+    /// **Seq guard (task #29).** Same rationale as `reconcile_page_etag`:
+    /// reject WAL entries that aren't strictly newer than the loaded
+    /// `dir_index_seq` — they reflect state already superseded by a later
+    /// root commit and would silently install a stale etag.
     pub fn reconcile_dir_index_etag(&mut self, seq: u64, etag: Option<String>) {
+        if let Some(existing_seq) = self.manifest.root.dir_index_seq {
+            if seq <= existing_seq {
+                return;
+            }
+        }
         self.manifest.root.dir_index_etag = etag;
         self.manifest.root.dir_index_seq = Some(seq);
     }
@@ -1171,9 +1198,19 @@ impl ShardedHamtPrivateForest {
             return;
         }
         let shard = self.manifest.shard_mut(idx);
-        if observed_seq > shard.seq {
-            shard.seq = observed_seq;
+        // Seq guard (task #29). Only apply WAL-derived shard reconciliation
+        // when the observed seq is strictly newer than the loaded shard's
+        // seq. Otherwise we'd clobber a fresh manifest's shard.etag with a
+        // stale post-PUT etag from a WAL entry already superseded by a
+        // later root commit — same failure mode as `reconcile_page_etag`,
+        // applied to the meta-HAMT layer. The previous implementation
+        // already gated the seq update behind `observed_seq > shard.seq`
+        // but unconditionally overwrote `etag` and forced `dirty_shards`,
+        // which still produced the corruption.
+        if observed_seq <= shard.seq {
+            return;
         }
+        shard.seq = observed_seq;
         shard.etag = observed_etag;
         self.dirty_shards[idx] = true;
     }

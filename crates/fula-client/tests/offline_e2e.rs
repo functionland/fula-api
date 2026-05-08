@@ -363,6 +363,183 @@ async fn offline_upload_download_e2e() {
 }
 
 // ============================================================================
+// 412 reproduction harness against a USER'S EXISTING bucket
+// ============================================================================
+//
+// Goal: reproduce / pin down task #29's 412 PreconditionFailed without
+// rebuilding FxFiles. Loads the user's existing forest (using their real
+// encryption key), then performs a configurable number of sequential small
+// writes — each one trips the conditional-PUT code path:
+//
+//   * Phase 1.5 page write (`If-Match` from `page_index[page_id].etag`)
+//   * Phase 1.6 dir-index write (`If-Match` from `manifest_snapshot.root.dir_index_etag`)
+//   * Phase 2 forest-manifest root write (`If-Match` from `manifest_etag`)
+//
+// If any of these emits a 412 against a fresh SDK state with the user's
+// real master, we have a local reproducer. If it doesn't, the bug requires
+// FxFiles-specific persistent state (WAL, on-disk cache) — different
+// debug path.
+//
+// ## Required env
+//
+// | Var                  | Required | Default        | Purpose                                                  |
+// |----------------------|----------|----------------|----------------------------------------------------------|
+// | `FULA_JWT`           | Yes      | —              | The user's Fula JWT.                                     |
+// | `FULA_TEST_SECRET`   | Yes      | —              | base64 of FxFiles Settings > Security > Encryption Key.  |
+// | `FULA_S3`            | No       | `https://s3.cloud.fx.land` | Live master endpoint.                          |
+// | `FULA_BUCKET`        | No       | `images`       | Target bucket — must exist for this user.                |
+// | `FULA_REPRO_WRITES`  | No       | `5`            | Number of sequential writes to perform.                  |
+// | `FULA_TIMEOUT_SECS`  | No       | `60`           | Per-request timeout.                                     |
+//
+// ## Run
+//
+// ```powershell
+// $env:FULA_JWT          = "eyJhbGci…"
+// $env:FULA_TEST_SECRET  = "<base64 from FxFiles>"
+// $env:FULA_BUCKET       = "images"     # or "face-metadata"
+// $env:FULA_REPRO_WRITES = "5"
+// cargo test -p fula-client --test offline_e2e --release `
+//   repro_412_existing_bucket_e2e -- --ignored --nocapture
+// ```
+//
+// ## Interpreting output
+//
+// * All writes succeed → bug is FxFiles-state-dependent, not reproducible
+//   from a fresh SDK state. Next debug path: capture FxFiles' WAL contents.
+// * One or more 412 → local reproducer. Pair with the master's
+//   `watch-images-upload.sh` log — the new diag headers (added in
+//   crates/fula-client/src/encryption.rs at all conditional-PUT sites)
+//   will show `sdk_debug_body_cid` + `sdk_debug_prior_etag` for each PUT,
+//   pinpointing the page / dir-index / root etag the SDK tracked.
+#[tokio::test]
+#[ignore]
+async fn repro_412_existing_bucket_e2e() {
+    use fula_crypto::keys::SecretKey;
+
+    let jwt = match read_required_env("FULA_JWT") {
+        Some(v) => v,
+        None => return,
+    };
+    let secret_b64 = match read_required_env("FULA_TEST_SECRET") {
+        Some(v) => v,
+        None => return,
+    };
+    let s3_url = std::env::var("FULA_S3")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://s3.cloud.fx.land".to_string());
+    let bucket = std::env::var("FULA_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "images".to_string());
+    let n_writes: usize = std::env::var("FULA_REPRO_WRITES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let timeout_secs: u64 = std::env::var("FULA_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+
+    eprintln!("\n[repro-412] master = {}", s3_url);
+    eprintln!("[repro-412] bucket = {}", bucket);
+    eprintln!("[repro-412] sequential writes = {}", n_writes);
+
+    // Decode user's actual encryption key from base64 (FxFiles Settings >
+    // Security > Encryption Key). This makes the SDK's storage_keys + page
+    // keys + dir-index keys match what FxFiles would compute, so any write
+    // we do here lands in the same forest state FxFiles is hitting.
+    use base64::Engine as _;
+    let trimmed = secret_b64.trim();
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
+        .expect("FULA_TEST_SECRET must be base64");
+    let secret = SecretKey::from_bytes(&key_bytes).expect("32-byte secret");
+
+    let cache_dir = TempDir::new().expect("tempdir for block cache");
+    let cache_path = cache_dir.path().join("blocks.redb");
+
+    let client = build_client(
+        &s3_url,
+        &jwt,
+        &cache_path,
+        secret,
+        true,
+        timeout_secs,
+    );
+
+    // Loading the existing forest first surfaces any 412 that's purely a
+    // load/cache-warming problem (vs. only triggered by writes). It also
+    // logs the forest's current page_index etags via the diag tracing.
+    eprintln!("\n[repro-412] phase 0: list existing files (warms forest cache)");
+    let initial_files = client
+        .list_files_from_forest(&bucket)
+        .await
+        .expect("list existing bucket — if this fails, encryption key or JWT is wrong");
+    eprintln!("[repro-412]   existing files in {} = {}", bucket, initial_files.len());
+
+    // Sequential writes: each PUT triggers a flush which exercises the
+    // Phase 1.5 / 1.6 / 2 conditional PUTs in order. Use a stable prefix +
+    // monotonic suffix so we can find these in master logs and clean them
+    // up later if needed.
+    eprintln!("\n[repro-412] phase 1: {} sequential writes", n_writes);
+    let session_tag = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let mut errors: Vec<(usize, String, String)> = Vec::new();
+    for i in 0..n_writes {
+        let key = format!("repro-412/session-{}/write-{:02}.bin", session_tag, i);
+        let payload: Vec<u8> = (0..256u32).map(|j| ((i as u32 + j) % 256) as u8).collect();
+        eprintln!("[repro-412]   write {} → {}/{}", i + 1, bucket, key);
+        match client
+            .put_object_flat(&bucket, &key, payload, Some("application/octet-stream"))
+            .await
+        {
+            Ok(_) => eprintln!("[repro-412]     OK"),
+            Err(e) => {
+                let msg = format!("{:?}", e);
+                eprintln!("[repro-412]     ERROR: {}", msg);
+                errors.push((i, key.clone(), msg));
+                // Do NOT break — we want to see if all subsequent writes
+                // also 412 (suggesting a permanent stuck etag) or only
+                // some (suggesting a transient race).
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        eprintln!(
+            "\n[repro-412] PASS — all {} writes succeeded against bucket {}.\n\
+             The 412 is NOT reproducible from a fresh SDK state with this user's key.\n\
+             It requires FxFiles-specific persistent state (WAL on disk, in-memory\n\
+             page_index from a long-running session). Next debug path: dump FxFiles'\n\
+             WAL files and replay them in a unit test.",
+            n_writes, bucket,
+        );
+    } else {
+        eprintln!(
+            "\n[repro-412] FAIL — {} of {} writes hit an error (e.g., 412):",
+            errors.len(),
+            n_writes,
+        );
+        for (i, k, msg) in &errors {
+            eprintln!("[repro-412]   write {} key={} err={}", i + 1, k, msg);
+        }
+        eprintln!(
+            "\n[repro-412] Local reproducer found. Pair this with the master's\n\
+             scripts/watch-images-upload.sh log — the SDK now emits real values\n\
+             for sdk_debug_body_cid + sdk_debug_prior_etag on the failing\n\
+             conditional PUT, so the master 412 diag will pinpoint where the\n\
+             stale etag is coming from."
+        );
+        panic!("repro_412 found {} write errors", errors.len());
+    }
+}
+
+// ============================================================================
 // v0.4.4 — COLD-START offline path
 // ============================================================================
 //
