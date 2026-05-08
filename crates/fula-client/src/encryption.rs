@@ -3384,13 +3384,28 @@ impl EncryptedClient {
             .with_metadata("fula-forest-manifest", "1");
 
         // TEMPORARY DIAGNOSTIC for #29.
-        tracing::warn!(
-            bucket,
-            index_key,
-            prior_etag = ?prior_etag,
-            next_sequence,
-            "save_forest (v1 monolithic) conditional PUT diag"
-        );
+        #[cfg(not(target_arch = "wasm32"))]
+        let metadata = {
+            let body_cid_hash = blake3::hash(&data);
+            let body_cid_mh =
+                cid::multihash::Multihash::<64>::wrap(0x1e, body_cid_hash.as_bytes())
+                    .expect("blake3 multihash wrap");
+            let body_cid = cid::Cid::new_v1(0x55, body_cid_mh);
+            tracing::warn!(
+                bucket,
+                index_key,
+                prior_etag = ?prior_etag,
+                body_cid = %body_cid,
+                next_sequence,
+                "save_forest (v1 monolithic) conditional PUT diag"
+            );
+            metadata
+                .with_metadata("fula-debug-body-cid", &body_cid.to_string())
+                .with_metadata(
+                    "fula-debug-prior-etag",
+                    prior_etag.as_deref().unwrap_or("<none>"),
+                )
+        };
         let put_result = self.inner.put_object_with_metadata_conditional(
             bucket,
             &index_key,
@@ -3556,6 +3571,34 @@ impl EncryptedClient {
                 Some(et) => (Some(et), None),
                 None => (None, Some("*")),
             };
+            // TEMPORARY DIAGNOSTIC for #29: surface the SDK-side prior etag
+            // (= `old_etag` from the in-memory page_index) and the new body's
+            // CID via x-amz-meta headers so master's 412 diag reports the
+            // exact value the SDK used as If-Match. Native-only; the wasm
+            // path is irrelevant for FxFiles 412 reproduction.
+            #[cfg(not(target_arch = "wasm32"))]
+            let metadata = {
+                let body_cid_hash = blake3::hash(&blob);
+                let body_cid_mh =
+                    cid::multihash::Multihash::<64>::wrap(0x1e, body_cid_hash.as_bytes())
+                        .expect("blake3 multihash wrap");
+                let body_cid = cid::Cid::new_v1(0x55, body_cid_mh);
+                tracing::warn!(
+                    bucket,
+                    page_id,
+                    page_key = %page_key,
+                    if_match = ?if_match,
+                    if_none_match = ?if_none_match,
+                    body_cid = %body_cid,
+                    "phase1.5 page conditional PUT diag"
+                );
+                metadata
+                    .with_metadata("fula-debug-body-cid", &body_cid.to_string())
+                    .with_metadata(
+                        "fula-debug-prior-etag",
+                        if_match.unwrap_or("<none>"),
+                    )
+            };
             let put = match self.inner.put_object_with_metadata_conditional(
                 bucket,
                 &page_key,
@@ -3639,6 +3682,31 @@ impl EncryptedClient {
             let metadata = ObjectMetadata::new()
                 .with_content_type("application/octet-stream")
                 .with_metadata("fula-bucket-lookup-h", &lookup_h_hex);
+            // TEMPORARY DIAGNOSTIC for #29 (same intent as the page-write
+            // site above; surface the SDK's view of the prior etag so the
+            // master 412 diag can confirm where a stale `If-Match` came from).
+            #[cfg(not(target_arch = "wasm32"))]
+            let metadata = {
+                let body_cid_hash = blake3::hash(&blob);
+                let body_cid_mh =
+                    cid::multihash::Multihash::<64>::wrap(0x1e, body_cid_hash.as_bytes())
+                        .expect("blake3 multihash wrap");
+                let body_cid = cid::Cid::new_v1(0x55, body_cid_mh);
+                tracing::warn!(
+                    bucket,
+                    dir_key = %dir_key,
+                    prior_etag = ?old_dir_etag,
+                    body_cid = %body_cid,
+                    next_seq = next_dir_seq,
+                    "phase1.6 dir-index conditional PUT diag"
+                );
+                metadata
+                    .with_metadata("fula-debug-body-cid", &body_cid.to_string())
+                    .with_metadata(
+                        "fula-debug-prior-etag",
+                        old_dir_etag.as_deref().unwrap_or("<none>"),
+                    )
+            };
             let put = match self.inner.put_object_with_metadata_conditional(
                 bucket,
                 &dir_key,
