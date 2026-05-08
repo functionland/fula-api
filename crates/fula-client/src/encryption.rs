@@ -2594,8 +2594,19 @@ impl EncryptedClient {
                             )
                             .await?
                         {
-                            Some((idx, seq)) => {
+                            Some((idx, seq, observed_etag)) => {
                                 forest.install_dir_index(idx, seq);
+                                // Task #29: refresh the root's dir_index_etag
+                                // pin from master's actual response etag if it
+                                // diverged from what the manifest recorded.
+                                // Without this, a Phase-1.6-landed-but-Phase-2-
+                                // crashed write on a different device leaves
+                                // this device with a stale `dir_index_etag`
+                                // and every Phase 1.6 conditional PUT 412s
+                                // against master's actual dir-index object.
+                                if observed_etag.as_deref() != dir_index_etag.as_deref() {
+                                    forest.refresh_dir_index_etag_from_load(seq, observed_etag);
+                                }
                             }
                             None => {
                                 let backend_for_rebuild = Arc::new(S3BlobBackend::new(
@@ -4138,20 +4149,24 @@ impl EncryptedClient {
 
     /// Try to load the directory index (F-1.3) for this bucket.
     ///
-    /// Returns `Ok(Some((index, seq, etag)))` if the object decrypts cleanly
-    /// and its stored ETag matches `expected_etag` (when the root pins one).
+    /// Returns `Ok(Some((index, seq, observed_etag)))` if the object decrypts
+    /// cleanly and (when applicable) its sequence matches the root's pin.
+    /// `observed_etag` is master's actual GET-response etag for the dir-index
+    /// object — used by the caller to refresh `manifest.root.dir_index_etag`
+    /// when it has diverged from master (task #29: same Phase-1.5/Phase-2
+    /// crash-divergence pattern as the page-level fix in `load_manifest_pages`).
     /// Returns `Ok(None)` when:
     ///   * The object is 404 (never flushed or backend lost it).
-    ///   * The root records an ETag but the fetched ETag / AEAD doesn't match.
     ///   * The plaintext sequence is older than the root's pin.
-    /// All of these trigger a caller-side rebuild-from-forest.
+    ///   * Envelope decode / AEAD decrypt fails.
+    /// All `None` outcomes trigger caller-side rebuild-from-forest.
     async fn load_directory_index(
         &self,
         bucket: &str,
         forest_dek: &fula_crypto::keys::DekKey,
         expected_etag: Option<&str>,
         expected_seq: Option<u64>,
-    ) -> std::result::Result<Option<(DirectoryIndex, u64)>, ClientError> {
+    ) -> std::result::Result<Option<(DirectoryIndex, u64, Option<String>)>, ClientError> {
         let key = derive_dir_index_key(forest_dek, bucket);
         // Phase 2.4 — route through offline-fallback wrapper. Same
         // security model as the manifest + page fetches: the dir-index
@@ -4173,15 +4188,26 @@ impl EncryptedClient {
         #[cfg(not(target_arch = "wasm32"))]
         let cid_hint: Option<cid::Cid> =
             expected_etag.and_then(|s| s.parse::<cid::Cid>().ok());
+        // Helper: turn the offline-fallback GetObjectResult into
+        // `(blob, Option<observed_etag>)`. Empty etag → None. Used by both
+        // native and wasm branches below so the etag-capture stays uniform.
+        let extract = |r: crate::types::OfflineGetResult| {
+            let etag = if r.inner.etag.is_empty() {
+                None
+            } else {
+                Some(r.inner.etag.clone())
+            };
+            (r.inner.data, etag)
+        };
         #[cfg(not(target_arch = "wasm32"))]
-        let blob = match cid_hint {
+        let (blob, observed_etag) = match cid_hint {
             Some(cid) => match self
                 .inner
                 .get_object_with_offline_fallback_known_cid(bucket, &key, &cid)
                 .await
-                .map(|r| r.inner.data)
+                .map(&extract)
             {
-                Ok(b) => b,
+                Ok(t) => t,
                 Err(e) if e.is_not_found() => return Ok(None),
                 Err(e) => return Err(e),
             },
@@ -4189,33 +4215,43 @@ impl EncryptedClient {
                 .inner
                 .get_object_with_offline_fallback(bucket, &key)
                 .await
-                .map(|r| r.inner.data)
+                .map(&extract)
             {
-                Ok(b) => b,
+                Ok(t) => t,
                 Err(e) if e.is_not_found() => return Ok(None),
                 Err(e) => return Err(e),
             },
         };
         #[cfg(target_arch = "wasm32")]
-        let blob = match self
+        let (blob, observed_etag) = match self
             .inner
             .get_object_with_offline_fallback(bucket, &key)
             .await
-            .map(|r| r.inner.data)
+            .map(&extract)
         {
-            Ok(b) => b,
+            Ok(t) => t,
             Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e),
         };
-        // `get_object` discards the HEAD ETag so we cannot cross-check
-        // `expected_etag` here directly; it stays threaded for future refactors
-        // that expose the GET ETag on the read path. `expected_seq` is the
-        // authoritative pin instead: the dir-index envelope's `seq` is
-        // AEAD-bound (AAD ties plaintext to `(bucket, seq)`), and the root we
-        // just loaded commits to exactly one value of it. A mismatch means
-        // we raced a concurrent migrator (or the key holds an overwrite we
-        // never committed to): treat as stale and trigger rebuild-from-forest.
-        let _ = expected_etag;
+        // Task #29: log if the manifest's recorded `expected_etag` diverges
+        // from the etag master actually serves for the dir-index object. The
+        // caller uses the returned `observed_etag` to overwrite the root's
+        // pin so Phase 1.6 conditional PUTs use the live etag (mirrors the
+        // page-level override in `load_manifest_pages`).
+        if let (Some(expected), Some(observed)) = (expected_etag, observed_etag.as_deref()) {
+            if expected != observed {
+                tracing::debug!(
+                    %bucket,
+                    expected_etag = expected,
+                    observed_etag = observed,
+                    "load_directory_index: dir_index_etag override (master diverged from manifest)"
+                );
+            }
+        }
+        // `expected_seq` is the authoritative pin: the dir-index envelope's
+        // `seq` is AEAD-bound (AAD ties plaintext to `(bucket, seq)`), and
+        // the root we just loaded commits to exactly one value of it. Seq
+        // mismatch → treat as stale and trigger rebuild-from-forest.
         let envelope = match EncryptedDirectoryIndex::from_bytes(&blob) {
             Ok(e) => e,
             Err(e) => {
@@ -4236,7 +4272,7 @@ impl EncryptedClient {
                         return Ok(None);
                     }
                 }
-                Ok(Some((index, seq)))
+                Ok(Some((index, seq, observed_etag)))
             }
             Err(e) => {
                 tracing::warn!(%bucket, error = %e, "dir-index decrypt failed; will rebuild");

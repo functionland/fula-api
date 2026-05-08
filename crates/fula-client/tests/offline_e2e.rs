@@ -511,13 +511,56 @@ async fn repro_412_existing_bucket_e2e() {
     }
 
     if errors.is_empty() {
+        // Phase 2 — durable persistence check (task #29 dir-index fix).
+        // The disappearing-images bug looks exactly like "put_object_flat
+        // returned Ok but the file isn't in the next listing": Phase 1.5/1.6
+        // conditional PUTs landed master's stored objects, but the dir-index
+        // commit at Phase 1.6 silently failed (412 → forest's master-side
+        // dir-index never advanced → next listing returns the pre-write set).
+        // Re-listing after all writes is the precise observable for that
+        // failure: if the listing length grew by exactly `n_writes`, the
+        // dir-index commits were durable and the bug is closed for this user.
+        let after_files = client
+            .list_files_from_forest(&bucket)
+            .await
+            .expect("post-write list must succeed");
+        let expected_len = initial_files.len() + n_writes;
+        let session_prefix = format!("repro-412/session-{}/", session_tag);
+        let written_visible = after_files
+            .iter()
+            .filter(|f| f.original_key.starts_with(&session_prefix))
+            .count();
         eprintln!(
-            "\n[repro-412] PASS — all {} writes succeeded against bucket {}.\n\
-             The 412 is NOT reproducible from a fresh SDK state with this user's key.\n\
-             It requires FxFiles-specific persistent state (WAL on disk, in-memory\n\
-             page_index from a long-running session). Next debug path: dump FxFiles'\n\
-             WAL files and replay them in a unit test.",
-            n_writes, bucket,
+            "\n[repro-412] phase 2: durable-persistence check\n\
+             [repro-412]   pre-write file count    = {}\n\
+             [repro-412]   post-write file count   = {} (expected {})\n\
+             [repro-412]   session-tagged visible  = {} of {}",
+            initial_files.len(),
+            after_files.len(),
+            expected_len,
+            written_visible,
+            n_writes,
+        );
+        assert_eq!(
+            written_visible, n_writes,
+            "DURABLE-PERSISTENCE FAIL: only {}/{} writes visible in post-write listing. \
+             This is the disappearing-images bug — Phase 1.5 / 1.6 conditional PUTs \
+             may have hit master, but the dir-index commit didn't durably advance, \
+             so listings still reflect the pre-write set. Check the master log for \
+             412s during the test window — if any appear after this test's \
+             cargo build, the dir-index override (load_directory_index → \
+             refresh_dir_index_etag_from_load) is not engaged on this code path.",
+            written_visible, n_writes,
+        );
+        eprintln!(
+            "\n[repro-412] PASS — all {} writes succeeded AND are visible in the \
+             post-write listing.\n\
+             [repro-412] Verify on master side: tail watch-images-upload.sh \
+             during this test run; the master log should show zero \
+             `412 diag` entries. If the master log is clean of 412s, the \
+             page-level + dir-index fixes are both engaged and the SDK is \
+             ready to ship to mobile.",
+            n_writes,
         );
     } else {
         eprintln!(

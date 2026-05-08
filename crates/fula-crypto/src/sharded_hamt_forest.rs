@@ -466,6 +466,23 @@ impl ShardedHamtPrivateForest {
         self.manifest.root.dir_index_etag = None;
     }
 
+    /// Override the root's `dir_index_etag` + `dir_index_seq` with values
+    /// observed during load (master's GET response etag + the dir-index
+    /// envelope's encrypted-in seq). Counterpart to `load_manifest_pages`'s
+    /// page-override logic for the F-1.3 dir-index blob.
+    ///
+    /// **Why no seq guard (unlike [`reconcile_dir_index_etag`]):** this is
+    /// invoked only at initial load, with values that came from the same
+    /// fresh fetch round-trip — the observed etag is by definition the
+    /// authoritative state of master's actual dir-index object, regardless
+    /// of what the manifest happens to have recorded. The seq-guard's
+    /// "manifest beats older WAL" semantics don't apply here because the
+    /// manifest's recorded etag is precisely what we're correcting.
+    pub fn refresh_dir_index_etag_from_load(&mut self, seq: u64, etag: Option<String>) {
+        self.manifest.root.dir_index_etag = etag;
+        self.manifest.root.dir_index_seq = Some(seq);
+    }
+
     /// Reconcile a single page's root-side etag/seq pin from a post-PUT WAL
     /// record. Invoked on crash-recovery replay: the committing root PUT
     /// didn't fire, so the reloaded `manifest.root.page_index[page_id]`
