@@ -1611,3 +1611,234 @@ async fn fxfiles_offline_open_bucket() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FxFiles `_encryptionKey` formula comparison — TEST-ONLY DIAGNOSTIC
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// FxFiles' `_deriveEncryptionKey` (auth_service.dart) has had two distinct
+// formulas in production:
+//
+//   v1 (pre-2026-01-18, FxFiles commit 02ef94e and earlier):
+//       PBKDF2-HMAC-SHA256(
+//           password = "${provider}:${userId}",
+//           salt     = "fula-files-v1:${email}",
+//           iter     = 100_000,
+//           output   = 32 bytes,
+//       )
+//
+//   v2 (post-2026-01-18, current):
+//       Argon2id(
+//           input  = "${provider}:${userId}:${email}",
+//           salt   = "fula-files-v1",
+//           memory = 64 MiB, iter = 3, par = 1,
+//           output = 32 bytes,
+//       )
+//
+// A user who installed FxFiles before the migration and never wiped
+// SecureStorage may still have a v1 key cached on device; their bucket
+// data was written under that v1 key; their PUT-time `bucket_lookup_h`
+// was derived from v1 bytes; and a fresh re-derivation today would
+// produce v2 bytes that DO NOT match what's on master.
+//
+// This test re-derives both candidate keys from operator-provided
+// `provider`, `userId`, `email` and prints, for each candidate:
+//
+//   * the 32 raw bytes (hex + base64),
+//   * the SDK-computed `bucket_lookup_h_hex`
+//     (BLAKE3(MetadataKey || bucket)[..16]),
+//
+// then compares both `lookup_h` values to `FULA_EXPECTED_LOOKUP_H` (the
+// value master holds for this user's bucket) and reports which formula
+// matches. If a v1 key is cached on the user's device, this test will
+// show the v1 derivation matching master and the v2 NOT matching.
+//
+// The test is purely test-side: it never touches fula-client / fula-crypto
+// production code, only uses their public APIs the same way any external
+// caller would. Re-deriving v1/v2 candidates, computing their lookup_h,
+// and printing the result has zero effect on encryption invariants,
+// HAMT semantics, or master-side state.
+//
+// Required env:
+//   FULA_DERIVE_PROVIDER  — "google" or "apple"
+//   FULA_DERIVE_USER_ID   — the OAuth provider's `sub` / userIdentifier
+//   FULA_DERIVE_EMAIL     — the user's email (lowercase, no whitespace)
+//
+// Optional env:
+//   FULA_BUCKET             — default "images"
+//   FULA_EXPECTED_LOOKUP_H  — master's bucket_lookup_h_hex for this bucket
+//   FULA_TEST_SECRET        — base64 of FxFiles' currently-cached key;
+//                             when set, the test compares it against both
+//                             candidates so the operator sees whether the
+//                             exported key is the v1 form, v2 form, or
+//                             neither.
+//
+// Run:
+//   $env:FULA_DERIVE_PROVIDER  = "google"
+//   $env:FULA_DERIVE_USER_ID   = "<raw OAuth sub>"
+//   $env:FULA_DERIVE_EMAIL     = "ehsan@fx.land"
+//   $env:FULA_BUCKET           = "images"
+//   $env:FULA_EXPECTED_LOOKUP_H= "93685a705deb32b9c8bfdd63a11376d8"
+//   # Optional: $env:FULA_TEST_SECRET = "<b64 from FxFiles Settings>"
+//   cargo test -p fula-client --test offline_e2e --release `
+//     compare_fxfiles_v1_v2_key_derivations -- --ignored --nocapture
+#[test]
+#[ignore = "operator-driven; requires FULA_DERIVE_* env vars"]
+fn compare_fxfiles_v1_v2_key_derivations() {
+    use base64::Engine as _;
+
+    let provider = match read_required_env("FULA_DERIVE_PROVIDER") {
+        Some(v) => v,
+        None => return,
+    };
+    let user_id = match read_required_env("FULA_DERIVE_USER_ID") {
+        Some(v) => v,
+        None => return,
+    };
+    let email = match read_required_env("FULA_DERIVE_EMAIL") {
+        Some(v) => v,
+        None => return,
+    };
+    let bucket = std::env::var("FULA_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "images".to_string());
+    let expected = std::env::var("FULA_EXPECTED_LOOKUP_H")
+        .ok()
+        .map(|s| s.trim().to_lowercase());
+    let cached: Option<Vec<u8>> = std::env::var("FULA_TEST_SECRET").ok().and_then(|s| {
+        let trimmed = s.trim().to_string();
+        base64::engine::general_purpose::STANDARD
+            .decode(&trimmed)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&trimmed))
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&trimmed))
+            .ok()
+    });
+
+    eprintln!(
+        "\n[fxfiles-key-compare] provider = {:?}, userId = {:?}, email = {:?}, bucket = {:?}",
+        provider, user_id, email, bucket
+    );
+
+    // ---- v1 (pre-2026-01-18): PBKDF2-HMAC-SHA256 ----
+    let v1_password = format!("{provider}:{user_id}");
+    let v1_salt = format!("fula-files-v1:{email}");
+    let mut v1_key = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<sha2::Sha256>(
+        v1_password.as_bytes(),
+        v1_salt.as_bytes(),
+        100_000,
+        &mut v1_key,
+    );
+
+    // ---- v2 (post-2026-01-18): Argon2id via fula-crypto's public helper ----
+    // Same call FxFiles makes via fula.deriveKey(context: 'fula-files-v1', input: ...).
+    let v2_input = format!("{provider}:{user_id}:{email}");
+    let v2_key = fula_crypto::hashing::derive_key_argon2id("fula-files-v1", v2_input.as_bytes());
+
+    // For each candidate, compute bucket_lookup_h via the SDK formula:
+    //   MetadataKey = derive_path_key("fula-metadata-v1")
+    //   lookup_h    = BLAKE3(MetadataKey || bucket_name)[..16]
+    let lookup_h_for = |key_bytes: &[u8; 32]| -> String {
+        let secret = SecretKey::from_bytes(key_bytes).expect("32-byte secret");
+        let km = fula_crypto::keys::KeyManager::from_secret_key(secret);
+        let mk = km.derive_path_key("fula-metadata-v1");
+        let mut h = blake3::Hasher::new();
+        h.update(mk.as_bytes());
+        h.update(bucket.as_bytes());
+        hex::encode(&h.finalize().as_bytes()[..16])
+    };
+
+    let v1_lookup_h = lookup_h_for(&v1_key);
+    let v2_lookup_h = lookup_h_for(&v2_key);
+
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+
+    eprintln!(
+        "\n[fxfiles-key-compare] v1 (PBKDF2-HMAC-SHA256, 100_000 iter, salt='fula-files-v1:{{email}}')"
+    );
+    eprintln!("[fxfiles-key-compare]   key (hex)  = {}", hex::encode(v1_key));
+    eprintln!("[fxfiles-key-compare]   key (b64)  = {}", b64(&v1_key));
+    eprintln!("[fxfiles-key-compare]   lookup_h   = {}", v1_lookup_h);
+
+    eprintln!("\n[fxfiles-key-compare] v2 (Argon2id, salt='fula-files-v1')");
+    eprintln!("[fxfiles-key-compare]   key (hex)  = {}", hex::encode(v2_key));
+    eprintln!("[fxfiles-key-compare]   key (b64)  = {}", b64(&v2_key));
+    eprintln!("[fxfiles-key-compare]   lookup_h   = {}", v2_lookup_h);
+
+    if let Some(c) = &cached {
+        if c.len() == 32 {
+            let v1_match = c[..] == v1_key[..];
+            let v2_match = c[..] == v2_key[..];
+            eprintln!("\n[fxfiles-key-compare] FULA_TEST_SECRET (decoded, 32 bytes)");
+            eprintln!("[fxfiles-key-compare]   key (hex)  = {}", hex::encode(c));
+            eprintln!("[fxfiles-key-compare]   matches v1 = {}", v1_match);
+            eprintln!("[fxfiles-key-compare]   matches v2 = {}", v2_match);
+            if !v1_match && !v2_match {
+                eprintln!(
+                    "[fxfiles-key-compare]   → exported key matches NEITHER candidate.\n\
+                     [fxfiles-key-compare]     Inputs used: provider={:?}, userId={:?}, email={:?}.\n\
+                     [fxfiles-key-compare]     Likely the cached _encryptionKey on device was\n\
+                     [fxfiles-key-compare]     populated under different inputs (Apple-relay\n\
+                     [fxfiles-key-compare]     drift, OAuth sub rotation, sign-out/in event), or\n\
+                     [fxfiles-key-compare]     was imported from another account/device.",
+                    provider, user_id, email
+                );
+            }
+        } else {
+            eprintln!(
+                "[fxfiles-key-compare] FULA_TEST_SECRET decoded len={} (expected 32) — skipping comparison",
+                c.len()
+            );
+        }
+    }
+
+    if let Some(e) = &expected {
+        eprintln!("\n[fxfiles-key-compare] master's expected bucket_lookup_h_hex = {}", e);
+        let v1_eq = v1_lookup_h.eq_ignore_ascii_case(e);
+        let v2_eq = v2_lookup_h.eq_ignore_ascii_case(e);
+        eprintln!("[fxfiles-key-compare]   v1 lookup_h matches master = {}", v1_eq);
+        eprintln!("[fxfiles-key-compare]   v2 lookup_h matches master = {}", v2_eq);
+        if v1_eq {
+            eprintln!(
+                "[fxfiles-key-compare] CONCLUSION: master's bucket_lookup_h matches the OLD\n\
+                 [fxfiles-key-compare]   FxFiles formula (PBKDF2-HMAC-SHA256). The user's\n\
+                 [fxfiles-key-compare]   data was written before the 2026-01-18 migration. They\n\
+                 [fxfiles-key-compare]   need their pre-migration v1 key to read those buckets;\n\
+                 [fxfiles-key-compare]   a fresh Argon2id-derived v2 key cannot decrypt them.\n\
+                 [fxfiles-key-compare]   Recovery options: (a) restore SecureStorage from a\n\
+                 [fxfiles-key-compare]   pre-migration backup, (b) re-encrypt the data under v2\n\
+                 [fxfiles-key-compare]   while still holding v1, (c) accept loss for those buckets."
+            );
+        } else if v2_eq {
+            eprintln!(
+                "[fxfiles-key-compare] CONCLUSION: master's bucket_lookup_h matches the CURRENT\n\
+                 [fxfiles-key-compare]   FxFiles formula (Argon2id). If the offline test still\n\
+                 [fxfiles-key-compare]   produced a different lookup_h, the FULA_TEST_SECRET or\n\
+                 [fxfiles-key-compare]   FULA_DERIVE_* inputs given to the test do NOT equal the\n\
+                 [fxfiles-key-compare]   v2 key produced for these inputs — i.e., the cache on\n\
+                 [fxfiles-key-compare]   device differs from a fresh re-derivation. Check\n\
+                 [fxfiles-key-compare]   whether the email/userId in SecureStorage match what\n\
+                 [fxfiles-key-compare]   was provided here (Apple-relay drift, sign-out/in)."
+            );
+        } else {
+            eprintln!(
+                "[fxfiles-key-compare] CONCLUSION: master's bucket_lookup_h matches NEITHER\n\
+                 [fxfiles-key-compare]   v1 nor v2 of the known FxFiles formulas. Possible\n\
+                 [fxfiles-key-compare]   causes:\n\
+                 [fxfiles-key-compare]     (a) bucket was written by a different account\n\
+                 [fxfiles-key-compare]         (different email/userId at PUT time),\n\
+                 [fxfiles-key-compare]     (b) bucket was written by a non-FxFiles client\n\
+                 [fxfiles-key-compare]         (pinning-webui WASM with different inputs, manual\n\
+                 [fxfiles-key-compare]         S3 PUT with crafted header),\n\
+                 [fxfiles-key-compare]     (c) the provider/userId/email values supplied to the\n\
+                 [fxfiles-key-compare]         test don't match what the writer's FxFiles\n\
+                 [fxfiles-key-compare]         instance had at PUT time."
+            );
+        }
+    } else {
+        eprintln!(
+            "[fxfiles-key-compare] (set FULA_EXPECTED_LOOKUP_H=<hex> to highlight the matching variant)"
+        );
+    }
+}

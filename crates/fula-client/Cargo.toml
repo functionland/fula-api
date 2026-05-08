@@ -88,6 +88,12 @@ tempfile = { workspace = true }
 # `Keccak256("latest()")[..4]`. Tests-only; the prod build hardcodes
 # the 4-byte constant to avoid a runtime crypto dep on the hot path.
 sha3 = "0.10"
+# FxFiles pre-2026-01-18 used PBKDF2-HMAC-SHA256 for `_encryptionKey`
+# (commit 02ef94e and earlier). The diagnostic test
+# `compare_fxfiles_v1_v2_key_derivations` re-derives both that v1 form
+# and the current v2 (Argon2id) form to compare against master's
+# `bucket_lookup_h_hex`. Test-only; never linked into prod binaries.
+pbkdf2 = "0.12"
 
 [features]
 default = []
