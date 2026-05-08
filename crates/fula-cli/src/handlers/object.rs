@@ -82,6 +82,38 @@ pub async fn put_object(
 
     if let Some(h) = headers.get("If-Match").and_then(|v| v.to_str().ok()) {
         if !match_if_match(h, current_etag) {
+            // TEMPORARY DIAGNOSTIC for #29 — compute the CID master
+            // WOULD assign to the body that just arrived. If the SDK's
+            // if_match equals this body_cid, the bug is "SDK uses the
+            // NEW body's CID as If-Match" (would always 412 the very
+            // first attempt). If if_match differs from BOTH current
+            // AND body_cid, it's something else (stale cache, WAL
+            // mis-restore, persisted state).
+            let body_cid_str = {
+                use cid::multihash::Multihash;
+                let h = blake3::hash(&body);
+                let mh = Multihash::<64>::wrap(0x1e, h.as_bytes())
+                    .expect("blake3 multihash wrap");
+                cid::Cid::new_v1(0x55, mh).to_string()
+            };
+            let dbg_body_cid = headers
+                .get("x-amz-meta-fula-debug-body-cid")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<no-sdk-rebuild>");
+            let dbg_prior_etag = headers
+                .get("x-amz-meta-fula-debug-prior-etag")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<no-sdk-rebuild>");
+            tracing::warn!(
+                bucket = %bucket_name,
+                key = %key,
+                if_match = %h,
+                current_etag = ?current_etag,
+                master_computed_body_cid = %body_cid_str,
+                sdk_debug_body_cid = %dbg_body_cid,
+                sdk_debug_prior_etag = %dbg_prior_etag,
+                "412 diag: if_match vs current vs body_cid"
+            );
             return Err(ApiError::s3(
                 S3ErrorCode::PreconditionFailed,
                 "If-Match precondition failed",

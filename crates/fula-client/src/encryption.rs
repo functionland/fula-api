@@ -3732,19 +3732,39 @@ impl EncryptedClient {
             .with_metadata("fula-bucket-lookup-h", &lookup_h_hex)
             .with_metadata("fula-forest-manifest", "1");
 
-        // TEMPORARY DIAGNOSTIC for #29.
+        // TEMPORARY DIAGNOSTIC for #29 — compute the CID master would
+        // assign to this body if the PUT succeeded, so we can compare
+        // against `prior_etag`. If `body_cid == prior_etag` we've
+        // found the bug: SDK is using the NEW body's CID as if_match
+        // instead of master's stored OLD body's CID. Send the
+        // computed body_cid as a custom debug header so it appears in
+        // master's diag log alongside if_match (no device-log capture
+        // required).
+        let body_cid_hash = blake3::hash(&data);
+        let body_cid_mh =
+            cid::multihash::Multihash::<64>::wrap(0x1e, body_cid_hash.as_bytes())
+                .expect("blake3 multihash wrap");
+        let body_cid = cid::Cid::new_v1(0x55, body_cid_mh);
         tracing::warn!(
             bucket,
             index_key,
             prior_etag = ?prior_etag,
+            body_cid = %body_cid,
             new_seq = next_seq,
-            "phase2 conditional PUT diag"
+            "phase2 conditional PUT diag (body_cid = CID master would assign)"
         );
+        let mut metadata_with_diag = metadata.clone();
+        metadata_with_diag = metadata_with_diag
+            .with_metadata("fula-debug-body-cid", &body_cid.to_string())
+            .with_metadata(
+                "fula-debug-prior-etag",
+                prior_etag.as_deref().unwrap_or("<none>"),
+            );
         let put_result = self.inner.put_object_with_metadata_conditional(
             bucket,
             &index_key,
             Bytes::from(data),
-            Some(metadata),
+            Some(metadata_with_diag),
             prior_etag.as_deref(),
             None,
         ).await;

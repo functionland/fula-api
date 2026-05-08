@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Run on the master, then upload an image from FxFiles. This tails the
-# gateway log filtered to lines that pinpoint where Phase 1.2 / v0.4.6
+# gateway log filtered to lines that pinpoint where Phase 1.2 / v0.4.7
 # migration is succeeding or failing for the user's `images` bucket:
 #
 #   * "Populated bucket_lookup_h"    — Phase 1.2 ran (good — should appear once per first-flush)
-#   * "Populated forest_manifest_cid" — v0.4.6 ran (good — should appear on every Phase 2 root commit)
+#   * "Populated forest_manifest_cid" — v0.4.7 ran (good — should appear on every Phase 2 root commit)
 #   * "populate_lookup_h_if_missing failed"
 #   * "populate_forest_manifest_cid failed"
 #   * "Failed to flush bucket"
@@ -34,4 +34,4 @@ echo "===== Tailing $CONTAINER (Ctrl-C to stop). Now upload an image from FxFile
 echo "" >&2
 
 docker logs --since 5s -f "$CONTAINER" 2>&1 | grep --line-buffered -iE \
-    'images|bucket_lookup_h|forest_manifest_cid|flush.*bucket|persist.*registry|concurrent modification|412 Precondition|ConcurrentModificationExhausted|put_object_flat|Phase ?2|save_(sharded_hamt_)?forest|Populated|Restoring bucket|BucketAlreadyExists|match_if_match diag|conditional PUT diag|GET diag|PUT diag'
+    'images|bucket_lookup_h|forest_manifest_cid|flush.*bucket|persist.*registry|concurrent modification|412 Precondition|ConcurrentModificationExhausted|put_object_flat|Phase ?2|save_(sharded_hamt_)?forest|Populated|Restoring bucket|BucketAlreadyExists|match_if_match diag|conditional PUT diag|GET diag|PUT diag|412 diag|sdk_debug|fula-debug'
