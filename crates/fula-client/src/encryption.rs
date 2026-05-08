@@ -6321,7 +6321,23 @@ impl EncryptedClient {
         }
 
         // Monolithic v1/v2: already loaded by ensure_forest_loaded.
-        let entry = self.forest_cache.get(bucket).unwrap();
+        // If the cache is empty here it almost always means
+        // `recover_wal_after_load` tripped a 412 retry-exhaust that evicted
+        // the cache entry (see save_sharded_hamt_forest's 412 handler).
+        // Surface a typed error instead of panicking so the caller can
+        // decide whether to retry, surface to the user, or fall back to a
+        // freshly-loaded read.
+        let entry = self.forest_cache.get(bucket).ok_or_else(|| {
+            ClientError::Encryption(fula_crypto::CryptoError::Encryption(
+                format!(
+                    "list_files_from_forest({}): forest cache empty after load — \
+                     prior recover_wal_after_load probably tripped a 412 retry-exhaust \
+                     that evicted the cache entry. Inspect the WAL at the platform's \
+                     fula data dir and the master's manifest page_index for divergence.",
+                    bucket
+                )
+            ))
+        })?;
         let files: Vec<FileMetadata> = match entry.value() {
             ForestCacheEntry::Monolithic { forest, .. } => {
                 forest.list_all_files().into_iter().map(&make_meta).collect()
