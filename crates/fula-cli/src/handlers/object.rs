@@ -808,11 +808,23 @@ pub async fn copy_object(
 /// RFC 7232 §3.1. True iff the If-Match precondition is satisfied.
 pub(crate) fn match_if_match(header: &str, current: Option<&str>) -> bool {
     let h = header.trim();
-    if h == "*" {
-        return current.is_some();
-    }
-    let Some(cur) = current else { return false; };
-    parse_etag_list(h).any(|t| t == cur)
+    let result = if h == "*" {
+        current.is_some()
+    } else {
+        match current {
+            Some(cur) => parse_etag_list(h).any(|t| t == cur),
+            None => false,
+        }
+    };
+    // TEMPORARY DIAGNOSTIC for #29 — emits exactly what's compared on every
+    // If-Match check. Remove once duplicate-bucket / 412-loop is closed.
+    tracing::warn!(
+        if_match = %h,
+        current = ?current,
+        result,
+        "match_if_match diag"
+    );
+    result
 }
 
 /// RFC 7232 §3.2. True iff the If-None-Match precondition is satisfied.

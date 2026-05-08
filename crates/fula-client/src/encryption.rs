@@ -3383,6 +3383,14 @@ impl EncryptedClient {
             .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket))
             .with_metadata("fula-forest-manifest", "1");
 
+        // TEMPORARY DIAGNOSTIC for #29.
+        tracing::warn!(
+            bucket,
+            index_key,
+            prior_etag = ?prior_etag,
+            next_sequence,
+            "save_forest (v1 monolithic) conditional PUT diag"
+        );
         let put_result = self.inner.put_object_with_metadata_conditional(
             bucket,
             &index_key,
@@ -3724,6 +3732,14 @@ impl EncryptedClient {
             .with_metadata("fula-bucket-lookup-h", &lookup_h_hex)
             .with_metadata("fula-forest-manifest", "1");
 
+        // TEMPORARY DIAGNOSTIC for #29.
+        tracing::warn!(
+            bucket,
+            index_key,
+            prior_etag = ?prior_etag,
+            new_seq = next_seq,
+            "phase2 conditional PUT diag"
+        );
         let put_result = self.inner.put_object_with_metadata_conditional(
             bucket,
             &index_key,

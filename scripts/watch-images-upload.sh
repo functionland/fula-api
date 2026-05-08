@@ -34,4 +34,4 @@ echo "===== Tailing $CONTAINER (Ctrl-C to stop). Now upload an image from FxFile
 echo "" >&2
 
 docker logs --since 5s -f "$CONTAINER" 2>&1 | grep --line-buffered -iE \
-    'images|bucket_lookup_h|forest_manifest_cid|flush.*bucket|persist.*registry|concurrent modification|412 Precondition|ConcurrentModificationExhausted|put_object_flat|Phase ?2|save_(sharded_hamt_)?forest|Populated|Restoring bucket|BucketAlreadyExists'
+    'images|bucket_lookup_h|forest_manifest_cid|flush.*bucket|persist.*registry|concurrent modification|412 Precondition|ConcurrentModificationExhausted|put_object_flat|Phase ?2|save_(sharded_hamt_)?forest|Populated|Restoring bucket|BucketAlreadyExists|match_if_match diag|conditional PUT diag'
