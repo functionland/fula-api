@@ -2729,6 +2729,53 @@ impl EncryptedClient {
         }
     }
 
+    /// Diagnostic snapshot of a loaded v7 sharded bucket — used by tests +
+    /// support tools to distinguish "manifest decoded fine but every shard
+    /// has root=None" (genuinely empty bucket published) from "shards have
+    /// root pointers but the walk silently dropped entries" (offline-fetch
+    /// failure path masked as success). Cheap: synchronous read against the
+    /// already-loaded in-memory manifest, no network or backend calls.
+    ///
+    /// **Gated to `test-fault-injection`** to match `sharded_forest_layout`'s
+    /// pattern: this is internal-state inspection, not a stable public API.
+    /// Production callers should not depend on the shape of the returned
+    /// struct; advisor flagged that exposing test/diagnostic accessors as
+    /// ungated public API invites callers to encode internal invariants
+    /// into their dependency contract.
+    ///
+    /// Returns `None` if the bucket isn't loaded as v7 sharded (either not
+    /// loaded at all, or loaded as v1 monolithic).
+    #[cfg(feature = "test-fault-injection")]
+    pub fn sharded_forest_diagnostic(&self, bucket: &str) -> Option<ShardedForestDiagnostic> {
+        let entry = self.forest_cache.get(bucket)?;
+        if let ForestCacheEntry::ShardedHamt { forest, last_manifest_sequence, .. } = entry.value() {
+            let guard = forest.try_read().ok()?;
+            let manifest = guard.manifest();
+            let total_shards = manifest.num_shards();
+            let mut shards_with_root = 0usize;
+            for i in 0..total_shards {
+                if manifest.shard(i).root.is_some() {
+                    shards_with_root += 1;
+                }
+            }
+            // Read the dir-index seq pin inline — folding this in keeps the
+            // public surface to a single accessor (the diagnostic struct)
+            // and avoids exposing both `dir_index_seq()` (live counter) and
+            // a separate `dir_index_seq_pin()` (snapshot value), which are
+            // easy to confuse from the outside.
+            let dir_index_seq = manifest.root.dir_index_seq;
+            Some(ShardedForestDiagnostic {
+                total_shards,
+                shards_with_root,
+                page_count: manifest.page_count(),
+                manifest_sequence: *last_manifest_sequence,
+                dir_index_seq,
+            })
+        } else {
+            None
+        }
+    }
+
 
     /// Path to the per-bucket manifest-version pin file.
     ///
@@ -3058,6 +3105,21 @@ impl EncryptedClient {
         input.extend_from_slice(bucket.as_bytes());
         let hash = blake3::hash(&input);
         hex::encode(&hash.as_bytes()[..16])
+    }
+
+    /// Test/diagnostic accessor: expose the same blinded-key derivation
+    /// used internally for `x-amz-meta-fula-bucket-lookup-h` so tests can
+    /// verify what the SDK computes for a given bucket name + secret pair
+    /// vs. what's published in the per-user bucketsIndex CBOR. Mismatch
+    /// indicates either the published entry was committed under a different
+    /// secret, or `derive_path_key("fula-metadata-v1")` has drifted across
+    /// SDK versions (the latter would be a serious compatibility regression).
+    ///
+    /// Gated behind `test-fault-injection` to match other diagnostic
+    /// accessors. Production code should not depend on this surface.
+    #[cfg(feature = "test-fault-injection")]
+    pub fn debug_compute_bucket_lookup_h_hex(&self, bucket: &str) -> String {
+        self.compute_bucket_lookup_h_hex(bucket)
     }
 
     /// Phase 3.3 escalation seam — fetch a manifest via the
@@ -7892,6 +7954,45 @@ impl EncryptedClient {
     pub fn should_use_chunked(size: usize) -> bool {
         fula_crypto::should_use_chunked(size)
     }
+}
+
+/// Diagnostic snapshot of a loaded v7 sharded forest. Returned by
+/// [`EncryptedClient::sharded_forest_diagnostic`].
+///
+/// **Test/diagnostic API only.** Gated to the `test-fault-injection`
+/// feature alongside its accessor — production code should not depend
+/// on the shape of this struct.
+///
+/// **Reading the result.** A v7 forest with `total_shards = 256`,
+/// `shards_with_root = 0`, `page_count = 0` and a non-trivial
+/// `manifest_sequence` means: the server published a manifest that
+/// decodes cleanly but contains no shard roots — the bucket is
+/// genuinely empty at this snapshot version. If the user has files
+/// online, the published `forest_manifest_cid` is pointing at an old
+/// snapshot from before any uploads landed (publisher staleness or
+/// publisher's diff-cache miss). Compare `manifest_sequence` against
+/// the master's last-known sequence to confirm.
+///
+/// `shards_with_root > 0` with `list_files_from_forest` returning 0 is
+/// a different bug class — the walk is silently dropping entries
+/// (most often: page or HAMT-node fetches failing on the offline
+/// path).
+#[cfg(feature = "test-fault-injection")]
+#[derive(Debug, Clone, Copy)]
+pub struct ShardedForestDiagnostic {
+    /// Configured shard count (always 256 for v7 unless future format).
+    pub total_shards: usize,
+    /// Shards whose `root` is `Some(_)` in the loaded manifest. If 0,
+    /// the manifest committed an empty state (no writes yet).
+    pub shards_with_root: usize,
+    /// Number of meta-HAMT pages in the manifest's `page_index`.
+    pub page_count: usize,
+    /// Manifest sequence the cache observed at load time. Helps the
+    /// operator identify how stale the resolver-served snapshot is
+    /// vs. master's current sequence.
+    pub manifest_sequence: Option<u64>,
+    /// Dir-index sequence from the loaded manifest's root.
+    pub dir_index_seq: Option<u64>,
 }
 
 /// File metadata (without file content) - optimized for file managers

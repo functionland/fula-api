@@ -1377,6 +1377,77 @@ async fn fxfiles_offline_open_bucket() {
         block_gateway_urls,
     );
 
+    // ─── Step -1: print the SDK-computed bucket_lookup_h for this bucket ───
+    //
+    // The cold-start resolver fetches the per-user bucketsIndex CBOR and
+    // looks up `BLAKE3(MetadataKey || bucket_name)[..16]` (hex). If that
+    // hex isn't a key in the CBOR, AND no `legacy=true` plaintext entry
+    // exists for the bucket name, cold-start surfaces BucketNotFound.
+    // Printing the SDK-computed value lets the operator grep their dump
+    // for it; no match → either the bucketsIndex genuinely lacks this
+    // bucket, or `derive_path_key("fula-metadata-v1")` is producing a
+    // different MetadataKey than what was used at PUT time.
+    #[cfg(feature = "test-fault-injection")]
+    {
+        let lookup_h = client.debug_compute_bucket_lookup_h_hex(&bucket);
+        eprintln!(
+            "\n[fxfiles-open-bucket] step -1: SDK-computed bucket_lookup_h\n\
+             [fxfiles-open-bucket]   bucket name      = {:?}\n\
+             [fxfiles-open-bucket]   bucket_lookup_h  = {}\n\
+             [fxfiles-open-bucket]   → grep your IPNS bucketsIndex CBOR for this hex.\n\
+             [fxfiles-open-bucket]     If absent: bucket entry was never committed under \
+             this user's MetadataKey, or `derive_path_key(\"fula-metadata-v1\")` has \
+             drifted across SDK versions (severe compat regression). \n\
+             [fxfiles-open-bucket]     If present in CBOR with `forest_manifest_cid`: \
+             cold-start should succeed; investigate why this test sees BucketNotFound \
+             (e.g., resolver hot-start serving a stale CBOR snapshot).",
+            bucket, lookup_h,
+        );
+    }
+
+    // ─── Step 0: surface the resolved forest_manifest_cid ────────────
+    //
+    // Calls the cold-start resolver directly so we see EXACTLY which
+    // CID it returned for this bucket BEFORE the load+walk runs. This
+    // is the single most informative datum for diagnosing the
+    // empty-forest case: the resolver's CID can be compared by the
+    // operator against their bucketsIndex CBOR dump to confirm:
+    //   * It matches the latest forest_manifest_cid the operator sees
+    //     in IPNS (no resolver staleness).
+    //   * It points at content that, when decrypted, has populated
+    //     shards (no empty-snapshot regression).
+    eprintln!(
+        "\n[fxfiles-open-bucket] step 0: cold_start_resolve_manifest({}) — \
+         direct resolver call so the CID is visible BEFORE the walk",
+        bucket
+    );
+    match client.cold_start_resolve_manifest(&bucket).await {
+        Ok((cid, bytes)) => {
+            eprintln!(
+                "[fxfiles-open-bucket]   resolver returned cid={} bytes_len={}",
+                cid,
+                bytes.len(),
+            );
+            eprintln!(
+                "[fxfiles-open-bucket]   compare this CID against `forest_manifest_cid` for \
+                 bucket {:?} in your IPNS bucketsIndex CBOR. Mismatch → resolver is reading \
+                 a stale snapshot. Match → the published CID itself points at empty shards.",
+                bucket
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "[fxfiles-open-bucket]   resolver FAILED: {:?}",
+                e
+            );
+            panic!(
+                "cold_start_resolve_manifest failed before load_forest could even run. \
+                 Inspect: resolver enabled? user_key matches IPNS dump? IPNS reachable from \
+                 this host?"
+            );
+        }
+    }
+
     // ─── Step 1: load_forest(bucket) — same as fula.loadForest ────────
     eprintln!(
         "\n[fxfiles-open-bucket] step 1: load_forest({}) — mirrors fula_api_service.dart:_ensureForestLoaded",
@@ -1407,6 +1478,71 @@ async fn fxfiles_offline_open_bucket() {
                 bucket
             );
         }
+    }
+
+    // ─── Step 1.5: shard-level diagnostic of the loaded manifest ─────
+    //
+    // After load_forest, the forest is in the in-memory cache. We can
+    // synchronously inspect how many of the 256 shards have a non-None
+    // root pointer. Distinguishes:
+    //   * total=256, with_root=0 → published manifest is empty
+    //     (forest_manifest_cid points at a snapshot from before any uploads)
+    //   * total=256, with_root>0, list returns 0 → walk is silently
+    //     dropping entries (offline page/HAMT-node fetch failure)
+    //
+    // Gated to `test-fault-injection` to match the diagnostic accessor's
+    // own gate; run the test with `--features test-fault-injection` to see
+    // the shard breakdown.
+    #[cfg(feature = "test-fault-injection")]
+    {
+        if let Some(diag) = client.sharded_forest_diagnostic(&bucket) {
+            eprintln!(
+                "\n[fxfiles-open-bucket] step 1.5: shard diagnostic\n\
+                 [fxfiles-open-bucket]   total_shards       = {}\n\
+                 [fxfiles-open-bucket]   shards_with_root   = {}\n\
+                 [fxfiles-open-bucket]   page_count         = {}\n\
+                 [fxfiles-open-bucket]   manifest_sequence  = {:?}\n\
+                 [fxfiles-open-bucket]   dir_index_seq      = {:?}",
+                diag.total_shards,
+                diag.shards_with_root,
+                diag.page_count,
+                diag.manifest_sequence,
+                diag.dir_index_seq,
+            );
+            if diag.shards_with_root == 0 {
+                eprintln!(
+                    "[fxfiles-open-bucket]   → all shards empty. The published \
+                     forest_manifest_cid points at a snapshot WITH NO WRITES YET. \
+                     Either the publisher never re-published after the user's \
+                     first upload to this bucket, OR master never updated \
+                     BucketMetadata.forest_manifest_cid for this bucket's \
+                     subsequent Phase 2 commits."
+                );
+            } else {
+                eprintln!(
+                    "[fxfiles-open-bucket]   → {}/{} shards have root pointers. If \
+                     list_files_from_forest below returns 0, the walk is silently \
+                     dropping entries — most likely a page or HAMT-node fetch \
+                     failing in offline mode without surfacing as an error.",
+                    diag.shards_with_root,
+                    diag.total_shards,
+                );
+            }
+        } else {
+            eprintln!(
+                "\n[fxfiles-open-bucket] step 1.5: shard diagnostic UNAVAILABLE — \
+                 bucket isn't loaded as v7 sharded (cache miss or v1 monolithic). \
+                 That contradicts the v7-marker swallow above; investigate."
+            );
+        }
+    }
+    #[cfg(not(feature = "test-fault-injection"))]
+    {
+        eprintln!(
+            "\n[fxfiles-open-bucket] step 1.5: shard diagnostic SKIPPED — \
+             rebuild with `cargo test --features test-fault-injection ...` \
+             to see total_shards / shards_with_root / page_count / sequence numbers."
+        );
     }
 
     // ─── Step 2: list_files_from_forest(bucket) — same as fula.listFromForest ──

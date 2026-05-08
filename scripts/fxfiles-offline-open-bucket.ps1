@@ -54,7 +54,13 @@ Write-Host "========================================"
 $crateDir = Join-Path $PSScriptRoot ".." | Resolve-Path
 Push-Location $crateDir
 try {
-    cargo test -p fula-client --test offline_e2e --release `
+    # `--features test-fault-injection` enables the gated
+    # `sharded_forest_diagnostic` accessor so step 1.5 prints the
+    # total_shards / shards_with_root / sequence numbers that
+    # distinguish "empty published manifest" from "walk silently
+    # dropping entries".
+    cargo test -p fula-client --features test-fault-injection `
+        --test offline_e2e --release `
         fxfiles_offline_open_bucket `
         -- --ignored --nocapture
 }
