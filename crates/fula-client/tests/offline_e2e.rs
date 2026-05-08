@@ -1206,3 +1206,272 @@ async fn offline_cold_start_documents_bucket_e2e() {
 
     eprintln!("\n[cold-start-e2e] PASS — v0.4.4 cold-start works end-to-end.");
 }
+
+// ============================================================================
+// FxFiles offline-bucket-open mirror (task #29 follow-up)
+// ============================================================================
+//
+// Mirrors `_loadCloudData` in FxFiles' file_browser_screen.dart EXACTLY for
+// the "open a bucket in cloud-storage screen while offline" path:
+//
+//   FxFiles _loadCloudData (file_browser_screen.dart:326-387)
+//     → listObjects(bucket, prefix)                  (fula_api_service.dart:446)
+//        → _ensureForestLoaded(bucket)               (fula_api_service.dart:317)
+//           → fula.loadForest(client, bucket)        (FRB → forest.rs:25)
+//              → EncryptedClient::load_forest        ← THIS test calls this
+//        → fula.listFromForest(client, bucket)       (FRB → forest.rs:138)
+//           → EncryptedClient::list_files_from_forest ← THIS test calls this
+//
+// Required env vars to target ehsan@fx.land's ACTUAL data on the live
+// IPNS/chain-published state, exercising the same code FxFiles runs on
+// the device:
+//
+// | Var                                 | Required | Notes                                                                            |
+// |-------------------------------------|----------|----------------------------------------------------------------------------------|
+// | `FULA_TEST_SECRET`                  | Yes      | base64 of FxFiles Settings > Security > Encryption Key for ehsan@fx.land.        |
+// | `FULA_JWT`                          | Yes      | ehsan@fx.land's Fula JWT (only used for the bogus-master HTTP attempt that       |
+// |                                     |          | fails fast and triggers the cold-start path).                                    |
+// | `FULA_USERS_INDEX_USER_KEY`         | Yes      | The 32-hex userKey for ehsan@fx.land = `4da2c0616b1d39660f9f94e145fbce4f`.       |
+// | `FULA_USERS_INDEX_IPNS_NAME`        | Yes      | The 16-byte k51… libp2p public-key hash, e.g.                                    |
+// |                                     |          | `k51qzi5uqu5dkkd6tv8slgoouzzs505qdcr4cb5egc9rlx7qwq0e794yxj9cg4`.                |
+// | `FULA_USERS_INDEX_CHAIN_RPC_URL`    | Yes      | e.g. `https://mainnet.base.org` (only used when IPNS race exhausts).             |
+// | `FULA_USERS_INDEX_ANCHOR_ADDRESS`   | Yes      | Deployed `FulaUsersIndexAnchor.sol` address.                                     |
+// | `FULA_BUCKET`                       | No       | Default `images`. MUST be a bucket whose entry in the published bucketsIndex     |
+// |                                     |          | CBOR has `forest_manifest_cid` populated (otherwise this isn't the right        |
+// |                                     |          | failure mode to investigate). From ehsan's bucketsIndex dump, `images`,         |
+// |                                     |          | `face-metadata`, and `other` all have it.                                       |
+// | `FULA_BOGUS_S3`                     | No       | Default `https://s33.cloud.fx.land` — DNS-fails on real DNS, mirrors what       |
+// |                                     |          | FxFiles uses to simulate offline.                                                |
+// | `FULA_TIMEOUT_SECS`                 | No       | Default 60.                                                                      |
+// | `FULA_USERS_INDEX_IPNS_GATEWAY_URLS`| No       | Comma-separated overrides. Empty → SDK 5-gateway default.                        |
+// | `FULA_BLOCK_GATEWAY_URLS`           | No       | Same shape; for the per-page/per-chunk block fetches.                            |
+//
+// Run from `crates/fula-client/`:
+//
+// ```powershell
+// $env:FULA_TEST_SECRET                = "<base64 from FxFiles Settings>"
+// $env:FULA_JWT                        = "eyJhbGci…"
+// $env:FULA_USERS_INDEX_USER_KEY       = "4da2c0616b1d39660f9f94e145fbce4f"
+// $env:FULA_USERS_INDEX_IPNS_NAME      = "k51qzi5uqu5dkkd6tv8slgoouzzs505qdcr4cb5egc9rlx7qwq0e794yxj9cg4"
+// $env:FULA_USERS_INDEX_CHAIN_RPC_URL  = "https://mainnet.base.org"
+// $env:FULA_USERS_INDEX_ANCHOR_ADDRESS = "0x…"
+// $env:FULA_BUCKET                     = "images"
+// cargo test -p fula-client --test offline_e2e --release `
+//   fxfiles_offline_open_bucket -- --ignored --nocapture
+// ```
+//
+// What this test reports (without panicking on 0 files — we want diagnostic
+// data, not a binary pass/fail at this stage of investigation):
+//
+//   1. Did `load_forest(bucket)` succeed?
+//   2. Did `list_files_from_forest(bucket)` succeed?
+//   3. How many entries did the forest contain?
+//   4. First N entry keys + storage_keys (for sanity vs. user's known files).
+//
+// All four signals together pinpoint exactly where the offline-open-bucket
+// failure mode falls in the cold-start chain for THIS bucket on THIS user.
+#[tokio::test]
+#[ignore]
+async fn fxfiles_offline_open_bucket() {
+    use fula_crypto::keys::SecretKey;
+
+    let secret_b64 = match read_required_env("FULA_TEST_SECRET") {
+        Some(v) => v,
+        None => return,
+    };
+    let jwt = match read_required_env("FULA_JWT") {
+        Some(v) => v,
+        None => return,
+    };
+    let user_key = match read_required_env("FULA_USERS_INDEX_USER_KEY") {
+        Some(v) => v,
+        None => return,
+    };
+    let ipns_name = match read_required_env("FULA_USERS_INDEX_IPNS_NAME") {
+        Some(v) => v,
+        None => return,
+    };
+    let chain_rpc_url = match read_required_env("FULA_USERS_INDEX_CHAIN_RPC_URL") {
+        Some(v) => v,
+        None => return,
+    };
+    let anchor_address = match read_required_env("FULA_USERS_INDEX_ANCHOR_ADDRESS") {
+        Some(v) => v,
+        None => return,
+    };
+    let bucket = std::env::var("FULA_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "images".to_string());
+    let bogus_s3 = std::env::var("FULA_BOGUS_S3")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://s33.cloud.fx.land".to_string());
+    let timeout_secs: u64 = std::env::var("FULA_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+
+    let parse_csv = |var: &str| -> Vec<String> {
+        std::env::var(var)
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let ipns_gateway_urls = parse_csv("FULA_USERS_INDEX_IPNS_GATEWAY_URLS");
+    let block_gateway_urls = parse_csv("FULA_BLOCK_GATEWAY_URLS");
+
+    eprintln!("\n[fxfiles-open-bucket] target = ehsan@fx.land's `{}` bucket", bucket);
+    eprintln!("[fxfiles-open-bucket] master = {} (DNS-fails → forces cold-start)", bogus_s3);
+    eprintln!("[fxfiles-open-bucket] userKey = {}", user_key);
+    eprintln!("[fxfiles-open-bucket] ipns_name = {}", ipns_name);
+    if ipns_gateway_urls.is_empty() {
+        eprintln!("[fxfiles-open-bucket] ipns_gateways = SDK default 5-gateway list");
+    } else {
+        eprintln!("[fxfiles-open-bucket] ipns_gateways (override) = {:?}", ipns_gateway_urls);
+    }
+    if block_gateway_urls.is_empty() {
+        eprintln!("[fxfiles-open-bucket] block_gateways = SDK default 6-gateway list");
+    } else {
+        eprintln!("[fxfiles-open-bucket] block_gateways (override) = {:?}", block_gateway_urls);
+    }
+
+    // Decode encryption key. MUST be the SAME secret FxFiles uses on
+    // device, otherwise bucket_lookup_h won't match anything in the
+    // published bucketsIndex CBOR.
+    use base64::Engine as _;
+    let trimmed = secret_b64.trim();
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
+        .expect("FULA_TEST_SECRET must be base64");
+    let secret = SecretKey::from_bytes(&key_bytes).expect("32-byte secret");
+
+    // Fresh tempdir for the block cache — guarantees this is a true
+    // cold-start, no warm-cache contribution. Mirrors the FxFiles cold
+    // path on a freshly reinstalled device or after `Clear data`.
+    let cache_dir = TempDir::new().expect("tempdir for block cache");
+    let cache_path = cache_dir.path().join("blocks.redb");
+
+    let client = build_client_with_cold_start(
+        &bogus_s3,
+        &jwt,
+        &cache_path,
+        secret,
+        // health_gate=false: bogus URL fails fast on first call, no
+        // need to wait for the gate's two-failure threshold. Mirrors
+        // what happens on the device after the gate has tripped.
+        false,
+        timeout_secs,
+        chain_rpc_url,
+        anchor_address,
+        ipns_name,
+        user_key,
+        ipns_gateway_urls,
+        block_gateway_urls,
+    );
+
+    // ─── Step 1: load_forest(bucket) — same as fula.loadForest ────────
+    eprintln!(
+        "\n[fxfiles-open-bucket] step 1: load_forest({}) — mirrors fula_api_service.dart:_ensureForestLoaded",
+        bucket
+    );
+    let load_result = client.load_forest(&bucket).await;
+    let load_swallowed_sharded_marker = matches!(&load_result, Err(e) if e.to_string().contains("forest is sharded"));
+    match &load_result {
+        Ok(_) => eprintln!("[fxfiles-open-bucket]   load_forest OK (monolithic)"),
+        Err(e) if load_swallowed_sharded_marker => {
+            // Same swallow as fula-flutter's load_forest wrapper: v7
+            // sharded forests surface this marker, all real I/O paths
+            // handle sharding transparently downstream.
+            eprintln!(
+                "[fxfiles-open-bucket]   load_forest returned the v7 marker \
+                 (\"forest is sharded\") — this is FxFiles' success-on-sharded \
+                 case (fula-flutter::api::forest.rs:32 swallows it)"
+            );
+        }
+        Err(e) => {
+            eprintln!("[fxfiles-open-bucket]   load_forest FAILED: {:?}", e);
+            panic!(
+                "load_forest({}) failed before list_files could run. \
+                 Inspect the chain: cold-start resolver → bucketsIndex lookup \
+                 → forest_manifest_cid fetch → AEAD decrypt. The failure mode \
+                 is in one of those steps; the error message above tells you \
+                 which.",
+                bucket
+            );
+        }
+    }
+
+    // ─── Step 2: list_files_from_forest(bucket) — same as fula.listFromForest ──
+    eprintln!(
+        "\n[fxfiles-open-bucket] step 2: list_files_from_forest({}) — mirrors fula_api_service.dart:listObjects",
+        bucket
+    );
+    let files = match client.list_files_from_forest(&bucket).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[fxfiles-open-bucket]   list_files_from_forest FAILED: {:?}", e);
+            panic!(
+                "list_files_from_forest({}) failed. The forest loaded but the \
+                 walk surfaced an error — most likely a v7 page-fetch failure \
+                 (page_ref.etag missing, or all gateways failed for a page CID).",
+                bucket
+            );
+        }
+    };
+
+    // ─── Step 3: report — DIAGNOSTIC, not pass/fail ───────────────────
+    //
+    // Whether 0 files or N files is "correct" depends on what the user
+    // actually has in this bucket. Print the count + sample entries so the
+    // operator can compare against ground truth (their own knowledge of
+    // what's in the bucket online). 0 files for a bucket the user knows
+    // contains 851 files is the "loaded but empty" failure mode from
+    // FxFiles' offline log — that signal is what this test surfaces.
+    eprintln!(
+        "\n[fxfiles-open-bucket] step 3: list result\n\
+         [fxfiles-open-bucket]   raw forest entry count = {}",
+        files.len()
+    );
+    let sample = files.iter().take(20).collect::<Vec<_>>();
+    if !sample.is_empty() {
+        eprintln!("[fxfiles-open-bucket]   first {} entries:", sample.len());
+        for (i, m) in sample.iter().enumerate() {
+            eprintln!(
+                "[fxfiles-open-bucket]     [{:2}] key={} size={} storage_key={}",
+                i, m.original_key, m.original_size, m.storage_key
+            );
+        }
+    }
+
+    if files.is_empty() {
+        eprintln!(
+            "\n[fxfiles-open-bucket] EMPTY-FOREST result.\n\
+             [fxfiles-open-bucket] If you know `{}` contains files online, this is \
+             the FxFiles \"Forest loaded for bucket: {} / listObjects: 0 files\" \
+             failure mode — manifest fetched + decrypted, but the v7 walk produced \
+             nothing. Either the forest_manifest_cid points at an old empty snapshot, \
+             or pages exist but their etags are missing/wrong on this manifest \
+             version, or the v7 walk is silently skipping unreachable pages.\n\
+             [fxfiles-open-bucket] Next debug: dump the manifest's page_index from \
+             the loaded forest cache, compare against master's actual page objects.",
+            bucket, bucket,
+        );
+    } else {
+        eprintln!(
+            "\n[fxfiles-open-bucket] PASS — `{}` returned {} entries via the EXACT \
+             same code path FxFiles runs (load_forest + list_files_from_forest), \
+             with master DNS-failing and a fresh block cache. Cold-start works for \
+             this bucket.",
+            bucket,
+            files.len(),
+        );
+    }
+}
