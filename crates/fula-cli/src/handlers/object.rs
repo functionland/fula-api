@@ -358,6 +358,18 @@ pub async fn get_object(
     let last_modified = metadata.last_modified;
     let last_modified_str = last_modified.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
 
+    // TEMPORARY DIAGNOSTIC for #29 — log the etag we return so we can
+    // pair it with the `match_if_match diag` line on the next PUT for
+    // the same key. If GET-time etag != PUT-time current, the
+    // ObjectMetadata.etag is being mutated by a sibling-key write.
+    tracing::warn!(
+        bucket = %bucket_name,
+        key = %key,
+        etag = %metadata.etag,
+        cid = %metadata.cid,
+        "GET diag: returning etag"
+    );
+
     // Handle If-None-Match (304 Not Modified)
     if let Some(if_none_match) = headers.get("If-None-Match").and_then(|v| v.to_str().ok()) {
         if if_none_match == etag || if_none_match == "*" {

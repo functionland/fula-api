@@ -133,7 +133,16 @@ impl<S: BlockStore> Bucket<S> {
     #[instrument(skip(self, metadata))]
     pub async fn put_object(&mut self, key: String, metadata: ObjectMetadata) -> Result<()> {
         validate_object_key(&key)?;
-        
+
+        // TEMPORARY DIAGNOSTIC for #29.
+        tracing::warn!(
+            bucket = %self.metadata.name,
+            key = %key,
+            new_etag = %metadata.etag,
+            new_cid = %metadata.cid,
+            "PUT diag: storing object"
+        );
+
         // Update bucket stats
         if let Some(existing) = self.index.get(&key).await? {
             self.metadata.total_size -= existing.size;
