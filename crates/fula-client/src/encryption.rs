@@ -3984,6 +3984,19 @@ impl EncryptedClient {
     ) -> std::result::Result<ShardManifestV7, ClientError> {
         let shard_salt = root.shard_salt.clone();
         let mut pages: std::collections::BTreeMap<PageId, ManifestPage> = std::collections::BTreeMap::new();
+        // Task #29: collect page-level (etag, seq) overrides from the actual
+        // GET responses + decrypted page envelopes. The manifest's recorded
+        // `page_index[page_id]` may be stale relative to the live page object
+        // when a different device's Phase-1.5 PUT advanced master's page
+        // object but its Phase-2 root commit failed. In that case THIS
+        // device has no WAL entry to reconcile from, and the loaded manifest
+        // remains stuck pointing at the pre-PUT etag, causing a permanent
+        // 412 loop on this device's next Phase-1.5 conditional PUT
+        // (`If-Match` = manifest's stale etag, master serves the post-PUT
+        // etag). Trust the page object: master's response etag and the
+        // envelope's encrypted-in seq are both more authoritative than
+        // whatever the manifest happens to record.
+        let mut page_overrides: Vec<(PageId, Option<String>, u64)> = Vec::new();
         for (page_id, page_ref) in root.page_index.iter() {
             let page_key = derive_manifest_page_key(forest_dek, bucket, &shard_salt, *page_id);
             // Phase 2.4 — route page fetches through the offline-fallback
@@ -4018,7 +4031,7 @@ impl EncryptedClient {
                 .as_deref()
                 .and_then(|s| s.parse::<cid::Cid>().ok());
             #[cfg(not(target_arch = "wasm32"))]
-            let blob = match cid_hint {
+            let (blob, observed_etag) = match cid_hint {
                 Some(cid) => self
                     .inner
                     .get_object_with_offline_fallback_known_cid(bucket, &page_key, &cid)
@@ -4029,7 +4042,14 @@ impl EncryptedClient {
                         .await
                 }
             }
-            .map(|r| r.inner.data)
+            .map(|r| {
+                let etag = if r.inner.etag.is_empty() {
+                    None
+                } else {
+                    Some(r.inner.etag.clone())
+                };
+                (r.inner.data, etag)
+            })
             .map_err(|e| {
                 ClientError::DownloadFailed(format!(
                     "failed to fetch manifest page {} for bucket {}: {}",
@@ -4037,11 +4057,18 @@ impl EncryptedClient {
                 ))
             })?;
             #[cfg(target_arch = "wasm32")]
-            let blob = self
+            let (blob, observed_etag) = self
                 .inner
                 .get_object_with_offline_fallback(bucket, &page_key)
                 .await
-                .map(|r| r.inner.data)
+                .map(|r| {
+                    let etag = if r.inner.etag.is_empty() {
+                        None
+                    } else {
+                        Some(r.inner.etag.clone())
+                    };
+                    (r.inner.data, etag)
+                })
                 .map_err(|e| {
                     ClientError::DownloadFailed(format!(
                         "failed to fetch manifest page {} for bucket {}: {}",
@@ -4066,9 +4093,44 @@ impl EncryptedClient {
                         page_id, envelope.seq, page_ref.seq)
                 )));
             }
+            // Task #29: queue an authoritative override for this page if
+            // master's response etag and/or the envelope's seq disagree
+            // with the manifest's recorded values. We only override when
+            // the new info is strictly newer (envelope.seq >= page_ref.seq
+            // is already guaranteed above; the etag check catches the
+            // master-divergence case where seq matches but the recorded
+            // etag predates a Phase-1.5 PUT that bumped master's page
+            // object without a corresponding root commit on this device).
+            let env_seq = envelope.seq;
+            let needs_override = match (&observed_etag, &page_ref.etag) {
+                (Some(observed), Some(recorded)) => observed != recorded,
+                (Some(_), None) => true,
+                (None, _) => false, // no observed etag → keep recorded
+            } || env_seq > page_ref.seq;
+            if needs_override {
+                tracing::debug!(
+                    %bucket,
+                    page_id = %page_id,
+                    recorded_etag = ?page_ref.etag,
+                    observed_etag = ?observed_etag,
+                    recorded_seq = page_ref.seq,
+                    envelope_seq = env_seq,
+                    "load_manifest_pages: page_index override (master diverged from manifest)"
+                );
+                page_overrides.push((*page_id, observed_etag, env_seq));
+            }
             let page = envelope.decrypt(forest_dek, bucket)
                 .map_err(ClientError::Encryption)?;
             pages.insert(*page_id, page);
+        }
+        // Apply the page-level overrides to the root before constructing the
+        // ShardManifestV7 — the in-memory forest's `page_index` will then
+        // reflect master's actual page objects, not the manifest's possibly-
+        // stale recording. Subsequent Phase 1.5 conditional PUTs use these
+        // values for `If-Match` and converge with master's state.
+        let mut root = root;
+        for (page_id, etag, seq) in page_overrides {
+            root.page_index.insert(page_id, PageRef { etag, seq });
         }
         ShardManifestV7::from_root_and_pages(root, pages)
             .map_err(ClientError::Encryption)
