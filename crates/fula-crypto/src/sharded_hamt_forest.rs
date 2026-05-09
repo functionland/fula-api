@@ -4379,4 +4379,233 @@ mod tests {
             largest, largest_path
         );
     }
+
+    // ========================================================================
+    // #88 — direct RPC-count parity between v7 and v8 writers (W.8.4 claim).
+    //
+    // The walkable-v8 plan §W.8.4 stated v8 adds zero new master RPCs vs v7.
+    // The walkable_v8_scale bench showed throughput equivalence within ~5%
+    // measurement noise (tracked in the v0.6.0 CHANGELOG entry as
+    // "suggestive but not proven"). This test closes that gap directly:
+    // identical write workload through a v7 backend (no CID surfaced) and a
+    // v8 backend (CID surfaced), compared via `CountingBlobBackend` —
+    // assertion is byte-equality on `puts` and `gets`, since the v8 cascade
+    // changes only what gets stamped in the parent's plaintext, NOT how many
+    // PUTs/GETs happen during the cascade.
+    //
+    // The discriminator `gets_with_some_hint` validates that the v8 wiring
+    // is actually live: under v7 it must be 0 (no LinkV2 entries → no CID
+    // hints flow); under v8 it must be positive after a read pass that walks
+    // through internal nodes.
+    // ========================================================================
+    #[tokio::test]
+    async fn walkable_v8_rpc_count_parity_writes_match_v7() {
+        use crate::wnfs_hamt::CountingBlobBackend;
+
+        // Same workload for both runs: enough entries that the cascade
+        // produces internal nodes (singletons-only would never exercise
+        // parent-pointer write paths). 32 entries with 16 shards
+        // typically grows ≥ 1 internal node per populated shard.
+        const N: u64 = 32;
+
+        async fn run<B>(backend: &std::sync::Arc<CountingBlobBackend<B>>, label: &str)
+        where
+            B: crate::wnfs_hamt::BlobBackend + 'static,
+        {
+            let mut forest =
+                ShardedHamtPrivateForest::new(label, test_dek(), 16);
+            for i in 0..N {
+                forest
+                    .upsert_file(file_entry(&format!("/p/f-{:03}.bin", i), i), backend)
+                    .await
+                    .unwrap();
+            }
+            forest.flush_dirty(backend).await.unwrap();
+        }
+
+        // v7 path: InMemoryBackend returns BlobPutResult::none() →
+        // cascade emits legacy `Link` everywhere.
+        let v7_inner = std::sync::Arc::new(InMemoryBackend::new());
+        let v7 = std::sync::Arc::new(CountingBlobBackend::new(v7_inner));
+        run(&v7, "rpc-parity-v7").await;
+        let v7_snap = v7.snapshot();
+
+        // v8 path: CidCapturingBackend returns Some(BLAKE3 raw CID) →
+        // cascade emits `LinkV2` everywhere it has parent pointers.
+        let v8_inner = std::sync::Arc::new(CidCapturingBackend::new());
+        let v8 = std::sync::Arc::new(CountingBlobBackend::new(v8_inner));
+        run(&v8, "rpc-parity-v8").await;
+        let v8_snap = v8.snapshot();
+
+        eprintln!(
+            "\n[#88 RPC parity — writes only]\n  v7: {:?}\n  v8: {:?}",
+            v7_snap, v8_snap
+        );
+
+        // Load-bearing equality: every PUT and GET site in the writer
+        // cascade fires identically under both modes. A drift here would
+        // mean v8 silently added a backend round-trip somewhere — that
+        // would invalidate W.8.4 directly.
+        assert_eq!(
+            v7_snap.puts, v8_snap.puts,
+            "W.8.4 violated: v7 and v8 writers must emit identical PUT \
+             counts. v7={} v8={} — investigate `flush_dirty` /  \
+             `node::store` for a v8-only RPC site that wasn't accounted \
+             for.",
+            v7_snap.puts, v8_snap.puts,
+        );
+        assert_eq!(
+            v7_snap.gets, v8_snap.gets,
+            "W.8.4 violated: v7 and v8 writers must emit identical GET \
+             counts (intermediate-node loads during cascade). v7={} \
+             v8={} — investigate the CID-stamping seam for a sneaky \
+             extra read.",
+            v7_snap.gets, v8_snap.gets,
+        );
+
+        // Writers don't call `get_with_cid_hint` — that's the reader's
+        // surface. Both should be 0 here. If this is non-zero, someone
+        // routed a writer-side load through the cid-hint variant, which
+        // would be a layering violation.
+        assert_eq!(
+            v7_snap.gets_with_hint, 0,
+            "writer cascade should not call `get_with_cid_hint`. v7={}",
+            v7_snap.gets_with_hint
+        );
+        assert_eq!(
+            v8_snap.gets_with_hint, 0,
+            "writer cascade should not call `get_with_cid_hint`. v8={}",
+            v8_snap.gets_with_hint
+        );
+    }
+
+    #[tokio::test]
+    async fn walkable_v8_rpc_count_parity_reader_uses_cid_hints_under_v8_only() {
+        use crate::wnfs_hamt::CountingBlobBackend;
+
+        // Build a populated v8 bucket, then walk it via `list_all_files`.
+        // The reader path resolves children through
+        // `Node::load_with_cid_hint`, which calls
+        // `BlobBackend::get_with_cid_hint`. Under v8 (LinkV2 present) the
+        // hint is `Some`; under v7 (legacy Link only) the hint is `None`.
+        // The discriminator `gets_with_some_hint` should be:
+        //   * 0 on the v7 walk (no LinkV2 → cid_hint is always None)
+        //   * > 0 on the v8 walk (LinkV2 children resolve with Some(cid))
+        // This is what proves the v8 cascade is actually wired through to
+        // the reader, not just stamping `LinkV2` into bytes that nobody
+        // reads.
+        const N: u64 = 64;
+
+        // ─── v7 baseline ────────────────────────────────────────────────
+        let v7_inner = std::sync::Arc::new(InMemoryBackend::new());
+        let v7 = std::sync::Arc::new(CountingBlobBackend::new(v7_inner));
+        {
+            let mut forest =
+                ShardedHamtPrivateForest::new("rpc-walk-v7", test_dek(), 16);
+            for i in 0..N {
+                forest
+                    .upsert_file(file_entry(&format!("/w/f-{:03}.bin", i), i), &v7)
+                    .await
+                    .unwrap();
+            }
+            forest.flush_dirty(&v7).await.unwrap();
+        }
+        v7.reset();
+        // Re-load the forest from scratch so the walk actually exercises
+        // gets (in-memory cache would short-circuit otherwise).
+        let v7_manifest = {
+            let mut forest =
+                ShardedHamtPrivateForest::new("rpc-walk-v7", test_dek(), 16);
+            for i in 0..N {
+                forest
+                    .upsert_file(file_entry(&format!("/w/f-{:03}.bin", i), i), &v7)
+                    .await
+                    .unwrap();
+            }
+            forest.flush_dirty(&v7).await.unwrap().clone()
+        };
+        v7.reset();
+        // Walk: read each shard root + descendants via list_all_files.
+        let v7_files = {
+            let forest = ShardedHamtPrivateForest::from_manifest(
+                v7_manifest,
+                "rpc-walk-v7",
+                test_dek(),
+            );
+            forest.list_all_files(&v7).await.unwrap()
+        };
+        let v7_snap = v7.snapshot();
+
+        // ─── v8 path ────────────────────────────────────────────────────
+        let v8_inner = std::sync::Arc::new(CidCapturingBackend::new());
+        let v8 = std::sync::Arc::new(CountingBlobBackend::new(v8_inner));
+        let v8_manifest = {
+            let mut forest =
+                ShardedHamtPrivateForest::new("rpc-walk-v8", test_dek(), 16);
+            for i in 0..N {
+                forest
+                    .upsert_file(file_entry(&format!("/w/f-{:03}.bin", i), i), &v8)
+                    .await
+                    .unwrap();
+            }
+            forest.flush_dirty(&v8).await.unwrap().clone()
+        };
+        v8.reset();
+        let v8_files = {
+            let forest = ShardedHamtPrivateForest::from_manifest(
+                v8_manifest,
+                "rpc-walk-v8",
+                test_dek(),
+            );
+            forest.list_all_files(&v8).await.unwrap()
+        };
+        let v8_snap = v8.snapshot();
+
+        eprintln!(
+            "\n[#88 RPC parity — reader walk]\n  v7: {:?}\n  v8: {:?}\n  \
+             v7 file count = {}, v8 file count = {}",
+            v7_snap,
+            v8_snap,
+            v7_files.len(),
+            v8_files.len(),
+        );
+
+        // Same data shape on both sides → same number of files visible.
+        assert_eq!(
+            v7_files.len(),
+            v8_files.len(),
+            "v7 and v8 walks must surface identical file counts. v7={} v8={}",
+            v7_files.len(),
+            v8_files.len(),
+        );
+
+        // The total `gets_with_hint` count should match — both walks
+        // descend through the same number of HAMT nodes. The DIFFERENCE
+        // is the `Some` vs `None` payload of the cid_hint argument.
+        assert_eq!(
+            v7_snap.gets_with_hint, v8_snap.gets_with_hint,
+            "W.8.4 violated: reader walks must call `get_with_cid_hint` \
+             the same number of times under v7 and v8 (only the hint \
+             argument differs). v7={} v8={}",
+            v7_snap.gets_with_hint, v8_snap.gets_with_hint,
+        );
+
+        // Discriminator: validates the v8 wiring is LIVE.
+        assert_eq!(
+            v7_snap.gets_with_some_hint, 0,
+            "v7 walk must not surface any Some(cid) hints — there are no \
+             LinkV2 entries in a v7 forest. Got {} — investigate whether \
+             a stale v8 cid leaked from a prior test run.",
+            v7_snap.gets_with_some_hint,
+        );
+        assert!(
+            v8_snap.gets_with_some_hint > 0,
+            "v8 walk must surface at least one Some(cid) hint — that's \
+             how the reader proves the LinkV2 wiring reaches the storage \
+             layer. Got 0 hints — investigate `Node::load_with_cid_hint` \
+             / `ChildPtr::resolve_owned` for a regression where the \
+             stored LinkV2 cid never makes it into the get_with_cid_hint \
+             call.",
+        );
+    }
 }

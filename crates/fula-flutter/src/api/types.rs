@@ -159,10 +159,16 @@ pub struct FulaConfig {
     /// Emit walkable-v8 CID hints in HAMT internal-node pointers,
     /// manifest pages, dir-index, and forest file-index entries from
     /// master's PUT-response ETag (= `BLAKE3(ciphertext)` raw-codec).
-    /// Off by default during the v0.6.x rollout — when off, every
-    /// write is byte-identical to v0.5 and old SDKs (FxFiles installs
-    /// that haven't updated yet) read newly-written buckets without
-    /// any wire-format awareness.
+    ///
+    /// Default flipped to `true` on 2026-05-09 (#89) per user
+    /// decision ("when we roll out everyone will update"). Pre-v0.6
+    /// FxFiles installs reading newly-written buckets surface
+    /// `FulaError::WireVersionUnsupported` (Dart `error_code() ==
+    /// "WIRE_VERSION_UNSUPPORTED"`) on the `LinkV2` portions of the
+    /// tree; v7 portions still in the bucket read normally. Set this
+    /// to `false` to keep emitting the v0.5-readable wire form.
+    /// Mirrors `fula_client::Config::default()` for cross-platform
+    /// parity (non-negotiable project rule).
     ///
     /// Each parsed CID is **self-verified** locally before being
     /// stamped: `BLAKE3(ciphertext)` is recomputed by the SDK and

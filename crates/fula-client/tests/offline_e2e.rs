@@ -362,6 +362,605 @@ async fn offline_upload_download_e2e() {
     run_offline_upload_download_e2e(256, "single-legacy-alias").await;
 }
 
+/// Deterministic file-set used by both the upload-only and walk-only
+/// walkable-v8 fresh-bucket tests below. Same content from both sides
+/// so the walk phase can recompute the expected payload bytes without
+/// having to persist them across test invocations. Mirrors the FxFiles
+/// content-shape mix:
+///   * 3 small text files (single-block encrypted path)
+///   * 1 medium binary file (single-block, larger payload)
+///   * 1 chunked binary file > 768 KiB (chunked encrypted path —
+///     `put_object_chunked_internal`, what FxFiles uses for photos /
+///     videos / PDFs)
+fn walkable_v8_fresh_bucket_test_files() -> Vec<(String, Vec<u8>)> {
+    vec![
+        (
+            "/text/hello.txt".to_string(),
+            b"Hello, walkable-v8! This is the simplest text file.".to_vec(),
+        ),
+        (
+            "/text/lorem.txt".to_string(),
+            b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, \
+              sed do eiusmod tempor incididunt ut labore et dolore magna \
+              aliqua. Ut enim ad minim veniam, quis nostrud exercitation."
+                .to_vec(),
+        ),
+        (
+            "/text/numbers.txt".to_string(),
+            (0..50)
+                .map(|i| format!("line {}\n", i))
+                .collect::<String>()
+                .into_bytes(),
+        ),
+        (
+            "/binary/medium.bin".to_string(),
+            (0..10_000usize).map(|i| (i % 256) as u8).collect(),
+        ),
+        (
+            "/binary/chunked.bin".to_string(),
+            (0..1_500_000usize).map(|i| ((i * 7) % 256) as u8).collect(),
+        ),
+    ]
+}
+
+/// Walkable-v8 fresh-bucket UPLOAD test (#20 / #89 follow-up, part 1 of 2).
+///
+/// Uploads the deterministic walkable-v8 file set to a fresh bucket on
+/// the live master. Prints copy-paste-ready env vars (bucket name +
+/// secret) for the matching walk test to consume.
+///
+/// **Pair with** `fxfiles_walkable_v8_fresh_bucket_walk`. Recommended
+/// flow:
+///
+/// ```text
+/// 1. Run this upload test.
+/// 2. Copy the FULA_TEST_BUCKET + FULA_TEST_SECRET it prints.
+/// 3. Wait at least 5 min (default publisher tick cadence) before
+///    running the walk test in cold-offline mode. For warm-offline
+///    only, no wait is needed.
+/// 4. Run the walk test.
+/// ```
+///
+/// **Why this is split**: the publisher's bucketsIndex CBOR tick is
+/// what surfaces a newly-created bucket to the cold-start resolver.
+/// Until the next tick fires, the cold-offline phase of the walk test
+/// will fail with `BucketNotFound`. Having upload and walk as separate
+/// tests lets the operator wait the right amount of time between them
+/// without holding a single test process open.
+///
+/// **Required env**: `FULA_JWT`, `FULA_S3`.
+/// **Optional env**: `FULA_TIMEOUT_SECS` (default 60), `FULA_TEST_BUCKET`
+/// (override generated bucket name), `FULA_TEST_SECRET` (override
+/// generated random secret — must be base64).
+#[tokio::test]
+#[ignore]
+async fn fxfiles_walkable_v8_fresh_bucket_upload() {
+    let jwt = match read_required_env("FULA_JWT") {
+        Some(v) => v,
+        None => return,
+    };
+    let s3_url = match read_required_env("FULA_S3") {
+        Some(v) => v,
+        None => return,
+    };
+    let timeout_secs: u64 = std::env::var("FULA_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+
+    // Allow operator override; otherwise generate.
+    let bucket = std::env::var("FULA_TEST_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            format!("walkable-v8-test-{}", timestamp)
+        });
+
+    let (secret, secret_b64) = if let Some(b64) = std::env::var("FULA_TEST_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        use base64::Engine as _;
+        let trimmed = b64.trim().to_string();
+        let key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&trimmed)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&trimmed))
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&trimmed))
+            .expect("FULA_TEST_SECRET must be base64");
+        let secret = SecretKey::from_bytes(&key_bytes).expect("32-byte secret");
+        (secret, trimmed)
+    } else {
+        use base64::Engine as _;
+        let secret = SecretKey::generate();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
+        (secret, b64)
+    };
+
+    eprintln!("\n[walkable-v8-upload] master  = {}", s3_url);
+    eprintln!("[walkable-v8-upload] bucket  = {}", bucket);
+    eprintln!("[walkable-v8-upload] timeout = {}s", timeout_secs);
+
+    let cache_dir = TempDir::new().expect("tempdir for upload-side block cache");
+    let cache_path = cache_dir.path().join("blocks.redb");
+    let files = walkable_v8_fresh_bucket_test_files();
+
+    eprintln!(
+        "\n[walkable-v8-upload] uploading {} files (3 small text + 1 medium + 1 chunked >768KB)",
+        files.len()
+    );
+    {
+        let client = build_client(
+            &s3_url,
+            &jwt,
+            &cache_path,
+            secret,
+            true,
+            timeout_secs,
+        );
+
+        // Ensure the bucket exists. PUT /{bucket} is idempotent at the
+        // user-scoped level: a second create against the same name
+        // either returns success or a benign "already exists" error.
+        // We tolerate any error here and let put_object_flat surface
+        // anything truly broken with a clearer per-file error message.
+        match client.create_bucket(&bucket).await {
+            Ok(_) => eprintln!(
+                "[walkable-v8-upload]   bucket {:?} ready (created or pre-existing)",
+                bucket
+            ),
+            Err(e) => eprintln!(
+                "[walkable-v8-upload]   create_bucket({:?}) returned: {:?} \
+                 — proceeding; may be already-exists. If the next put_object_flat \
+                 surfaces NoSuchBucket, this was a real bucket-create failure \
+                 (auth, permissions, or master-side state).",
+                bucket, e
+            ),
+        }
+
+        for (key, payload) in &files {
+            let path_class = if payload.len() > 768 * 1024 {
+                "chunked"
+            } else {
+                "single-block"
+            };
+            client
+                .put_object_flat(
+                    &bucket,
+                    key,
+                    payload.clone(),
+                    Some("application/octet-stream"),
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "upload failed for {} ({} bytes, {} path): {:?}",
+                        key,
+                        payload.len(),
+                        path_class,
+                        e
+                    )
+                });
+            eprintln!(
+                "[walkable-v8-upload]   uploaded {:?} ({} bytes, {} path)",
+                key,
+                payload.len(),
+                path_class
+            );
+        }
+    }
+
+    eprintln!(
+        "\n[walkable-v8-upload] DONE — copy these env vars to run the walk test:\n\
+         \n\
+         PowerShell:\n\
+         \n\
+         $env:FULA_TEST_BUCKET = \"{}\"\n\
+         $env:FULA_TEST_SECRET = \"{}\"\n\
+         \n\
+         Bash:\n\
+         \n\
+         export FULA_TEST_BUCKET=\"{}\"\n\
+         export FULA_TEST_SECRET=\"{}\"\n\
+         \n\
+         Then: wait 5+ min for publisher tick if you intend to run cold-walk \
+         (warm-walk has no wait requirement), and invoke:\n\
+         \n\
+         cargo test -p fula-client --test offline_e2e --release \\\n\
+             -- --ignored fxfiles_walkable_v8_fresh_bucket_walk --nocapture\n",
+        bucket, secret_b64, bucket, secret_b64,
+    );
+}
+
+/// Walkable-v8 fresh-bucket WALK test (#20 / #89 follow-up, part 2 of 2).
+///
+/// Reads the bucket name + secret produced by
+/// `fxfiles_walkable_v8_fresh_bucket_upload`, then exercises:
+///   * **Phase B** — online: list + per-file download + byte equality
+///     vs the deterministic test payload (always runs; populates warm
+///     cache).
+///   * **Phase C — warm-cache offline** — if `FULA_WALK_MODE=warm` or
+///     `FULA_WALK_MODE=both`. Uses the cache populated in B.
+///   * **Phase D — cold-cache offline** — if `FULA_WALK_MODE=cold` or
+///     `FULA_WALK_MODE=both` AND all 5 cold-start env vars are set.
+///     Drops the cache before this phase, so every fetch must go via
+///     cold-start resolver + gateway race + W.9.4 cid-hint dispatch.
+///
+/// **Default `FULA_WALK_MODE` = `warm`** (does not require publisher
+/// tick; safe to run immediately after upload). Use `cold` or `both`
+/// after waiting 5+ min for the publisher to tick.
+///
+/// All operations go through `put_object_flat` / `get_object_flat` —
+/// the FxFiles-encrypted file-management path
+/// (`fula-flutter::api::forest`). The size-based auto-routing inside
+/// these calls selects single-block vs chunked based on the 768 KiB
+/// `CHUNKED_THRESHOLD`. The shared deterministic file set (defined by
+/// `walkable_v8_fresh_bucket_test_files`) covers both paths plus simple
+/// text content — matching what FxFiles actually persists.
+///
+/// **Required env**: `FULA_JWT`, `FULA_S3`, `FULA_TEST_BUCKET`,
+/// `FULA_TEST_SECRET` (the latter two are produced by the upload test —
+/// see its docstring for the copy-paste env var block it prints).
+/// **Optional env**: `FULA_TIMEOUT_SECS` (default 60), `FULA_WALK_MODE`
+/// (default `warm`; valid: `warm`, `cold`, `both`).
+///
+/// **For Phase D (cold-cache)**, additionally set:
+///   * `FULA_BLOCK_GATEWAY_URLS` (typically `https://<master-host>/gateway/{cid}`)
+///   * `FULA_USERS_INDEX_CHAIN_RPC_URL`
+///   * `FULA_USERS_INDEX_ANCHOR_ADDRESS`
+///   * `FULA_USERS_INDEX_IPNS_NAME`
+///   * `FULA_USERS_INDEX_USER_KEY`
+///   Optional: `FULA_USERS_INDEX_IPNS_GATEWAY_URLS` (comma-separated).
+///
+/// **Cleanup**: this test does NOT create or delete buckets — it
+/// operates on the bucket the upload test produced. Operator periodic
+/// cleanup is recommended for `walkable-v8-test-*` buckets.
+#[tokio::test]
+#[ignore]
+async fn fxfiles_walkable_v8_fresh_bucket_walk() {
+    let jwt = match read_required_env("FULA_JWT") {
+        Some(v) => v,
+        None => return,
+    };
+    let s3_url = match read_required_env("FULA_S3") {
+        Some(v) => v,
+        None => return,
+    };
+    let bucket = match read_required_env("FULA_TEST_BUCKET") {
+        Some(v) => v,
+        None => return,
+    };
+    let secret_b64 = match read_required_env("FULA_TEST_SECRET") {
+        Some(v) => v,
+        None => return,
+    };
+    let timeout_secs: u64 = std::env::var("FULA_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+
+    let walk_mode = std::env::var("FULA_WALK_MODE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "warm".to_string())
+        .to_lowercase();
+    let do_warm = walk_mode == "warm" || walk_mode == "both";
+    let do_cold = walk_mode == "cold" || walk_mode == "both";
+    if !do_warm && !do_cold {
+        panic!(
+            "FULA_WALK_MODE must be one of: warm, cold, both. Got: {:?}",
+            walk_mode
+        );
+    }
+
+    use base64::Engine as _;
+    let trimmed = secret_b64.trim();
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
+        .expect("FULA_TEST_SECRET must be base64");
+    let secret = SecretKey::from_bytes(&key_bytes).expect("32-byte secret");
+
+    eprintln!("\n[walkable-v8-walk] master    = {}", s3_url);
+    eprintln!("[walkable-v8-walk] bucket    = {}", bucket);
+    eprintln!("[walkable-v8-walk] mode      = {} (warm={}, cold={})", walk_mode, do_warm, do_cold);
+    eprintln!("[walkable-v8-walk] timeout   = {}s", timeout_secs);
+
+    let files = walkable_v8_fresh_bucket_test_files();
+    let expected_keys: std::collections::BTreeSet<String> =
+        files.iter().map(|(k, _)| k.clone()).collect();
+
+    let cache_dir = TempDir::new().expect("tempdir for warm block cache");
+    let cache_path = cache_dir.path().join("blocks.redb");
+
+    // ─── Phase B: online list + download — populate cache + capture baseline ──
+    eprintln!("\n[walkable-v8-walk] phase B: online list + download (baseline + cache warmup)");
+    {
+        let client = build_client(
+            &s3_url,
+            &jwt,
+            &cache_path,
+            secret.clone(),
+            true,
+            timeout_secs,
+        );
+
+        let listed = client
+            .list_files_from_forest(&bucket)
+            .await
+            .expect("phase B: online list must succeed");
+        let online_keys: std::collections::BTreeSet<String> =
+            listed.iter().map(|m| m.original_key.clone()).collect();
+        eprintln!(
+            "[walkable-v8-walk]   online list: {} files",
+            listed.len()
+        );
+        assert_eq!(
+            online_keys, expected_keys,
+            "online list keys must equal what the upload test wrote \
+             ({} expected, got {}).\n\
+             \n\
+             If got = 0: master has zero files for FULA_TEST_BUCKET \
+             ({}). Most likely cause: FULA_TEST_BUCKET doesn't match \
+             what the upload test created. Verify:\n\
+               (a) you ran scripts/walkable-v8-fresh-bucket-upload.ps1 \
+                   first, AND\n\
+               (b) FULA_TEST_BUCKET is the EXACT name from that script's \
+                   trailing 'copy these env vars' block (timestamp will \
+                   match roughly when upload ran), AND\n\
+               (c) FULA_TEST_SECRET also matches that block — a wrong \
+                   secret would surface as bucket_lookup_h mismatch and \
+                   master returns the empty forest for an unknown lookup_h.\n\
+             \n\
+             If 0 < got < {}: real walk regression — some HAMT entries \
+             are missing.",
+            expected_keys.len(),
+            online_keys.len(),
+            bucket,
+            expected_keys.len(),
+        );
+
+        for (key, payload) in &files {
+            let dl = client
+                .get_object_flat(&bucket, key)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("phase B online download failed for {}: {:?}", key, e)
+                });
+            assert_eq!(
+                dl.as_ref(),
+                payload.as_slice(),
+                "phase B online download bytes mismatch for {} \
+                 ({} expected, {} got). The decrypted plaintext from \
+                 master differs from what the upload test wrote — \
+                 either FULA_TEST_SECRET diverged from the upload, or \
+                 the file was rewritten between upload and walk.",
+                key,
+                payload.len(),
+                dl.len(),
+            );
+            eprintln!(
+                "[walkable-v8-walk]   online download {:?} OK ({} bytes verified)",
+                key,
+                dl.len()
+            );
+        }
+    }
+
+    // ─── Phase C: warm-cache offline list + download ──────────────────
+    if do_warm {
+        eprintln!("\n[walkable-v8-walk] phase C: warm-cache OFFLINE list + download (bogus master)");
+        let client = build_client(
+            "http://127.0.0.1:1",
+            &jwt,
+            &cache_path,
+            secret.clone(),
+            false,
+            timeout_secs,
+        );
+
+        let listed = client
+            .list_files_from_forest(&bucket)
+            .await
+            .expect("phase C: warm-cache offline list must succeed");
+        let warm_keys: std::collections::BTreeSet<String> =
+            listed.iter().map(|m| m.original_key.clone()).collect();
+        eprintln!(
+            "[walkable-v8-walk]   warm-offline list: {} files",
+            listed.len()
+        );
+        assert_eq!(
+            warm_keys, expected_keys,
+            "phase C warm-offline list keys must equal the uploaded set \
+             — a diff means HAMT walk silently dropped entries"
+        );
+
+        for (key, payload) in &files {
+            let dl = client
+                .get_object_flat(&bucket, key)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "phase C warm-offline download failed for {}: {:?}\n\
+                         The forest list succeeded but the chunk fetch \
+                         did not — likely a per-chunk warm-cache miss \
+                         that should have been a hit (#32 / W.9.4-A2 \
+                         regression?).",
+                        key, e
+                    )
+                });
+            assert_eq!(
+                dl.as_ref(),
+                payload.as_slice(),
+                "phase C warm-offline download bytes mismatch for {} \
+                 ({} expected, {} got)",
+                key,
+                payload.len(),
+                dl.len(),
+            );
+            eprintln!(
+                "[walkable-v8-walk]   warm-offline download {:?} OK ({} bytes verified)",
+                key,
+                dl.len()
+            );
+        }
+    } else {
+        eprintln!("\n[walkable-v8-walk] phase C (warm offline) SKIPPED — FULA_WALK_MODE={}", walk_mode);
+    }
+
+    // ─── Phase D: cold-cache offline ──────────────────────────────────
+    if do_cold {
+        let cold_block_gateway = std::env::var("FULA_BLOCK_GATEWAY_URLS")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let cold_chain_rpc = std::env::var("FULA_USERS_INDEX_CHAIN_RPC_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let cold_anchor = std::env::var("FULA_USERS_INDEX_ANCHOR_ADDRESS")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let cold_ipns = std::env::var("FULA_USERS_INDEX_IPNS_NAME")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let cold_user_key = std::env::var("FULA_USERS_INDEX_USER_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        let cold_ready = cold_block_gateway.is_some()
+            && cold_chain_rpc.is_some()
+            && cold_anchor.is_some()
+            && cold_ipns.is_some()
+            && cold_user_key.is_some();
+
+        if !cold_ready {
+            panic!(
+                "FULA_WALK_MODE={} requires cold-start env vars. \
+                 Missing one or more of:\n\
+                   FULA_BLOCK_GATEWAY_URLS\n\
+                   FULA_USERS_INDEX_CHAIN_RPC_URL\n\
+                   FULA_USERS_INDEX_ANCHOR_ADDRESS\n\
+                   FULA_USERS_INDEX_IPNS_NAME\n\
+                   FULA_USERS_INDEX_USER_KEY",
+                walk_mode
+            );
+        }
+
+        eprintln!(
+            "\n[walkable-v8-walk] phase D: cold-cache OFFLINE list + download \
+             (resolver + gateway race)"
+        );
+        eprintln!(
+            "[walkable-v8-walk]   pre-req: publisher must have ticked since \
+             the upload test ran"
+        );
+
+        let cold_cache_dir = TempDir::new().expect("tempdir for COLD block cache");
+        let cold_cache_path = cold_cache_dir.path().join("blocks.redb");
+
+        let block_gateway_urls: Vec<String> = cold_block_gateway
+            .unwrap()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let ipns_gateway_urls = std::env::var("FULA_USERS_INDEX_IPNS_GATEWAY_URLS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let client = build_client_with_cold_start(
+            "http://127.0.0.1:1",
+            &jwt,
+            &cold_cache_path,
+            secret,
+            false,
+            timeout_secs,
+            cold_chain_rpc.unwrap(),
+            cold_anchor.unwrap(),
+            cold_ipns.unwrap(),
+            cold_user_key.unwrap(),
+            ipns_gateway_urls,
+            block_gateway_urls,
+        );
+
+        let listed = client
+            .list_files_from_forest(&bucket)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "phase D cold-offline list failed: {:?}\n\
+                     Most likely cause: publisher has not ticked since the \
+                     upload test ran. Wait 5+ min (default cadence) and \
+                     re-run, OR call the master's \
+                     `/_internal/publish-now` admin endpoint between \
+                     upload and walk.",
+                    e
+                )
+            });
+        let cold_keys: std::collections::BTreeSet<String> =
+            listed.iter().map(|m| m.original_key.clone()).collect();
+        eprintln!(
+            "[walkable-v8-walk]   cold-offline list: {} files",
+            listed.len()
+        );
+        assert_eq!(
+            cold_keys, expected_keys,
+            "phase D cold-offline list keys must equal the uploaded set \
+             — a diff means resolver returned the wrong CID OR HAMT \
+             walk dropped entries during gateway race"
+        );
+
+        for (key, payload) in &files {
+            let dl = client
+                .get_object_flat(&bucket, key)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("phase D cold-offline download failed for {}: {:?}", key, e)
+                });
+            assert_eq!(
+                dl.as_ref(),
+                payload.as_slice(),
+                "phase D cold-offline download bytes mismatch for {} \
+                 ({} expected, {} got)",
+                key,
+                payload.len(),
+                dl.len(),
+            );
+            eprintln!(
+                "[walkable-v8-walk]   cold-offline download {:?} OK ({} bytes verified)",
+                key,
+                dl.len()
+            );
+        }
+    } else {
+        eprintln!("\n[walkable-v8-walk] phase D (cold offline) SKIPPED — FULA_WALK_MODE={}", walk_mode);
+    }
+
+    let phases_ran = match (do_warm, do_cold) {
+        (true, true) => "online + warm-offline + cold-offline",
+        (true, false) => "online + warm-offline",
+        (false, true) => "online + cold-offline",
+        (false, false) => unreachable!("guarded above"),
+    };
+    eprintln!(
+        "\n[walkable-v8-walk] PASS — v0.6.1 walkable-v8 walk verified \
+         on bucket {}: {} files round-tripped (text + binary + chunked) \
+         with byte-equality across {}.",
+        bucket,
+        files.len(),
+        phases_ran,
+    );
+}
+
 // ============================================================================
 // 412 reproduction harness against a USER'S EXISTING bucket
 // ============================================================================

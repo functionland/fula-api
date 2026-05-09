@@ -1262,11 +1262,33 @@ impl EncryptedClient {
         // path carries the same ciphertext bytes but an empty
         // `metadata` map — the lookup helpers below pick up the
         // metadata from the forest entry instead.
-        let result = self
-            .inner
-            .get_object_with_offline_fallback(bucket, storage_key)
-            .await?
-            .inner;
+        //
+        // Walkable-v8 (#90, 2026-05-09): when the forest entry carries a
+        // `storage_cid` (single-block encrypted uploads stamp this at
+        // `put_object_encrypted_with_type` after master's PUT-response
+        // self-verify), forward the CID through the `_known_cid`
+        // variant. That activates the cold-cache gateway-race path:
+        // even when both master is unreachable AND the warm block cache
+        // is empty (= cold-start scenario), the gateway race fetches
+        // the encrypted body by CID and content-verifies before handing
+        // it to the AEAD decrypt step below. Without this branch,
+        // single-block-encrypted cold-cache reads would fall through to
+        // the no-hint fallback, which only checks the warm cache by
+        // storage_key and then errors — exactly the failure mode the
+        // walkable-v8 fresh-bucket cold-walk test surfaced.
+        let cid_hint = forest_entry.as_ref().and_then(|e| e.storage_cid.as_ref());
+        let result = match cid_hint {
+            Some(cid) => self
+                .inner
+                .get_object_with_offline_fallback_known_cid(bucket, storage_key, cid)
+                .await?
+                .inner,
+            None => self
+                .inner
+                .get_object_with_offline_fallback(bucket, storage_key)
+                .await?
+                .inner,
+        };
 
         // Helper: fetch a metadata key, preferring HTTP headers, falling
         // back to the (AEAD-protected) forest entry's user_metadata.

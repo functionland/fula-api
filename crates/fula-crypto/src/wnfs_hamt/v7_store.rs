@@ -420,6 +420,139 @@ impl BlobBackend for InMemoryBackend {
     }
 }
 
+// =============================================================================
+// CountingBlobBackend — RPC-count instrumentation for #88 (W.8.4 validation).
+//
+// Wraps any [`BlobBackend`] and counts every operation atomically. Tests use
+// this to drive an identical workload through a v7-mode backend (returns
+// `BlobPutResult::none()`) and a v8-mode backend (returns
+// `BlobPutResult { cid: Some(_) }`) and assert that the `puts` and `gets`
+// counts match, validating the W.8.4 plan claim that v8 adds zero new master
+// RPCs vs v7. The `gets_with_some_hint` counter is the discriminator that
+// SHOULD differ — it's 0 under v7 (no `LinkV2` exists, no CID hints flow) and
+// non-zero under v8 (the reader resolves `LinkV2` children with `Some` hints).
+//
+// Gated on `cfg(any(test, feature = "test-fault-injection"))` so it's visible
+// to fula-crypto's own unit tests AND to fula-client integration tests that
+// pull in fula-crypto with the feature enabled.
+// =============================================================================
+
+/// Atomic operation-count snapshot for a [`CountingBlobBackend`].
+#[cfg(any(test, feature = "test-fault-injection"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CountSnapshot {
+    pub puts: u64,
+    pub gets: u64,
+    pub gets_with_hint: u64,
+    pub gets_with_some_hint: u64,
+}
+
+/// [`BlobBackend`] wrapper that counts every operation. See module-level
+/// commentary above for usage.
+#[cfg(any(test, feature = "test-fault-injection"))]
+pub struct CountingBlobBackend<B> {
+    inner: Arc<B>,
+    puts: std::sync::atomic::AtomicU64,
+    gets: std::sync::atomic::AtomicU64,
+    gets_with_hint: std::sync::atomic::AtomicU64,
+    gets_with_some_hint: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(any(test, feature = "test-fault-injection"))]
+impl<B> CountingBlobBackend<B> {
+    pub fn new(inner: Arc<B>) -> Self {
+        Self {
+            inner,
+            puts: std::sync::atomic::AtomicU64::new(0),
+            gets: std::sync::atomic::AtomicU64::new(0),
+            gets_with_hint: std::sync::atomic::AtomicU64::new(0),
+            gets_with_some_hint: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub fn snapshot(&self) -> CountSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        CountSnapshot {
+            puts: self.puts.load(Relaxed),
+            gets: self.gets.load(Relaxed),
+            gets_with_hint: self.gets_with_hint.load(Relaxed),
+            gets_with_some_hint: self.gets_with_some_hint.load(Relaxed),
+        }
+    }
+
+    pub fn reset(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.puts.store(0, Relaxed);
+        self.gets.store(0, Relaxed);
+        self.gets_with_hint.store(0, Relaxed);
+        self.gets_with_some_hint.store(0, Relaxed);
+    }
+
+    pub fn inner(&self) -> &Arc<B> {
+        &self.inner
+    }
+}
+
+#[cfg(all(any(test, feature = "test-fault-injection"), not(target_arch = "wasm32")))]
+#[async_trait::async_trait]
+impl<B: BlobBackend> BlobBackend for CountingBlobBackend<B> {
+    async fn get(&self, path: &str) -> Result<Vec<u8>> {
+        self.gets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.get(path).await
+    }
+
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<BlobPutResult> {
+        self.puts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.put(path, bytes).await
+    }
+
+    async fn get_with_cid_hint(
+        &self,
+        path: &str,
+        cid_hint: Option<&Cid>,
+    ) -> Result<Vec<u8>> {
+        self.gets_with_hint
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cid_hint.is_some() {
+            self.gets_with_some_hint
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.inner.get_with_cid_hint(path, cid_hint).await
+    }
+}
+
+#[cfg(all(any(test, feature = "test-fault-injection"), target_arch = "wasm32"))]
+#[async_trait::async_trait(?Send)]
+impl<B: BlobBackend> BlobBackend for CountingBlobBackend<B> {
+    async fn get(&self, path: &str) -> Result<Vec<u8>> {
+        self.gets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.get(path).await
+    }
+
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<BlobPutResult> {
+        self.puts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.put(path, bytes).await
+    }
+
+    async fn get_with_cid_hint(
+        &self,
+        path: &str,
+        cid_hint: Option<&Cid>,
+    ) -> Result<Vec<u8>> {
+        self.gets_with_hint
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cid_hint.is_some() {
+            self.gets_with_some_hint
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.inner.get_with_cid_hint(path, cid_hint).await
+    }
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
