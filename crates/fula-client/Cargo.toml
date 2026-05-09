@@ -78,6 +78,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 uuid = { version = "1.11", features = ["v4", "serde", "js"] }
 # MultipartAbortGuard Drop impl spawns the abort future on wasm
 wasm-bindgen-futures = "0.4"
+# Walkable-v8 (W.9.2): `S3BlobBackend::put` parses master's PUT-response
+# ETag into a `Cid` on every target so the cross-platform CID-stamping
+# seam stays symmetric. cid 0.11 is wasm-compatible; default-features
+# include `std` and `serde` which both work in wasm32.
+cid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

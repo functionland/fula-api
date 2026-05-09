@@ -71,6 +71,14 @@ clap = { workspace = true }
 # Storage
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
+# W.9.6 — durable pin queue. Same workspace dep that backs
+# fula-client's BlockCache, so we get a known-good crash-safety story
+# without inventing a new persistence layer.
+redb = { workspace = true }
+# Encoding for pin-queue records (pin_queue.rs). Same workspace dep
+# fula-crypto already uses for HAMT wire types — deterministic,
+# compact, and stable across Rust versions.
+postcard = { workspace = true }
 
 # HTTP client (for balance check API)
 reqwest = { workspace = true }

@@ -244,6 +244,7 @@ async fn test_v1_to_v7_preserves_subtree_deks() {
             user_metadata: HashMap::new(),
             encrypted: false,
             min_version: 0,
+            storage_cid: None,
         },
     );
 

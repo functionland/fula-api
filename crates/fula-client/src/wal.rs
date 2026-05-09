@@ -493,6 +493,7 @@ mod tests {
             user_metadata: HashMap::new(),
             encrypted: true,
             min_version: 0,
+            storage_cid: None,
         }
     }
 

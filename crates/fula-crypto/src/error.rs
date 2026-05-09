@@ -102,4 +102,147 @@ pub enum CryptoError {
     /// within `fula-crypto::Result`.
     #[error("storage backend error: {0}")]
     Storage(String),
+
+    /// **#81 (2026-05-09)** — postcard decoded an enum variant tag the
+    /// reader doesn't know. Hit on the read path when an old SDK
+    /// (e.g. v0.5) encounters a blob written under a forward-incompatible
+    /// wire format (e.g. walkable-v8's `PointerWire::LinkV2` variant
+    /// tag 2). Distinguishes "you need to upgrade your SDK to read
+    /// this bucket" from generic serialization corruption — operators
+    /// can filter telemetry on the typed variant rather than
+    /// substring-matching postcard's error class.
+    ///
+    /// `context` describes WHERE the unknown variant was hit (e.g.
+    /// "decode hamt node"); `postcard_error` carries postcard's own
+    /// error stringification for diagnostic depth.
+    #[error("wire format version unsupported (need newer SDK): {context}: {postcard_error}")]
+    WireVersionUnsupported {
+        context: String,
+        postcard_error: String,
+    },
+}
+
+impl CryptoError {
+    /// **#81 (2026-05-09)** — classify a postcard decode error. Maps
+    /// postcard's `DeserializeBadEnum` (= "unknown enum variant tag,
+    /// likely from a newer wire format") to the typed
+    /// [`CryptoError::WireVersionUnsupported`] variant for stable
+    /// telemetry handling. All other postcard errors fall through to
+    /// the generic [`CryptoError::Serialization`] variant — they
+    /// represent genuine codec failures, not version skew.
+    ///
+    /// Centralised here (rather than inline at call sites) so adding
+    /// future detection sites is a one-liner. Detection currently
+    /// applied at:
+    ///   - `wnfs_hamt::node::Node::load`
+    ///   - `wnfs_hamt::node::Node::load_with_cid_hint`
+    pub fn classify_postcard_decode(err: postcard::Error, context: impl Into<String>) -> Self {
+        let context = context.into();
+        let postcard_error = err.to_string();
+        // Postcard 1.x quirk: unknown enum variant tags during
+        // serde-driven deserialization can surface via EITHER
+        // `DeserializeBadEnum` (postcard's direct enum-tag-out-of-
+        // range path) OR `SerdeDeCustom` (when serde's inner
+        // `Error::custom("unknown variant ...")` is reached during
+        // postcard's variant-discriminant decode). Empirically — see
+        // the `unknown_variant_tag_maps_to_wire_version_unsupported`
+        // unit test below — postcard 1.1.3 routes `LinkV2`-style
+        // unknown-variant blobs through `SerdeDeCustom`, NOT
+        // `DeserializeBadEnum`. Without matching `SerdeDeCustom` here
+        // the typed variant would never fire in production.
+        //
+        // Trade-off: `SerdeDeCustom` is generic. Any other serde
+        // error (e.g. malformed payload that triggers a custom
+        // serde error during decode) would also map here. For our
+        // controlled wire types (HAMT nodes, manifest pages,
+        // ChunkedFileMetadata) the only realistic path to
+        // `SerdeDeCustom` IS wire-version skew; non-skew corruption
+        // tends to surface as `DeserializeUnexpectedEnd` or
+        // `DeserializeBadEncoding` instead. Acceptable conflation
+        // for telemetry — the variant message includes the postcard
+        // error stringification so operators get diagnostic depth.
+        match err {
+            postcard::Error::DeserializeBadEnum | postcard::Error::SerdeDeCustom => {
+                CryptoError::WireVersionUnsupported {
+                    context,
+                    postcard_error,
+                }
+            }
+            _ => CryptoError::Serialization(format!("{context}: {postcard_error}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod classify_postcard_decode_tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    /// **#81** — feed postcard bytes for a v2-only enum to a v1 reader
+    /// that doesn't know variant tag 1 (Value). Postcard returns
+    /// `DeserializeBadEnum`, which `classify_postcard_decode` maps to
+    /// `WireVersionUnsupported`. This is the load-bearing assertion:
+    /// the typed variant fires for unknown-variant errors specifically,
+    /// not for any old postcard error.
+    #[test]
+    fn unknown_variant_tag_maps_to_wire_version_unsupported() {
+        #[derive(Serialize)]
+        enum V2Writer {
+            #[allow(dead_code)]
+            A,
+            B(u32),
+        }
+        #[derive(Deserialize, Debug)]
+        enum V1Reader {
+            #[allow(dead_code)]
+            A,
+        }
+
+        // Encode V2's Variant 1 (B) — V1 reader doesn't know tag 1.
+        let bytes = postcard::to_allocvec(&V2Writer::B(42)).expect("encode");
+        let err = postcard::from_bytes::<V1Reader>(&bytes).expect_err("must fail");
+        let mapped = CryptoError::classify_postcard_decode(err, "test ctx");
+        match mapped {
+            CryptoError::WireVersionUnsupported {
+                context,
+                postcard_error,
+            } => {
+                assert_eq!(context, "test ctx");
+                assert!(
+                    !postcard_error.is_empty(),
+                    "postcard error stringified for telemetry depth"
+                );
+            }
+            other => panic!("expected WireVersionUnsupported, got: {other:?}"),
+        }
+    }
+
+    /// Other postcard decode failures (e.g. truncated input) remain
+    /// generic `Serialization` errors — the typed variant is reserved
+    /// for genuine wire-version skew.
+    #[test]
+    fn truncated_input_stays_as_serialization_error() {
+        #[derive(Deserialize, Debug)]
+        struct NeedsTwoFields {
+            #[allow(dead_code)]
+            a: u32,
+            #[allow(dead_code)]
+            b: u32,
+        }
+        // Encode only one u32 — postcard hits DeserializeUnexpectedEnd.
+        let bytes = postcard::to_allocvec(&7u32).expect("encode");
+        let err = postcard::from_bytes::<NeedsTwoFields>(&bytes).expect_err("must fail");
+        let mapped = CryptoError::classify_postcard_decode(err, "trunc ctx");
+        match mapped {
+            CryptoError::Serialization(msg) => {
+                assert!(
+                    msg.contains("trunc ctx"),
+                    "context propagated into serialization message: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Serialization for truncated input (NOT WireVersionUnsupported), got: {other:?}"
+            ),
+        }
+    }
 }

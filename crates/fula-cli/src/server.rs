@@ -23,6 +23,36 @@ pub async fn run_server(config: GatewayConfig) -> anyhow::Result<()> {
         users_index_publisher::start_publisher_loop(publisher);
     }
 
+    // W.9.6 — spawn the pin-queue drainer iff the queue was opened
+    // at AppState construction time. When the queue is None, this is
+    // a no-op and the PUT handler falls back to fire-and-forget pins
+    // (legacy v0.5 behavior). On runtime shutdown the tokio runtime
+    // aborts the spawned task; pending records survive the next
+    // master restart via redb durability (this is the load-bearing
+    // crash-safety property — the queue is the source of truth, not
+    // the drainer's in-flight state).
+    //
+    // We `mem::forget` both the JoinHandle and the cancel oneshot:
+    // the drainer is a process-lifetime task. A future graceful-
+    // shutdown wiring would replace this with a registry of cancel
+    // tokens that `run_server_with_shutdown` drains during its
+    // tokio-runtime-shutdown grace period. For now, abrupt cancel
+    // is safe because pin RPCs are idempotent at cluster — a
+    // partially-completed pin gets retried on next startup, no harm.
+    if let Some(queue) = state.pin_queue.clone() {
+        let dispatcher: Arc<dyn crate::pin_drainer::PinDispatcher> = Arc::new(
+            crate::pin_drainer::LivePinDispatcher::new(Arc::clone(&state.block_store)),
+        );
+        let (handle, cancel) = crate::pin_drainer::spawn_drainer_loop(
+            queue,
+            dispatcher,
+            crate::pin_drainer::DrainerConfig::default(),
+        );
+        std::mem::forget(handle);
+        std::mem::forget(cancel);
+        info!("✓ Pin drainer (W.9.6) started");
+    }
+
     // Create router
     let app = routes::create_router(state);
 
@@ -53,6 +83,36 @@ pub async fn run_server_with_shutdown(
     // disabled, this is a no-op and nothing about S3 routing changes.
     if let Some(publisher) = state.users_index_publisher.clone() {
         users_index_publisher::start_publisher_loop(publisher);
+    }
+
+    // W.9.6 — spawn the pin-queue drainer iff the queue was opened
+    // at AppState construction time. When the queue is None, this is
+    // a no-op and the PUT handler falls back to fire-and-forget pins
+    // (legacy v0.5 behavior). On runtime shutdown the tokio runtime
+    // aborts the spawned task; pending records survive the next
+    // master restart via redb durability (this is the load-bearing
+    // crash-safety property — the queue is the source of truth, not
+    // the drainer's in-flight state).
+    //
+    // We `mem::forget` both the JoinHandle and the cancel oneshot:
+    // the drainer is a process-lifetime task. A future graceful-
+    // shutdown wiring would replace this with a registry of cancel
+    // tokens that `run_server_with_shutdown` drains during its
+    // tokio-runtime-shutdown grace period. For now, abrupt cancel
+    // is safe because pin RPCs are idempotent at cluster — a
+    // partially-completed pin gets retried on next startup, no harm.
+    if let Some(queue) = state.pin_queue.clone() {
+        let dispatcher: Arc<dyn crate::pin_drainer::PinDispatcher> = Arc::new(
+            crate::pin_drainer::LivePinDispatcher::new(Arc::clone(&state.block_store)),
+        );
+        let (handle, cancel) = crate::pin_drainer::spawn_drainer_loop(
+            queue,
+            dispatcher,
+            crate::pin_drainer::DrainerConfig::default(),
+        );
+        std::mem::forget(handle);
+        std::mem::forget(cancel);
+        info!("✓ Pin drainer (W.9.6) started");
     }
 
     let app = routes::create_router(state);

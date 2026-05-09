@@ -1242,9 +1242,39 @@ async fn offline_cold_start_documents_bucket_e2e() {
 // |                                     |          | `face-metadata`, and `other` all have it.                                       |
 // | `FULA_BOGUS_S3`                     | No       | Default `https://s33.cloud.fx.land` — DNS-fails on real DNS, mirrors what       |
 // |                                     |          | FxFiles uses to simulate offline.                                                |
+// | `FULA_PROD_S3`                      | No       | Default `https://s3.cloud.fx.land` — the REAL master, used for Phase 0 (online   |
+// |                                     |          | baseline). Override only if testing against a staging mirror.                    |
 // | `FULA_TIMEOUT_SECS`                 | No       | Default 60.                                                                      |
 // | `FULA_USERS_INDEX_IPNS_GATEWAY_URLS`| No       | Comma-separated overrides. Empty → SDK 5-gateway default.                        |
 // | `FULA_BLOCK_GATEWAY_URLS`           | No       | Same shape; for the per-page/per-chunk block fetches.                            |
+//
+// **#20 expansion (2026-05-09)**: this test now runs in TWO phases —
+// an online baseline against the REAL master (`FULA_PROD_S3`) followed
+// by the existing offline cold-start against the bogus master
+// (`FULA_BOGUS_S3`). The hard end-to-end assertion is `offline ⊆ online`
+// — every file the cold-start path returns must exist in master's
+// authoritative listing. A soft warning surfaces if `online ≠ offline`,
+// distinguishing publisher-staleness (recent uploads not yet published
+// to the IPNS+chain CBOR) from a cold-start regression.
+//
+// **Failure-mode taxonomy (investigate in this order)**:
+//
+//   1. **Online phase fails** → "is production healthy?" Fula master
+//      down, JWT expired, or this host can't reach `s3.cloud.fx.land`.
+//      NOT a cold-start regression. Don't waste time chasing the
+//      offline path until the online one works.
+//   2. **Online OK, offline cold-start fails** → existing failure
+//      modes per the per-step diagnostic eprintlns below (resolver
+//      → load_forest → list_files chain).
+//   3. **Both succeed but `offline ⊄ online`** → cold-start invented
+//      files master doesn't have. Real bug in resolver / decrypt /
+//      walk. The hard `panic!` below catches this.
+//   4. **Both succeed but `online \ offline ≠ ∅`** → master has files
+//      cold-start didn't return. Most commonly publisher staleness
+//      (publisher tick is 5min; recent uploads land in master
+//      synchronously but the next IPNS publish takes ≤5min). Soft
+//      warning, not panic — operator decides whether to wait or
+//      investigate.
 //
 // Run from `crates/fula-client/`:
 //
@@ -1307,6 +1337,13 @@ async fn fxfiles_offline_open_bucket() {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "https://s33.cloud.fx.land".to_string());
+    // **#20 expansion**: real production master URL for the online
+    // baseline phase. Default `https://s3.cloud.fx.land`; override
+    // only when targeting a staging mirror.
+    let prod_s3 = std::env::var("FULA_PROD_S3")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://s3.cloud.fx.land".to_string());
     let timeout_secs: u64 = std::env::var("FULA_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1353,9 +1390,92 @@ async fn fxfiles_offline_open_bucket() {
         .expect("FULA_TEST_SECRET must be base64");
     let secret = SecretKey::from_bytes(&key_bytes).expect("32-byte secret");
 
-    // Fresh tempdir for the block cache — guarantees this is a true
-    // cold-start, no warm-cache contribution. Mirrors the FxFiles cold
-    // path on a freshly reinstalled device or after `Clear data`.
+    // ─── Phase 0 (NEW, #20 expansion): online baseline ───────────────
+    //
+    // Connect to the REAL master and capture the authoritative file
+    // listing. This is the "what should the bucket actually contain"
+    // ground truth that the offline phase below is compared against.
+    //
+    // If this phase fails, the test stops here — there's no point
+    // running offline assertions with no baseline. Failure at this
+    // step means production is unreachable / JWT expired / TLS
+    // surprise; investigate that before touching cold-start.
+    eprintln!(
+        "\n[fxfiles-open-bucket] Phase 0 (online baseline) ─────────────\n\
+         [fxfiles-open-bucket]   master = {} (real production)\n\
+         [fxfiles-open-bucket]   purpose: capture authoritative file list \
+         to compare against the offline cold-start result below.",
+        prod_s3
+    );
+    let online_cache_dir = TempDir::new().expect("tempdir for online block cache");
+    let online_cache_path = online_cache_dir.path().join("blocks.redb");
+    let online_client = build_client_with_cold_start(
+        &prod_s3,
+        &jwt,
+        &online_cache_path,
+        // Cloned: same encryption material across both phases
+        // (otherwise decryption fails on at least one side and the
+        // comparison is meaningless).
+        SecretKey::from_bytes(&key_bytes).expect("32-byte secret"),
+        // health_gate=true: real master should respond promptly. If
+        // it doesn't, the gate trips and we surface a clean failure.
+        true,
+        timeout_secs,
+        chain_rpc_url.clone(),
+        anchor_address.clone(),
+        ipns_name.clone(),
+        user_key.clone(),
+        ipns_gateway_urls.clone(),
+        block_gateway_urls.clone(),
+    );
+    // Real master should serve list_files_from_forest directly via S3
+    // (no resolver fallback). If this errors, production is down or
+    // the JWT/secret combo doesn't decrypt this user's bucket.
+    let online_files = match online_client.list_files_from_forest(&bucket).await {
+        Ok(v) => v,
+        Err(e) => {
+            panic!(
+                "Phase 0 (online baseline) FAILED: list_files_from_forest({}) \
+                 against real master {} returned error: {:?}\n\
+                 \n\
+                 Investigation order:\n\
+                   1. Is the master reachable from this host? (`curl -I {}`)\n\
+                   2. Is FULA_JWT valid + non-expired?\n\
+                   3. Does FULA_TEST_SECRET match the encryption key on \
+                 device for this user?\n\
+                 \n\
+                 Don't troubleshoot the offline cold-start until this \
+                 phase succeeds — without a baseline there's nothing to \
+                 compare offline results against.",
+                bucket, prod_s3, e, prod_s3,
+            );
+        }
+    };
+    let online_keys: std::collections::BTreeSet<String> = online_files
+        .iter()
+        .map(|m| m.original_key.clone())
+        .collect();
+    eprintln!(
+        "[fxfiles-open-bucket]   online list returned {} files \
+         ({} unique keys)",
+        online_files.len(),
+        online_keys.len(),
+    );
+    if online_files.is_empty() {
+        eprintln!(
+            "[fxfiles-open-bucket]   WARNING: online baseline is EMPTY for \
+             bucket {:?}. The test will still run the offline phase but \
+             the comparison degrades to 'offline must also be empty' \
+             (the trivial subset). Pick a populated bucket via FULA_BUCKET \
+             to actually exercise the parity assertion.",
+            bucket,
+        );
+    }
+    drop(online_client);
+
+    // Fresh tempdir for the OFFLINE block cache — guarantees this is a
+    // true cold-start, no warm-cache contribution. Mirrors the FxFiles
+    // cold path on a freshly reinstalled device or after `Clear data`.
     let cache_dir = TempDir::new().expect("tempdir for block cache");
     let cache_path = cache_dir.path().join("blocks.redb");
 
@@ -1602,12 +1722,116 @@ async fn fxfiles_offline_open_bucket() {
         );
     } else {
         eprintln!(
-            "\n[fxfiles-open-bucket] PASS — `{}` returned {} entries via the EXACT \
-             same code path FxFiles runs (load_forest + list_files_from_forest), \
-             with master DNS-failing and a fresh block cache. Cold-start works for \
-             this bucket.",
+            "\n[fxfiles-open-bucket] cold-start surfaced — `{}` returned {} entries \
+             via the EXACT same code path FxFiles runs (load_forest + \
+             list_files_from_forest), with master DNS-failing and a fresh block \
+             cache. Final pass/fail decided by Phase 4 (parity check) below.",
             bucket,
             files.len(),
+        );
+    }
+
+    // ─── Phase 4 (NEW, #20 expansion): parity assertion ──────────────
+    //
+    // The end-to-end claim being validated: cold-start produces the
+    // SAME view of the bucket as the master. Specifically:
+    //
+    //   * HARD: `offline ⊆ online`. Every key the cold-start path
+    //     returns must exist in the online baseline. Anything else
+    //     means cold-start invented files — a real resolver / decrypt
+    //     / walk bug, panic immediately.
+    //
+    //   * SOFT: `online == offline`. If master has files cold-start
+    //     missed, that's most often publisher staleness (the IPNS
+    //     publisher tick is 5 min; recently-uploaded files land in
+    //     master synchronously but the next IPNS publish carries them
+    //     out). Surface as a warning with the explainer; operator
+    //     decides whether to wait + re-run or to investigate.
+    let offline_keys: std::collections::BTreeSet<String> = files
+        .iter()
+        .map(|m| m.original_key.clone())
+        .collect();
+    let offline_extras: Vec<&String> = offline_keys
+        .difference(&online_keys)
+        .collect();
+    let online_extras: Vec<&String> = online_keys
+        .difference(&offline_keys)
+        .collect();
+
+    eprintln!(
+        "\n[fxfiles-open-bucket] Phase 4 (parity) ─────────────────────────\n\
+         [fxfiles-open-bucket]   online={} files / offline={} files",
+        online_keys.len(),
+        offline_keys.len(),
+    );
+
+    // HARD assertion: offline ⊆ online.
+    assert!(
+        offline_extras.is_empty(),
+        "Phase 4 HARD-FAIL: cold-start surfaced {} files master doesn't have:\n  {}\n\
+         \nFirst, RULE OUT THE COMMON BENIGN CASE — concurrent writes between \
+         Phase 0 and Phase 1+ (~30s window):\n\
+           * Was another device (the user's phone, a CI runner, a sibling test) \
+             writing to bucket {:?} during this test run? Recent uploads land in \
+             master AND in the published bucketsIndex CBOR (the IPNS publisher \
+             tick is 5 min) — if a write landed AFTER Phase 0's snapshot but \
+             BEFORE the offline cold-start fetched the CBOR, the offline path \
+             would include the file while Phase 0's online list wouldn't. Quiet \
+             your other devices and re-run.\n\
+         \nIf concurrent writes are ruled out, this is a real bug — the \
+         resolver / decrypt / walk path produced entries that don't exist in \
+         master's authoritative listing. Investigate:\n\
+           * Did the resolver return a stale CID pointing at a different bucket's data?\n\
+           * Is the bucket_lookup_h colliding with another bucket?\n\
+           * Did AEAD decrypt succeed on bytes from the wrong bucket?\n\
+         The full per-step diagnostic eprintlns above show which step the \
+         erroneous CID came from.",
+        offline_extras.len(),
+        offline_extras.iter().take(10).map(|s| s.as_str()).collect::<Vec<_>>().join("\n  "),
+        bucket,
+    );
+
+    // SOFT warning: online \ offline ≠ ∅. Several legitimate causes
+    // — operator must triage; framing biased toward the most common
+    // (publisher tick) but enumerating the others equally so the
+    // operator doesn't default to "wait 5 min" when something else
+    // is the real cause.
+    if !online_extras.is_empty() {
+        eprintln!(
+            "[fxfiles-open-bucket]   SOFT-WARN: master has {} files cold-start \
+             didn't return:\n  {}\n\
+             \n[fxfiles-open-bucket]   Possible causes (triage in this order):\n\
+             [fxfiles-open-bucket]     (a) PUBLISHER STALENESS — the IPNS publisher \
+             tick is 5 min; recent uploads land in master synchronously but the \
+             next IPNS+chain publish carries them out. If the missing files were \
+             uploaded within the last ~5 min, wait for the publisher and re-run.\n\
+             [fxfiles-open-bucket]     (b) STALE PUBLISHED CBOR — the published \
+             bucketsIndex CBOR points at an older `forest_manifest_cid`. Step 1.5 \
+             above prints the loaded manifest's `manifest_sequence`; compare \
+             against master's current sequence (admin endpoint or registry CBOR \
+             dump). If the loaded sequence is older than master's, the publisher \
+             never caught up for this user — investigate publisher health.\n\
+             [fxfiles-open-bucket]     (c) PAGE-FETCH SILENT DROP — the v7 walk \
+             fetches manifest pages by their etag/cid; if a gateway returns 4xx \
+             for a page right now, the walk skips that page and its entries \
+             without surfacing an error. Step 1.5's `shards_with_root` count \
+             vs. expected helps localize this.\n\
+             [fxfiles-open-bucket]     (d) PIN LAG — master serves a file via S3 \
+             that isn't yet pinned to ipfs-cluster (pinning is best-effort + \
+             retried); offline gateway race can't find it. Distinct from \
+             publisher staleness; pin verification needed.\n\
+             [fxfiles-open-bucket]     (e) UNFLUSHED MIGRATION — a v1→v7 migration \
+             that didn't fully flush. Rare post-deploy, common during migration.",
+            online_extras.len(),
+            online_extras.iter().take(10).map(|s| s.as_str()).collect::<Vec<_>>().join("\n  "),
+        );
+    } else if offline_keys == online_keys {
+        eprintln!(
+            "[fxfiles-open-bucket]   PARITY ✅ — online and offline listings \
+             match exactly ({} files). End-to-end cold-start works for \
+             bucket {:?}.",
+            online_keys.len(),
+            bucket,
         );
     }
 }

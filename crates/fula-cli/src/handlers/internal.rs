@@ -260,6 +260,11 @@ mod tests {
             multipart_manager: Arc::new(crate::multipart::MultipartManager::new(60)),
             lock_store: crate::handlers::locks::LockStore::new(),
             users_index_publisher,
+            // W.9.6 pin queue not exercised by users-index-publisher
+            // tests; leaving None routes pinning back through the
+            // legacy fire-and-forget path which is fine for these
+            // tests (they don't trigger PUTs / pinning).
+            pin_queue: None,
         })
     }
 
@@ -468,6 +473,7 @@ mod tests {
             // Publisher disabled — we expect 503, not 401 (no token)
             // and not 403 (S3 auth would trigger if middleware leaked).
             users_index_publisher: None,
+            pin_queue: None,
         });
 
         let _ = state_path; // silence unused; only here to mirror prod path layout
@@ -515,6 +521,7 @@ mod tests {
             multipart_manager: Arc::new(crate::multipart::MultipartManager::new(60)),
             lock_store: crate::handlers::locks::LockStore::new(),
             users_index_publisher: None,
+            pin_queue: None,
         });
 
         let app = crate::routes::create_router(Arc::clone(&state));

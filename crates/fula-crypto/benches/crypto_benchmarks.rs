@@ -9,7 +9,7 @@ use fula_crypto::{
     streaming::{encode as bao_encode, verify as bao_verify},
     private_forest::{PrivateForest, ForestFileEntry, EncryptedForest},
     sharded_hamt_forest::ShardedHamtPrivateForest,
-    wnfs_hamt::BlobBackend,
+    wnfs_hamt::{BlobBackend, BlobPutResult},
     error::{CryptoError, Result as CryptoResult},
 };
 use std::collections::HashMap;
@@ -150,9 +150,9 @@ impl BlobBackend for BenchBackend {
             .cloned()
             .ok_or_else(|| CryptoError::Hamt(format!("object not found: {}", path)))
     }
-    async fn put(&self, path: &str, bytes: Vec<u8>) -> CryptoResult<()> {
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> CryptoResult<BlobPutResult> {
         self.objects.lock().unwrap().insert(path.to_string(), bytes);
-        Ok(())
+        Ok(BlobPutResult::none())
     }
 }
 
@@ -172,6 +172,7 @@ fn mk_file_entry(path: &str) -> ForestFileEntry {
         user_metadata: Default::default(),
         encrypted: false,
         min_version: 0,
+        storage_cid: None,
     }
 }
 
@@ -305,6 +306,7 @@ fn bench_v1_monolithic_vs_v7_write(c: &mut Criterion) {
                     user_metadata: Default::default(),
                     encrypted: false,
                     min_version: 0,
+                    storage_cid: None,
                 });
             }
             f

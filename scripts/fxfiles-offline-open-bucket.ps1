@@ -12,13 +12,23 @@
 #   $env:FULA_USERS_INDEX_ANCHOR_ADDRESS = "0x..."
 #
 # Optional:
-#   $env:FULA_BUCKET = "images"   # default; pick a bucket that has
-#                                 # forest_manifest_cid populated (images,
-#                                 # face-metadata, other in ehsan's index)
+#   $env:FULA_BUCKET   = "images"   # default; pick a bucket that has
+#                                   # forest_manifest_cid populated (images,
+#                                   # face-metadata, other in ehsan's index)
+#   $env:FULA_PROD_S3  = "https://s3.cloud.fx.land"
+#                                   # Real master used for #20 Phase 0 online
+#                                   # baseline. Override only when targeting
+#                                   # a staging mirror.
 #
 # Output: prints what each step (load_forest, list_files_from_forest)
-# returned + the first 20 entries. Reports EMPTY-FOREST if 0 files surfaced
-# despite the bucket being known to contain files.
+# returned + the first 20 entries.
+#
+# **#20 expansion (2026-05-09)**: the test now runs ONLINE-baseline first
+# (against `FULA_PROD_S3`), then offline cold-start, and asserts
+# `offline ⊆ online` (HARD) + `online == offline` (SOFT, warn-only —
+# publisher tick is 5 min so recent uploads may not have propagated yet).
+# A missing online baseline means production is unreachable; investigate
+# that BEFORE chasing offline-path bugs.
 
 $ErrorActionPreference = 'Stop'
 

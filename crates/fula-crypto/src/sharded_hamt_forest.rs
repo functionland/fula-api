@@ -38,6 +38,7 @@ use crate::private_forest::{
 use crate::subtree_keys::EncryptedSubtreeDek;
 use crate::wnfs_hamt::{BlobBackend, V7NodeStore};
 use crate::{CryptoError, Result};
+use cid::Cid;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
@@ -77,10 +78,31 @@ pub enum HamtEntry {
 // to postcard-serialize as the HAMT value type. Conversion happens only at
 // the `upsert_file` / `get_file` boundaries.
 
+/// Wire format for a HAMT leaf entry.
+///
+/// **Wire-version compatibility (walkable-v8 plan, section W.3.2 / W.9.1b).**
+/// Variant tags are part of the on-disk contract:
+///
+/// | Variant   | Tag | Introduced | Read by   | Written by    |
+/// |-----------|-----|------------|-----------|---------------|
+/// | `File`    | 0   | v7         | v7+, v8+  | v7+           |
+/// | `Dir`     | 1   | v7         | v7+, v8+  | v7+           |
+/// | `FileV2`  | 2   | v8         | v8+       | v8+ (W.9.3)   |
+///
+/// A v7-only deserializer fails on tag `2` with postcard's "unknown variant"
+/// error — the intended forward-incompatibility boundary. Mirrors
+/// `PointerWire::LinkV2` (W.9.1a). For W.9.1b the writer never emits
+/// variant 2 (W.9.3 wires the actual CID-stamping); production HAMT leaves
+/// stay byte-identical to v7 on encode, preserving the load-bearing
+/// backward-compat property: `From<HamtEntry> for HamtEntryWire` produces
+/// byte-identical output for `ForestFileEntry { storage_cid: None, .. }`
+/// as it did before W.9.1b. See test
+/// `hamt_entry_wire_from_forest_file_entry_with_none_cid_emits_legacy_variant`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum HamtEntryWire {
     File(FileEntryWire),
     Dir(DirEntryWire),
+    FileV2(FileEntryWireV2),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,13 +116,73 @@ struct FileEntryWire {
     content_hash: Option<String>,
     user_metadata: BTreeMap<String, String>,
     encrypted: bool,
-    /// Minimum blob-format version for this entry (H-2). `0` = legacy,
-    /// `4` = written under AAD-bound v4 encryption and requires the
-    /// download path to reject lower advertised versions. `#[serde(default)]`
-    /// keeps wire compatibility with pre-H-2 shard blobs that lack the
-    /// field — postcard's strict decoder will fail without this attribute.
+    /// Minimum blob-format version for this entry (audit finding H-2).
+    /// `0` = legacy (allowed pre-H-2), `4` = written under AAD-bound v4
+    /// encryption (download path rejects lower advertised versions).
+    ///
+    /// AUDIT NOTE (task #42, 2026-05-08): the `#[serde(default)]` here is
+    /// operationally dead. Postcard 1.x does NOT honor `serde(default)` for
+    /// missing trailing struct fields — it errors with
+    /// `DeserializeUnexpectedEnd` (verified empirically during W.9.1b, which
+    /// is why `FileEntryWireV2` was added as an enum-variant rather than
+    /// appending `storage_cid` to this struct). The reason this attribute
+    /// has never broken production is timing: `min_version` landed in
+    /// commit `13139c7` on 2026-04-19 17:41Z, and the earliest tag containing
+    /// `sharded_hamt_forest.rs` is v0.3.0 dated 2026-04-21 — i.e. no tagged
+    /// release ever shipped this struct without `min_version`. The 40h
+    /// window between `dd126cf` (file introduced) and `13139c7` saw no
+    /// release; any shards persisted from `main` HEAD inside that window
+    /// (internal/staging only) are not decodable today, accepted.
+    ///
+    /// CONTRAST: `ForestFileEntry::min_version` at `private_forest.rs:140-146`
+    /// is JSON-encoded, and `serde_json` DOES honor `serde(default)` for
+    /// trailing fields — that comment is correct. Only the postcard surface
+    /// (this struct) has the misleading-`serde(default)` issue.
+    ///
+    /// To extend `FileEntryWire` with a future optional field, follow the
+    /// W.9.1b pattern: add a new variant to `HamtEntryWire` (cf. `FileV2`).
+    /// Do NOT append a field with `serde(default)` and assume backward-compat.
     #[serde(default)]
     min_version: u8,
+}
+
+/// Walkable-v8 (W.9.1b) variant of [`FileEntryWire`].
+///
+/// Mirrors `FileEntryWire` field-for-field PLUS a `storage_cid: Option<Cid>`
+/// hint for the encrypted chunk/object blob. Selected by [`HamtEntryWire`]'s
+/// variant tag dispatch (variant 2 = `FileV2`), NOT by appending a field to
+/// `FileEntryWire` — postcard 1.x does not honor `#[serde(default)]` for
+/// missing trailing struct fields (it errors with `DeserializeUnexpectedEnd`
+/// rather than substituting the default), so struct field-append is unsafe
+/// for backward compatibility. Enum-variant dispatch is the only postcard-safe
+/// pattern; this mirrors `PointerWire::LinkV2` in `wnfs_hamt::pointer` (W.9.1a).
+///
+/// Until W.9.3 wires the writer to capture chunk CIDs from S3BlobBackend's
+/// PUT response, the writer continues to emit [`HamtEntryWire::File`]
+/// (variant 0). `FileEntryWireV2` is type plumbing only at this stage.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FileEntryWireV2 {
+    path: String,
+    storage_key: String,
+    size: u64,
+    content_type: Option<String>,
+    created_at: i64,
+    modified_at: i64,
+    content_hash: Option<String>,
+    user_metadata: BTreeMap<String, String>,
+    encrypted: bool,
+    /// No `#[serde(default)]` here: `FileEntryWireV2` is the W.9.1b-introduced
+    /// variant and was never emitted without `min_version`. Postcard does not
+    /// honor `serde(default)` on missing trailing fields anyway (see the
+    /// audit note on `FileEntryWire::min_version`); leaving it off makes
+    /// the postcard contract explicit — every field of every variant is
+    /// required at the wire level, no exceptions.
+    min_version: u8,
+    /// CID hint for the encrypted chunk/object blob, populated from master's
+    /// PUT-response ETag. `Some(_)` here is the trigger for emitting variant
+    /// 2 (`FileV2`) on the wire; `None` falls back to legacy variant 0
+    /// (`File`) so that v7 SDKs can still read the leaf.
+    storage_cid: Option<Cid>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -142,6 +224,44 @@ impl From<FileEntryWire> for ForestFileEntry {
             user_metadata: w.user_metadata.into_iter().collect::<HashMap<_, _>>(),
             encrypted: w.encrypted,
             min_version: w.min_version,
+            // Legacy wire never carried a CID hint.
+            storage_cid: None,
+        }
+    }
+}
+
+impl From<ForestFileEntry> for FileEntryWireV2 {
+    fn from(e: ForestFileEntry) -> Self {
+        Self {
+            path: e.path,
+            storage_key: e.storage_key,
+            size: e.size,
+            content_type: e.content_type,
+            created_at: e.created_at,
+            modified_at: e.modified_at,
+            content_hash: e.content_hash,
+            user_metadata: e.user_metadata.into_iter().collect(),
+            encrypted: e.encrypted,
+            min_version: e.min_version,
+            storage_cid: e.storage_cid,
+        }
+    }
+}
+
+impl From<FileEntryWireV2> for ForestFileEntry {
+    fn from(w: FileEntryWireV2) -> Self {
+        Self {
+            path: w.path,
+            storage_key: w.storage_key,
+            size: w.size,
+            content_type: w.content_type,
+            created_at: w.created_at,
+            modified_at: w.modified_at,
+            content_hash: w.content_hash,
+            user_metadata: w.user_metadata.into_iter().collect::<HashMap<_, _>>(),
+            encrypted: w.encrypted,
+            min_version: w.min_version,
+            storage_cid: w.storage_cid,
         }
     }
 }
@@ -175,6 +295,20 @@ impl From<DirEntryWire> for ForestDirectoryEntry {
 impl From<HamtEntry> for HamtEntryWire {
     fn from(e: HamtEntry) -> Self {
         match e {
+            // Walkable-v8 (W.9.1b) writer dispatch: files with a stamped
+            // `storage_cid` emit variant 2 (`FileV2`); files without
+            // continue to emit variant 0 (`File`) byte-identically to v7.
+            //
+            // For W.9.1b foundational scope the upstream call sites do NOT
+            // populate `storage_cid` — that's W.9.3's writer integration —
+            // so this dispatch always falls through to the legacy variant
+            // in production today. The load-bearing property: existing v7
+            // SDKs reading buckets written by post-W.9.1b SDKs see
+            // byte-identical wire bytes until W.9.3 ships, preserving
+            // backward compat throughout the SDK adoption window.
+            HamtEntry::File(f) if f.storage_cid.is_some() => {
+                HamtEntryWire::FileV2(f.into())
+            }
             HamtEntry::File(f) => HamtEntryWire::File(f.into()),
             HamtEntry::Dir(d) => HamtEntryWire::Dir(d.into()),
         }
@@ -186,6 +320,7 @@ impl From<HamtEntryWire> for HamtEntry {
         match w {
             HamtEntryWire::File(f) => HamtEntry::File(f.into()),
             HamtEntryWire::Dir(d) => HamtEntry::Dir(d.into()),
+            HamtEntryWire::FileV2(f) => HamtEntry::File(f.into()),
         }
     }
 }
@@ -512,9 +647,19 @@ impl ShardedHamtPrivateForest {
                 return;
             }
         }
+        // Walkable-v8 (#52): recover the CID from the etag string when
+        // possible. Master returns `cid.to_string()` as the etag for
+        // v8 page PUTs, so a successful parse is the same trustworthy
+        // CID the W.9.3 writer would have stamped. Failure (legacy
+        // etag, malformed string) falls through to None — the warm
+        // cache + storage_key path covers reads in that case. Inline
+        // here rather than depending on fula-client's
+        // `walkable_v8::cid_hint_from_manifest_field_or_etag` because
+        // fula-crypto sits below fula-client in the dep graph.
+        let cid: Option<cid::Cid> = etag.as_deref().and_then(|s| s.parse().ok());
         self.manifest.root.page_index.insert(
             page_id,
-            crate::private_forest::PageRef { etag, seq },
+            crate::private_forest::PageRef { etag, seq, cid },
         );
     }
 
@@ -536,8 +681,18 @@ impl ShardedHamtPrivateForest {
                 return;
             }
         }
+        // Walkable-v8 (#52): recover dir_index_cid from the etag
+        // string when possible. Same etag-as-`cid.to_string()`
+        // contract the W.9.3 writer establishes; the W.9.4 reader's
+        // `cid_hint_from_manifest_field_or_etag` precedence holds —
+        // explicit `dir_index_cid` would still take priority on the
+        // read path (this just keeps the etag-fallback usable across
+        // a master-divergence reconcile instead of silently going to
+        // None).
+        let cid: Option<cid::Cid> = etag.as_deref().and_then(|s| s.parse().ok());
         self.manifest.root.dir_index_etag = etag;
         self.manifest.root.dir_index_seq = Some(seq);
+        self.manifest.root.dir_index_cid = cid;
     }
 
     /// O(1) list of immediate subdirectories beneath `dir_path`, answered
@@ -656,7 +811,20 @@ impl ShardedHamtPrivateForest {
             }
             Some(root_key) => {
                 let store = self.reader_store_for(shard_idx, backend);
-                let node: ForestHamt = Node::load(&root_key, &store).await?;
+                // Walkable-v8 (W.9.4): forward `manifest.shard.root_cid`
+                // as the cid hint when present so a master-down read of
+                // the shard root engages the gateway race. `None` (a
+                // legacy v7 manifest, or a manifest written when the
+                // writer flag was off) falls through to the
+                // storage-key path. The returned plaintext is still
+                // verified via `V7NodeStore::decrypt_and_verify`'s
+                // recompute-vs-key check, so a malicious manifest that
+                // pointed at the right cid but the wrong storage_key
+                // would be rejected here.
+                let root_cid = self.manifest.shard(shard_idx).root_cid;
+                let node: ForestHamt =
+                    Node::load_with_cid_hint(&root_key, root_cid.as_ref(), &store)
+                        .await?;
                 *guard = LoadedShard::Loaded(Arc::new(node));
             }
         }
@@ -823,13 +991,17 @@ impl ShardedHamtPrivateForest {
         // `get_directory("/a")` resolves after a single
         // `upsert_file("/a/b/c.txt")`.
         let had_dir = prior_dir.is_some();
+        // #72: do NOT append `file_path` to `d.files` — that field is the
+        // 1 MiB single-directory cliff (a flat photo library with 100k+
+        // files grew the Dir blob to 1.66 MiB and broke offline reads).
+        // `dir.files` is no longer the source of truth for "which files
+        // live in this directory"; the listing methods (`list_directory`,
+        // `list_subtree`) walk the HAMT for `F:` entries and filter by
+        // parent prefix. Legacy buckets with populated `dir.files`
+        // continue to deserialize fine; the new walk-based listing
+        // returns the same set whether the field is populated or empty.
         let new_dir_entry: ForestDirectoryEntry = match prior_dir.map(HamtEntry::from) {
-            Some(HamtEntry::Dir(mut d)) => {
-                if !d.files.contains(&file_path) {
-                    d.files.push(file_path.clone());
-                }
-                d
-            }
+            Some(HamtEntry::Dir(d)) => d,
             Some(HamtEntry::File(_)) => {
                 return Err(CryptoError::Hamt(format!(
                     "directory key D:{} resolved to a File entry — type-tagged HAMT invariant violated",
@@ -838,7 +1010,7 @@ impl ShardedHamtPrivateForest {
             }
             None => ForestDirectoryEntry {
                 path: parent.clone(),
-                files: vec![file_path.clone()],
+                files: Vec::new(),
                 subdirs: Vec::new(),
                 metadata: None,
                 subtree_dek: None,
@@ -907,6 +1079,15 @@ impl ShardedHamtPrivateForest {
         entry: ForestDirectoryEntry,
         backend: &Arc<B>,
     ) -> Result<()> {
+        // #72: strip `files` before writing. v1→v7 migration carries v1's
+        // populated `dir.files` into v7 verbatim today; that's the path
+        // that creates the 1 MiB cliff for migrated buckets where v1 had
+        // 100k+ files in one directory. v7's listing methods walk the
+        // HAMT for `F:` entries (which the migration's separate
+        // `upsert_file` loop populates), so `dir.files` is dead weight.
+        // Other fields (path, subdirs, metadata, subtree_dek) preserve.
+        let mut entry = entry;
+        entry.files = Vec::new();
         let dir_path = entry.path.clone();
         let shard_idx = self.shard_for_dir(&dir_path);
         self.ensure_shard_loaded(shard_idx, backend).await?;
@@ -1093,8 +1274,10 @@ impl ShardedHamtPrivateForest {
         }
     }
 
-    /// Fetch a directory entry by path. Used by listing callers to walk the
-    /// `files: Vec<String>` / `subdirs: Vec<String>` children in parallel.
+    /// Fetch a directory entry by path. Returns the `ForestDirectoryEntry`
+    /// with its `subdirs` vector populated; `files` is empty on post-#72
+    /// buckets — callers should use [`Self::list_directory`] for the file
+    /// children, which walks the HAMT directly.
     pub async fn get_directory<B: BlobBackend + 'static>(
         &self,
         dir_path: &str,
@@ -1125,65 +1308,54 @@ impl ShardedHamtPrivateForest {
     }
 
     /// List direct children of a directory as `ForestFileEntry` values. Only
-    /// the owning shard is touched (dir-local routing); HAMT lookups for
-    /// each child are independent and can be issued in parallel by a
-    /// higher-level caller if desired.
+    /// the owning shard is touched (dir-local routing).
+    ///
+    /// **#72 (2026-05-09)**: walks the dir's outer-shard HAMT for `F:`
+    /// entries and filters by `parent_dir_of(file.path) == normalized`,
+    /// rather than reading `dir.files` (which is no longer populated
+    /// post-#72). Eliminates the 1 MiB single-directory cliff at
+    /// 60-100k files in one folder. Cost is O(entries in this outer
+    /// shard) — under dir-local routing the upper bound is the count
+    /// of files belonging to this directory plus any other dirs that
+    /// happen to outer-shard-collide with it (typically small). The
+    /// trade-off vs. the prior O(K direct children) approach is
+    /// acceptable: production fula-client listing already walks the
+    /// HAMT this way (`list_recursive_page`), and the prior approach
+    /// hit the cliff at K ≥ ~60k anyway.
     pub async fn list_directory<B: BlobBackend + 'static>(
         &self,
         dir_path: &str,
         backend: &Arc<B>,
     ) -> Result<Vec<ForestFileEntry>> {
-        let dir_entry = self.get_directory(dir_path, backend).await?;
-        let children = match dir_entry {
-            Some(d) => d.files,
-            None => return Ok(Vec::new()),
-        };
+        let normalized = normalize_dir_path(dir_path);
+        let shard_idx = self.shard_for_dir(&normalized);
+        self.ensure_shard_loaded(shard_idx, backend).await?;
 
-        // Every child of `dir` hashes into the same shard, so we can reuse
-        // the reader we already primed.
-        let shard_idx = self.shard_for_dir(&normalize_dir_path(dir_path));
         let reader = self.reader_store_for(shard_idx, backend);
-
         let guard = self.loaded_shards[shard_idx].read().await;
         match &*guard {
-            LoadedShard::NotLoaded => unreachable!("get_directory loaded this above"),
-            LoadedShard::LoadedEmpty => {
-                // Shard loaded empty but we found a dir entry — impossible,
-                // but handle gracefully.
-                Ok(Vec::new())
-            }
+            LoadedShard::NotLoaded => unreachable!("ensure_shard_loaded above"),
+            LoadedShard::LoadedEmpty => Ok(Vec::new()),
             LoadedShard::Loaded(node) => {
-                // P-4a: parallelize the N independent child lookups.
-                // Each child hashes into the same shard (dir-local routing)
-                // but has an independent down-path; concurrent fetches
-                // overlap HTTP latency. `buffered` (not `buffer_unordered`)
-                // preserves the input order so callers observing the output
-                // sequence don't see reshuffled results.
-                use futures::stream::{self, StreamExt, TryStreamExt};
-                let node = Arc::clone(node);
-                let reader_ref = &reader;
-                let entries: Vec<Option<ForestFileEntry>> = stream::iter(children.into_iter())
-                    .map(|child| {
-                        let node = Arc::clone(&node);
-                        async move {
-                            let maybe = node.get(&file_key(&child), reader_ref).await?;
-                            // Silently skip type-mismatches here (a stale dir
-                            // entry pointing at a removed file is possible
-                            // across crashes and is not an integrity failure
-                            // of the HAMT itself).
-                            Ok::<Option<ForestFileEntry>, CryptoError>(maybe.and_then(|wire| {
-                                if let HamtEntry::File(f) = HamtEntry::from(wire) {
-                                    Some(f)
-                                } else {
-                                    None
-                                }
-                            }))
-                        }
-                    })
-                    .buffered(MAX_CONCURRENT_HAMT_SIBLINGS)
-                    .try_collect()
+                // Walk the shard's HAMT collecting File entries whose
+                // parent dir matches. Dir-local routing ensures every
+                // file under `normalized` lives in this single shard,
+                // so no cross-shard fan-out is needed.
+                let wires: Vec<HamtEntryWire> = node
+                    .flat_map(
+                        &|pair: &Pair<Vec<u8>, HamtEntryWire>| Ok(pair.value.clone()),
+                        &reader,
+                    )
                     .await?;
-                Ok(entries.into_iter().flatten().collect())
+                let mut out: Vec<ForestFileEntry> = Vec::new();
+                for wire in wires {
+                    if let HamtEntry::File(f) = HamtEntry::from(wire) {
+                        if parent_dir_of(&f.path) == normalized {
+                            out.push(f);
+                        }
+                    }
+                }
+                Ok(out)
             }
         }
     }
@@ -1478,78 +1650,58 @@ impl ShardedHamtPrivateForest {
         Ok((out, next_cursor))
     }
 
-    /// Collect every file and directory under `prefix` by walking the
-    /// directory graph, not by scanning every shard.
+    /// Collect every file and directory whose path lies under `prefix`.
     ///
-    /// This is the shard-local alternative to [`Self::list_recursive`] (which
-    /// calls `list_all_files` and filters by path prefix, touching every
-    /// shard regardless of how localized the prefix is). The walker starts
-    /// at `prefix`, follows its `subdirs` list to descendants, and fetches
-    /// each directory's direct files in parallel. Cost is O(entries under
-    /// prefix), bounded by the number of subtree shards — not by the global
-    /// shard count.
+    /// **#72 (2026-05-09)**: rewritten to walk every shard's HAMT and
+    /// filter by path prefix, replacing the prior BFS-via-`dir.files`
+    /// walker. `dir.files` is no longer populated post-#72 (single-dir
+    /// 1 MiB cliff fix) so the BFS-via-`dir.files` approach would
+    /// return empty results on new buckets. The new approach matches
+    /// the cost characteristic of `extract_subtree` (already used
+    /// `collect_all_entries` + prefix-filter for the same reason).
     ///
-    /// Returns `(files, directories)`. The root directory (at `prefix`) is
-    /// included in `directories` if it exists. Stale subdir entries that
-    /// resolve to `None` are silently skipped (consistent with the
-    /// idempotency-on-remove documentation near the type definition).
-    ///
-    /// Order inside each return vec mirrors a BFS traversal of the subtree.
+    /// Returns `(files, directories)`. The root directory (at `prefix`)
+    /// is included in `directories` if it exists. Cost is O(N total
+    /// entries in bucket) regardless of how localized the prefix is —
+    /// trade-off accepted because (a) `list_subtree` was already not on
+    /// any hot path, (b) the alternative (sharded `dir.files`) is
+    /// ~600 LOC of wire-format work for the same correctness.
     pub async fn list_subtree<B: BlobBackend + 'static>(
         &self,
         prefix: &str,
         backend: &Arc<B>,
     ) -> Result<(Vec<ForestFileEntry>, Vec<ForestDirectoryEntry>)> {
-        use futures::stream::{self, StreamExt, TryStreamExt};
+        let normalized_prefix = normalize_dir_path(prefix);
+        let all = self.collect_all_entries(backend).await?;
 
         let mut files_out: Vec<ForestFileEntry> = Vec::new();
         let mut dirs_out: Vec<ForestDirectoryEntry> = Vec::new();
-        let mut queue: VecDeque<String> = VecDeque::new();
-        queue.push_back(normalize_dir_path(prefix));
 
-        while let Some(dir_path) = queue.pop_front() {
-            let Some(dir_entry) = self.get_directory(&dir_path, backend).await? else {
-                continue;
-            };
-
-            for sub in &dir_entry.subdirs {
-                queue.push_back(sub.clone());
+        // Match semantics of the prior BFS walker: a path is "under
+        // prefix" if it equals prefix OR starts with `prefix + "/"`.
+        // Pure `starts_with(prefix)` would over-match (e.g., prefix
+        // "/photos" would match "/photos2024"). Treat root specially —
+        // every path is under "/".
+        let is_under_prefix = |path: &str| -> bool {
+            if normalized_prefix == "/" {
+                return true;
             }
+            path == normalized_prefix || path.starts_with(&format!("{}/", normalized_prefix))
+        };
 
-            // Fetch this directory's direct files in parallel. Reuses
-            // dir-local routing: every child path hashes into the same shard
-            // as `dir_path`, so we reuse one reader.
-            let shard_idx = self.shard_for_dir(&dir_path);
-            let reader = self.reader_store_for(shard_idx, backend);
-            let guard = self.loaded_shards[shard_idx].read().await;
-            if let LoadedShard::Loaded(node) = &*guard {
-                let node = Arc::clone(node);
-                let reader_ref = &reader;
-                let children = dir_entry.files.clone();
-                let fs: Vec<Option<ForestFileEntry>> = stream::iter(children.into_iter())
-                    .map(|child| {
-                        let node = Arc::clone(&node);
-                        async move {
-                            let maybe = node.get(&file_key(&child), reader_ref).await?;
-                            Ok::<Option<ForestFileEntry>, CryptoError>(maybe.and_then(
-                                |wire| {
-                                    if let HamtEntry::File(f) = HamtEntry::from(wire) {
-                                        Some(f)
-                                    } else {
-                                        None
-                                    }
-                                },
-                            ))
-                        }
-                    })
-                    .buffered(MAX_CONCURRENT_HAMT_SIBLINGS)
-                    .try_collect()
-                    .await?;
-                files_out.extend(fs.into_iter().flatten());
+        for entry in all {
+            match entry {
+                HamtEntry::File(f) => {
+                    if is_under_prefix(&f.path) {
+                        files_out.push(f);
+                    }
+                }
+                HamtEntry::Dir(d) => {
+                    if is_under_prefix(&d.path) {
+                        dirs_out.push(d);
+                    }
+                }
             }
-            drop(guard);
-
-            dirs_out.push(dir_entry);
         }
 
         Ok((files_out, dirs_out))
@@ -1643,7 +1795,19 @@ impl ShardedHamtPrivateForest {
                 backend.clone(),
             );
 
-            let new_root = {
+            // Walkable-v8 (W.9.3): we surface BOTH the storage_key (used
+            // by master-S3 reads + the conditional-PUT story) AND the
+            // master-attested CID (used by W.9.4's offline gateway race).
+            // `cid` is `Some` only when the BlobBackend's `put` returned
+            // one (i.e. master S3 with `walkable_v8_writer_enabled = true`
+            // and a verified ETag); `None` for in-memory test backends,
+            // for writes under the v0.5 default-off mode, or when the
+            // master-attested CID failed self-verify against
+            // `BLAKE3(ciphertext)`. The two are stamped together so a
+            // future flush that doesn't change this shard preserves the
+            // pair atomically (next-flush logic only updates a shard's
+            // `root` + `root_cid` when its dirty flag is set).
+            let (new_root, new_root_cid) = {
                 let guard = self.loaded_shards[idx].read().await;
                 match &*guard {
                     LoadedShard::NotLoaded => {
@@ -1652,18 +1816,21 @@ impl ShardedHamtPrivateForest {
                             idx
                         )));
                     }
-                    LoadedShard::LoadedEmpty => None,
+                    LoadedShard::LoadedEmpty => (None, None),
                     LoadedShard::Loaded(node) => {
                         if node.is_empty() {
-                            None
+                            (None, None)
                         } else {
-                            Some(node.store(&store).await?)
+                            let result = node.store(&store).await?;
+                            (Some(result.storage_key), result.cid)
                         }
                     }
                 }
             };
 
-            self.manifest.shard_mut(idx).root = new_root;
+            let shard = self.manifest.shard_mut(idx);
+            shard.root = new_root;
+            shard.root_cid = new_root_cid;
             self.dirty_shards[idx] = false;
         }
         self.manifest.touch();
@@ -1698,6 +1865,7 @@ mod tests {
             user_metadata: Default::default(),
             encrypted: true,
             min_version: 0,
+            storage_cid: None,
         }
     }
 
@@ -1740,9 +1908,14 @@ mod tests {
         let leaf_shard_2 = forest.shard_for_file("/x/y/two.txt");
         assert_eq!(leaf_shard_1, leaf_shard_2);
 
+        // #72: ForestDirectoryEntry.files is no longer populated;
+        // listing direct children goes through `list_directory` which
+        // walks the dir's outer-shard HAMT for `F:` entries.
         let dir = forest.get_directory("/x/y", &backend).await.unwrap();
         let dir = dir.expect("parent directory must be materialized");
-        let mut got: HashSet<_> = dir.files.iter().cloned().collect();
+        assert_eq!(dir.path, "/x/y");
+        let listing = forest.list_directory("/x/y", &backend).await.unwrap();
+        let mut got: HashSet<_> = listing.iter().map(|f| f.path.clone()).collect();
         let want: HashSet<_> = ["/x/y/one.txt".to_string(), "/x/y/two.txt".to_string()]
             .into_iter()
             .collect();
@@ -2142,7 +2315,15 @@ mod tests {
             .unwrap()
             .expect("/a/b must exist after deep upsert");
         assert_eq!(leaf.path, "/a/b");
-        assert_eq!(leaf.files, vec!["/a/b/c.txt".to_string()]);
+        // #72: dir.files is no longer populated; verify via list_directory.
+        let leaf_files: Vec<String> = forest
+            .list_directory("/a/b", &backend)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(leaf_files, vec!["/a/b/c.txt".to_string()]);
         assert!(leaf.subdirs.is_empty());
 
         let mid = forest
@@ -2537,5 +2718,1665 @@ mod tests {
             assert!(pages < 1000, "pagination failed to terminate");
         }
         assert_eq!(seen.len(), total, "paginated walk must see every match");
+    }
+
+    // ========================================================================
+    // Walkable-v8 wire format tests (W.9.1b)
+    //
+    // The v8 chunk-CID hint goes through `HamtEntryWire`'s **enum-variant
+    // dispatch** (mirrors `PointerWire::LinkV2` in `wnfs_hamt::pointer`),
+    // NOT through field-append on `FileEntryWire`. This is the only
+    // postcard-safe approach: postcard 1.x does not honor `#[serde(default)]`
+    // for missing trailing struct fields (it errors with
+    // `DeserializeUnexpectedEnd` rather than substituting the default), so
+    // a struct field-append would break backward compat for every existing
+    // HAMT leaf the day W.9.3 ships. Enum-variant dispatch keeps v7 leaves
+    // byte-identical (variant tag 0 = `File`) while letting v8 writers emit
+    // `FileV2` (variant tag 2) when a CID hint is available.
+    //
+    // Pinned properties (mirror `pointer.rs::walkable_v8_wire_tests`):
+    //   1. `HamtEntryWire::FileV2` round-trips through postcard losslessly.
+    //   2. The `FileV2` variant index is the postcard tag `2` —
+    //      the value an old (v7-only) deserializer doesn't recognize.
+    //   3. A v7-only deserializer (`LegacyHamtEntryWire` with only File +
+    //      Dir variants) errors cleanly on a v8-format `FileV2` blob.
+    //   4. The v8 deserializer reads a v7-format `File` blob unchanged
+    //      (legacy data written pre-W.9.1b round-trips fine).
+    //   5. **Load-bearing backward-compat**: `From<HamtEntry> for
+    //      HamtEntryWire` produces byte-identical output for a
+    //      `ForestFileEntry { storage_cid: None, .. }` as it did before
+    //      W.9.1b. Without this property, every existing v7 SDK reader
+    //      would break the day post-W.9.1b code lands.
+    // ========================================================================
+
+    fn walkable_v8_test_cid(seed: u8) -> cid::Cid {
+        let digest = [seed; 32];
+        let mh = cid::multihash::Multihash::<64>::wrap(0x1e, &digest)
+            .expect("BLAKE3 multihash wrap");
+        cid::Cid::new_v1(0x55, mh)
+    }
+
+    fn fixture_forest_file_entry(path: &str, storage_cid: Option<cid::Cid>) -> ForestFileEntry {
+        ForestFileEntry {
+            path: path.to_string(),
+            storage_key: format!("Qm{}", hex::encode(blake3::hash(path.as_bytes()).as_bytes())),
+            size: 1024,
+            content_type: Some("text/plain".to_string()),
+            created_at: 1,
+            modified_at: 2,
+            content_hash: Some("blake3:...".to_string()),
+            user_metadata: HashMap::new(),
+            encrypted: true,
+            min_version: 4,
+            storage_cid,
+        }
+    }
+
+    #[test]
+    fn hamt_entry_wire_file_legacy_round_trips_via_postcard_variant_0() {
+        let entry = fixture_forest_file_entry("/legacy.bin", None);
+        let wire: HamtEntryWire = HamtEntry::File(entry.clone()).into();
+        let encoded = postcard::to_allocvec(&wire).expect("encode");
+        // Legacy variant must be `File` (tag 0). Postcard writes the variant
+        // index as the leading byte for small tags.
+        assert_eq!(encoded[0], 0, "legacy File variant must be index 0");
+        let decoded: HamtEntryWire = postcard::from_bytes(&encoded).expect("decode");
+        match decoded {
+            HamtEntryWire::File(_) => {}
+            other => panic!("expected File variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn hamt_entry_wire_file_v2_round_trips_via_postcard_variant_2() {
+        let cid = walkable_v8_test_cid(0xAB);
+        let entry = fixture_forest_file_entry("/v8.bin", Some(cid));
+        let wire: HamtEntryWire = HamtEntry::File(entry.clone()).into();
+        let encoded = postcard::to_allocvec(&wire).expect("encode");
+        // FileV2 must be variant 2 — this is the load-bearing
+        // forward-incompat dispatch byte. v7-only HamtEntryWire decoders
+        // (only File=0, Dir=1) error cleanly on tag 2.
+        assert_eq!(
+            encoded[0], 2,
+            "FileV2 must be variant 2 in the wire format — do not change this. \
+             A v7-only HamtEntryWire deserializer relies on tag 2 being \
+             unknown to surface a typed error rather than corrupting state."
+        );
+        let decoded: HamtEntryWire = postcard::from_bytes(&encoded).expect("decode");
+        match decoded {
+            HamtEntryWire::FileV2(f2) => {
+                assert_eq!(f2.storage_cid, Some(cid));
+                assert_eq!(f2.path, "/v8.bin");
+                assert_eq!(f2.min_version, 4);
+            }
+            other => panic!("expected FileV2 variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn hamt_entry_wire_from_forest_file_entry_with_none_cid_emits_legacy_variant() {
+        // LOAD-BEARING BACKWARD-COMPAT (W.4.3 hard-constraint #1).
+        //
+        // For W.9.1b's foundational scope the writer NEVER stamps a CID
+        // (W.9.3 wires that). All production writes have
+        // `storage_cid = None` and MUST emit variant 0 (`File`) byte-
+        // identically to v7 so that v7 SDKs continue reading the bucket
+        // through the entire SDK-adoption window. If this dispatch ever
+        // accidentally picks variant 2 for a None CID, every existing v7
+        // reader breaks the day post-W.9.1b code lands.
+        let entry = fixture_forest_file_entry("/no-cid.bin", None);
+        let wire_v8: HamtEntryWire = HamtEntry::File(entry.clone()).into();
+        let v8_bytes = postcard::to_allocvec(&wire_v8).expect("encode v8");
+        assert_eq!(
+            v8_bytes[0], 0,
+            "ForestFileEntry with storage_cid=None MUST emit variant 0 (File), \
+             NOT variant 2 (FileV2). Otherwise v7 SDKs break."
+        );
+
+        // And the bytes must match exactly what an SDK without W.9.1b
+        // changes would have emitted. Construct that simulated-legacy emit
+        // by going `HamtEntry → HamtEntryWire::File(FileEntryWire)`
+        // explicitly, encode, and compare.
+        let wire_legacy_explicit = HamtEntryWire::File(FileEntryWire {
+            path: "/no-cid.bin".to_string(),
+            storage_key: format!(
+                "Qm{}",
+                hex::encode(blake3::hash("/no-cid.bin".as_bytes()).as_bytes())
+            ),
+            size: 1024,
+            content_type: Some("text/plain".to_string()),
+            created_at: 1,
+            modified_at: 2,
+            content_hash: Some("blake3:...".to_string()),
+            user_metadata: BTreeMap::new(),
+            encrypted: true,
+            min_version: 4,
+        });
+        let legacy_bytes =
+            postcard::to_allocvec(&wire_legacy_explicit).expect("encode legacy");
+        assert_eq!(
+            v8_bytes, legacy_bytes,
+            "v8 SDK emit for None-CID entry must be byte-identical to v7 emit"
+        );
+    }
+
+    /// A v7-only enum (only File + Dir variants) — simulates a v0.5-or-earlier
+    /// SDK that has never been recompiled to know about `FileV2`. Reading a
+    /// v8-format `FileV2` blob into this enum must produce a typed error.
+    #[derive(Debug, Serialize, Deserialize)]
+    enum LegacyHamtEntryWire {
+        File(FileEntryWire),
+        Dir(DirEntryWire),
+    }
+
+    #[test]
+    fn legacy_v7_decoder_errors_on_v8_file_v2_blob() {
+        let cid = walkable_v8_test_cid(0xCD);
+        let entry = fixture_forest_file_entry("/forward-incompat.bin", Some(cid));
+        let wire_v8: HamtEntryWire = HamtEntry::File(entry).into();
+        let encoded = postcard::to_allocvec(&wire_v8).expect("encode v8");
+        // Sanity check: the FileV2 dispatch fired and we have a variant-2
+        // blob to feed to the legacy decoder.
+        assert_eq!(encoded[0], 2, "fixture must produce v8 FileV2 blob");
+
+        let result: std::result::Result<LegacyHamtEntryWire, _> =
+            postcard::from_bytes(&encoded);
+        assert!(
+            result.is_err(),
+            "v7-only HamtEntryWire deserializer must error on v8 FileV2 blob \
+             (forward-incompatibility boundary), got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn v8_decoder_reads_legacy_v7_file_blob() {
+        // A v7 SDK encoded a `File(FileEntryWire)` blob. A v8 SDK reading
+        // the same bucket must decode it identically — no upgrade-on-read,
+        // legacy data stays accessible until the user happens to write to
+        // it (W.4.2: lazy migration on next write).
+        let v7_blob = LegacyHamtEntryWire::File(FileEntryWire {
+            path: "/v7.bin".to_string(),
+            storage_key: "QmV7".to_string(),
+            size: 100,
+            content_type: None,
+            created_at: 0,
+            modified_at: 0,
+            content_hash: None,
+            user_metadata: BTreeMap::new(),
+            encrypted: true,
+            min_version: 4,
+        });
+        let encoded = postcard::to_allocvec(&v7_blob).expect("encode v7");
+        assert_eq!(encoded[0], 0, "v7 File blob must use variant 0");
+
+        let decoded: HamtEntryWire = postcard::from_bytes(&encoded)
+            .expect("v8 decoder must read v7 File blob");
+        match decoded {
+            HamtEntryWire::File(f) => {
+                assert_eq!(f.path, "/v7.bin");
+                assert_eq!(f.storage_key, "QmV7");
+                assert_eq!(f.min_version, 4);
+            }
+            other => panic!("expected File variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn forest_file_entry_to_file_entry_wire_v2_preserves_storage_cid_both_directions() {
+        // The two-way conversion at the FileEntryWireV2 boundary preserves
+        // every field including storage_cid. Mirrors the round-trip pattern
+        // in `pointer.rs::walkable_v8_wire_tests::child_ptr_stored_v2_full_pipeline_roundtrip`.
+        let cid = walkable_v8_test_cid(0x42);
+        let original = fixture_forest_file_entry("/x.bin", Some(cid));
+
+        let wire: FileEntryWireV2 = original.clone().into();
+        assert_eq!(wire.storage_cid, Some(cid));
+        assert_eq!(wire.storage_key, original.storage_key);
+        assert_eq!(wire.path, "/x.bin");
+
+        let recovered: ForestFileEntry = wire.into();
+        assert_eq!(recovered.storage_cid, Some(cid));
+        assert_eq!(recovered.path, original.path);
+        assert_eq!(recovered.encrypted, true);
+        assert_eq!(recovered.min_version, 4);
+    }
+
+    #[test]
+    fn file_entry_wire_legacy_to_forest_file_entry_yields_none_storage_cid() {
+        // The legacy `FileEntryWire` (no storage_cid) → `ForestFileEntry`
+        // conversion produces `storage_cid = None`. This is what fires when
+        // a v8 SDK reads a v7-format `HamtEntryWire::File` leaf — the
+        // backward-compat path through `From<FileEntryWire> for ForestFileEntry`.
+        let wire = FileEntryWire {
+            path: "/legacy.bin".to_string(),
+            storage_key: "QmLegacy".to_string(),
+            size: 42,
+            content_type: None,
+            created_at: 0,
+            modified_at: 0,
+            content_hash: None,
+            user_metadata: BTreeMap::new(),
+            encrypted: true,
+            min_version: 4,
+        };
+        let entry: ForestFileEntry = wire.into();
+        assert_eq!(entry.storage_cid, None);
+        assert_eq!(entry.path, "/legacy.bin");
+        assert_eq!(entry.storage_key, "QmLegacy");
+    }
+
+    // ========================================================================
+    // Walkable-v8 writer integration tests (W.9.3)
+    //
+    // These tests pin the END-TO-END writer wiring: a v8-aware backend
+    // surfaces a CID in `BlobPutResult.cid`, the HAMT cascade in
+    // `node.rs`/`pointer.rs`/`sharded_hamt_forest.rs` propagates it
+    // through `NodePutResult`, and the manifest's per-shard `root_cid`
+    // gets stamped. A v8 reader (W.9.4) will then walk via those CIDs.
+    //
+    // Without these tests the W.9.3 wiring could silently regress —
+    // the unit tests in `pointer.rs` and `private_forest.rs` cover
+    // each layer in isolation, but only the integration test here
+    // exercises the full v8 cascade against a real HAMT.
+    // ========================================================================
+
+    /// In-memory backend that emulates master S3's walkable-v8 contract:
+    /// every PUT records `BLAKE3(ciphertext)` raw-codec as the returned
+    /// CID. Real master computes this via kubo's `block/put?cid-codec=
+    /// raw&mhtype=blake3` (see `crates/fula-cli/src/handlers/object.rs:
+    /// 103-137`); this fake implements the same contract so the SDK
+    /// can be tested end-to-end without a wiremock harness.
+    ///
+    /// Captures every PUT (`path -> ciphertext`) so the test can later
+    /// assert the parent's pointer plaintext references each child
+    /// with the correct CID.
+    struct CidCapturingBackend {
+        objects: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    }
+
+    impl CidCapturingBackend {
+        fn new() -> Self {
+            Self {
+                objects: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        fn get_sync(&self, path: &str) -> Option<Vec<u8>> {
+            self.objects.lock().unwrap().get(path).cloned()
+        }
+
+        /// Build the same v1 raw-codec BLAKE3-multihash CID master would
+        /// emit on PUT for these bytes. This is the contract every
+        /// walkable-v8-enabled BlobBackend exposes: `cid.to_string()` is
+        /// what master returns in the ETag header.
+        fn cid_for(bytes: &[u8]) -> cid::Cid {
+            let h = blake3::hash(bytes);
+            let mh = cid::multihash::Multihash::<64>::wrap(0x1e, h.as_bytes())
+                .expect("blake3 multihash wrap");
+            cid::Cid::new_v1(0x55, mh)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::wnfs_hamt::v7_store::BlobBackend for CidCapturingBackend {
+        async fn get(&self, path: &str) -> Result<Vec<u8>> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::CryptoError::Hamt(format!("v8 fake: object not found: {}", path))
+                })
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            bytes: Vec<u8>,
+        ) -> Result<crate::wnfs_hamt::v7_store::BlobPutResult> {
+            let cid = Self::cid_for(&bytes);
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), bytes);
+            Ok(crate::wnfs_hamt::v7_store::BlobPutResult { cid: Some(cid) })
+        }
+    }
+
+    #[tokio::test]
+    async fn walkable_v8_writer_e2e_stamps_shard_root_cid_matching_ciphertext_hash() {
+        // Goal: end-to-end check that when the BlobBackend returns a
+        // CID for every PUT (= walkable-v8-enabled writer), the flush
+        // stamps `manifest.shards[i].root_cid` to a value that matches
+        // BLAKE3(ciphertext) of the actual stored bytes. Failure here
+        // would mean either:
+        //   - sharded_hamt_forest's flush_dirty doesn't propagate the
+        //     CID into root_cid (regressing W.9.3-C), OR
+        //   - the BlobPutResult plumbing through NodePutResult drops
+        //     the CID somewhere (regressing W.9.2's seam).
+        let backend = std::sync::Arc::new(CidCapturingBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-w8", test_dek(), 16);
+
+        // Spread enough entries that at least one shard ends up with a
+        // populated root. 256 keys with 16 shards is ~16 entries per
+        // shard on average — well past the singleton-bucket threshold.
+        for i in 0..32u64 {
+            forest
+                .upsert_file(
+                    file_entry(&format!("/v8/file-{:03}.bin", i), i),
+                    &backend,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Flush. After this the manifest should carry root_cid hints on
+        // every populated shard.
+        let manifest = forest.flush_dirty(&backend).await.unwrap().clone();
+
+        // Find populated shards. With CidCapturingBackend, every shard
+        // that flushed a non-empty root MUST also carry a Some(cid).
+        let mut populated_count = 0usize;
+        for (_idx, shard) in manifest.shards_iter().enumerate() {
+            if shard.root.is_some() {
+                populated_count += 1;
+                assert!(
+                    shard.root_cid.is_some(),
+                    "walkable-v8 writer wired: every populated shard must \
+                     have its root_cid stamped (W.9.3 — sharded_hamt_forest::\
+                     flush_dirty propagates BlobPutResult.cid into root_cid)"
+                );
+            } else {
+                assert!(
+                    shard.root_cid.is_none(),
+                    "empty shard must not carry a stale root_cid hint"
+                );
+            }
+        }
+        assert!(
+            populated_count > 0,
+            "test setup invalid: no shard got populated"
+        );
+    }
+
+    #[tokio::test]
+    async fn walkable_v8_writer_e2e_internal_node_pointers_use_link_v2() {
+        // Goal: end-to-end check that internal HAMT nodes (parents of
+        // mutated children) emit `PointerWire::LinkV2` on their child
+        // pointers when the BlobBackend returns CIDs. Loads the shard
+        // root's plaintext from the backend, decrypts, and decodes the
+        // wire form; asserts at least one `LinkV2` variant appears in
+        // a parent that has a mutated subtree.
+        //
+        // This test exercises the load-bearing assertion of W.9.3-C:
+        // the InMemory arm at pointer.rs:243 emits LinkV2 when
+        // result.cid is Some. Without it the wire format would still
+        // be all-`Link`, breaking offline walks.
+        use crate::wnfs_hamt::store::HamtNodeStore;
+        let backend = std::sync::Arc::new(CidCapturingBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-w8b", test_dek(), 16);
+
+        // Enough entries to force at least one shard to grow past a
+        // single-leaf bucket and produce internal nodes.
+        for i in 0..64u64 {
+            forest
+                .upsert_file(
+                    file_entry(&format!("/deep/{:03}.bin", i), i),
+                    &backend,
+                )
+                .await
+                .unwrap();
+        }
+        let manifest = forest.flush_dirty(&backend).await.unwrap().clone();
+
+        // Find a populated shard whose root has at least one child
+        // pointer (indicating an internal node exists in the cascade).
+        let mut found_link_v2 = false;
+        for (idx, shard) in manifest.shards_iter().enumerate() {
+            if shard.root.is_none() {
+                continue;
+            }
+            // Decrypt the root node and inspect its wire form. Use the
+            // same V7NodeStore the writer used so AAD matches.
+            let store = crate::wnfs_hamt::v7_store::V7NodeStore::new(
+                "bucket-w8b",
+                idx as u16,
+                manifest.shard_salt().to_vec(),
+                test_dek(),
+                backend.clone(),
+            );
+            let plaintext = store
+                .get_node(&shard.root.unwrap())
+                .await
+                .expect("root node must decrypt under the writer's DEK");
+
+            // `plaintext` is `postcard(NodeWire { bitmask, pointers })`.
+            // Decode and walk the pointers list looking for `LinkV2`.
+            #[derive(serde::Deserialize)]
+            struct NodeWireInspect<K, V> {
+                #[allow(dead_code)]
+                bitmask: u16,
+                pointers: Vec<crate::wnfs_hamt::pointer::PointerWire<K, V>>,
+            }
+            let wire: NodeWireInspect<Vec<u8>, HamtEntryWire> =
+                postcard::from_bytes(&plaintext).expect("decode root wire");
+            for ptr in &wire.pointers {
+                if let crate::wnfs_hamt::pointer::PointerWire::LinkV2 { storage_key, cid } =
+                    ptr
+                {
+                    found_link_v2 = true;
+                    // Belt-and-suspenders: the CID embedded in the
+                    // pointer should match BLAKE3 of the child's stored
+                    // ciphertext at this storage_key path.
+                    let child_path = format!(
+                        "{}{}",
+                        crate::wnfs_hamt::v7_store::V7_NODE_PREFIX,
+                        hex::encode(storage_key)
+                    );
+                    let child_bytes = backend
+                        .get_sync(&child_path)
+                        .expect("child blob must be persisted");
+                    let recomputed = CidCapturingBackend::cid_for(&child_bytes);
+                    assert_eq!(
+                        *cid, recomputed,
+                        "LinkV2.cid in parent's pointer plaintext must equal \
+                         BLAKE3(child's ciphertext) — without this guarantee, \
+                         W.9.4's gateway-race walker would fetch the wrong \
+                         bytes for this child"
+                    );
+                }
+            }
+            // First populated shard with parent pointers is enough.
+            if found_link_v2 {
+                break;
+            }
+        }
+        assert!(
+            found_link_v2,
+            "no LinkV2 variant found in any flushed shard root — the writer \
+             cascade either short-circuited (every shard has only a single-leaf \
+             bucket) or pointer.rs's InMemory arm is regressing back to legacy \
+             Link. Try increasing the entry count for this test, or check \
+             pointer.rs:to_wire."
+        );
+    }
+
+    #[tokio::test]
+    async fn walkable_v8_writer_e2e_in_memory_backend_keeps_link_legacy() {
+        // Negative control: with the default `InMemoryBackend` (which
+        // returns BlobPutResult::none()), the writer cascade MUST emit
+        // legacy `Link` only — no `LinkV2`. This pins the v0.5-default
+        // backwards-compat: when the writer flag is off (or the backend
+        // doesn't surface CIDs), the wire format is byte-identical to
+        // the pre-walkable-v8 v7 form.
+        use crate::wnfs_hamt::store::HamtNodeStore;
+        let backend = std::sync::Arc::new(InMemoryBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-w8c", test_dek(), 16);
+
+        for i in 0..64u64 {
+            forest
+                .upsert_file(
+                    file_entry(&format!("/d/{:03}.bin", i), i),
+                    &backend,
+                )
+                .await
+                .unwrap();
+        }
+        let manifest = forest.flush_dirty(&backend).await.unwrap().clone();
+
+        // Every populated shard's root_cid MUST be None — the backend
+        // returned no CID hints.
+        for shard in manifest.shards_iter() {
+            assert!(
+                shard.root_cid.is_none(),
+                "InMemoryBackend returns BlobPutResult::none() — root_cid \
+                 must stay None, otherwise the writer is fabricating CIDs"
+            );
+        }
+
+        // Decode any populated shard's root plaintext and assert no
+        // `LinkV2` variant appears in any pointer.
+        for (idx, shard) in manifest.shards_iter().enumerate() {
+            if shard.root.is_none() {
+                continue;
+            }
+            let store = crate::wnfs_hamt::v7_store::V7NodeStore::new(
+                "bucket-w8c",
+                idx as u16,
+                manifest.shard_salt().to_vec(),
+                test_dek(),
+                backend.clone(),
+            );
+            let plaintext = store.get_node(&shard.root.unwrap()).await.unwrap();
+            #[derive(serde::Deserialize)]
+            struct NodeWireInspect<K, V> {
+                #[allow(dead_code)]
+                bitmask: u16,
+                pointers: Vec<crate::wnfs_hamt::pointer::PointerWire<K, V>>,
+            }
+            let wire: NodeWireInspect<Vec<u8>, HamtEntryWire> =
+                postcard::from_bytes(&plaintext).unwrap();
+            for ptr in &wire.pointers {
+                assert!(
+                    !matches!(
+                        ptr,
+                        crate::wnfs_hamt::pointer::PointerWire::LinkV2 { .. }
+                    ),
+                    "InMemoryBackend returns no CIDs — wire MUST stay all-Link, \
+                     but found a LinkV2 in shard {}'s root pointers. Writer is \
+                     fabricating CIDs.",
+                    idx
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // Walkable-v8 reader integration tests (W.9.4)
+    //
+    // These tests exercise the cid-hint plumbing end-to-end:
+    //   * `ChildPtr::StoredV2` → `Node::load_with_cid_hint` →
+    //     `HamtNodeStore::get_node_with_cid_hint` →
+    //     `BlobBackend::get_with_cid_hint`.
+    //
+    // The W.9.4 contract has three integrity layers (per advisor design):
+    //   1. Gateway content-address check (verify_cid_against_bytes) —
+    //      tested separately in gateway_fetch.rs's tampering tests.
+    //   2. AEAD decrypt with `(bucket, shard_idx)` AAD — tested by
+    //      `get_node_rejects_wrong_shard_idx` / `..._wrong_bucket` /
+    //      `..._tampered_blob` in v7_store::tests.
+    //   3. **Plaintext storage_key recompute vs caller-supplied key** —
+    //      this is the layer that's NEW for W.9.4 and is the subject
+    //      of the tamper test below. It defends against a malicious
+    //      parent that swapped a sibling's storage_key while keeping
+    //      the (cryptographically-valid) cid hint.
+    // ========================================================================
+
+    /// Reader-side CID-hint plumbing test (W.9.4). Records every
+    /// `get_with_cid_hint` call against the wrapped storage so the test
+    /// can assert that:
+    ///   * The cid passed down at fetch time is exactly the cid
+    ///     embedded in the parent's `PointerWire::LinkV2`.
+    ///   * The storage_key passed alongside is the same one the
+    ///     parent recorded (NOT silently substituted somewhere in the
+    ///     plumbing).
+    ///
+    /// Wraps a `CidCapturingBackend` so the writer-side cascade still
+    /// stamps cids on flush; the reader-side test focuses on what
+    /// flows DOWN to the backend during the walk.
+    struct HintRecordingBackend {
+        inner: std::sync::Arc<CidCapturingBackend>,
+        hints_observed: std::sync::Mutex<Vec<(String, Option<cid::Cid>)>>,
+    }
+
+    impl HintRecordingBackend {
+        fn new() -> Self {
+            Self {
+                inner: std::sync::Arc::new(CidCapturingBackend::new()),
+                hints_observed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn observed(&self) -> Vec<(String, Option<cid::Cid>)> {
+            self.hints_observed.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::wnfs_hamt::v7_store::BlobBackend for HintRecordingBackend {
+        async fn get(&self, path: &str) -> Result<Vec<u8>> {
+            self.inner.get(path).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            bytes: Vec<u8>,
+        ) -> Result<crate::wnfs_hamt::v7_store::BlobPutResult> {
+            self.inner.put(path, bytes).await
+        }
+
+        async fn get_with_cid_hint(
+            &self,
+            path: &str,
+            cid_hint: Option<&cid::Cid>,
+        ) -> Result<Vec<u8>> {
+            self.hints_observed
+                .lock()
+                .unwrap()
+                .push((path.to_string(), cid_hint.cloned()));
+            // Delegate to the underlying CidCapturingBackend's `get` —
+            // both online and "offline" branches return the same bytes
+            // for this test (the test is about what the parent fed us,
+            // not about gateway availability).
+            self.inner.get(path).await
+        }
+    }
+
+    /// Regression guard for #52: a master-divergence reconcile via
+    /// `reconcile_page_etag` must NOT silently drop the CID hint
+    /// when master's etag is a parseable CID string. Pre-#52 the
+    /// reconcile inserted `cid: None` which left
+    /// `manifest.root.page_index[page_id].cid` empty until the next
+    /// flush re-stamped it — a quiet degradation to v0.5 fidelity.
+    #[tokio::test]
+    async fn reconcile_page_etag_recovers_cid_from_etag_string() {
+        use crate::private_forest::PageRef;
+        let backend = std::sync::Arc::new(InMemoryBackend::new());
+        let mut forest =
+            ShardedHamtPrivateForest::new("bucket-recon", test_dek(), 16);
+        // Seed page 0 with a low seq so the reconcile is accepted.
+        forest.manifest.root.page_index.insert(
+            0,
+            PageRef {
+                etag: Some("\"old\"".to_string()),
+                seq: 5,
+                cid: None,
+            },
+        );
+        let _ = backend; // silence unused
+
+        // A real CID (BLAKE3-multihash, raw codec) — the same shape
+        // master returns as an etag on v8 page PUTs.
+        let cid_str = {
+            let h = blake3::hash(b"fake-page-blob");
+            let mh = cid::multihash::Multihash::<64>::wrap(0x1e, h.as_bytes())
+                .expect("blake3 multihash wrap");
+            cid::Cid::new_v1(0x55, mh).to_string()
+        };
+        let new_seq = 10u64;
+        forest.reconcile_page_etag(0, new_seq, Some(cid_str.clone()));
+
+        let entry = forest
+            .manifest
+            .root
+            .page_index
+            .get(&0)
+            .expect("page 0 reconciled");
+        assert_eq!(entry.seq, new_seq, "seq advanced");
+        assert_eq!(entry.etag.as_deref(), Some(cid_str.as_str()), "etag updated");
+        assert!(
+            entry.cid.is_some(),
+            "#52 regression: reconcile_page_etag must recover the CID \
+             from a CID-shaped etag string instead of silently inserting \
+             cid: None"
+        );
+        // The recovered cid should match what `cid_str.parse()` would produce.
+        assert_eq!(
+            entry.cid.unwrap().to_string(),
+            cid_str,
+            "recovered cid must round-trip through the etag string"
+        );
+    }
+
+    /// Regression guard for #52: same property for the dir-index
+    /// reconcile path. `reconcile_dir_index_etag` previously left
+    /// `dir_index_cid` untouched on master-divergence, leaving a
+    /// stale value lingering even when master's new etag was a
+    /// parseable CID.
+    #[tokio::test]
+    async fn reconcile_dir_index_etag_recovers_cid_from_etag_string() {
+        let backend = std::sync::Arc::new(InMemoryBackend::new());
+        let mut forest =
+            ShardedHamtPrivateForest::new("bucket-recon-dir", test_dek(), 16);
+        forest.manifest.root.dir_index_etag = Some("\"old\"".to_string());
+        forest.manifest.root.dir_index_seq = Some(3);
+        forest.manifest.root.dir_index_cid = None;
+        let _ = backend;
+
+        let cid_str = {
+            let h = blake3::hash(b"fake-dir-index-blob");
+            let mh = cid::multihash::Multihash::<64>::wrap(0x1e, h.as_bytes())
+                .expect("blake3 multihash wrap");
+            cid::Cid::new_v1(0x55, mh).to_string()
+        };
+        let new_seq = 9u64;
+        forest.reconcile_dir_index_etag(new_seq, Some(cid_str.clone()));
+
+        assert_eq!(forest.manifest.root.dir_index_seq, Some(new_seq));
+        assert_eq!(
+            forest.manifest.root.dir_index_etag.as_deref(),
+            Some(cid_str.as_str())
+        );
+        assert!(
+            forest.manifest.root.dir_index_cid.is_some(),
+            "#52 regression: reconcile_dir_index_etag must recover the \
+             CID from a CID-shaped etag string"
+        );
+        assert_eq!(
+            forest.manifest.root.dir_index_cid.unwrap().to_string(),
+            cid_str
+        );
+    }
+
+    /// `reconcile_page_etag` with a non-CID etag (legacy / malformed)
+    /// must NOT panic and must leave `cid: None` so the warm cache +
+    /// storage_key path can take over.
+    #[tokio::test]
+    async fn reconcile_page_etag_handles_non_cid_etag_as_none() {
+        use crate::private_forest::PageRef;
+        let backend = std::sync::Arc::new(InMemoryBackend::new());
+        let mut forest =
+            ShardedHamtPrivateForest::new("bucket-recon-bad", test_dek(), 16);
+        forest.manifest.root.page_index.insert(
+            0,
+            PageRef {
+                etag: None,
+                seq: 0,
+                cid: None,
+            },
+        );
+        let _ = backend;
+        forest.reconcile_page_etag(0, 1, Some("\"definitely-not-a-cid\"".to_string()));
+        let entry = forest.manifest.root.page_index.get(&0).unwrap();
+        assert_eq!(entry.seq, 1);
+        assert!(
+            entry.cid.is_none(),
+            "non-CID etag must surface as cid: None — soft-fail to the \
+             storage-key path, no panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn walkable_v8_reader_passes_cid_hint_through_to_backend() {
+        // Goal: every fetch of an INTERNAL HAMT node carries the cid
+        // its parent recorded at write time. Without this property
+        // W.9.4's offline gateway race never engages — the path
+        // would silently degrade to the storage-key-only fetch.
+        let backend = std::sync::Arc::new(HintRecordingBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-r8a", test_dek(), 16);
+
+        // Plant enough entries so at least one shard grows internal nodes.
+        for i in 0..64u64 {
+            forest
+                .upsert_file(
+                    file_entry(&format!("/r/{:03}.bin", i), i),
+                    &backend,
+                )
+                .await
+                .unwrap();
+        }
+        forest.flush_dirty(&backend).await.unwrap();
+
+        // Drop the writer's in-memory caches by rebuilding the forest
+        // from the persisted manifest. This forces the next walk to
+        // hit the backend for every internal-node fetch.
+        let manifest = forest.manifest().clone();
+        let mut reader = ShardedHamtPrivateForest::from_manifest(
+            manifest,
+            "bucket-r8a",
+            test_dek(),
+        );
+
+        // Reset hint recorder so we measure ONLY the read-side calls.
+        reader
+            .list_recursive("/", &backend)
+            .await
+            .expect("list_recursive on freshly-loaded reader");
+
+        // Among the recorded hints, every internal-node fetch (path
+        // matching V7_NODE_PREFIX) must carry Some(cid) UNLESS the
+        // parent that referenced it was itself a legacy `Stored`
+        // pointer — but in this test every node was written by a v8
+        // writer with cid-capturing backend, so every internal-node
+        // fetch path MUST have a Some(cid) hint.
+        let observed = backend.observed();
+        let internal_node_fetches: Vec<_> = observed
+            .iter()
+            .filter(|(p, _)| p.starts_with(crate::wnfs_hamt::v7_store::V7_NODE_PREFIX))
+            .collect();
+        assert!(
+            !internal_node_fetches.is_empty(),
+            "test setup invalid: no internal-node fetches recorded"
+        );
+        for (path, hint) in &internal_node_fetches {
+            assert!(
+                hint.is_some(),
+                "every internal-node fetch must carry a cid hint when the \
+                 forest was written by a v8-aware backend; missing for path {}",
+                path
+            );
+        }
+
+        // Cross-check that each cid hint matches BLAKE3(child ciphertext)
+        // — i.e. the cid recorded in the parent points at exactly the
+        // bytes the reader is fetching. This is the load-bearing
+        // walkable-v8 contract: parent's `LinkV2.cid` IS the address
+        // of the child's ciphertext.
+        for (path, hint) in &internal_node_fetches {
+            let cid = hint.expect("cid hint present (asserted above)");
+            let stored = backend
+                .inner
+                .get_sync(path)
+                .expect("backend has the bytes");
+            let recomputed = CidCapturingBackend::cid_for(&stored);
+            assert_eq!(
+                cid, recomputed,
+                "cid hint at path {} disagrees with BLAKE3(stored ciphertext); \
+                 W.9.3 writer didn't stamp the right cid OR the reader \
+                 forwarded a stale value",
+                path
+            );
+        }
+    }
+
+    /// Reader-side tamper test (W.9.4 third integrity layer). The
+    /// gateway content-address verify (layer 1) and AEAD decrypt
+    /// (layer 2) are NOT enough on their own — a malicious parent
+    /// could keep both happy by pointing `LinkV2 { storage_key: A,
+    /// cid: hash_of_real_node_B }`. The parent's pointer is inside an
+    /// AEAD-encrypted ciphertext (key-holders only) so this scenario
+    /// requires `forest_dek` compromise; even so, the reader must NOT
+    /// be redirected to a sibling node's plaintext just because both
+    /// sides pass cryptographic checks. Layer 3 (recompute the
+    /// plaintext's storage_key, compare to caller-supplied key)
+    /// catches it.
+    ///
+    /// Setup: plant TWO valid nodes A and B at distinct storage_keys.
+    /// Construct a "malicious" backend whose `get_with_cid_hint(path_A,
+    /// Some(cid_B))` returns the bytes addressed by cid_B (= node B's
+    /// ciphertext, perfectly valid for that cid). The post-fetch
+    /// recompute must reject because plaintext_B's storage_key is B,
+    /// not A.
+    struct MaliciousRedirectBackend {
+        cid_to_bytes: std::sync::Mutex<std::collections::HashMap<cid::Cid, Vec<u8>>>,
+        path_to_bytes: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    }
+
+    impl MaliciousRedirectBackend {
+        fn new() -> Self {
+            Self {
+                cid_to_bytes: std::sync::Mutex::new(std::collections::HashMap::new()),
+                path_to_bytes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::wnfs_hamt::v7_store::BlobBackend for MaliciousRedirectBackend {
+        async fn get(&self, path: &str) -> Result<Vec<u8>> {
+            self.path_to_bytes
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| crate::CryptoError::Hamt(format!("not found: {}", path)))
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            bytes: Vec<u8>,
+        ) -> Result<crate::wnfs_hamt::v7_store::BlobPutResult> {
+            let cid = CidCapturingBackend::cid_for(&bytes);
+            self.cid_to_bytes
+                .lock()
+                .unwrap()
+                .insert(cid, bytes.clone());
+            self.path_to_bytes
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), bytes);
+            Ok(crate::wnfs_hamt::v7_store::BlobPutResult { cid: Some(cid) })
+        }
+
+        async fn get_with_cid_hint(
+            &self,
+            _path: &str,
+            cid_hint: Option<&cid::Cid>,
+        ) -> Result<Vec<u8>> {
+            // Malicious behaviour: when the caller supplies a cid hint,
+            // resolve via cid (gateway-race emulation) and IGNORE the
+            // path. This models a compromised master/gateway that
+            // could serve cid_B's bytes when the SDK was looking for
+            // node A. The third integrity layer in V7NodeStore must
+            // reject this regardless of cid validity.
+            match cid_hint {
+                Some(cid) => self
+                    .cid_to_bytes
+                    .lock()
+                    .unwrap()
+                    .get(cid)
+                    .cloned()
+                    .ok_or_else(|| {
+                        crate::CryptoError::Hamt(format!("cid not found: {}", cid))
+                    }),
+                None => self.get(_path).await,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn walkable_v8_reader_rejects_when_redirected_to_sibling_node() {
+        use crate::wnfs_hamt::store::HamtNodeStore;
+        let backend = std::sync::Arc::new(MaliciousRedirectBackend::new());
+        let store = crate::wnfs_hamt::v7_store::V7NodeStore::new(
+            "bucket-tamper",
+            0,
+            vec![0x33; 16],
+            test_dek(),
+            backend.clone(),
+        );
+
+        // Plant two distinct plaintexts. Different bytes ⇒ different
+        // storage_keys ⇒ different cids when stored.
+        let bytes_a = b"plaintext-node-A".to_vec();
+        let bytes_b = b"plaintext-node-B-differs".to_vec();
+        let result_a = store.put_node(bytes_a.clone()).await.unwrap();
+        let result_b = store.put_node(bytes_b.clone()).await.unwrap();
+        assert_ne!(
+            result_a.storage_key, result_b.storage_key,
+            "test setup: A and B must have distinct storage_keys"
+        );
+        let cid_b = result_b.cid.expect("MaliciousRedirectBackend stamps cids");
+
+        // Sanity: legitimate read of A succeeds (path → A's bytes).
+        let plaintext_a = store
+            .get_node_with_cid_hint(&result_a.storage_key, result_a.cid.as_ref())
+            .await
+            .expect("legitimate (A, cid_A) fetch must succeed");
+        assert_eq!(plaintext_a, bytes_a);
+
+        // Tamper attempt: ask for storage_key A but supply cid_B.
+        // Layer 1 (gateway): would pass — bytes are valid under cid_B.
+        // Layer 2 (AEAD): passes — bytes_B is a legitimately-encrypted
+        //                 node under the same DEK + bucket + shard.
+        // Layer 3 (recompute): MUST FAIL — plaintext_B's storage_key
+        //                 is B, not A.
+        let result = store
+            .get_node_with_cid_hint(&result_a.storage_key, Some(&cid_b))
+            .await;
+        assert!(
+            result.is_err(),
+            "third integrity layer must reject when the supplied cid \
+             addresses bytes whose plaintext recomputes to a DIFFERENT \
+             storage_key. Got: {:?}",
+            result.map(|p| p.len())
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("content-address mismatch"),
+            "tamper rejection must surface the content-address-mismatch \
+             error so the failure mode is unambiguous in logs. Got: {}",
+            err_msg
+        );
+    }
+
+    /// Reader-side default-off test (W.9.4). When the writer flag was
+    /// off when the bucket was written (no LinkV2 entries persisted),
+    /// the walker's `resolve_owned` dispatches to the legacy `Stored`
+    /// arm, which passes `None` as the cid hint. Verifies that:
+    ///   * No `Some(cid)` is ever forwarded to the backend during the
+    ///     walk of a flag-off bucket.
+    ///   * `get_with_cid_hint(_, None)` is byte-identical to `get(_)`
+    ///     (the trait's default impl IS this — we just confirm the
+    ///     end-to-end path doesn't accidentally fabricate a hint).
+    #[tokio::test]
+    async fn walkable_v8_reader_default_off_bucket_passes_none_hint() {
+        let backend = std::sync::Arc::new(HintRecordingBackend::new());
+        // Use the InMemoryBackend's contract (no cids) by giving the
+        // hint-recorder a CidCapturingBackend wrapper but ignoring the
+        // cids — actually, HintRecordingBackend wraps CidCapturingBackend
+        // which DOES return cids on put. To simulate "writer flag off"
+        // without changing backends, we construct the manifest manually
+        // with `root_cid = None` so the reader sees no v8 hints.
+        //
+        // Simpler approach: write through CidCapturingBackend so cids
+        // are stamped, then strip them from the manifest before the
+        // reader phase. The reader's resolve_owned will see only
+        // legacy Stored pointers (assuming v7 writes); but the
+        // writer in `flush_dirty` and `pointer.rs:to_wire` is what
+        // actually decides Link vs LinkV2 based on result.cid. Since
+        // CidCapturingBackend returns Some(cid) every time, every
+        // node will be written as LinkV2. To get a true flag-off
+        // simulation we need a backend whose `put` returns
+        // `BlobPutResult::none()` — that's `InMemoryBackend`.
+        let inmem_backend = std::sync::Arc::new(InMemoryBackend::new());
+        let mut forest =
+            ShardedHamtPrivateForest::new("bucket-roff", test_dek(), 16);
+        for i in 0..32u64 {
+            forest
+                .upsert_file(
+                    file_entry(&format!("/off/{:03}.bin", i), i),
+                    &inmem_backend,
+                )
+                .await
+                .unwrap();
+        }
+        forest.flush_dirty(&inmem_backend).await.unwrap();
+        let manifest = forest.manifest().clone();
+
+        // Now wrap the InMemory backend with the hint recorder so we
+        // can observe what the reader passes down. Reader walks via
+        // hint-recorder; since the manifest has root_cid = None on
+        // every shard AND every internal node was written as legacy
+        // `Link` (InMemoryBackend returns no cids), the recorder
+        // should see ONLY None hints.
+        let recorder = std::sync::Arc::new(InMemoryDelegateRecorder {
+            inner: inmem_backend.clone(),
+            hints_observed: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let mut reader =
+            ShardedHamtPrivateForest::from_manifest(manifest, "bucket-roff", test_dek());
+        let _ = reader
+            .list_recursive("/", &recorder)
+            .await
+            .expect("list_recursive must succeed under default-off");
+
+        let observed = recorder.hints_observed.lock().unwrap().clone();
+        let internal_fetches: Vec<_> = observed
+            .iter()
+            .filter(|(p, _)| p.starts_with(crate::wnfs_hamt::v7_store::V7_NODE_PREFIX))
+            .collect();
+        assert!(
+            !internal_fetches.is_empty(),
+            "test setup invalid: no internal-node fetches occurred"
+        );
+        for (path, hint) in &internal_fetches {
+            assert!(
+                hint.is_none(),
+                "default-off bucket: cid hint at {} must be None — was {:?}. \
+                 If a Some leaks, the reader is fabricating cids that the \
+                 writer never stamped, breaking the wire-format-is-the-gate \
+                 invariant.",
+                path,
+                hint
+            );
+        }
+    }
+
+    /// Local backend wrapper used by `walkable_v8_reader_default_off_*`
+    /// — delegates everything to an `InMemoryBackend` while recording
+    /// each `get_with_cid_hint` call's `cid_hint` argument.
+    struct InMemoryDelegateRecorder {
+        inner: std::sync::Arc<InMemoryBackend>,
+        hints_observed: std::sync::Mutex<Vec<(String, Option<cid::Cid>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::wnfs_hamt::v7_store::BlobBackend for InMemoryDelegateRecorder {
+        async fn get(&self, path: &str) -> Result<Vec<u8>> {
+            self.inner.get(path).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            bytes: Vec<u8>,
+        ) -> Result<crate::wnfs_hamt::v7_store::BlobPutResult> {
+            self.inner.put(path, bytes).await
+        }
+
+        async fn get_with_cid_hint(
+            &self,
+            path: &str,
+            cid_hint: Option<&cid::Cid>,
+        ) -> Result<Vec<u8>> {
+            self.hints_observed
+                .lock()
+                .unwrap()
+                .push((path.to_string(), cid_hint.cloned()));
+            self.inner.get(path).await
+        }
+    }
+
+    /// Mixed-bucket reader test (W.9.4). A bucket can legitimately
+    /// contain BOTH legacy `Stored` pointers (subtrees written under
+    /// the v0.5 default-off mode) AND `StoredV2` pointers (subtrees
+    /// written after the writer flag flipped on). The reader must
+    /// handle both in the SAME walk without errors — legacy children
+    /// fetch via no-cid path, v8 children fetch via cid path.
+    ///
+    /// Constructs the mixed state by:
+    ///   1. Writing batch A through `InMemoryBackend` (no cids → Link).
+    ///   2. Writing batch B through `CidCapturingBackend` against the
+    ///      SAME manifest state (same `bucket_salt`, same DEK), so
+    ///      batch B's path-of-change cascade re-encodes some shared
+    ///      ancestor nodes with mixed-variant pointers.
+    /// Then walks via the cid-capturing backend and verifies every
+    /// upserted file is reachable.
+    #[tokio::test]
+    async fn walkable_v8_reader_mixed_link_and_link_v2_in_one_bucket() {
+        // Phase 1 — write batch A through a no-cid backend.
+        let no_cid = std::sync::Arc::new(InMemoryBackend::new());
+        let mut forest =
+            ShardedHamtPrivateForest::new("bucket-mixed", test_dek(), 16);
+        for i in 0..16u64 {
+            forest
+                .upsert_file(file_entry(&format!("/A/{:02}.bin", i), i), &no_cid)
+                .await
+                .unwrap();
+        }
+        forest.flush_dirty(&no_cid).await.unwrap();
+
+        // Phase 2 — switch to a cid-capturing backend that has access
+        // to the SAME object map (so it can read the legacy nodes
+        // batch A wrote AND surface cids on subsequent puts). We
+        // achieve this by sharing the same underlying object store.
+        let mixed = std::sync::Arc::new(SharedObjectsBackend {
+            objects: no_cid.clone(),
+            stamp_cid: true,
+        });
+
+        // Continue mutating the forest with the new backend. Any
+        // internal node touched by the path-of-change re-encodes; the
+        // re-encoded parent contains a mix of `Link` (untouched
+        // sibling, came from batch A) and `LinkV2` (mutated child,
+        // freshly stamped).
+        for i in 16..32u64 {
+            forest
+                .upsert_file(file_entry(&format!("/B/{:02}.bin", i), i), &mixed)
+                .await
+                .unwrap();
+        }
+        forest.flush_dirty(&mixed).await.unwrap();
+
+        // Reader phase — walk the mixed forest and verify every
+        // entry from BOTH batches is reachable. If the resolve_owned
+        // dispatch were buggy (e.g. failing the legacy Stored arm
+        // when intermixed with StoredV2), this list_recursive would
+        // miss the batch-A entries.
+        let manifest = forest.manifest().clone();
+        let mut reader = ShardedHamtPrivateForest::from_manifest(
+            manifest,
+            "bucket-mixed",
+            test_dek(),
+        );
+        let listed = reader
+            .list_recursive("/", &mixed)
+            .await
+            .expect("mixed-bucket walk must succeed");
+        let paths: std::collections::HashSet<String> =
+            listed.iter().map(|f| f.path.clone()).collect();
+        for i in 0..16u64 {
+            assert!(
+                paths.contains(&format!("/A/{:02}.bin", i)),
+                "batch-A entry /A/{:02}.bin missing — the reader's legacy \
+                 Stored arm regressed when intermixed with StoredV2",
+                i
+            );
+        }
+        for i in 16..32u64 {
+            assert!(
+                paths.contains(&format!("/B/{:02}.bin", i)),
+                "batch-B entry /B/{:02}.bin missing — the reader's StoredV2 \
+                 arm broke",
+                i
+            );
+        }
+    }
+
+    /// Backend wrapper that shares the same underlying object map as
+    /// another `InMemoryBackend` while choosing whether to surface
+    /// cids on `put`. Used by the mixed-bucket test to swap the
+    /// stamping policy mid-bucket without losing the batch-A objects.
+    struct SharedObjectsBackend {
+        objects: std::sync::Arc<InMemoryBackend>,
+        stamp_cid: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::wnfs_hamt::v7_store::BlobBackend for SharedObjectsBackend {
+        async fn get(&self, path: &str) -> Result<Vec<u8>> {
+            self.objects.get(path).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            bytes: Vec<u8>,
+        ) -> Result<crate::wnfs_hamt::v7_store::BlobPutResult> {
+            // Compute the cid from bytes BEFORE delegating — the
+            // delegate consumes bytes and returns BlobPutResult::none().
+            let cid = if self.stamp_cid {
+                Some(CidCapturingBackend::cid_for(&bytes))
+            } else {
+                None
+            };
+            self.objects.put(path, bytes).await?;
+            Ok(crate::wnfs_hamt::v7_store::BlobPutResult { cid })
+        }
+
+        async fn get_with_cid_hint(
+            &self,
+            path: &str,
+            _cid_hint: Option<&cid::Cid>,
+        ) -> Result<Vec<u8>> {
+            // For this test we don't simulate master-down; just
+            // delegate to `get`. The hint-bearing path inside
+            // V7NodeStore is exercised at the V7NodeStore level, not
+            // here.
+            self.objects.get(path).await
+        }
+    }
+
+    // ========================================================================
+    // Walkable-v8 scale + block-size tests (W.9.7)
+    //
+    // The single load-bearing W.8 design assertion: **no IPFS block
+    // exceeds 1 MiB** at any production-realistic scale. Standard
+    // gateways enforce this limit; a single >1MiB block would fail
+    // every offline-walk fetch (W.9.4) and invalidate the W.10
+    // default-on rollout.
+    //
+    // Cliff to actively look for: the writer cascade serialises the
+    // pointer list at each HAMT level. If anything ever lets the
+    // pointer-array grow past the HAMT branching factor (16 — bounded
+    // by the bitmask u16), block size could spike past 1 MiB. The
+    // size assertion is the regression guard.
+    //
+    // Three scales:
+    //   * `_at_1k_entries`         — regular test, runs in CI.
+    //   * `_at_100k_entries`       — `#[ignore]`. Operator runs in
+    //     release mode (`cargo test --release -- --ignored
+    //     walkable_v8_block_size_at_100k`). ~30 s on a fast box.
+    //     Memory ceiling: ~150 MB residual encrypted blobs in the
+    //     backend's HashMap.
+    //   * `_at_1m_entries`         — `#[ignore]`. Pre-release operator
+    //     check. Could take 30+ min in release mode. Memory ceiling:
+    //     ~5 GB. The test enforces the ceiling by running it only
+    //     when explicitly opted-in.
+    // ========================================================================
+
+    /// Backend that returns `Some(BLAKE3-raw-cid)` from `put` so the
+    /// walkable-v8 writer cascade actually emits `LinkV2` (advisor
+    /// note: the existing `InMemoryBackend` returns
+    /// `BlobPutResult::none()`, which would silently regress the test
+    /// to v7 wire-format and miss any v8-specific blowup).
+    ///
+    /// Records the largest observed encrypted-blob size + a
+    /// per-blob histogram so the assertion has a clear failure
+    /// payload when violated (e.g., "shard root grew to 1.3 MiB at
+    /// entry 87523").
+    struct WalkableV8RecordingBackend {
+        objects: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+        max_observed_size: std::sync::atomic::AtomicUsize,
+        max_observed_path: std::sync::Mutex<String>,
+    }
+
+    impl WalkableV8RecordingBackend {
+        fn new() -> Self {
+            Self {
+                objects: std::sync::Mutex::new(std::collections::HashMap::new()),
+                max_observed_size: std::sync::atomic::AtomicUsize::new(0),
+                max_observed_path: std::sync::Mutex::new(String::new()),
+            }
+        }
+
+        fn record_max_size(&self, path: &str, size: usize) {
+            // CAS loop to keep the path label in sync with the size —
+            // we want operator triage to know WHICH path was the
+            // biggest, not just the size.
+            let prev = self
+                .max_observed_size
+                .fetch_max(size, std::sync::atomic::Ordering::SeqCst);
+            if size > prev {
+                let mut guard = self.max_observed_path.lock().unwrap();
+                *guard = path.to_string();
+            }
+        }
+
+        fn max_size(&self) -> usize {
+            self.max_observed_size
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn max_path(&self) -> String {
+            self.max_observed_path.lock().unwrap().clone()
+        }
+
+        fn object_count(&self) -> usize {
+            self.objects.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::wnfs_hamt::v7_store::BlobBackend for WalkableV8RecordingBackend {
+        async fn get(&self, path: &str) -> Result<Vec<u8>> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| crate::CryptoError::Hamt(format!("not found: {}", path)))
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            bytes: Vec<u8>,
+        ) -> Result<crate::wnfs_hamt::v7_store::BlobPutResult> {
+            // Reuse the shared cid_for helper from CidCapturingBackend
+            // (defined earlier in this test module) so both backends
+            // hash bytes identically — the v8 cascade then sees
+            // consistent CIDs across the test suite.
+            let cid = CidCapturingBackend::cid_for(&bytes);
+            self.record_max_size(path, bytes.len());
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), bytes);
+            Ok(crate::wnfs_hamt::v7_store::BlobPutResult { cid: Some(cid) })
+        }
+    }
+
+    /// Standard IPFS gateway block-size limit (1 MiB) — the **hard
+    /// gateway-correctness guard**. Any block above this fails
+    /// offline-walk fetches via public gateways and invalidates W.8.3.
+    const IPFS_BLOCK_LIMIT: usize = 1 << 20;
+
+    /// Architectural early-warning ceiling (64 KiB). Per plan W.8.3 the
+    /// **expected** worst-case HAMT internal-node ciphertext size is
+    /// ~4 KB. Any block above 64 KiB is a 16× regression vs the
+    /// architectural prediction — well below the gateway limit but
+    /// indicative of an unintended fanout / pointer-list growth that
+    /// would eventually blow past the hard ceiling at higher scale.
+    /// Crossing this threshold prints a structured `eprintln!` for
+    /// operator triage but does NOT fail the test (only IPFS_BLOCK_LIMIT
+    /// is a hard fail). Two distinct failure modes, two distinct
+    /// signals — gateway correctness vs architectural regression.
+    const SOFT_BLOCK_WARN_KIB: usize = 64 * 1024;
+
+    /// Inner helper shared by all three scales so the assertion
+    /// surface stays identical regardless of which `#[test]` /
+    /// `#[ignore]` gate fires.
+    ///
+    /// **Scope** (per W.9.7 dual-advisor audit): this helper observes
+    /// only blobs written via the in-crate `BlobBackend::put` path
+    /// — i.e. HAMT internal-node and shard-leaf-bucket ciphertexts
+    /// from `V7NodeStore`. Manifest pages, the manifest root, and
+    /// the directory-index ciphertexts are persisted by
+    /// `crates/fula-client/src/encryption.rs`'s Phase 1.5 / 1.6 / 2
+    /// commits via `S3BlobBackend.put_object_*` (a different layer
+    /// the SDK owns). Those blobs need a sibling block-size test in
+    /// `fula-client/tests/` to fully establish W.8.3's "no block
+    /// exceeds 1 MiB" claim across every persisted blob class. See
+    /// the W.9.7 follow-up task for the manifest-side variant.
+    ///
+    /// **Distribution** (W.9.7 finding from first 100k run): when
+    /// every entry is `/d/f{i}.bin` (single parent dir), the
+    /// `ForestDirectoryEntry` for `/d` accumulates one filename per
+    /// entry in its `files: Vec<String>` field. At 100k entries
+    /// that single Dir blob grows to ~1.7 MiB, exceeding the gateway
+    /// limit. This is a real architectural cliff for "single
+    /// directory with 100k+ files" — separate from HAMT-cascade
+    /// scaling. Tracked as follow-up #72 (directory sharding).
+    /// To exercise pure HAMT scaling without that confound, this
+    /// helper distributes entries across `~sqrt(N)` parent dirs so
+    /// each Dir entry stays small (~`sqrt(N)` filenames) regardless
+    /// of total N. Production-scale FxFiles users with 100k files
+    /// would naturally distribute across folders; the test mirrors
+    /// that.
+    async fn run_walkable_v8_block_size_assertion(num_entries: usize) {
+        let backend = std::sync::Arc::new(WalkableV8RecordingBackend::new());
+        // Use enough shards (256) that internal-node depth at 1M
+        // entries stays at log_16(1M / 256) ≈ 3-4 levels, matching
+        // production sharding heuristics. Fewer shards would
+        // artificially inflate internal-node fanout per shard and
+        // give a falsely-large worst-case block size.
+        let mut forest =
+            ShardedHamtPrivateForest::new("scale-bucket", test_dek(), 256);
+
+        // Distribute across `~sqrt(N)` parent dirs (capped reasonably).
+        // Picking sqrt(N) rather than fixed-1000 keeps the per-dir
+        // file count balanced across scales (1k → 32 files/dir,
+        // 100k → 316 files/dir, 1M → 1000 files/dir). Each
+        // ForestDirectoryEntry stays small enough that its
+        // serialized blob fits comfortably under 1 MiB at every
+        // scale this test covers.
+        let dirs_per_layer: usize = ((num_entries as f64).sqrt() as usize).max(1);
+
+        // Minimal `ForestFileEntry` — the test is about HAMT block
+        // size, not about realistic file metadata. Smaller entries
+        // also let us stretch to higher N before memory ceilings.
+        for i in 0..num_entries {
+            let dir_idx = i % dirs_per_layer;
+            let path = format!("/d{:04}/f{:08}.bin", dir_idx, i);
+            forest
+                .upsert_file(file_entry(&path, 0), &backend)
+                .await
+                .unwrap();
+        }
+        forest.flush_dirty(&backend).await.unwrap();
+
+        let largest = backend.max_size();
+        let largest_path = backend.max_path();
+        let object_count = backend.object_count();
+
+        eprintln!(
+            "[walkable-v8 W.9.7] entries={} hamt_node_objects={} largest_hamt_block={} bytes \
+             ({:.1} KiB) at path {}",
+            num_entries,
+            object_count,
+            largest,
+            largest as f64 / 1024.0,
+            largest_path
+        );
+
+        // Architectural early-warning (soft). Emits but does NOT
+        // fail — the regression-vs-prediction signal is decoupled
+        // from the gateway-correctness signal so operators can act
+        // on either independently.
+        if largest > SOFT_BLOCK_WARN_KIB {
+            eprintln!(
+                "[walkable-v8 W.9.7] SOFT WARNING: largest HAMT-node block ({} bytes / \
+                 {} KiB) exceeds the architectural early-warning ceiling ({} KiB). \
+                 Plan W.8.3 predicts ~4 KB worst-case; >64 KiB is a 16× regression. \
+                 The hard 1 MiB assert below still passes (gateway correctness \
+                 preserved), but inspect the parent-pointer fanout at path {} before \
+                 letting this land in production.",
+                largest,
+                largest / 1024,
+                SOFT_BLOCK_WARN_KIB / 1024,
+                largest_path,
+            );
+        }
+
+        assert!(
+            largest > 0,
+            "test setup invalid: no objects landed in the backend"
+        );
+        assert!(
+            largest <= IPFS_BLOCK_LIMIT,
+            "LOAD-BEARING W.8.3 ASSERTION VIOLATED: encrypted HAMT-node block at {} \
+             grew to {} bytes ({} KiB) which exceeds the 1 MiB IPFS gateway limit. \
+             Walkable-v8 offline walks would fail for this block. Investigate: \
+             pointer-array fanout exceeded HAMT branching factor (16)? Run with \
+             `RUST_BACKTRACE=1` and inspect the parent chain of {}. NOTE: this \
+             test scope is HAMT-node blobs only — manifest-page / dir-index blobs \
+             are persisted via fula-client's S3BlobBackend and need a sibling \
+             test (see W.9.7 follow-up task #72).",
+            largest_path,
+            largest,
+            largest / 1024,
+            largest_path
+        );
+    }
+
+    #[tokio::test]
+    async fn walkable_v8_block_size_at_1k_entries_stays_under_1mib() {
+        // Regular test — runs in CI on every PR. 1k entries finishes
+        // in ~1-3 s in debug mode.
+        run_walkable_v8_block_size_assertion(1_000).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "operator-run pre-release; release mode required, ~30s + ~150MB RAM"]
+    async fn walkable_v8_block_size_at_100k_entries_stays_under_1mib() {
+        // `cargo test --release -p fula-crypto --lib -- --ignored \
+        //   walkable_v8_block_size_at_100k_entries_stays_under_1mib`
+        //
+        // 100k is the realistic upper bound for FxFiles users
+        // (hundreds-to-thousands typical, 100k is a power user). If
+        // this fails, walkable-v8 is broken for power users — block
+        // and rollout.
+        run_walkable_v8_block_size_assertion(100_000).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "operator-run pre-major-release only; release mode required, ~30 min + ~5GB RAM"]
+    async fn walkable_v8_block_size_at_1m_entries_stays_under_1mib() {
+        // `cargo test --release -p fula-crypto --lib -- --ignored \
+        //   walkable_v8_block_size_at_1m_entries_stays_under_1mib`
+        //
+        // 1M is a stress ceiling, not a realistic workload. Per
+        // advisor's W.9.7 brief: this test exists to "find the
+        // architectural cliff before users do." A failure here would
+        // not block rollout for typical-scale users but would force
+        // a redesign for the long-tail enterprise case.
+        //
+        // Memory: every one of the ~1M-ish persisted encrypted blobs
+        // stays in the backend's HashMap so canonicalize-during-write
+        // can read its children. Expect ~5 GB residual at peak. If
+        // the test OOMs your dev box, run on a host with ≥ 16 GB
+        // free or skip it (the 100k test is the practical pre-release
+        // gate; 1M is the long-tail check).
+        run_walkable_v8_block_size_assertion(1_000_000).await;
+    }
+
+    /// **Architectural finding documented as a regression guard.**
+    ///
+    /// First 100k run of `walkable_v8_block_size_at_100k_entries_*`
+    /// (with all entries in a single parent dir) failed at
+    /// 1.66 MiB — the `ForestDirectoryEntry` for the single shared
+    /// parent grew unbounded as `files: Vec<String>` accumulated one
+    /// entry per upsert. This is a known limitation: a directory
+    /// containing 100k+ files in flat layout produces a single
+    /// HAMT-stored Dir blob that exceeds the 1 MiB gateway ceiling.
+    ///
+    /// This test pins the threshold by ramping up entries in a SINGLE
+    /// directory until the block-size limit is hit. It runs at a
+    /// modest scale (10k entries — well below the cliff but
+    /// approaching the documented warning ceiling) so it stays in
+    /// CI; the actual failure mode (~60-100k entries in one dir
+    /// pushes past 1 MiB) is documented in the assertion message.
+    ///
+    /// Why keep this test rather than just deleting it: a future
+    /// regression re-introducing per-file growth in `dir.files`
+    /// would silently re-create the cliff — this test catches it.
+    ///
+    /// **#72 RESOLVED 2026-05-09**: `upsert_file` no longer appends
+    /// the file's path to its parent dir's `files: Vec<String>`. The
+    /// listing API (`list_directory`, `list_subtree`) walks the HAMT
+    /// for `F:` entries directly, so `dir.files` is dead weight on
+    /// new buckets. This test is now an inverted regression guard.
+    #[tokio::test]
+    async fn walkable_v8_single_directory_block_size_under_post_fix_72() {
+        // 10k entries in /single-dir. Pre-fix this produced a
+        // ForestDirectoryEntry blob in the ~150-300 KiB range
+        // (linear in number of children). Post-fix the Dir blob
+        // contains only `path`, empty `files`, empty `subdirs`,
+        // None metadata, None subtree_dek — a few hundred bytes
+        // at most regardless of child count.
+        let backend = std::sync::Arc::new(WalkableV8RecordingBackend::new());
+        let mut forest =
+            ShardedHamtPrivateForest::new("single-dir-test", test_dek(), 256);
+        for i in 0..10_000usize {
+            let path = format!("/single-dir/f{:08}.bin", i);
+            forest
+                .upsert_file(file_entry(&path, 0), &backend)
+                .await
+                .unwrap();
+        }
+        forest.flush_dirty(&backend).await.unwrap();
+
+        // Verify dir.files is empty post-fix (the load-bearing change).
+        let dir_entry = forest
+            .get_directory("/single-dir", &backend)
+            .await
+            .unwrap()
+            .expect("/single-dir must materialize after 10k upserts");
+        assert!(
+            dir_entry.files.is_empty(),
+            "#72 regression: ForestDirectoryEntry.files should stay empty post-fix \
+             but contained {} entries. The single-directory cliff returned.",
+            dir_entry.files.len()
+        );
+
+        // Verify the listing API still surfaces all 10k files via
+        // the new walk-based path.
+        let listing = forest.list_directory("/single-dir", &backend).await.unwrap();
+        assert_eq!(
+            listing.len(),
+            10_000,
+            "list_directory must return all 10k files via HAMT walk (got {})",
+            listing.len()
+        );
+
+        // Hard ceiling: no encrypted HAMT-node blob exceeds 1 MiB.
+        // Pre-fix this would have been at risk at much larger N
+        // (60-100k); post-fix it's not even close at 10k.
+        let largest = backend.max_size();
+        eprintln!(
+            "[walkable-v8 #72 post-fix] 10k files in /single-dir/: largest blob \
+             {} bytes ({:.1} KiB), dir.files.len()={}",
+            largest, largest as f64 / 1024.0, dir_entry.files.len()
+        );
+        assert!(
+            largest <= IPFS_BLOCK_LIMIT,
+            "Largest HAMT blob {} bytes exceeds 1 MiB at 10k single-dir entries — \
+             post-fix invariant violated.",
+            largest
+        );
+    }
+
+    /// **#72 stress test**: 100k FILES in a SINGLE directory. This
+    /// is the size that empirically hit the 1 MiB cliff pre-fix
+    /// (1.66 MiB Dir blob). Post-fix the Dir blob stays tiny
+    /// regardless of file count. Operator-run pre-major-release;
+    /// release mode required for memory headroom.
+    ///
+    /// **NOTE (Reviewer B audit)**: this only verifies the FILES
+    /// cliff is gone. A symmetric `subdirs: Vec<String>` cliff
+    /// exists for directories with 100k+ direct subdirectories
+    /// (`ensure_ancestor_chain` does `d.subdirs.push(child)`
+    /// linearly). That parallel cliff is tracked separately; it
+    /// has not been observed empirically and is rarer in practice
+    /// (users with 100k subdirs at one level are uncommon).
+    ///
+    /// `cargo test --release -p fula-crypto --lib -- --ignored \
+    ///   walkable_v8_single_directory_at_100k_post_fix_72`
+    #[tokio::test]
+    #[ignore = "operator-run pre-release; release mode required, ~30s + ~150MB RAM"]
+    async fn walkable_v8_single_directory_at_100k_post_fix_72() {
+        let backend = std::sync::Arc::new(WalkableV8RecordingBackend::new());
+        let mut forest =
+            ShardedHamtPrivateForest::new("single-dir-100k", test_dek(), 256);
+        for i in 0..100_000usize {
+            let path = format!("/single-dir/f{:08}.bin", i);
+            forest
+                .upsert_file(file_entry(&path, 0), &backend)
+                .await
+                .unwrap();
+        }
+        forest.flush_dirty(&backend).await.unwrap();
+
+        let dir_entry = forest
+            .get_directory("/single-dir", &backend)
+            .await
+            .unwrap()
+            .expect("/single-dir must exist after 100k upserts");
+        assert!(
+            dir_entry.files.is_empty(),
+            "#72 regression at 100k: dir.files should be empty, was {}",
+            dir_entry.files.len()
+        );
+
+        let largest = backend.max_size();
+        let largest_path = backend.max_path();
+        eprintln!(
+            "[walkable-v8 #72 100k] largest blob {} bytes ({:.1} KiB) at {}",
+            largest, largest as f64 / 1024.0, largest_path
+        );
+        assert!(
+            largest <= IPFS_BLOCK_LIMIT,
+            "100k files in /single-dir/ → largest blob {} bytes exceeds 1 MiB. \
+             #72 regression: the cliff returned. Inspect {} for dir.files growth \
+             or HAMT-node fanout regression.",
+            largest, largest_path
+        );
     }
 }
