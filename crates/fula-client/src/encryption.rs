@@ -1276,19 +1276,33 @@ impl EncryptedClient {
         // the no-hint fallback, which only checks the warm cache by
         // storage_key and then errors — exactly the failure mode the
         // walkable-v8 fresh-bucket cold-walk test surfaced.
-        let cid_hint = forest_entry.as_ref().and_then(|e| e.storage_cid.as_ref());
-        let result = match cid_hint {
-            Some(cid) => self
-                .inner
-                .get_object_with_offline_fallback_known_cid(bucket, storage_key, cid)
-                .await?
-                .inner,
-            None => self
-                .inner
-                .get_object_with_offline_fallback(bucket, storage_key)
-                .await?
-                .inner,
+        //
+        // Native-only: `_known_cid` is gated to non-wasm (block_cache +
+        // gateway_fetch infrastructure isn't compiled into wasm builds).
+        // wasm32 keeps the legacy no-hint path; cold-cache offline reads
+        // are not yet supported on browser SDKs.
+        #[cfg(not(target_arch = "wasm32"))]
+        let result = {
+            let cid_hint = forest_entry.as_ref().and_then(|e| e.storage_cid.as_ref());
+            match cid_hint {
+                Some(cid) => self
+                    .inner
+                    .get_object_with_offline_fallback_known_cid(bucket, storage_key, cid)
+                    .await?
+                    .inner,
+                None => self
+                    .inner
+                    .get_object_with_offline_fallback(bucket, storage_key)
+                    .await?
+                    .inner,
+            }
         };
+        #[cfg(target_arch = "wasm32")]
+        let result = self
+            .inner
+            .get_object_with_offline_fallback(bucket, storage_key)
+            .await?
+            .inner;
 
         // Helper: fetch a metadata key, preferring HTTP headers, falling
         // back to the (AEAD-protected) forest entry's user_metadata.

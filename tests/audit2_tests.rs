@@ -349,6 +349,7 @@ mod content_type_privacy {
             root_hash: "00".repeat(32),
             chunk_nonces: vec![],
             content_type: None,
+            chunk_cids: Vec::new(),
         };
 
         let json = serde_json::to_string(&meta).unwrap();
@@ -649,6 +650,7 @@ mod chunked_metadata_format {
             root_hash: "abcd".repeat(16),
             chunk_nonces: vec![],
             content_type: None,
+            chunk_cids: Vec::new(),
         };
 
         let json = serde_json::to_string(&meta).unwrap();
@@ -671,6 +673,7 @@ mod chunked_metadata_format {
             root_hash: "00".repeat(32),
             chunk_nonces: vec![],
             content_type: None,
+            chunk_cids: Vec::new(),
         };
         assert_eq!(meta.total_size, 9500);
     }
