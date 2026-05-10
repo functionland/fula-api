@@ -375,6 +375,38 @@ fn normalize_dir_path(dir_path: &str) -> String {
     }
 }
 
+/// #84 fix — path-component-aware "is `path` under `prefix`?" check.
+///
+/// Replaces raw `path.starts_with(prefix)` everywhere a prefix-scoped
+/// listing or extraction is computed. The raw check overmatches sibling
+/// directories that share a byte prefix (e.g. `/photos` vs `/photosold`);
+/// this helper enforces that the (normalized) `path` either equals the
+/// (normalized) prefix or begins with `normalized_prefix + "/"`.
+///
+/// **Normalization applied to BOTH operands.** Each is run through
+/// [`normalize_dir_path`] (strip trailing slash; ensure leading slash)
+/// before comparison so:
+/// - `prefix` and `prefix/` behave identically (callers may pass either).
+/// - Legacy entries whose stored path has no leading slash
+///   (`foo/cat.jpg`) are still surfaced by canonical prefix queries
+///   (`/foo`). Pre-fix the listing returned them via a buggy byte-prefix
+///   match; post-fix they are returned by a correct path-component
+///   match. Direct-key GET for those legacy entries continues to work
+///   verbatim — no write-side migration is required, and no entry
+///   becomes orphaned.
+///
+/// Identical semantics in `private_forest::path_under_prefix_v1` and
+/// `hamt_index::path_under_prefix_index`.
+fn path_under_prefix(path: &str, prefix: &str) -> bool {
+    let normalized_prefix = normalize_dir_path(prefix);
+    let normalized_path = normalize_dir_path(path);
+    if normalized_prefix == "/" {
+        return true;
+    }
+    normalized_path == normalized_prefix
+        || normalized_path.starts_with(&format!("{}/", normalized_prefix))
+}
+
 /// Return the normalized parent directory of a file path.
 fn parent_dir_of(file_path: &str) -> String {
     match file_path.rfind('/') {
@@ -1631,7 +1663,12 @@ impl ShardedHamtPrivateForest {
         backend: &Arc<B>,
     ) -> Result<Vec<ForestFileEntry>> {
         let all = self.list_all_files(backend).await?;
-        Ok(all.into_iter().filter(|f| f.path.starts_with(prefix)).collect())
+        // #84: path-component-aware filter — `/photos` must not match
+        // `/photosold/legacy.jpg`. See `path_under_prefix`.
+        Ok(all
+            .into_iter()
+            .filter(|f| path_under_prefix(&f.path, prefix))
+            .collect())
     }
 
     /// Paginated variant of [`Self::list_recursive`].
@@ -1690,7 +1727,8 @@ impl ShardedHamtPrivateForest {
                         .await?;
                     for w in wires {
                         if let HamtEntry::File(f) = HamtEntry::from(w) {
-                            if f.path.starts_with(prefix) {
+                            // #84: path-component-aware filter.
+                            if path_under_prefix(&f.path, prefix) {
                                 out.push(f);
                             }
                         }
@@ -1739,33 +1777,23 @@ impl ShardedHamtPrivateForest {
         prefix: &str,
         backend: &Arc<B>,
     ) -> Result<(Vec<ForestFileEntry>, Vec<ForestDirectoryEntry>)> {
-        let normalized_prefix = normalize_dir_path(prefix);
         let all = self.collect_all_entries(backend).await?;
 
         let mut files_out: Vec<ForestFileEntry> = Vec::new();
         let mut dirs_out: Vec<ForestDirectoryEntry> = Vec::new();
 
-        // Match semantics of the prior BFS walker: a path is "under
-        // prefix" if it equals prefix OR starts with `prefix + "/"`.
-        // Pure `starts_with(prefix)` would over-match (e.g., prefix
-        // "/photos" would match "/photos2024"). Treat root specially —
-        // every path is under "/".
-        let is_under_prefix = |path: &str| -> bool {
-            if normalized_prefix == "/" {
-                return true;
-            }
-            path == normalized_prefix || path.starts_with(&format!("{}/", normalized_prefix))
-        };
-
+        // #84 fix — uses `path_under_prefix` (extracted from this method's
+        // original closure). Pure `starts_with(prefix)` would over-match
+        // (e.g., prefix `/photos` would match `/photos2024`).
         for entry in all {
             match entry {
                 HamtEntry::File(f) => {
-                    if is_under_prefix(&f.path) {
+                    if path_under_prefix(&f.path, prefix) {
                         files_out.push(f);
                     }
                 }
                 HamtEntry::Dir(d) => {
-                    if is_under_prefix(&d.path) {
+                    if path_under_prefix(&d.path, prefix) {
                         dirs_out.push(d);
                     }
                 }
@@ -1797,15 +1825,25 @@ impl ShardedHamtPrivateForest {
         for e in all {
             match e {
                 HamtEntry::File(f) => {
-                    if f.path.starts_with(prefix) {
+                    // #84: path-component-aware filter — keep files only
+                    // when they live under the prefix as a directory
+                    // boundary, never when they share a byte prefix.
+                    if path_under_prefix(&f.path, prefix) {
                         subtree.files.insert(f.path.clone(), f);
                     }
                 }
                 HamtEntry::Dir(d) => {
                     // Keep dirs inside the subtree AND dirs that are
-                    // ancestors of the prefix (so the caller can walk the
-                    // path down). Matches `PrivateForest::extract_subtree`.
-                    if d.path.starts_with(prefix) || prefix.starts_with(&d.path) {
+                    // ancestors of the prefix (so the caller can walk
+                    // the path down). The ancestor side uses the same
+                    // path-component-aware check (a dir is an ancestor
+                    // iff `prefix == d.path` OR `prefix` starts with
+                    // `d.path + "/"`); this avoids matching `/foo` as
+                    // an ancestor of `/foobar`. Matches the equivalent
+                    // fix in `PrivateForest::extract_subtree`.
+                    if path_under_prefix(&d.path, prefix)
+                        || path_under_prefix(prefix, &d.path)
+                    {
                         subtree.directories.insert(d.path.clone(), d);
                     }
                 }
@@ -4768,6 +4806,228 @@ mod tests {
              / `ChildPtr::resolve_owned` for a regression where the \
              stored LinkV2 cid never makes it into the get_with_cid_hint \
              call.",
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // #84 — prefix-overmatch regression guard (v7 sharded path)
+    // ----------------------------------------------------------------------
+    //
+    // Pre-fix bug: `list_recursive`, `list_recursive_page`, and
+    // `extract_subtree` use `path.starts_with(prefix)` directly. With
+    // `prefix = "/photos"` and a file at `/photosold/legacy.jpg`, the
+    // byte-prefix match incorrectly includes the sibling. The intended
+    // semantics — already implemented in `list_subtree` at lines
+    // 1750-1758 — are: a path is "under prefix" iff it equals the prefix
+    // OR begins with `prefix + "/"`. These guards fail under the buggy
+    // implementation and pass after the fix is applied.
+    //
+    // The bug surfaces on every public surface that takes a prefix and
+    // returns matching files: `EncryptedClient::list_directory_from_forest`
+    // (encryption.rs:7570/7605), the share-export path
+    // (`extract_subtree`, encryption.rs:8149/8157), and the v7
+    // `list_recursive` / `list_recursive_page` callers exposed via the
+    // SDK's bulk-listing APIs.
+    #[tokio::test]
+    async fn list_recursive_does_not_overmatch_sibling_prefix_84() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-84", test_dek(), 16);
+
+        // Siblings sharing a byte prefix but living in independent dirs.
+        forest.upsert_file(file_entry("/photos/cat.jpg", 1), &backend).await.unwrap();
+        forest.upsert_file(file_entry("/photos/dog.jpg", 2), &backend).await.unwrap();
+        forest.upsert_file(file_entry("/photosold/legacy.jpg", 3), &backend).await.unwrap();
+        forest.upsert_file(file_entry("/other/x.txt", 4), &backend).await.unwrap();
+
+        let listing: HashSet<String> = forest
+            .list_recursive("/photos", &backend)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+
+        assert!(
+            listing.contains("/photos/cat.jpg") && listing.contains("/photos/dog.jpg"),
+            "list_recursive('/photos') must include both /photos/* files; got {:?}",
+            listing
+        );
+        assert!(
+            !listing.contains("/photosold/legacy.jpg"),
+            "list_recursive('/photos') must NOT include /photosold/legacy.jpg \
+             (sibling-prefix overmatch). got {:?}",
+            listing
+        );
+        assert!(
+            !listing.contains("/other/x.txt"),
+            "list_recursive('/photos') must NOT include unrelated paths; got {:?}",
+            listing
+        );
+    }
+
+    #[tokio::test]
+    async fn list_recursive_page_does_not_overmatch_sibling_prefix_84() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-84p", test_dek(), 16);
+
+        forest.upsert_file(file_entry("/photos/cat.jpg", 1), &backend).await.unwrap();
+        forest.upsert_file(file_entry("/photos/dog.jpg", 2), &backend).await.unwrap();
+        forest.upsert_file(file_entry("/photosold/legacy.jpg", 3), &backend).await.unwrap();
+        forest.upsert_file(file_entry("/photoshoot/2025/best.jpg", 4), &backend).await.unwrap();
+
+        // Drain every page to be order-insensitive.
+        let mut all: HashSet<String> = HashSet::new();
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let (page, next) = forest
+                .list_recursive_page("/photos", cursor.as_deref(), 1000, &backend)
+                .await
+                .unwrap();
+            for f in page {
+                all.insert(f.path);
+            }
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        assert!(
+            all.contains("/photos/cat.jpg") && all.contains("/photos/dog.jpg"),
+            "page walk for '/photos' must surface every /photos/* file; got {:?}",
+            all
+        );
+        assert!(
+            !all.contains("/photosold/legacy.jpg"),
+            "page walk for '/photos' must NOT surface /photosold/legacy.jpg \
+             (sibling-prefix overmatch). got {:?}",
+            all
+        );
+        assert!(
+            !all.contains("/photoshoot/2025/best.jpg"),
+            "page walk for '/photos' must NOT surface /photoshoot/* either; got {:?}",
+            all
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_subtree_does_not_overmatch_sibling_prefix_84() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-84e", test_dek(), 16);
+
+        forest.upsert_file(file_entry("/photos/cat.jpg", 1), &backend).await.unwrap();
+        forest.upsert_file(file_entry("/photosold/legacy.jpg", 2), &backend).await.unwrap();
+
+        let extracted = forest.extract_subtree("/photos", &backend).await.unwrap();
+
+        assert!(
+            extracted.get_file("/photos/cat.jpg").is_some(),
+            "extract_subtree('/photos') must include /photos/cat.jpg",
+        );
+        assert!(
+            extracted.get_file("/photosold/legacy.jpg").is_none(),
+            "extract_subtree('/photos') must NOT include /photosold/legacy.jpg \
+             (sibling-prefix overmatch). The extracted forest's files map: {:?}",
+            extracted
+                .list_all_files()
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// #84 — legacy entries with non-canonical (no-leading-slash) paths
+    /// must still be surfaced by canonical prefix queries.
+    ///
+    /// Backward-compat preservation: an older fula-client could have
+    /// stored an entry with `path = "foo/cat.jpg"` (no leading slash).
+    /// Pre-#84 the byte-prefix overmatch surfaced it via
+    /// `list_recursive("foo")` (and `list_recursive("/foo")` would
+    /// not, but listing was buggy in other directions too). Post-#84
+    /// we want canonical queries to find legacy entries while the
+    /// stored bytes stay verbatim — no write-side migration. The
+    /// helper `path_under_prefix` normalizes BOTH operands so this
+    /// works.
+    ///
+    /// We construct the entry by hand (rather than via `upsert_file`)
+    /// because the in-memory `file_entry` test helper doesn't accept
+    /// a non-canonical path through any normal flow. Going forward
+    /// every new write uses canonical paths; this test just guards
+    /// the legacy-data accessibility property.
+    #[tokio::test]
+    async fn list_recursive_finds_legacy_no_leading_slash_path_84() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-84-legacy", test_dek(), 16);
+
+        // Insert a legacy-shaped entry directly. `upsert_file` writes
+        // both `F:` and `D:` HAMT entries; routing is based on the
+        // file path, so a no-leading-slash path will land in some
+        // shard. We use the upsert API so the test exercises the same
+        // storage path real legacy clients would have written.
+        let mut legacy = file_entry("foo/cat.jpg", 1);
+        legacy.path = "foo/cat.jpg".to_string(); // explicit no-slash
+        forest.upsert_file(legacy, &backend).await.unwrap();
+
+        // Canonical query should still see the legacy entry.
+        let listing: HashSet<String> = forest
+            .list_recursive("/foo", &backend)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert!(
+            listing.contains("foo/cat.jpg"),
+            "list_recursive('/foo') must surface legacy non-canonical \
+             entry 'foo/cat.jpg'. Path normalization in path_under_prefix \
+             handles either-shape paths so legacy data isn't orphaned. got {:?}",
+            listing
+        );
+    }
+
+    /// #84 — `extract_subtree`'s directory-ancestor branch must use the
+    /// same path-component-aware check, in BOTH directions. Pre-fix it
+    /// used `prefix.starts_with(&d.path)` which byte-overmatched a
+    /// sibling-named ancestor: with prefix `/foo` and a directory
+    /// entry at `/foobar`, the byte check `"/foo".starts_with("/foobar")`
+    /// is false (good), but the OPPOSITE direction
+    /// `"/foobar".starts_with("/foo")` is true — wrongly admitting
+    /// `/foobar` into the extracted forest's `directories` map.
+    ///
+    /// The post-fix check uses `path_under_prefix(prefix, &d.path)` for
+    /// the ancestor side, which evaluates to false because `/foo` is not
+    /// under `/foobar`. This regression guard catches a future revert
+    /// that drops either direction of the symmetric helper.
+    #[tokio::test]
+    async fn extract_subtree_dir_ancestor_branch_does_not_overmatch_sibling_84() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut forest = ShardedHamtPrivateForest::new("bucket-84a", test_dek(), 16);
+
+        // Two sibling directories sharing a byte prefix. Each gets a file
+        // so `upsert_file` writes the corresponding `D:` HAMT entries via
+        // `ensure_ancestor_chain`.
+        forest.upsert_file(file_entry("/foo/inside.txt", 1), &backend).await.unwrap();
+        forest.upsert_file(file_entry("/foobar/sibling.txt", 2), &backend).await.unwrap();
+
+        let extracted = forest.extract_subtree("/foo", &backend).await.unwrap();
+
+        // The legitimate match.
+        assert!(
+            extracted.get_file("/foo/inside.txt").is_some(),
+            "extract_subtree('/foo') must include /foo/inside.txt"
+        );
+        // Sibling file must not leak.
+        assert!(
+            extracted.get_file("/foobar/sibling.txt").is_none(),
+            "extract_subtree('/foo') must NOT include /foobar/sibling.txt"
+        );
+        // Critical: the directory map must not include /foobar.
+        // Pre-fix this would have leaked because `"/foobar".starts_with("/foo")` is true.
+        assert!(
+            !extracted.directories.contains_key("/foobar"),
+            "extract_subtree('/foo')'s directories map must NOT include /foobar \
+             (sibling-prefix ancestor overmatch). got keys {:?}",
+            extracted.directories.keys().collect::<Vec<_>>()
         );
     }
 }

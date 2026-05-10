@@ -539,22 +539,15 @@ impl PrivateForest {
     }
 
     /// List files recursively under a path
-    /// 
+    ///
     /// Works with both FlatMapV1 and HamtV2 formats.
     pub fn list_recursive(&self, prefix: &str) -> Vec<&ForestFileEntry> {
-        let normalized = if prefix.is_empty() {
-            "/".to_string()
-        } else if prefix.starts_with('/') {
-            prefix.to_string()
-        } else {
-            format!("/{}", prefix)
-        };
-
-        // For both formats, filter all files by prefix
-        // This is still efficient as list_all_files uses the right storage
+        // #84: path-component-aware filter — `/photos` must not match
+        // `/photosold/legacy.jpg`. The helper normalizes both operands
+        // internally, so the raw caller-supplied prefix is fine.
         self.list_all_files()
             .into_iter()
-            .filter(|f| f.path.starts_with(&normalized))
+            .filter(|f| path_under_prefix_v1(&f.path, prefix))
             .collect()
     }
 
@@ -580,27 +573,79 @@ impl PrivateForest {
     }
 
     /// Extract a subtree for sharing
-    /// 
+    ///
     /// Works with both FlatMapV1 and HamtV2 formats.
     pub fn extract_subtree(&self, prefix: &str) -> PrivateForest {
         let mut subtree = PrivateForest::new();
         subtree.salt = self.salt.clone();
         subtree.root = prefix.to_string();
-        
-        // Copy matching files using format-aware iteration
+
+        // Copy matching files via the (now path-component-aware)
+        // `list_recursive` — picks up the #84 fix automatically.
         for entry in self.list_recursive(prefix) {
             subtree.files.insert(entry.path.clone(), entry.clone());
         }
-        
-        // Copy matching directories
+
+        // Copy matching directories. A directory belongs in the subtree
+        // when it lives under `prefix` OR is an ancestor of `prefix`
+        // (so the recipient can resolve the path chain). Both checks
+        // use `path_under_prefix_v1` so neither one byte-prefix-overmatches
+        // a sibling. (Pre-fix `path.starts_with(prefix) || prefix.starts_with(path)`
+        // matched `/foo` as an ancestor of `/foobar` and `/foobar` as a
+        // descendant of `/foo`.) The helper normalizes both operands.
         for (path, dir) in &self.directories {
-            if path.starts_with(prefix) || prefix.starts_with(path) {
+            if path_under_prefix_v1(path, prefix)
+                || path_under_prefix_v1(prefix, path)
+            {
                 subtree.directories.insert(path.clone(), dir.clone());
             }
         }
-        
+
         subtree
     }
+}
+
+/// #84 helper — normalize a caller-supplied path prefix to the form used
+/// by [`path_under_prefix_v1`].
+///
+/// Strips trailing slashes (so `/photos` and `/photos/` are equivalent),
+/// ensures a leading slash, and treats empty input as root. Identical
+/// semantics to `sharded_hamt_forest::normalize_dir_path`; duplicated
+/// here to avoid pulling the v7 module into v1's read paths.
+fn normalize_path_component_prefix(prefix: &str) -> String {
+    if prefix.is_empty() || prefix == "/" {
+        return "/".to_string();
+    }
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{}", trimmed)
+    }
+}
+
+/// #84 helper — path-component-aware "is `path` under `prefix`?" check.
+///
+/// **Both operands are normalized inside the helper.** Callers may pass
+/// either operand in non-canonical form (`foo` vs `/foo`, `/foo/`) and
+/// get consistent results. This matches `sharded_hamt_forest::path_under_prefix`
+/// so v1 and v7 behave identically, and it's the load-bearing property
+/// for `extract_subtree`'s symmetric ancestor branch — that branch
+/// passes a directory entry's `path` as the helper's second argument,
+/// and v1's directory map can hold legacy non-canonical keys.
+///
+/// A path is "under" the prefix iff (after normalization) it equals the
+/// prefix OR begins with `prefix + "/"`. The root prefix `/` matches
+/// every path. Replaces raw `path.starts_with(prefix)` in v1 monolithic
+/// listing/extraction surfaces.
+fn path_under_prefix_v1(path: &str, prefix: &str) -> bool {
+    let normalized_prefix = normalize_path_component_prefix(prefix);
+    let normalized_path = normalize_path_component_prefix(path);
+    if normalized_prefix == "/" {
+        return true;
+    }
+    normalized_path == normalized_prefix
+        || normalized_path.starts_with(&format!("{}/", normalized_prefix))
 }
 
 impl Default for PrivateForest {
@@ -1992,6 +2037,277 @@ impl EncryptedDirectoryIndex {
     }
 }
 
+/// plan-D5 — directory-index sharded envelope (version 8).
+///
+/// Splits a [`DirectoryIndex`] into N=16 hash-prefix shards, each
+/// encrypted as its own AEAD ciphertext with `(bucket, shard_idx,
+/// sequence)` bound into AAD. Lifts the 1 MiB single-blob cliff
+/// (`MAX_MANIFEST_BLOCK_SIZE`) for buckets with ≥ ~30k directories
+/// without breaking pre-D5 buckets — the v7 envelope continues to be
+/// readable, and pre-D5 buckets still write v7 until the auto-shard
+/// threshold (~80% of the cap) triggers.
+///
+/// **Sharding rule** (operator-confirmed, plan-D5 question #2): a
+/// constant domain-separator prefix is mixed with `dir_path` so the
+/// routing is deterministic across buckets and the DEK is NOT used —
+/// routing is not a confidentiality boundary (the path is decrypted
+/// before routing), so adding the DEK adds no security and complicates
+/// debugging. See [`shard_index_for_path`].
+///
+/// **Sequence model** (operator-confirmed, plan-D5 question #1): one
+/// `sequence` per envelope, bound into every shard's AAD. All 16
+/// shards re-PUT on every flush even if only one shard changed. Write
+/// amplification can be optimized later via per-shard diff caching;
+/// the simpler model is the safer default for the initial v8 wire.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EncryptedDirectoryIndexV8 {
+    /// Envelope version (= 8).
+    pub version: u8,
+    /// Number of hash-prefix shards. Locked at 16 for the initial
+    /// design. Future tuning would require a coordinated reader+writer
+    /// rollout because the shard a path lands in changes with
+    /// `num_shards`.
+    pub num_shards: u8,
+    /// Monotonic sequence shared across all shards. Bound into every
+    /// shard's AAD so a stale shard ciphertext cannot replay against a
+    /// newer envelope-level claim.
+    pub sequence: u64,
+    /// One ciphertext per shard, ordered by `shard_idx` (0..num_shards).
+    pub shards: Vec<EncryptedDirectoryIndexV8Shard>,
+}
+
+/// One shard of a sharded directory index. Holds the AEAD ciphertext
+/// over the JSON-serialized sub-index containing only entries that
+/// hash to this shard's `shard_idx`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EncryptedDirectoryIndexV8Shard {
+    /// 0-indexed shard position, < num_shards.
+    pub shard_idx: u8,
+    /// AEAD ciphertext over the per-shard sub-DirectoryIndex JSON.
+    #[serde(with = "base64_serde")]
+    pub ciphertext: Vec<u8>,
+    /// Nonce used for encryption.
+    #[serde(with = "base64_serde")]
+    pub nonce: Vec<u8>,
+}
+
+impl EncryptedDirectoryIndexV8Shard {
+    pub fn shard_idx(&self) -> u8 {
+        self.shard_idx
+    }
+
+    /// Serialize this shard's envelope for storage. Each shard's bytes
+    /// MUST fit a single IPFS block (`MAX_MANIFEST_BLOCK_SIZE`).
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+}
+
+/// plan-D5 — fixed shard count for the v8 envelope. Documented as
+/// "16 hash-prefix shards" in the issue and locked here so a future
+/// drift between envelope and routing can never silently change which
+/// shard a path lands in.
+pub const DIR_INDEX_V8_NUM_SHARDS: u8 = 16;
+
+/// plan-D5 — domain separator prefix for the directory-index shard
+/// routing function. Mixed with `dir_path` to derive a uniform
+/// hash-prefix across the 0..16 range. The literal value is part of
+/// the wire format — changing it would change which shard every path
+/// lands in, breaking lazy migration. Locked at v1.
+const DIR_INDEX_V8_ROUTE_PREFIX: &[u8] = b"fula:dir-index-shard-route:v1";
+
+/// plan-D5 — AAD domain separator prefix for v8 shard ciphertexts.
+/// Distinct from the v7 `dir_index_aad` prefix so a v7 reader cannot
+/// be tricked into accepting a v8 ciphertext. Each shard's full AAD
+/// is `DIR_INDEX_V8_AAD_PREFIX || bucket || shard_idx || sequence`.
+const DIR_INDEX_V8_AAD_PREFIX: &[u8] = b"fula:dir-index:v8:";
+
+/// plan-D5 — compute the 0..16 shard index for `dir_path`. Uses a
+/// constant domain-separator prefix (NOT the DEK) so the routing is
+/// deterministic across buckets and easy to debug.
+pub fn shard_index_for_path(dir_path: &str) -> u8 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DIR_INDEX_V8_ROUTE_PREFIX);
+    hasher.update(dir_path.as_bytes());
+    let h = hasher.finalize();
+    h.as_bytes()[0] & 0x0F
+}
+
+/// plan-D5 — AAD for one v8 shard ciphertext. Binds bucket name,
+/// shard index, and the envelope-level sequence so a shard ciphertext
+/// cannot be cross-shard-swapped, cross-bucket-replayed, or replayed
+/// against a newer sequence claim.
+fn dir_index_v8_aad(bucket: &str, shard_idx: u8, sequence: u64) -> Vec<u8> {
+    // capacity = prefix + bucket + ':' + shard_idx + ':' + sequence_le (8 bytes)
+    let mut aad = Vec::with_capacity(
+        DIR_INDEX_V8_AAD_PREFIX.len() + bucket.len() + 1 + 1 + 1 + 8,
+    );
+    aad.extend_from_slice(DIR_INDEX_V8_AAD_PREFIX);
+    aad.extend_from_slice(bucket.as_bytes());
+    aad.push(b':');
+    aad.push(shard_idx);
+    aad.push(b':');
+    aad.extend_from_slice(&sequence.to_le_bytes());
+    aad
+}
+
+impl EncryptedDirectoryIndexV8 {
+    pub fn num_shards(&self) -> u8 {
+        self.num_shards
+    }
+
+    pub fn shards(&self) -> &[EncryptedDirectoryIndexV8Shard] {
+        &self.shards
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Encrypt a [`DirectoryIndex`] as a 16-shard sharded envelope.
+    ///
+    /// 1. Each entry routes to [`shard_index_for_path`].
+    /// 2. Each shard's sub-`DirectoryIndex` (only the entries routing
+    ///    to that shard) is JSON-serialized.
+    /// 3. Each shard's plaintext is AEAD-encrypted with
+    ///    [`dir_index_v8_aad`]`(bucket, shard_idx, sequence)`.
+    /// 4. The 16 ciphertexts (plus envelope-level sequence) form the
+    ///    returned [`EncryptedDirectoryIndexV8`].
+    ///
+    /// Per-shard plaintext size is ~`total_plaintext / 16` (uniform
+    /// hash distribution), so a 1.9 MB single-blob input becomes 16
+    /// blobs each ~120 KB. Test 2 (`dir_index_v8_30k_entries_handled_via_sharding_d5`)
+    /// asserts each shard's serialized envelope is < 256 KiB — well
+    /// under the 1 MiB IPFS block cap.
+    pub fn encrypt_sharded(
+        index: &DirectoryIndex,
+        dek: &DekKey,
+        bucket: &str,
+        sequence: u64,
+    ) -> Result<Self> {
+        // Route every entry into one of N=16 sub-indices. Each sub-index
+        // carries the same `version` field so the merged DirectoryIndex
+        // round-trips byte-identically. Entries below 16 are normal;
+        // empty shards are still emitted (with an empty `entries` map)
+        // so the envelope shape is constant.
+        let mut sub_indices: Vec<DirectoryIndex> = (0..DIR_INDEX_V8_NUM_SHARDS)
+            .map(|_| DirectoryIndex {
+                version: index.version,
+                entries: HashMap::new(),
+            })
+            .collect();
+        for (path, dir_entry) in &index.entries {
+            let idx = shard_index_for_path(path) as usize;
+            sub_indices[idx]
+                .entries
+                .insert(path.clone(), dir_entry.clone());
+        }
+
+        // Encrypt each shard with shard-bound AAD. We deliberately do
+        // NOT enforce per-shard plaintext caps here: at N=16 a 1 MiB
+        // shard implies a ~16 MiB total dir-index, far past anything
+        // the SDK should be writing. The next plan-D5b would split
+        // further or change N upstream.
+        let mut shards = Vec::with_capacity(DIR_INDEX_V8_NUM_SHARDS as usize);
+        for shard_idx in 0..DIR_INDEX_V8_NUM_SHARDS {
+            let json = serde_json::to_vec(&sub_indices[shard_idx as usize])
+                .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+            let nonce = Nonce::generate();
+            let aead = Aead::new_default(dek);
+            let aad = dir_index_v8_aad(bucket, shard_idx, sequence);
+            let ciphertext = aead.encrypt_with_aad(&nonce, &json, &aad)?;
+            shards.push(EncryptedDirectoryIndexV8Shard {
+                shard_idx,
+                ciphertext,
+                nonce: nonce.as_bytes().to_vec(),
+            });
+        }
+
+        Ok(Self {
+            version: 8,
+            num_shards: DIR_INDEX_V8_NUM_SHARDS,
+            sequence,
+            shards,
+        })
+    }
+
+    /// Decrypt + verify a 16-shard envelope, merging the 16 sub-indices
+    /// back into a single [`DirectoryIndex`]. Returns the index along
+    /// with the sealed `sequence`.
+    ///
+    /// Validates: `version == 8`, `num_shards == DIR_INDEX_V8_NUM_SHARDS`,
+    /// `shards.len() == num_shards`, every shard's `shard_idx` matches
+    /// its position. Each AEAD failure surfaces as `CryptoError::Decryption`.
+    pub fn decrypt_sharded(
+        &self,
+        dek: &DekKey,
+        bucket: &str,
+    ) -> Result<(DirectoryIndex, u64)> {
+        if self.version != 8 {
+            return Err(CryptoError::Decryption(format!(
+                "expected EncryptedDirectoryIndexV8 version 8, got {}",
+                self.version
+            )));
+        }
+        if self.num_shards != DIR_INDEX_V8_NUM_SHARDS {
+            return Err(CryptoError::Decryption(format!(
+                "expected num_shards={}, got {}",
+                DIR_INDEX_V8_NUM_SHARDS, self.num_shards
+            )));
+        }
+        if self.shards.len() != self.num_shards as usize {
+            return Err(CryptoError::Decryption(format!(
+                "shards vec length {} does not match num_shards {}",
+                self.shards.len(),
+                self.num_shards
+            )));
+        }
+        let mut merged = DirectoryIndex {
+            version: DirectoryIndex::default_version(),
+            entries: HashMap::new(),
+        };
+        for (i, shard) in self.shards.iter().enumerate() {
+            if shard.shard_idx as usize != i {
+                return Err(CryptoError::Decryption(format!(
+                    "shard at position {} has shard_idx={} (mismatch)",
+                    i, shard.shard_idx
+                )));
+            }
+            let nonce = Nonce::from_bytes(&shard.nonce)?;
+            let aead = Aead::new_default(dek);
+            let aad = dir_index_v8_aad(bucket, shard.shard_idx, self.sequence);
+            let plaintext =
+                aead.decrypt_with_aad(&nonce, &shard.ciphertext, &aad)?;
+            let sub: DirectoryIndex = serde_json::from_slice(&plaintext)
+                .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+            // Guard: every entry in the sub-index must route to this
+            // shard. Otherwise an attacker who knows the DEK could try
+            // a cross-shard plaintext swap (within the same bucket /
+            // sequence). AAD already binds shard_idx, so the AEAD itself
+            // catches this — the explicit check is belt-and-suspenders
+            // and gives a clearer error.
+            for path in sub.entries.keys() {
+                let routed = shard_index_for_path(path);
+                if routed != shard.shard_idx {
+                    return Err(CryptoError::Decryption(format!(
+                        "shard {} contains path '{}' that routes to shard {}",
+                        shard.shard_idx, path, routed
+                    )));
+                }
+            }
+            // Pick up the version from the first non-empty sub-index;
+            // they should all agree (they were all built from the same
+            // input index).
+            if !sub.entries.is_empty() {
+                merged.version = sub.version;
+            }
+            merged.entries.extend(sub.entries);
+        }
+        Ok((merged, self.sequence))
+    }
+}
+
 /// Result of detecting the format at the index_key
 pub enum ForestOrManifest {
     /// Monolithic forest (version 1, 2, or 4).
@@ -3055,4 +3371,497 @@ mod tests {
         assert_eq!(modern.dir_index_cid, None);
     }
 
+    // ----------------------------------------------------------------------
+    // #84 — prefix-overmatch regression guard (v1 monolithic path)
+    // ----------------------------------------------------------------------
+    //
+    // Same bug shape as the v7 sharded variant: `PrivateForest::list_recursive`
+    // (line 544) normalizes the prefix but still uses `starts_with(&normalized)`,
+    // and `extract_subtree` (line 585) inherits the bug via list_recursive.
+    // With prefix `/photos` and a file at `/photosold/legacy.jpg`, both
+    // surfaces wrongly include the sibling.
+
+    #[test]
+    fn list_recursive_does_not_overmatch_sibling_prefix_84_v1() {
+        let dek = DekKey::generate();
+        let mut forest = PrivateForest::new();
+
+        for path in &[
+            "/photos/cat.jpg",
+            "/photos/dog.jpg",
+            "/photosold/legacy.jpg",
+            "/other/x.txt",
+        ] {
+            let metadata = PrivateMetadata::new(*path, 100);
+            let storage_key = forest.generate_key(path, &dek);
+            let entry = ForestFileEntry::from_metadata(&metadata, storage_key);
+            forest.upsert_file(entry);
+        }
+
+        let listing: std::collections::HashSet<String> = forest
+            .list_recursive("/photos")
+            .into_iter()
+            .map(|f| f.path.clone())
+            .collect();
+
+        assert!(
+            listing.contains("/photos/cat.jpg") && listing.contains("/photos/dog.jpg"),
+            "v1 list_recursive('/photos') must include all /photos/* files; got {:?}",
+            listing
+        );
+        assert!(
+            !listing.contains("/photosold/legacy.jpg"),
+            "v1 list_recursive('/photos') must NOT include /photosold/legacy.jpg \
+             (sibling-prefix overmatch). got {:?}",
+            listing
+        );
+    }
+
+    #[test]
+    fn extract_subtree_does_not_overmatch_sibling_prefix_84_v1() {
+        let dek = DekKey::generate();
+        let mut forest = PrivateForest::new();
+
+        for path in &["/photos/cat.jpg", "/photosold/legacy.jpg"] {
+            let metadata = PrivateMetadata::new(*path, 100);
+            let storage_key = forest.generate_key(path, &dek);
+            let entry = ForestFileEntry::from_metadata(&metadata, storage_key);
+            forest.upsert_file(entry);
+        }
+
+        let subtree = forest.extract_subtree("/photos");
+
+        assert!(
+            subtree.get_file("/photos/cat.jpg").is_some(),
+            "v1 extract_subtree('/photos') must include /photos/cat.jpg",
+        );
+        assert!(
+            subtree.get_file("/photosold/legacy.jpg").is_none(),
+            "v1 extract_subtree('/photos') must NOT include /photosold/legacy.jpg \
+             (sibling-prefix overmatch)",
+        );
+    }
+
+    /// #84 — legacy v1 entries with non-canonical (no-leading-slash)
+    /// paths must still be surfaced by canonical prefix queries.
+    /// See the v7 sharded counterpart for the rationale.
+    #[test]
+    fn list_recursive_finds_legacy_no_leading_slash_path_84_v1() {
+        let dek = DekKey::generate();
+        let mut forest = PrivateForest::new();
+
+        let metadata = PrivateMetadata::new("foo/cat.jpg", 100); // no leading slash
+        let storage_key = forest.generate_key("foo/cat.jpg", &dek);
+        let entry = ForestFileEntry::from_metadata(&metadata, storage_key);
+        forest.upsert_file(entry);
+
+        // Canonical query should still find the legacy entry.
+        let listing: std::collections::HashSet<String> = forest
+            .list_recursive("/foo")
+            .into_iter()
+            .map(|f| f.path.clone())
+            .collect();
+        assert!(
+            listing.contains("foo/cat.jpg"),
+            "v1 list_recursive('/foo') must surface legacy non-canonical \
+             entry 'foo/cat.jpg' via path normalization in the comparison. \
+             got {:?}",
+            listing
+        );
+    }
+
+    /// #84 — v1 monolithic mirror of the dir-ancestor branch test in
+    /// `sharded_hamt_forest.rs`. Pre-fix `extract_subtree`'s directory
+    /// loop used `prefix.starts_with(path)` which is true for
+    /// `"/foo".starts_with("/foobar")` is false but
+    /// `"/foobar".starts_with("/foo")` is true — wrongly including
+    /// `/foobar` as a "descendant" of `/foo`. The other direction
+    /// (`path.starts_with(prefix)`) was the file-branch overmatch.
+    /// Post-fix both directions go through `path_under_prefix_v1`.
+    // ----------------------------------------------------------------------
+    // plan-D5 — directory-index prefix sharding regression guards.
+    //
+    // Pre-D5, `EncryptedDirectoryIndex::encrypt` serializes the entire
+    // `DirectoryIndex` to a single JSON, encrypts as one blob, and rejects
+    // anything ≥ `MAX_MANIFEST_BLOCK_SIZE` (1 MiB). At ~30k+ entries the
+    // cliff triggers and **NEW writes to that bucket fail until the user
+    // re-organizes** (D1 surfaces this in the error message). Existing
+    // data remains readable; only writes are blocked.
+    //
+    // Test 1 documents the cliff exists today (encrypts a 30k-entry index
+    // and asserts the existing v7 path errors with the documented cliff
+    // message). It passes both pre- and post-fix because the v7 envelope
+    // contract is unchanged.
+    //
+    // Test 2 asserts the post-fix property: a new sharded encrypt path
+    // (`EncryptedDirectoryIndexV8`) handles the same 30k-entry index
+    // without hitting the cliff. Won't compile until the fix lands.
+    // ----------------------------------------------------------------------
+
+    /// Build a DirectoryIndex large enough to push the JSON serialization
+    /// past `MAX_MANIFEST_BLOCK_SIZE` (1 MiB). Separate function so the
+    /// pre- and post-fix tests share the construction.
+    ///
+    /// Uses a 100-section × 300-leaf pattern (= 30k+ leaf dirs, 100
+    /// section dirs, plus root) rather than 30k flat top-level dirs.
+    /// The flat pattern would put root's 30k-subdir BTreeSet into one
+    /// hash-prefix shard, making that single shard ~660 KB by itself —
+    /// still well under the 1 MiB cliff but skewing the per-shard
+    /// distribution. Real-world directory trees aren't 30k-flat-children;
+    /// the scattered pattern below better models the expected workload.
+    ///
+    /// Known limitation (plan-D5b): under N=16 hash-prefix sharding, a
+    /// pathologically flat tree where root has 100k+ direct children
+    /// would still concentrate ~1 MiB of subdir-set JSON into one
+    /// shard. A future plan-D5b could shard `DirEntry.subdirs`
+    /// internally, similar to #72/#83's HAMT-walk replacement of the
+    /// cliff-prone Vec<String> field.
+    #[cfg(test)]
+    fn build_d5_cliff_index() -> DirectoryIndex {
+        let mut index = DirectoryIndex::new();
+        for section in 0..100 {
+            for leaf in 0..300 {
+                index.ensure_dir(&format!("/sec{:03}/dir{:06}", section, leaf));
+            }
+        }
+        index
+    }
+
+    /// plan-D5 / Test 1 — confirms the cliff exists in the v7 single-blob
+    /// path. This is a regression guard: if this test starts failing, it
+    /// means somebody silently lifted the cap in the v7 envelope, which
+    /// would break the cross-version compat invariant (v7 readers MUST be
+    /// able to bound block size).
+    #[test]
+    fn dir_index_v7_30k_entries_hits_1mib_cliff_d5() {
+        let dek = DekKey::generate();
+        let index = build_d5_cliff_index();
+
+        // Independently confirm the JSON exceeds the cap so the test is
+        // self-explanatory if it ever starts erroring elsewhere.
+        let json_len = serde_json::to_vec(&index)
+            .expect("serialize DirectoryIndex")
+            .len();
+        assert!(
+            json_len > 1_048_576,
+            "test setup precondition: 30k-entry index must produce >1 MiB JSON; got {} bytes",
+            json_len
+        );
+
+        let result = EncryptedDirectoryIndex::encrypt(&index, &dek, "bucket-d5-pre", 1);
+        let err = result.expect_err("v7 encrypt must reject >=1 MiB plaintext");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("exceeds the 1048576 byte block cap"),
+            "expected the documented cliff error from D1, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("(plan D5)"),
+            "expected the error to mention plan D5 as the proper fix, got: {}",
+            msg
+        );
+    }
+
+    /// plan-D5 / Test 2 — the post-fix property. A new sharded encrypt
+    /// path must accept the same 30k-entry index and produce 16 separate
+    /// shard blobs, each well under `MAX_MANIFEST_BLOCK_SIZE`. Round-trip
+    /// must reproduce the original `DirectoryIndex`.
+    ///
+    /// Pre-fix: this test won't compile because `EncryptedDirectoryIndexV8`
+    /// doesn't exist. Post-fix: it compiles and passes.
+    #[test]
+    fn dir_index_v8_30k_entries_handled_via_sharding_d5() {
+        let dek = DekKey::generate();
+        let index = build_d5_cliff_index();
+        let bucket = "bucket-d5-post";
+        let sequence = 1u64;
+
+        // Encrypt-sharded: must split entries across 16 hash-prefix shards
+        // and emit a `Vec<EncryptedDirectoryIndexV8Shard>` whose
+        // serialized envelope per shard is < 1 MiB.
+        let envelope = EncryptedDirectoryIndexV8::encrypt_sharded(
+            &index, &dek, bucket, sequence,
+        )
+        .expect("sharded encrypt must accept a 30k-entry DirectoryIndex");
+
+        assert_eq!(
+            envelope.num_shards(),
+            16,
+            "plan-D5 picks N=16 hash-prefix shards"
+        );
+
+        // Each shard's serialized envelope must comfortably fit one IPFS
+        // block. 1 MiB hard cap; assert ≤ 256 KB to surface a regression
+        // long before the cliff returns.
+        for shard in envelope.shards() {
+            let bytes = shard.to_bytes().expect("serialize shard");
+            assert!(
+                bytes.len() < 256 * 1024,
+                "shard {} serialized to {} bytes; want < 256 KiB to keep \
+                 a comfortable margin under the IPFS block cap",
+                shard.shard_idx(),
+                bytes.len()
+            );
+        }
+
+        // Round-trip must reproduce the original DirectoryIndex exactly.
+        let (decoded, decoded_seq) = envelope
+            .decrypt_sharded(&dek, bucket)
+            .expect("sharded decrypt round-trip");
+        assert_eq!(decoded_seq, sequence);
+        assert_eq!(
+            decoded, index,
+            "sharded round-trip must reconstruct the original DirectoryIndex"
+        );
+    }
+
+    /// plan-D5 — small-input round-trip. The 16-shard envelope must
+    /// also work for low-entry buckets (the common case) so callers can
+    /// adopt v8 unconditionally once the auto-shard threshold logic
+    /// lands. Empty shards (no entries routed there) are still part of
+    /// the envelope; deserialization handles them as
+    /// `DirectoryIndex { entries: empty_map }`.
+    #[test]
+    fn dir_index_v8_small_input_round_trips_d5() {
+        let dek = DekKey::generate();
+        let bucket = "bucket-d5-small";
+        let mut index = DirectoryIndex::new();
+        for path in &[
+            "/photos",
+            "/photos/2024",
+            "/photos/2024/jan",
+            "/docs",
+            "/docs/tax",
+        ] {
+            index.ensure_dir(path);
+        }
+
+        let envelope =
+            EncryptedDirectoryIndexV8::encrypt_sharded(&index, &dek, bucket, 7)
+                .expect("encrypt small input");
+        assert_eq!(envelope.num_shards(), 16);
+        assert_eq!(envelope.shards().len(), 16);
+        assert_eq!(envelope.sequence(), 7);
+
+        let (decoded, seq) = envelope
+            .decrypt_sharded(&dek, bucket)
+            .expect("round-trip");
+        assert_eq!(seq, 7);
+        assert_eq!(decoded, index);
+    }
+
+    /// plan-D5 — cross-shard ciphertext swap is rejected.
+    ///
+    /// AEAD AAD binds `shard_idx`, so swapping two shards' ciphertexts
+    /// in the envelope must fail decryption. Belt-and-suspenders: the
+    /// decoder also re-routes every entry post-decrypt and rejects a
+    /// shard whose entries don't all hash to its `shard_idx`.
+    #[test]
+    fn dir_index_v8_cross_shard_swap_rejected_d5() {
+        let dek = DekKey::generate();
+        let bucket = "bucket-d5-swap";
+        let index = build_d5_cliff_index();
+
+        let mut envelope =
+            EncryptedDirectoryIndexV8::encrypt_sharded(&index, &dek, bucket, 1)
+                .expect("encrypt");
+        // Swap the ciphertext + nonce of shards 3 and 7. shard_idx
+        // fields are NOT changed (otherwise the post-decrypt routing
+        // check could short-circuit before AAD verification).
+        let s3_ct = envelope.shards[3].ciphertext.clone();
+        let s3_nonce = envelope.shards[3].nonce.clone();
+        envelope.shards[3].ciphertext = envelope.shards[7].ciphertext.clone();
+        envelope.shards[3].nonce = envelope.shards[7].nonce.clone();
+        envelope.shards[7].ciphertext = s3_ct;
+        envelope.shards[7].nonce = s3_nonce;
+
+        let err = envelope
+            .decrypt_sharded(&dek, bucket)
+            .expect_err("cross-shard swap must fail");
+        // AEAD layer rejects first because shard_idx 3's AAD doesn't
+        // match the AEAD tag generated for shard 7's plaintext (and
+        // vice versa). Any decryption-grade error is acceptable; we
+        // just want to confirm the swap doesn't silently succeed.
+        let msg = format!("{}", err);
+        assert!(
+            msg.to_lowercase().contains("decrypt")
+                || msg.to_lowercase().contains("aead")
+                || msg.to_lowercase().contains("aes")
+                || msg.to_lowercase().contains("invalid")
+                || msg.to_lowercase().contains("tag"),
+            "expected an AEAD-grade rejection, got: {}",
+            msg
+        );
+    }
+
+    /// plan-D5 — cross-bucket replay is rejected.
+    ///
+    /// Bucket name is bound into AAD, so a v8 envelope encrypted for
+    /// bucket A cannot be decrypted as bucket B even with the same DEK.
+    #[test]
+    fn dir_index_v8_cross_bucket_aad_rejected_d5() {
+        let dek = DekKey::generate();
+        let mut index = DirectoryIndex::new();
+        index.ensure_dir("/some/path");
+        let envelope =
+            EncryptedDirectoryIndexV8::encrypt_sharded(&index, &dek, "bucket-A", 1)
+                .expect("encrypt for bucket-A");
+
+        let err = envelope
+            .decrypt_sharded(&dek, "bucket-B")
+            .expect_err("cross-bucket decrypt must fail");
+        let msg = format!("{}", err);
+        assert!(
+            msg.to_lowercase().contains("decrypt")
+                || msg.to_lowercase().contains("aead")
+                || msg.to_lowercase().contains("aes")
+                || msg.to_lowercase().contains("invalid")
+                || msg.to_lowercase().contains("tag"),
+            "expected AEAD rejection on cross-bucket attempt, got: {}",
+            msg
+        );
+    }
+
+    /// plan-D5 — sequence-replay defense.
+    ///
+    /// `sequence` is bound into every shard's AAD. Mutating the
+    /// envelope-level sequence on a captured ciphertext must fail
+    /// decryption (the AEAD tag was computed with the original sequence).
+    #[test]
+    fn dir_index_v8_sequence_replay_rejected_d5() {
+        let dek = DekKey::generate();
+        let bucket = "bucket-d5-seq";
+        let mut index = DirectoryIndex::new();
+        index.ensure_dir("/x");
+        let mut envelope =
+            EncryptedDirectoryIndexV8::encrypt_sharded(&index, &dek, bucket, 42)
+                .expect("encrypt");
+
+        // Tamper: claim the envelope is sequence 100 (replay against a
+        // newer sequence number). AAD includes sequence per shard, so
+        // each shard's AEAD tag mismatches.
+        envelope.sequence = 100;
+        let err = envelope
+            .decrypt_sharded(&dek, bucket)
+            .expect_err("sequence-replay decrypt must fail");
+        let msg = format!("{}", err);
+        assert!(
+            msg.to_lowercase().contains("decrypt")
+                || msg.to_lowercase().contains("aead")
+                || msg.to_lowercase().contains("aes")
+                || msg.to_lowercase().contains("invalid")
+                || msg.to_lowercase().contains("tag"),
+            "expected AEAD rejection on sequence replay, got: {}",
+            msg
+        );
+    }
+
+    /// plan-D5 — version envelope rejects v7 ciphertext fed as v8.
+    ///
+    /// A v7 single-blob envelope cannot be decrypted as v8 (would
+    /// silently misinterpret bytes). Decoder explicitly checks
+    /// `version == 8`.
+    #[test]
+    fn dir_index_v8_decoder_rejects_v7_envelope_d5() {
+        let v7_envelope = EncryptedDirectoryIndex {
+            version: 7,
+            ciphertext: vec![0; 32],
+            nonce: vec![0; 12],
+            sequence: 1,
+        };
+        // Construct a v7-version-tagged value in v8's struct shape and
+        // confirm decrypt rejects. (Real cross-version protection is
+        // at the format-detection layer; this test guards the v8 decoder
+        // itself against an attacker who crafted a v8 envelope with
+        // version=7.)
+        let envelope = EncryptedDirectoryIndexV8 {
+            version: 7, // wrong
+            num_shards: DIR_INDEX_V8_NUM_SHARDS,
+            sequence: 1,
+            shards: Vec::new(),
+        };
+        let dek = DekKey::generate();
+        let err = envelope
+            .decrypt_sharded(&dek, "bucket")
+            .expect_err("v8 decoder must reject version=7");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("version 8"),
+            "expected version-mismatch error, got: {}",
+            msg
+        );
+        // Suppress unused-var warning on v7_envelope; it's documentation.
+        let _ = v7_envelope;
+    }
+
+    /// plan-D5 — a v7 envelope still encrypts/decrypts correctly after
+    /// the v8 envelope was added. Guards against accidental regression
+    /// in the v7 path.
+    #[test]
+    fn dir_index_v7_round_trip_unaffected_by_v8_d5() {
+        let dek = DekKey::generate();
+        let bucket = "bucket-d5-v7";
+        let mut index = DirectoryIndex::new();
+        index.ensure_dir("/photos/2024");
+        index.ensure_dir("/photos/2025");
+        index.insert_file("/photos/2024/cat.jpg");
+
+        let envelope = EncryptedDirectoryIndex::encrypt(&index, &dek, bucket, 9)
+            .expect("v7 encrypt small input");
+        let (decoded, seq) = envelope.decrypt(&dek, bucket).expect("v7 decrypt");
+        assert_eq!(seq, 9);
+        assert_eq!(decoded, index);
+    }
+
+    #[test]
+    fn extract_subtree_dir_ancestor_branch_does_not_overmatch_sibling_84_v1() {
+        let dek = DekKey::generate();
+        let mut forest = PrivateForest::new();
+
+        // Plant siblings with distinct directory entries.
+        for path in &["/foo/inside.txt", "/foobar/sibling.txt"] {
+            let metadata = PrivateMetadata::new(*path, 100);
+            let storage_key = forest.generate_key(path, &dek);
+            let entry = ForestFileEntry::from_metadata(&metadata, storage_key);
+            forest.upsert_file(entry);
+        }
+        forest.directories.insert(
+            "/foo".to_string(),
+            ForestDirectoryEntry {
+                path: "/foo".to_string(),
+                files: Vec::new(),
+                subdirs: Vec::new(),
+                metadata: None,
+                subtree_dek: None,
+            },
+        );
+        forest.directories.insert(
+            "/foobar".to_string(),
+            ForestDirectoryEntry {
+                path: "/foobar".to_string(),
+                files: Vec::new(),
+                subdirs: Vec::new(),
+                metadata: None,
+                subtree_dek: None,
+            },
+        );
+
+        let subtree = forest.extract_subtree("/foo");
+
+        assert!(
+            subtree.get_file("/foo/inside.txt").is_some(),
+            "v1 extract_subtree('/foo') must include /foo/inside.txt"
+        );
+        assert!(
+            subtree.get_file("/foobar/sibling.txt").is_none(),
+            "v1 extract_subtree('/foo') must NOT include /foobar/sibling.txt"
+        );
+        assert!(
+            !subtree.directories.contains_key("/foobar"),
+            "v1 extract_subtree('/foo')'s directories map must NOT include /foobar \
+             (sibling-prefix ancestor overmatch). got keys {:?}",
+            subtree.directories.keys().collect::<Vec<_>>()
+        );
+    }
 }

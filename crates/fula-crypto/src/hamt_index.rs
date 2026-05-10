@@ -33,6 +33,42 @@ fn hash_path(path: &str) -> [u8; 32] {
     *blake3::hash(path.as_bytes()).as_bytes()
 }
 
+/// #84 helper — normalize a caller-supplied path prefix.
+///
+/// Strips trailing slashes (so `/photos` and `/photos/` are equivalent),
+/// ensures a leading slash, treats empty input as root. Mirror of
+/// `private_forest::normalize_path_component_prefix` and
+/// `sharded_hamt_forest::normalize_dir_path`.
+fn normalize_path_component_prefix_index(prefix: &str) -> String {
+    if prefix.is_empty() || prefix == "/" {
+        return "/".to_string();
+    }
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{}", trimmed)
+    }
+}
+
+/// #84 helper — path-component-aware "is `path` under `prefix`?" check.
+///
+/// **Both operands are normalized inside the helper** (matches the v7
+/// + v1 helpers). Replaces raw `path.starts_with(prefix)` so
+/// `iter_prefix("/photos")` no longer surfaces `/photosold/legacy`,
+/// and a legacy entry whose stored key lacks a leading slash is still
+/// surfaced by a canonical prefix query. Mirror of the helpers in
+/// `private_forest.rs` and `sharded_hamt_forest.rs`.
+fn path_under_prefix_index(path: &str, prefix: &str) -> bool {
+    let normalized_prefix = normalize_path_component_prefix_index(prefix);
+    let normalized_path = normalize_path_component_prefix_index(path);
+    if normalized_prefix == "/" {
+        return true;
+    }
+    normalized_path == normalized_prefix
+        || normalized_path.starts_with(&format!("{}/", normalized_prefix))
+}
+
 /// Get the nibble (4 bits) at a specific level from a hash
 fn get_nibble(hash: &[u8; 32], level: usize) -> usize {
     let byte_index = level / 2;
@@ -182,8 +218,15 @@ impl<V: Clone> HamtIndex<V> {
     }
 
     /// Iterate over entries with a path prefix
+    ///
+    /// #84: path-component-aware match. `prefix = "/photos"` yields
+    /// `/photos/...` and `/photos` itself, but never the sibling
+    /// `/photosold/...`. The pre-fix raw `starts_with` was a byte-prefix
+    /// match. See [`path_under_prefix_index`] for semantics — helper
+    /// normalizes both operands internally.
     pub fn iter_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = (&'a String, &'a V)> + 'a {
-        self.iter().filter(move |(path, _)| path.starts_with(prefix))
+        self.iter()
+            .filter(move |(path, _)| path_under_prefix_index(path, prefix))
     }
 
     /// Convert from a HashMap (for migration from FlatMapV1)
@@ -475,8 +518,11 @@ impl<V: Clone> ShardedIndex<V> {
     }
 
     /// Iterate over entries with a path prefix
+    ///
+    /// #84: path-component-aware match. See `HamtIndex::iter_prefix`.
     pub fn iter_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = (&'a String, &'a V)> + 'a {
-        self.iter().filter(move |(path, _)| path.starts_with(prefix))
+        self.iter()
+            .filter(move |(path, _)| path_under_prefix_index(path, prefix))
     }
 
     /// Convert from a HashMap
@@ -613,5 +659,83 @@ mod tests {
         // Total should match
         let total: usize = shard_sizes.iter().sum();
         assert_eq!(total, 1000);
+    }
+
+    // ----------------------------------------------------------------------
+    // #84 — `iter_prefix` overmatches sibling-prefix paths.
+    //
+    // Both `HamtIndex::iter_prefix` (line 185) and
+    // `ShardedIndex::iter_prefix` (line 478) filter via
+    // `path.starts_with(prefix)`. With prefix `/photos` and a key
+    // `/photosold/x`, the byte-prefix match wrongly includes the sibling.
+    // ----------------------------------------------------------------------
+    #[test]
+    fn hamt_index_iter_prefix_does_not_overmatch_sibling_prefix_84() {
+        let mut index: HamtIndex<u32> = HamtIndex::new();
+        index.insert("/photos/cat".to_string(), 1);
+        index.insert("/photos/dog".to_string(), 2);
+        index.insert("/photosold/legacy".to_string(), 3);
+
+        let collected: std::collections::HashSet<String> = index
+            .iter_prefix("/photos")
+            .map(|(p, _)| p.clone())
+            .collect();
+
+        assert!(
+            collected.contains("/photos/cat") && collected.contains("/photos/dog"),
+            "HamtIndex::iter_prefix('/photos') must yield /photos/cat and /photos/dog; got {:?}",
+            collected
+        );
+        assert!(
+            !collected.contains("/photosold/legacy"),
+            "HamtIndex::iter_prefix('/photos') must NOT yield /photosold/legacy \
+             (sibling-prefix overmatch). got {:?}",
+            collected
+        );
+    }
+
+    #[test]
+    fn hamt_index_iter_prefix_finds_legacy_no_leading_slash_path_84() {
+        // Legacy entry stored without leading slash. Canonical query
+        // should still surface it because path_under_prefix_index
+        // normalizes both operands.
+        let mut index: HamtIndex<u32> = HamtIndex::new();
+        index.insert("foo/cat".to_string(), 1);
+
+        let collected: std::collections::HashSet<String> = index
+            .iter_prefix("/foo")
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert!(
+            collected.contains("foo/cat"),
+            "HamtIndex::iter_prefix('/foo') must surface legacy 'foo/cat' \
+             via path normalization. got {:?}",
+            collected
+        );
+    }
+
+    #[test]
+    fn sharded_index_iter_prefix_does_not_overmatch_sibling_prefix_84() {
+        let mut index: ShardedIndex<u32> = ShardedIndex::new(16);
+        index.insert("/photos/cat".to_string(), 1);
+        index.insert("/photos/dog".to_string(), 2);
+        index.insert("/photosold/legacy".to_string(), 3);
+
+        let collected: std::collections::HashSet<String> = index
+            .iter_prefix("/photos")
+            .map(|(p, _)| p.clone())
+            .collect();
+
+        assert!(
+            collected.contains("/photos/cat") && collected.contains("/photos/dog"),
+            "ShardedIndex::iter_prefix('/photos') must yield /photos/cat and /photos/dog; got {:?}",
+            collected
+        );
+        assert!(
+            !collected.contains("/photosold/legacy"),
+            "ShardedIndex::iter_prefix('/photos') must NOT yield /photosold/legacy \
+             (sibling-prefix overmatch). got {:?}",
+            collected
+        );
     }
 }
