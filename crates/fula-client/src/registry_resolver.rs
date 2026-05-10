@@ -312,7 +312,41 @@ pub async fn fetch_cid_via_gateways(
     let mut last_err: Option<String> = None;
     for tmpl in gateways {
         let url = tmpl.replace("{cid}", &cid_str);
-        let resp = match tokio::time::timeout(per_request_timeout, http.get(&url).send()).await {
+        // IPFS gateway spec (IPIP-412): path-style endpoints like
+        // `gateway.example.com/ipfs/<cid>` and `gateway.example.com/ipns/<name>`
+        // return their HTML directory-listing UI when no Accept header is sent
+        // (or `application/vnd.ipld.car`/`raw`/`dag-json` for those types). To
+        // get the raw block bytes for content verification we MUST request
+        // `application/vnd.ipld.raw`. Without this, dweb.link returns 276 KB of
+        // HTML that fails `verify_cid_against_bytes`, the resolver exhausts the
+        // IPNS leg, and falls back to chain. Reproducible: any user pointing
+        // FULA_USERS_INDEX_IPNS_GATEWAY_URLS at a path-style gateway saw stale
+        // bucketsIndex (chain CIDs lag by up to 12h) → cold-start lookups for
+        // recently-created buckets returned `BucketNotFound`, swallowed by
+        // `list_files_from_forest` as 0 files.
+        // Multi-value Accept (RFC 7231 §5.3.2 quality-ordered list). The
+        // path-style `/ipfs/<cid>` endpoint resolves to a block whose codec
+        // is encoded in the CID — for fula it's either raw (0x55, used for
+        // EncryptedShardManifestV7 envelopes) or dag-cbor (0x71, used for
+        // GlobalUsersIndex and per-user bucketsIndex CBORs). Send both
+        // codec-specific media types so the gateway returns the right
+        // bytes regardless of which CID we're fetching. Without this,
+        // path-style gateways (dweb.link, ipfs.io) return their HTML
+        // directory listing UI and `verify_cid_against_bytes` rejects it.
+        // `application/cbor` is the legacy fallback some gateways accept
+        // for dag-cbor; `*/*` lets a stricter gateway pick anything if it
+        // doesn't honor the typed forms.
+        let resp = match tokio::time::timeout(
+            per_request_timeout,
+            http.get(&url)
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/vnd.ipld.raw, application/vnd.ipld.dag-cbor, application/cbor, */*;q=0.1",
+                )
+                .send(),
+        )
+        .await
+        {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 last_err = Some(format!("{} transport: {}", url, e));
@@ -1048,9 +1082,28 @@ impl UsersIndexResolver {
     /// pool's dynamic-priority state machine — this is one-shot
     /// cold-start, not the ongoing warm-device hot path.
     async fn fetch_with_timeout(&self, url: &str) -> Result<Bytes, ClientError> {
+        // IPIP-412: request raw IPLD bytes so path-style gateways (e.g.
+        // dweb.link/ipns/<name>) return the underlying CBOR rather than
+        // their HTML directory listing. Without this header, the IPNS
+        // leg silently exhausted across every gateway that wraps
+        // responses in HTML, forcing fall-back to the chain leg (which
+        // can be up to 12h stale).
+        // IPNS path. The resolved object is the GlobalUsersIndex CBOR
+        // (dag-cbor codec 0x71), so explicitly accept dag-cbor; include
+        // raw + cbor + */* as fallbacks for gateways that don't honor
+        // the typed forms. dweb.link 406s `vnd.ipld.raw` on IPNS paths
+        // (raw doesn't apply to IPNS-resolved typed content) but
+        // happily serves `vnd.ipld.dag-cbor` — empirically verified
+        // during the cold-walk diagnostic that produced this fix.
         let resp = tokio::time::timeout(
             self.config.per_request_timeout,
-            self.http.get(url).send(),
+            self.http
+                .get(url)
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/vnd.ipld.dag-cbor, application/vnd.ipld.raw, application/cbor, */*;q=0.1",
+                )
+                .send(),
         )
         .await
         .map_err(|_| ClientError::UsersIndexResolutionFailed {

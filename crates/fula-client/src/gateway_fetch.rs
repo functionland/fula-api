@@ -318,8 +318,25 @@ pub(crate) async fn fetch_one(
     timeout: Duration,
 ) -> Result<Bytes, FetchError> {
     let url = gateway.url_for(cid);
+    // IPIP-412: request raw IPLD bytes. Path-style gateways like
+    // dweb.link return HTML directory listings without this header,
+    // which then fail `verify_cid_against_bytes` on the caller side.
+    // Subdomain-style gateways (`<cid>.ipfs.<host>`) usually serve raw
+    // bytes by default but accept the header harmlessly. Sending
+    // unconditionally is the safest, most portable choice.
+    // Multi-value Accept: this fetcher serves both raw blocks
+    // (`bafkr4i...` codec 0x55) AND dag-cbor blocks (`bafyrei...` codec
+    // 0x71) — Phase 2.4 cold-walk uses the same gateway race for shard
+    // manifest pages (dag-cbor) and HAMT internal nodes (raw). A single
+    // `Accept: application/vnd.ipld.raw` gets 406 from gateways that
+    // serve dag-cbor as typed content. Including both typed forms lets
+    // the gateway pick the codec matching the CID.
     let resp = http
         .get(&url)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/vnd.ipld.raw, application/vnd.ipld.dag-cbor, application/cbor, */*;q=0.1",
+        )
         .timeout(timeout)
         .send()
         .await
