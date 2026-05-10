@@ -47,16 +47,28 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 const N_FILES: usize = 64;
 
 /// Upper bound on GETs the read phase is allowed to issue against the
-/// wiremock master. The post-fix path issues:
-///   - 0..=N_HAMT internal-node GETs to walk the path → entry (HAMT
-///     depth is O(log N); for N=64 with bucket-size 3 that's ≤8 levels).
-///   - 1 GET for the encrypted file body itself.
-///   - A handful for forest-load bookkeeping if the cache cooled.
-/// The pre-fix bug would have added N_FILES additional GETs (linear
-/// scan of every leaf in `list_all_files`). 32 is well below 64 and
-/// well above the post-fix expected count, giving healthy slack
-/// without risking flakiness.
-const MAX_READ_GETS: usize = 32;
+/// wiremock master after `invalidate_all_forest_caches` forces a fresh
+/// load.
+///
+/// **Empirically observed post-fix**: 6 GETs (1 manifest + 1 dir-index
+/// probe + 1 shard root + 1 internal-node walk + 1 leaf bucket + 1 file
+/// body, roughly).
+///
+/// **Pre-fix expected**: ≥40 GETs. `find_by_storage_key` →
+/// `list_all_files` → `collect_all_entries` would
+/// `ensure_shard_loaded` for every one of the 16 v7 default shards
+/// (16 GETs minimum just for shard roots) plus walk every leaf bucket
+/// across all shards (~16-30 more GETs depending on HAMT branching
+/// and entry distribution). The total is comfortably ≥40 in any
+/// realistic shard layout — see `sharded_hamt_forest.rs:1499-1506`
+/// for the O(N) scan implementation.
+///
+/// **Threshold = 16**: tight enough to catch any regression that
+/// re-introduces a per-shard fetch (the cheapest O(N) scan still
+/// has to fetch all 16 shard roots), loose enough that the post-fix
+/// path's ~6 GETs has 10× slack against unrelated test
+/// infrastructure changes.
+const MAX_READ_GETS: usize = 16;
 
 fn blake3_raw_cid(data: &[u8]) -> Cid {
     let h = blake3::hash(data);
@@ -165,6 +177,27 @@ async fn get_object_flat_does_not_o_n_scan_v7_forest() {
         .flush_forest(bucket)
         .await
         .expect("flush_forest");
+
+    // CRITICAL: invalidate the forest cache before reading.
+    //
+    // `flush_dirty` (sharded_hamt_forest.rs:1772) takes `&self` on the
+    // node store and does NOT rewrite the in-memory pointer state from
+    // `InMemory(node)` → `Stored(key)` after persist. The Arc-held node
+    // tree retains its `InMemory` pointers post-flush. Without
+    // invalidation, a subsequent `get_object_flat` walks the in-memory
+    // tree directly without issuing ANY backend GETs — and so does the
+    // bug-equivalent `find_by_storage_key` linear scan, since it also
+    // walks via `flat_map` over the same in-memory pointers. The test
+    // would then trivially pass with or without the fix, defeating the
+    // regression-guard purpose entirely.
+    //
+    // Invalidating the forest cache evicts the in-memory tree. The
+    // next `ensure_forest_loaded` re-fetches the manifest CBOR from
+    // wiremock, which decodes shard roots as `Stored`/`StoredV2`
+    // pointers (the on-disk wire form). Walking those then forces
+    // real backend GETs — exactly the behavior a fresh-installed
+    // device would see, which is the scenario the fix targets.
+    client.invalidate_all_forest_caches();
 
     // Phase 2: pick one file and read it. Turn on GET counting only
     // for this read so any forest-load bookkeeping during the prior
