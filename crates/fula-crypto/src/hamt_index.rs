@@ -54,11 +54,13 @@ fn normalize_path_component_prefix_index(prefix: &str) -> String {
 /// #84 helper — path-component-aware "is `path` under `prefix`?" check.
 ///
 /// **Both operands are normalized inside the helper** (matches the v7
-/// + v1 helpers). Replaces raw `path.starts_with(prefix)` so
-/// `iter_prefix("/photos")` no longer surfaces `/photosold/legacy`,
-/// and a legacy entry whose stored key lacks a leading slash is still
-/// surfaced by a canonical prefix query. Mirror of the helpers in
-/// `private_forest.rs` and `sharded_hamt_forest.rs`.
+/// + v1 helpers). Replaces raw `path.starts_with(prefix)` so:
+///
+/// - `iter_prefix("/photos")` no longer surfaces `/photosold/legacy`.
+/// - A legacy entry whose stored key lacks a leading slash is still
+///   surfaced by a canonical prefix query.
+///
+/// Mirror of the helpers in `private_forest.rs` and `sharded_hamt_forest.rs`.
 fn path_under_prefix_index(path: &str, prefix: &str) -> bool {
     let normalized_prefix = normalize_path_component_prefix_index(prefix);
     let normalized_path = normalize_path_component_prefix_index(path);

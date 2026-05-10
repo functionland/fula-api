@@ -204,6 +204,22 @@ impl From<fula_client::ClientError> for FulaError {
             ClientError::WireVersionUnsupported { context, postcard_error } => {
                 FulaError::WireVersionUnsupported { context, postcard_error }
             }
+            // D6 (#102) — multipart 10000-part precondition. Surface as
+            // a precondition-grade upload failure so Dart callers can
+            // surface the operator-actionable suggestion (raise
+            // `multipart_chunk_size`). Mapped to `UploadFailed` rather
+            // than a new typed variant to keep the FRB binding surface
+            // small; the message preserves the structured fields from
+            // the source error so callers can parse if needed.
+            ClientError::PartCountExceeded {
+                computed_parts,
+                max,
+                suggested_chunk_size,
+            } => FulaError::UploadFailed(format!(
+                "multipart upload requires {} parts which exceeds the S3 limit \
+                 of {}; increase multipart_chunk_size to at least {} bytes",
+                computed_parts, max, suggested_chunk_size
+            )),
         }
     }
 }
