@@ -193,6 +193,27 @@ pub enum ClientError {
         context: String,
         postcard_error: String,
     },
+
+    /// **D6 audit fix** — a multipart upload would require more than
+    /// the S3 hard limit of 10,000 parts at the configured
+    /// `multipart_chunk_size`. Surfaced as a typed pre-condition error
+    /// before any HTTP traffic, so callers see a clear actionable
+    /// signal ("increase chunk size to N bytes") instead of an opaque
+    /// S3 error at part #10001.
+    ///
+    /// `computed_parts` is what the upload would need at the current
+    /// chunk size; `max` is the S3-enforced ceiling (10,000); the
+    /// `suggested_chunk_size` is the smallest chunk size that fits the
+    /// file under the cap.
+    #[error(
+        "multipart upload requires {computed_parts} parts which exceeds the S3 limit \
+         of {max}; increase multipart_chunk_size to at least {suggested_chunk_size} bytes"
+    )]
+    PartCountExceeded {
+        computed_parts: u64,
+        max: u64,
+        suggested_chunk_size: u64,
+    },
 }
 
 /// **#81** — custom `From<CryptoError>` (replaces the prior `#[from]`

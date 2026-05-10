@@ -99,7 +99,11 @@ pub struct PutObjectResult {
 }
 
 /// Get object result
-#[derive(Clone, Debug)]
+///
+/// `data` carries decrypted plaintext on the encrypted-SDK path. The
+/// hand-rolled `Debug` impl redacts the byte payload so a stray
+/// `tracing::warn!("{:?}", result)` cannot dump user file contents.
+#[derive(Clone)]
 pub struct GetObjectResult {
     /// Object data
     pub data: bytes::Bytes,
@@ -113,6 +117,19 @@ pub struct GetObjectResult {
     pub last_modified: Option<DateTime<Utc>>,
     /// User metadata
     pub metadata: std::collections::HashMap<String, String>,
+}
+
+impl std::fmt::Debug for GetObjectResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GetObjectResult")
+            .field("data", &format_args!("[{} bytes redacted]", self.data.len()))
+            .field("etag", &self.etag)
+            .field("content_type", &self.content_type)
+            .field("content_length", &self.content_length)
+            .field("last_modified", &self.last_modified)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
 }
 
 /// Phase 19 — origin of a successfully-served byte payload.
@@ -179,7 +196,10 @@ pub enum ReadFreshness {
 /// new wrapper type lets callers opt in to the transparency surface
 /// while existing consumers (including encrypted-SDK internals that
 /// read `.data` / `.etag`) keep using `GetObjectResult` unchanged.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is hand-rolled to delegate to `GetObjectResult`'s redacted
+/// impl — the wrapped plaintext bytes never appear in log output.
+#[derive(Clone)]
 pub struct OfflineGetResult {
     /// The underlying `GetObjectResult` — `data`, `etag`, etc., are on
     /// `inner`. Callers that don't care about transparency just read
@@ -189,6 +209,16 @@ pub struct OfflineGetResult {
     pub source: ReadSource,
     /// How fresh the bytes are. See `ReadFreshness` for variants.
     pub freshness: ReadFreshness,
+}
+
+impl std::fmt::Debug for OfflineGetResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OfflineGetResult")
+            .field("inner", &self.inner)
+            .field("source", &self.source)
+            .field("freshness", &self.freshness)
+            .finish()
+    }
 }
 
 /// Head object result

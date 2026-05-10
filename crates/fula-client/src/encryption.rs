@@ -763,14 +763,25 @@ pub struct EncryptionConfig {
 }
 
 impl EncryptionConfig {
-    /// Create a new encryption config with random keys
-    /// Metadata privacy is ENABLED by default with FlatNamespace mode (RECOMMENDED)
-    /// 
-    /// FlatNamespace provides complete structure hiding:
-    /// - Storage keys look like random CID-style hashes
-    /// - No prefixes or structure hints visible to server
-    /// - Server cannot determine folder structure or parent/child relationships
+    /// Create a new encryption config with **random** keys.
+    ///
+    /// **DEPRECATED — see [`EncryptionConfig::from_secret_key`].** Production
+    /// code must derive its `SecretKey` from a stable, OAuth-derived seed
+    /// (e.g. Argon2id over `{provider}:{rawSub}:{email}`) and pass it via
+    /// `from_secret_key`. Calling `new()` produces a throwaway keypair: every
+    /// session gets a different identity, so any data encrypted under it
+    /// becomes permanently unreadable on the next process start.
+    ///
+    /// Tests and examples that legitimately need ephemeral keys should
+    /// annotate the call with `#[allow(deprecated)]`.
+    ///
+    /// Metadata privacy is ENABLED by default with FlatNamespace mode.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use EncryptionConfig::from_secret_key — random keypair locks users out of all writes on next session restart"
+    )]
     pub fn new() -> Self {
+        #[allow(deprecated)]
         Self {
             key_manager: Arc::new(KeyManager::new()),
             metadata_privacy: true,
@@ -779,7 +790,17 @@ impl EncryptionConfig {
         }
     }
 
-    /// Create without metadata privacy (filenames visible to server)
+    /// Create without metadata privacy (filenames visible to server).
+    ///
+    /// **DEPRECATED — see [`EncryptionConfig::from_secret_key`] and
+    /// `with_metadata_privacy(false)`.** Random-keypair semantics carry the
+    /// same data-loss trap as [`EncryptionConfig::new`]; additionally,
+    /// `KeyObfuscation::DeterministicHash` is itself deprecated in favor of
+    /// `KeyObfuscation::FlatNamespace`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use EncryptionConfig::from_secret_key + with_metadata_privacy(false) — random keypair locks users out on session restart"
+    )]
     #[allow(deprecated)]
     pub fn new_without_privacy() -> Self {
         Self {
@@ -790,16 +811,18 @@ impl EncryptionConfig {
         }
     }
 
-    /// Create with FlatNamespace mode - RECOMMENDED for maximum privacy
+    /// Create with FlatNamespace mode and **random** keys.
     ///
-    /// This mode provides complete structure hiding:
-    /// - Storage keys look like random CID-style hashes (e.g., `QmX7a8f3...`)
-    /// - No prefixes or structure hints visible to server
-    /// - Server cannot determine folder structure or parent/child relationships
-    /// - File tree is stored in an encrypted PrivateForest index
-    ///
-    /// Inspired by WNFS (WebNative File System) and Peergos.
+    /// **DEPRECATED — see [`EncryptionConfig::from_secret_key`].**
+    /// `from_secret_key` already defaults to `FlatNamespace` (best privacy
+    /// posture) so the only thing this constructor adds is the random-keypair
+    /// data-loss trap.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use EncryptionConfig::from_secret_key — defaults to FlatNamespace and avoids random-keypair data loss"
+    )]
     pub fn new_flat_namespace() -> Self {
+        #[allow(deprecated)]
         Self {
             key_manager: Arc::new(KeyManager::new()),
             metadata_privacy: true,
@@ -860,19 +883,40 @@ impl EncryptionConfig {
     }
 }
 
+/// **DEPRECATED — see [`EncryptionConfig::new`] for migration.**
+///
+/// Kept callable so existing source compiles, but every invocation produces a
+/// random throwaway keypair. Production must construct via
+/// `EncryptionConfig::from_secret_key`. Rust does not permit `#[deprecated]`
+/// on trait method impls; the deprecation warning fires through the inner
+/// `Self::new()` call and through the doc note here.
 impl Default for EncryptionConfig {
     fn default() -> Self {
+        #[allow(deprecated)]
         Self::new()
     }
 }
 
 /// Pinning credentials for remote pinning services
-#[derive(Clone, Debug)]
+///
+/// `token` is a bearer credential. `Debug` is hand-rolled so the token
+/// never appears in log output — same redaction pattern as
+/// `Config::access_token`.
+#[derive(Clone)]
 pub struct PinningCredentials {
     /// Pinning service endpoint URL
     pub endpoint: String,
     /// Bearer token for authentication
     pub token: String,
+}
+
+impl std::fmt::Debug for PinningCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinningCredentials")
+            .field("endpoint", &self.endpoint)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl PinningCredentials {
@@ -1112,6 +1156,14 @@ impl EncryptedClient {
 
         // Determine the storage key and metadata based on privacy settings
         let (storage_key, private_metadata_json) = if self.encryption.metadata_privacy {
+            // Generate obfuscated storage key FIRST. The storage_key is the
+            // canonical S3 path the metadata blob lives at; binding it into
+            // the metadata AEAD's AAD prevents a server from swapping
+            // metadata blobs across paths (F2 audit fix). Path-derived DEK,
+            // not per-file DEK, so retrieval can recompute the same key.
+            let path_dek = self.encryption.key_manager.derive_path_key(key);
+            let storage_key = obfuscate_key(key, &path_dek, self.encryption.obfuscation_mode.clone());
+
             // Create private metadata with original info. H-1: compute BLAKE3
             // over the plaintext *before* AEAD so the hash is bound to the
             // forest entry (outside the attacker-forgeable HPKE envelope).
@@ -1120,14 +1172,12 @@ impl EncryptedClient {
                 .with_content_type(content_type.unwrap_or("application/octet-stream"))
                 .with_content_hash(content_hash);
 
-            // Encrypt private metadata with the per-file DEK
-            let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
+            // Encrypt private metadata with the per-file DEK and AAD bound
+            // to the storage_key (v2 wire format; legacy v1 blobs without
+            // AAD remain readable via PublicMetadata::decrypt_private).
+            let aad = EncryptedPrivateMetadata::aad_v2(&storage_key);
+            let encrypted_meta = EncryptedPrivateMetadata::encrypt_v2(&private_meta, &dek, &aad)
                 .map_err(ClientError::Encryption)?;
-
-            // Generate obfuscated storage key using PATH-DERIVED DEK (not per-file DEK)
-            // This ensures we can compute the same storage key later for retrieval
-            let path_dek = self.encryption.key_manager.derive_path_key(key);
-            let storage_key = obfuscate_key(key, &path_dek, self.encryption.obfuscation_mode.clone());
 
             (storage_key, Some(encrypted_meta.to_json().map_err(ClientError::Encryption)?))
         } else {
@@ -2195,14 +2245,35 @@ impl EncryptedClient {
 
         Self::enforce_content_hash(forest_entry.as_ref(), &plaintext)?;
 
-        // Decrypt private metadata if present
+        // Decrypt private metadata if present. F2 dispatch: v1 (legacy,
+        // no AAD) vs v2 (AAD bound to storage_key). Future versions error
+        // cleanly so a downgrade attack cannot pick the wrong arm.
         let (original_key, original_size, content_type, user_metadata) =
             if let Some(private_meta_str) = enc_metadata["private_metadata"].as_str() {
                 let encrypted_meta = EncryptedPrivateMetadata::from_json(private_meta_str)
                     .map_err(ClientError::Encryption)?;
-                let private_meta = encrypted_meta.decrypt(&dek)
-                    .map_err(ClientError::Encryption)?;
-                
+                let private_meta = match encrypted_meta.version {
+                    1 => {
+                        #[allow(deprecated)]
+                        encrypted_meta.decrypt(&dek).map_err(ClientError::Encryption)?
+                    }
+                    2 => {
+                        let aad = EncryptedPrivateMetadata::aad_v2(storage_key);
+                        encrypted_meta
+                            .decrypt_v2(&dek, &aad)
+                            .map_err(ClientError::Encryption)?
+                    }
+                    v => {
+                        return Err(ClientError::Encryption(
+                            fula_crypto::CryptoError::Decryption(format!(
+                                "unsupported EncryptedPrivateMetadata wire version {} — \
+                                 this SDK reads v1 and v2",
+                                v
+                            )),
+                        ));
+                    }
+                };
+
                 (
                     private_meta.original_key,
                     private_meta.actual_size,
@@ -2337,13 +2408,33 @@ impl EncryptedClient {
         let dek = decryptor.decrypt_dek(&wrapped_key)
             .map_err(ClientError::Encryption)?;
 
-        // Decrypt private metadata if present (this is tiny - just a few hundred bytes)
+        // Decrypt private metadata if present (this is tiny - just a few hundred bytes).
+        // F2 dispatch: v1 (legacy, no AAD) vs v2 (AAD bound to storage_key).
         if let Some(private_meta_str) = enc_metadata["private_metadata"].as_str() {
             let encrypted_meta = EncryptedPrivateMetadata::from_json(private_meta_str)
                 .map_err(ClientError::Encryption)?;
-            let private_meta = encrypted_meta.decrypt(&dek)
-                .map_err(ClientError::Encryption)?;
-            
+            let private_meta = match encrypted_meta.version {
+                1 => {
+                    #[allow(deprecated)]
+                    encrypted_meta.decrypt(&dek).map_err(ClientError::Encryption)?
+                }
+                2 => {
+                    let aad = EncryptedPrivateMetadata::aad_v2(storage_key);
+                    encrypted_meta
+                        .decrypt_v2(&dek, &aad)
+                        .map_err(ClientError::Encryption)?
+                }
+                v => {
+                    return Err(ClientError::Encryption(
+                        fula_crypto::CryptoError::Decryption(format!(
+                            "unsupported EncryptedPrivateMetadata wire version {} — \
+                             this SDK reads v1 and v2",
+                            v
+                        )),
+                    ));
+                }
+            };
+
             Ok(FileMetadata {
                 storage_key: storage_key.to_string(),
                 original_key: private_meta.original_key,
@@ -5466,7 +5557,10 @@ impl EncryptedClient {
             .with_content_type(content_type.unwrap_or("application/octet-stream"))
             .with_content_hash(content_hash);
 
-        let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
+        // Encrypt private metadata with the per-file DEK and AAD bound to
+        // the obfuscated storage_key (v2 wire format; F2 audit fix).
+        let meta_aad = EncryptedPrivateMetadata::aad_v2(&storage_key);
+        let encrypted_meta = EncryptedPrivateMetadata::encrypt_v2(&private_meta, &dek, &meta_aad)
             .map_err(ClientError::Encryption)?;
 
         // Mark the forest entry as encrypted so subsequent reads refuse a
@@ -6000,18 +6094,21 @@ impl EncryptedClient {
         let wrapped_dek = encryptor.encrypt_dek(&dek)
             .map_err(ClientError::Encryption)?;
 
+        // Generate obfuscated storage_key first so the metadata AEAD can
+        // bind to it via AAD (F2 audit fix; see EncryptedPrivateMetadata::aad_v2).
+        let path_dek = self.encryption.key_manager.derive_path_key(key);
+        let storage_key = obfuscate_key(key, &path_dek, self.encryption.obfuscation_mode.clone());
+        let kek_version = self.encryption.key_manager.version();
+
         // H-1: BLAKE3 over the plaintext stream — bound to the forest
         // entry, not to the attacker-controllable ChunkedFileMetadata blob.
         let content_hash = blake3::hash(&data).to_hex().to_string();
         let private_meta = PrivateMetadata::new(key, original_size)
             .with_content_type(content_type.unwrap_or("application/octet-stream"))
             .with_content_hash(content_hash);
-        let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
+        let meta_aad = EncryptedPrivateMetadata::aad_v2(&storage_key);
+        let encrypted_meta = EncryptedPrivateMetadata::encrypt_v2(&private_meta, &dek, &meta_aad)
             .map_err(ClientError::Encryption)?;
-
-        let path_dek = self.encryption.key_manager.derive_path_key(key);
-        let storage_key = obfuscate_key(key, &path_dek, self.encryption.obfuscation_mode.clone());
-        let kek_version = self.encryption.key_manager.version();
 
         // Encode all chunks (in memory — for streaming, use put_object_encrypted_streaming)
         let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
@@ -6262,7 +6359,10 @@ impl EncryptedClient {
         let private_meta = PrivateMetadata::new(key, total_size)
             .with_content_type(content_type.unwrap_or("application/octet-stream"))
             .with_content_hash(content_hash);
-        let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
+        // F2: bind metadata AEAD to the storage_key (computed at line 6299)
+        // so a server cannot swap metadata blobs across paths.
+        let meta_aad = EncryptedPrivateMetadata::aad_v2(&storage_key);
+        let encrypted_meta = EncryptedPrivateMetadata::encrypt_v2(&private_meta, &dek, &meta_aad)
             .map_err(ClientError::Encryption)?;
 
         // Walkable-v8 (#80 / W.9.4-A2 port to streaming): mirror the
@@ -6468,7 +6568,8 @@ impl EncryptedClient {
             // All chunks uploaded — no nonce-reuse risk so skip BAO.
             // Decrypt private_meta and register (#82). `data` is
             // unused here because no chunks are re-encrypted.
-            let (_, _, private_meta) = self.decrypt_resumable_private_meta(&index_meta)?;
+            let (_, _, private_meta) =
+                self.decrypt_resumable_private_meta(&index_meta, &manifest.storage_key)?;
             self.ensure_forest_loaded(&manifest.bucket).await?;
             return self.finalize_and_register_resumed_upload(
                 &manifest,
@@ -6519,7 +6620,7 @@ impl EncryptedClient {
         // wrapped_key JSON that fails parse, and the tests assert
         // the BAO error fires first.
         let (wrapped_dek, dek, private_meta) =
-            self.decrypt_resumable_private_meta(&index_meta)?;
+            self.decrypt_resumable_private_meta(&index_meta, &manifest.storage_key)?;
 
         // #82: forest must be loaded before any chunk PUT so we
         // surface a load failure (e.g., master unreachable) before
@@ -6928,6 +7029,12 @@ impl EncryptedClient {
     /// branches of `resume_upload` (early-return when all chunks
     /// were already uploaded; main path post-BAO).
     ///
+    /// `storage_key` is the path the metadata blob was stored under;
+    /// it's bound into the v2 AAD on encrypt and reconstructed here on
+    /// decrypt to verify the metadata hasn't been swapped to a
+    /// different path. Pre-0.7 manifests carry v1 metadata (no AAD)
+    /// and dispatch through the legacy decrypt path.
+    ///
     /// CRITICAL: do NOT call this before the F1 BAO check on the
     /// main path. The `f1_resume_nonce_reuse_protection` test
     /// fixtures use a placeholder `wrapped_key` that's intentionally
@@ -6937,6 +7044,7 @@ impl EncryptedClient {
     fn decrypt_resumable_private_meta(
         &self,
         index_meta: &serde_json::Value,
+        storage_key: &str,
     ) -> Result<(EncryptedData, fula_crypto::keys::DekKey, PrivateMetadata)> {
         let wrapped_dek: EncryptedData = serde_json::from_value(
             index_meta["wrapped_key"].clone()
@@ -6953,8 +7061,30 @@ impl EncryptedClient {
         })?;
         let encrypted_private_meta = EncryptedPrivateMetadata::from_json(encrypted_meta_str)
             .map_err(ClientError::Encryption)?;
-        let private_meta = encrypted_private_meta.decrypt(&dek)
-            .map_err(ClientError::Encryption)?;
+        // F2 dispatch: v1 (legacy, no AAD) vs v2 (AAD bound to storage_key).
+        // Future versions error cleanly so a downgrade attack cannot pick
+        // the wrong arm.
+        let private_meta = match encrypted_private_meta.version {
+            1 => {
+                #[allow(deprecated)]
+                encrypted_private_meta.decrypt(&dek).map_err(ClientError::Encryption)?
+            }
+            2 => {
+                let aad = EncryptedPrivateMetadata::aad_v2(storage_key);
+                encrypted_private_meta
+                    .decrypt_v2(&dek, &aad)
+                    .map_err(ClientError::Encryption)?
+            }
+            v => {
+                return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                    format!(
+                        "unsupported EncryptedPrivateMetadata wire version {} in resumable manifest — \
+                         this SDK reads v1 and v2",
+                        v
+                    ),
+                )));
+            }
+        };
         Ok((wrapped_dek, dek, private_meta))
     }
 
@@ -8649,10 +8779,10 @@ impl EncryptedClient {
         chunk_size: Option<usize>,
     ) -> Result<PutObjectResult> {
         use fula_crypto::chunked::{ChunkedEncoder, ChunkedFileMetadata, DEFAULT_CHUNK_SIZE};
-        
+
         let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
         let dek = self.encryption.key_manager.generate_dek();
-        
+
         // Generate storage key using obfuscation (same as put_object_encrypted)
         let storage_key = if self.encryption.metadata_privacy {
             let path_dek = self.encryption.key_manager.derive_path_key(key);
@@ -8660,23 +8790,36 @@ impl EncryptedClient {
         } else {
             key.to_string()
         };
-        
+
         // Create chunked encoder with AAD binding chunks to storage key
         let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
         let mut encoder = ChunkedEncoder::with_aad_and_chunk_size(dek.clone(), aad_prefix, chunk_size);
 
         // Process all data and collect chunks
         let mut chunks = encoder.update(data)?;
-        let (final_chunk, metadata, outboard) = encoder.finalize()?;
-        
+        let (final_chunk, mut metadata, outboard) = encoder.finalize()?;
+
         if let Some(chunk) = final_chunk {
             chunks.push(chunk);
         }
-        
+
+        // **E51 audit fix — Walkable-v8 (W.9.4-A2) per-chunk CID stamping.**
+        //
+        // Pre-fix this public API didn't pre-compute or post-verify chunk
+        // CIDs, so files uploaded via it could not be read via the
+        // gateway-race fallback when master was down — the offline reader
+        // had no per-chunk CIDs to fetch. Mirror the
+        // `put_object_chunked_internal` pattern (already W.9.4-A2 patched
+        // in task #77): pre-compute `BLAKE3(chunk.ciphertext)` BEFORE
+        // each chunk's body is moved into the PUT, then post-PUT verify
+        // master's etag-attested CID matches.
+        let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
+
         // Upload chunks in parallel with bounded concurrency. Using
         // futures::stream::buffer_unordered rather than tokio::spawn so the
         // same code runs on wasm32 (where tokio has no multi-thread runtime).
-        let _uploaded_keys = {
+        let total_chunks = metadata.num_chunks as usize;
+        let (uploaded_keys, chunk_cids): (Vec<String>, Vec<Option<cid::Cid>>) = {
             use futures::StreamExt;
             let futs = chunks.into_iter().map(|chunk| {
                 let chunk_key = ChunkedFileMetadata::chunk_key(&storage_key, chunk.index);
@@ -8685,31 +8828,72 @@ impl EncryptedClient {
                     .with_metadata("x-fula-chunk", "true")
                     .with_metadata("x-fula-chunk-index", &chunk.index.to_string());
 
+                // E51 / W.9.4-A2: pre-compute the chunk's expected CID
+                // BEFORE `chunk.ciphertext` is moved into the PUT call.
+                // `Bytes` cloning would be cheap (Arc-based) but we don't
+                // need it: BLAKE3 over the body is a single pass either
+                // way, and computing it before the move keeps the post-
+                // PUT verify allocation-free.
+                let expected_chunk_cid = if walkable_v8 {
+                    Some(crate::walkable_v8::local_blake3_raw_cid(&chunk.ciphertext))
+                } else {
+                    None
+                };
+                let chunk_index_for_collect = chunk.index;
+
                 let client = self.inner.clone();
                 let bucket = bucket.to_string();
                 let chunk_key_ret = chunk_key.clone();
 
                 async move {
-                    client.put_object_with_metadata(
+                    let put_result = client.put_object_with_metadata(
                         &bucket,
                         &chunk_key,
                         chunk.ciphertext,
                         Some(chunk_metadata),
                     ).await?;
-                    Ok::<String, ClientError>(chunk_key_ret)
+                    // E51 / W.9.4-A2: verify master's etag-attested CID
+                    // against our pre-computed BLAKE3(ciphertext). Mismatch
+                    // soft-fails to None — chunk PUT succeeded; only the
+                    // offline-walk hint for THIS chunk is missing; the
+                    // reader falls back to storage_key for that chunk.
+                    let chunk_cid = match (walkable_v8, expected_chunk_cid) {
+                        (true, Some(expected)) => crate::walkable_v8::verify_etag_against_expected_cid(
+                            &put_result.etag,
+                            expected,
+                            &bucket,
+                            &chunk_key,
+                        ),
+                        _ => None,
+                    };
+                    Ok::<(String, u32, Option<cid::Cid>), ClientError>((
+                        chunk_key_ret,
+                        chunk_index_for_collect,
+                        chunk_cid,
+                    ))
                 }
             });
 
-            let results: Vec<std::result::Result<String, ClientError>> = futures::stream::iter(futs)
-                .buffer_unordered(Self::MAX_CONCURRENT_CHUNK_UPLOADS)
-                .collect()
-                .await;
+            let results: Vec<std::result::Result<(String, u32, Option<cid::Cid>), ClientError>> =
+                futures::stream::iter(futs)
+                    .buffer_unordered(Self::MAX_CONCURRENT_CHUNK_UPLOADS)
+                    .collect()
+                    .await;
 
+            // E51 / W.9.4-A2: collect per-chunk CIDs indexed by
+            // chunk_index (NOT result-iteration order — `buffer_unordered`
+            // doesn't preserve order).
             let mut uploaded_keys: Vec<String> = Vec::new();
+            let mut chunk_cids: Vec<Option<cid::Cid>> = vec![None; total_chunks];
             let mut upload_error: Option<ClientError> = None;
             for result in results {
                 match result {
-                    Ok(key) => uploaded_keys.push(key),
+                    Ok((key, index, cid)) => {
+                        uploaded_keys.push(key);
+                        if let Some(slot) = chunk_cids.get_mut(index as usize) {
+                            *slot = cid;
+                        }
+                    }
                     Err(e) => { if upload_error.is_none() { upload_error = Some(e); } }
                 }
             }
@@ -8721,17 +8905,25 @@ impl EncryptedClient {
                 return Err(err);
             }
 
-            uploaded_keys
+            (uploaded_keys, chunk_cids)
         };
 
         // Don't set content_type in unencrypted ChunkedFileMetadata — it would leak
         // file type to the server. Content type is already stored in encrypted
         // PrivateMetadata when using put_object_flat_deferred().
 
+        // E51 / W.9.4-A2: stamp the per-chunk CID Vec into the metadata
+        // BEFORE serializing the index body. When walkable_v8 is off,
+        // chunk_cids is all-None — skip the populate to keep the wire
+        // 100% byte-identical to v0.5/v0.6 output.
+        if walkable_v8 && chunk_cids.iter().any(|c| c.is_some()) {
+            metadata.populate_chunk_cids(chunk_cids);
+        }
+
         // Wrap the DEK with HPKE
         let encryptor = Encryptor::new(self.encryption.key_manager.public_key());
         let wrapped_dek = encryptor.encrypt_dek(&dek)?;
-        
+
         // Create index object metadata
         let kek_version = self.encryption.key_manager.version();
         let enc_metadata = serde_json::json!({
@@ -8742,20 +8934,56 @@ impl EncryptedClient {
             "chunked": metadata,
             "bao_outboard": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, outboard.to_bytes()),
         });
-        
-        // Upload index object (small, contains metadata only)
+
+        // **E51 audit fix — body-resident encryption JSON for offline reads.**
+        //
+        // Pre-fix the index object body was the literal `b"CHUNKED"`
+        // marker, with the actual encryption metadata living only in the
+        // HTTP `x-fula-encryption` user-metadata header. A gateway fetch
+        // by CID returns only the body, so an offline walker got just the
+        // marker bytes — useless. Mirror `put_object_chunked_internal`'s
+        // design: put the JSON in BOTH the body AND the header. Online
+        // reads continue using the header (no behavior change for v0.5
+        // readers); offline gateway-race reads get the JSON via body.
+        let index_body = enc_metadata.to_string();
         let index_metadata = ObjectMetadata::new()
             .with_content_type("application/json")
             .with_metadata("x-fula-encrypted", "true")
             .with_metadata("x-fula-chunked", "true")
-            .with_metadata("x-fula-encryption", &enc_metadata.to_string());
-        
+            .with_metadata("x-fula-encryption", &index_body);
+
+        // E51 / W.9.3: pre-compute `BLAKE3(index_body)` so the post-PUT
+        // self-verify can compare master's etag-attested CID against a
+        // CID we computed locally. Cheap; only when the writer flag is on.
+        let expected_index_cid = if walkable_v8 {
+            Some(crate::walkable_v8::local_blake3_raw_cid(index_body.as_bytes()))
+        } else {
+            None
+        };
+
         let result = self.inner.put_object_with_metadata(
             bucket,
             &storage_key,
-            Bytes::from(b"CHUNKED".to_vec()), // Marker content
+            Bytes::from(index_body),
             Some(index_metadata),
         ).await?;
+
+        // E51 / W.9.3: verify master's etag-attested CID against the
+        // pre-computed BLAKE3(index_body). On match, stamp the
+        // `storage_cid` field on the forest entry below so a future
+        // offline walker can fetch this index object via gateway race.
+        // Mismatch soft-fails to None — the chunked file uploads
+        // succeeded; only the offline-walk hint for the index object
+        // is missing.
+        let index_cid = match (walkable_v8, expected_index_cid) {
+            (true, Some(expected)) => crate::walkable_v8::verify_etag_against_expected_cid(
+                &result.etag,
+                expected,
+                bucket,
+                &storage_key,
+            ),
+            _ => None,
+        };
         
         // Update forest cache if we have one.
         //
@@ -8783,22 +9011,20 @@ impl EncryptedClient {
             // H-2: entry is written under v4 AAD-bound encryption; reject
             // any later download that advertises a lower blob-format version.
             min_version: 4,
-            // Walkable-v8 (W.9.3): intentionally `None` on this path. The
-            // public `put_object_chunked` writes a literal `b"CHUNKED"`
-            // marker as the index-object body (line below this match) and
-            // carries the actual encryption metadata in the HTTP
-            // `x-fula-encryption` user-metadata header. A gateway fetch
-            // by CID would therefore return only the marker bytes, which
-            // is useless to an offline walker. Stamping
-            // `CID(b"CHUNKED")` here would also collide across every
-            // chunked file in every bucket from every user (the body is
-            // a constant), giving an ambiguous offline pointer that can't
-            // distinguish files. The sister path `put_object_chunked_
-            // internal` puts the encryption JSON IN the body and DOES
-            // stamp `storage_cid`; offline-walkability for this path
-            // requires migrating `put_object_chunked` to that design,
-            // tracked as a follow-up task.
-            storage_cid: None,
+            // **E51 audit fix — `storage_cid` populated when walkable-v8
+            // is on.** Pre-fix the public `put_object_chunked` wrote a
+            // literal `b"CHUNKED"` marker as the index-object body, so
+            // a gateway-race fetch returned only the marker bytes
+            // (useless to an offline walker) AND stamping
+            // `CID(b"CHUNKED")` would have collided across every
+            // chunked file ever uploaded (the body was a constant).
+            // Both the body and the chunk-CID stamping are fixed
+            // above (mirroring `put_object_chunked_internal`'s W.9.4-A2
+            // design), so this entry can carry the verified index CID.
+            // `index_cid` is `None` when walkable_v8 writer is off OR
+            // when the post-PUT etag mismatch soft-failed; in either
+            // case the offline walker falls back to the storage_key.
+            storage_cid: index_cid,
         };
 
         let v7_forest_arc = {
@@ -9250,6 +9476,7 @@ impl RotationReport {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // F1: tests legitimately exercise random-keypair constructors; deprecation targets production callers only
 mod tests {
     use super::*;
 

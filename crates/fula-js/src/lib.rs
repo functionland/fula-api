@@ -507,19 +507,32 @@ pub async fn create_encrypted_client(
     // Build client config (callback wired to dispatcher).
     let client_config = build_inner_config(config, &dispatcher);
 
-    // Build encryption config
-    let enc_config = if let Some(secret_key) = encryption.secret_key {
-        if secret_key.len() != 32 {
-            return Err(JsError::new("Secret key must be exactly 32 bytes"));
-        }
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(&secret_key);
-        let secret = fula_crypto::SecretKey::from_bytes(&key_bytes)
-            .map_err(|e| JsError::new(&format!("Invalid secret key: {}", e)))?;
-        fula_client::EncryptionConfig::from_secret_key(secret)
-    } else {
-        fula_client::EncryptionConfig::new()
-    };
+    // Build encryption config.
+    //
+    // `encryption.secret_key` is REQUIRED. fula derives every per-user identity
+    // (X25519 keypair, content_encryption_key, userKey, bucket_lookup_h) from a
+    // stable OAuth-derived seed; falling back to a random keypair (pre-0.7
+    // behavior) silently locks the user out of every blob they previously
+    // wrote. Surface the misconfiguration as a clean error instead.
+    let secret_key = encryption
+        .secret_key
+        .as_ref()
+        .ok_or_else(|| {
+            JsError::new(
+                "encryption.secretKey is required: derive a stable 32-byte SecretKey from \
+                 your OAuth-stable seed (e.g. Argon2id(provider:rawSub:email)) and pass it \
+                 via JsEncryptionConfig.secretKey. A random keypair would lock the user out \
+                 of all previously-uploaded data on the next session restart.",
+            )
+        })?;
+    if secret_key.len() != 32 {
+        return Err(JsError::new("Secret key must be exactly 32 bytes"));
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(secret_key);
+    let secret = fula_crypto::SecretKey::from_bytes(&key_bytes)
+        .map_err(|e| JsError::new(&format!("Invalid secret key: {}", e)))?;
+    let enc_config = fula_client::EncryptionConfig::from_secret_key(secret);
 
     let enc_config = enc_config.with_metadata_privacy(encryption.enable_metadata_privacy);
     #[allow(deprecated)]

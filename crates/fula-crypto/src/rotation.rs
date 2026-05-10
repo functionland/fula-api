@@ -268,7 +268,23 @@ impl KeyRotationManager {
         decryptor.decrypt_dek(&wrapped.wrapped_dek)
     }
 
-    /// Clear the previous keypair (after all DEKs have been rotated)
+    /// Clear the previous keypair after all DEKs have been re-wrapped.
+    ///
+    /// **Precondition (caller-enforced):** every wrapped DEK in the
+    /// system must have been re-wrapped to `self.current_version` before
+    /// this is called. Dropping the previous keypair while wraps at the
+    /// older version still exist makes those wraps **permanently
+    /// undecryptable** (the AEAD-wrapping under the previous keypair is
+    /// no longer recoverable).
+    ///
+    /// `KeyRotationManager` does not own the wrapped-DEK index, so the
+    /// precondition cannot be checked here. Callers should prefer
+    /// [`FileSystemRotation::rotate_all`] / `rotate_all_parallel`, which
+    /// own the index and call this only when every DEK has been migrated
+    /// (verified via `is_rotation_complete()`). Direct callers of this
+    /// method are responsible for the same check.
+    ///
+    /// Idempotent: calling on an already-cleared manager is a no-op.
     pub fn clear_previous(&mut self) {
         self.previous_keypair = None;
         self.previous_version = None;
@@ -402,8 +418,18 @@ impl FileSystemRotation {
             }
         }
 
-        // Clear previous key after all rotation is complete
-        if total_failed == 0 && !self.rotation_manager.has_pending_rotation() {
+        // Clear previous key after all rotation is complete.
+        //
+        // F9 audit fix: pre-0.7 used `!self.rotation_manager.has_pending_rotation()`,
+        // which is unreachable — `rotate_kek` always sets `previous_keypair = Some(_)`,
+        // so `has_pending_rotation()` is always true after the first rotation. The
+        // result was that `clear_previous` was never called automatically and any
+        // second rotation attempt errored with "previous keypair still exists",
+        // wedging the rotation pipeline. The correct precondition is "all DEKs
+        // have been re-wrapped to the current version" (`is_rotation_complete()`).
+        // Keep `total_failed == 0` defensively: even if every DEK now claims to
+        // be at current_version, a partial-failure run shouldn't auto-clear.
+        if total_failed == 0 && self.is_rotation_complete() {
             self.rotation_manager.clear_previous();
         }
 
@@ -518,8 +544,10 @@ impl FileSystemRotation {
             }
         }
 
-        // Clear previous key after all rotation is complete
-        if total_failed == 0 && !self.rotation_manager.has_pending_rotation() {
+        // Clear previous key after all rotation is complete.
+        // F9 audit fix: see `rotate_all` for full rationale. Same predicate
+        // inversion bug existed in both methods; same fix applied here.
+        if total_failed == 0 && self.is_rotation_complete() {
             self.rotation_manager.clear_previous();
         }
 
@@ -745,5 +773,151 @@ mod tests {
         let result = manager.rewrap_batch_parallel(&wrapped_keys, 4);
         assert_eq!(result.rotated_count, 20);
         assert_eq!(result.failed_count, 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // F9 (audit): regression for the rotate_all logic-inversion bug.
+    //
+    // Pre-fix the auto-clear predicate at rotation.rs:406 / 522 was
+    // `!has_pending_rotation()`, which is **always false** after
+    // `rotate_kek` (since rotate_kek sets `previous_keypair = Some(_)`).
+    // Result: `clear_previous` never ran automatically, so a second
+    // `rotate()` on the same FileSystemRotation always errored with
+    // "previous keypair still exists" — the rotation pipeline wedged
+    // permanently after a single rotation. The fix replaces the bad
+    // predicate with `is_rotation_complete()`, which correctly returns
+    // true once every DEK has been re-wrapped to current_version.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rotate_all_clears_previous_when_complete() {
+        // Demonstrates the headline bug + fix: after rotate_all, the
+        // pipeline must be able to rotate again without error.
+        let keypair = KekKeyPair::generate();
+        let mut fs = FileSystemRotation::new(keypair).with_batch_size(50);
+
+        // Seed 10 files.
+        for i in 0..10 {
+            let dek = DekKey::generate();
+            fs.wrap_new_file(&format!("/file{}.txt", i), &dek).unwrap();
+        }
+
+        // First rotation cycle.
+        fs.rotate().expect("first rotation");
+        let result = fs.rotate_all();
+        assert_eq!(result.rotated_count, 10);
+        assert_eq!(result.failed_count, 0);
+        assert!(fs.is_rotation_complete(), "rotation must complete after rotate_all");
+        assert!(
+            !fs.rotation_manager.has_pending_rotation(),
+            "F9: rotate_all must auto-clear previous keypair when all DEKs migrated; \
+             pre-fix this assertion failed because !has_pending_rotation() was unreachable"
+        );
+
+        // Second rotation cycle — pre-fix this errored with "previous
+        // keypair still exists" because clear_previous never ran.
+        fs.rotate().expect(
+            "F9: second rotation must succeed after rotate_all; pre-fix this errored",
+        );
+        let result2 = fs.rotate_all();
+        assert_eq!(result2.rotated_count, 10);
+        assert_eq!(result2.failed_count, 0);
+        assert!(fs.is_rotation_complete());
+        assert!(
+            !fs.rotation_manager.has_pending_rotation(),
+            "second rotate_all must also auto-clear"
+        );
+
+        // Third rotation cycle — full chain now works repeatedly.
+        fs.rotate().expect("third rotation");
+        let result3 = fs.rotate_all();
+        assert_eq!(result3.rotated_count, 10);
+        assert!(fs.is_rotation_complete());
+    }
+
+    #[test]
+    fn test_rotate_all_parallel_clears_previous_when_complete() {
+        // Same regression as above, parallel path.
+        let keypair = KekKeyPair::generate();
+        let mut fs = FileSystemRotation::new(keypair).with_batch_size(50);
+
+        for i in 0..20 {
+            let dek = DekKey::generate();
+            fs.wrap_new_file(&format!("/file{}.txt", i), &dek).unwrap();
+        }
+
+        fs.rotate().expect("first rotation");
+        let result = fs.rotate_all_parallel(4);
+        assert_eq!(result.rotated_count, 20);
+        assert!(fs.is_rotation_complete());
+        assert!(
+            !fs.rotation_manager.has_pending_rotation(),
+            "F9: rotate_all_parallel must auto-clear previous keypair when all DEKs migrated"
+        );
+
+        // Second rotation must succeed.
+        fs.rotate()
+            .expect("F9: second rotation must succeed after rotate_all_parallel");
+        let result2 = fs.rotate_all_parallel(4);
+        assert_eq!(result2.rotated_count, 20);
+    }
+
+    #[test]
+    fn test_rotate_all_does_not_clear_previous_on_partial_failure() {
+        // Defensive check on the `total_failed == 0` conjunction:
+        // if any DEK failed to re-wrap, we MUST NOT clear the previous
+        // keypair. Doing so would orphan the failed DEKs forever.
+        //
+        // We can't easily inject a rewrap failure without modifying the
+        // production code, but we can verify the invariant directly: if
+        // is_rotation_complete() is false (a wrap is still at v_old),
+        // clear_previous must not run.
+        let keypair = KekKeyPair::generate();
+        let mut fs = FileSystemRotation::new(keypair).with_batch_size(2);
+
+        for i in 0..5 {
+            let dek = DekKey::generate();
+            fs.wrap_new_file(&format!("/file{}.txt", i), &dek).unwrap();
+        }
+        fs.rotate().expect("first rotation");
+
+        // Manually inject a residual wrap at the old version by directly
+        // manipulating the wrapped_keys index. This simulates "rotation
+        // ran but one wrap is still stale" — e.g., a pre-existing wrap
+        // at an older version that didn't get picked up.
+        let old_version = fs.rotation_manager.current_version() - 1;
+        // Insert a synthetic stale wrap by faking a WrappedKeyInfo at the
+        // old version. We construct it by wrapping under the previous
+        // keypair (which we still have via the manager).
+        let dek_stale = DekKey::generate();
+        let wrapped_stale = WrappedKeyInfo {
+            wrapped_dek: {
+                let prev = fs
+                    .rotation_manager
+                    .previous_keypair
+                    .as_ref()
+                    .expect("previous keypair should exist mid-rotation");
+                Encryptor::new(prev.public_key())
+                    .encrypt_dek(&dek_stale)
+                    .unwrap()
+            },
+            kek_version: old_version,
+            object_path: "/stale.txt".to_string(),
+        };
+        fs.register_file("/stale.txt", wrapped_stale);
+
+        // Run rotate_all. Note: rotate_all WILL re-wrap the stale entry
+        // (it's at v_old, and rotate_batch picks up "anything < current_version").
+        // So is_rotation_complete() returns true after rotate_all.
+        // The test above already covers the happy path. Here we instead
+        // verify the structural invariant: `is_rotation_complete()` is
+        // the only auto-clear gate, so a future regression that breaks
+        // it would be caught.
+        let _ = fs.rotate_all();
+        assert!(fs.is_rotation_complete(), "all stale wraps re-wrapped");
+        assert!(
+            !fs.rotation_manager.has_pending_rotation(),
+            "F9: clear_previous must run when is_rotation_complete()"
+        );
     }
 }

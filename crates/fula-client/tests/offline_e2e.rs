@@ -405,9 +405,29 @@ fn walkable_v8_fresh_bucket_test_files() -> Vec<(String, Vec<u8>)> {
 
 /// Walkable-v8 fresh-bucket UPLOAD test (#20 / #89 follow-up, part 1 of 2).
 ///
-/// Uploads the deterministic walkable-v8 file set to a fresh bucket on
-/// the live master. Prints copy-paste-ready env vars (bucket name +
-/// secret) for the matching walk test to consume.
+/// Mirrors the FxFiles encrypted upload flow byte-for-byte. The same
+/// `EncryptedClient::new(config, encryption)` construction
+/// (`fula_api_service.dart:224`), the same `put_object_flat`
+/// (`fula_api_service.dart:667 putFlat` → `EncryptedClient::put_object_flat`)
+/// for every file, the same `list_files_from_forest`
+/// (`fula_api_service.dart:463 listFromForest` →
+/// `EncryptedClient::list_files_from_forest`). The 768 KiB chunk-threshold
+/// dispatch inside the SDK exercises both single-block and chunked
+/// paths from the same call site, exactly as FxFiles drives them.
+///
+/// Two phases:
+///   * **Phase 0 (optional, opt-in)** — verify the user's existing
+///     `images` bucket lists ≥1 file using their actual secret. Mirrors
+///     FxFiles' "Cloud Files" screen. Opt-in via
+///     `FULA_VERIFY_IMAGES_BUCKET=1` because it requires a real
+///     user secret (not a generated random one); when the secret is
+///     wrong, the bucket would deserialize as empty and the assertion
+///     would surface that clearly.
+///   * **Phase 1 (always)** — fresh-bucket uploads of 5 deterministic
+///     files spanning the chunk threshold (3 text + 1 medium binary +
+///     1 >768 KiB chunked binary). The same
+///     `walkable_v8_fresh_bucket_test_files` set the walk test
+///     reproduces.
 ///
 /// **Pair with** `fxfiles_walkable_v8_fresh_bucket_walk`. Recommended
 /// flow:
@@ -429,9 +449,23 @@ fn walkable_v8_fresh_bucket_test_files() -> Vec<(String, Vec<u8>)> {
 /// without holding a single test process open.
 ///
 /// **Required env**: `FULA_JWT`, `FULA_S3`.
-/// **Optional env**: `FULA_TIMEOUT_SECS` (default 60), `FULA_TEST_BUCKET`
-/// (override generated bucket name), `FULA_TEST_SECRET` (override
-/// generated random secret — must be base64).
+///
+/// **Optional secret-source env (precedence high→low)**:
+///   1. `FULA_TEST_PROVIDER` + `FULA_TEST_OAUTH_SUB` + `FULA_TEST_EMAIL`
+///      — derive secret via `Argon2id("fula-files-v1", "{provider}:{sub}:{email}")`,
+///      matching FxFiles' `auth_service.dart:535-541` exactly. Required
+///      for Phase 0 (no other path can reproduce the user's actual key).
+///   2. `FULA_TEST_SECRET` — pre-derived 32-byte secret as base64
+///      (legacy override; useful for cross-device-key sharing).
+///   3. (none of the above) — random `SecretKey::generate()`. Phase 0
+///      cannot run with this; opt-in flag is rejected.
+///
+/// **Other optional env**:
+///   * `FULA_TIMEOUT_SECS` (default 60).
+///   * `FULA_TEST_BUCKET` — override generated test-bucket name.
+///   * `FULA_VERIFY_IMAGES_BUCKET` (`1`/`true`) — run Phase 0.
+///   * `FULA_IMAGES_BUCKET` (default `images`) — bucket name to verify
+///     in Phase 0. FxFiles writes to `images` by default.
 #[tokio::test]
 #[ignore]
 async fn fxfiles_walkable_v8_fresh_bucket_upload() {
@@ -460,7 +494,32 @@ async fn fxfiles_walkable_v8_fresh_bucket_upload() {
             format!("walkable-v8-test-{}", timestamp)
         });
 
-    let (secret, secret_b64) = if let Some(b64) = std::env::var("FULA_TEST_SECRET")
+    // Secret-source dispatch (precedence high→low):
+    //   1. Email-derived (matches FxFiles auth_service.dart:535-541
+    //      Argon2id("fula-files-v1", "{provider}:{userId}:{email}")).
+    //   2. Pre-derived FULA_TEST_SECRET (base64).
+    //   3. Random.
+    let provider = std::env::var("FULA_TEST_PROVIDER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let oauth_sub = std::env::var("FULA_TEST_OAUTH_SUB")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let email = std::env::var("FULA_TEST_EMAIL")
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    let (secret, secret_b64, secret_source, secret_is_user_supplied) = if let (Some(p), Some(s), Some(e)) =
+        (provider.as_ref(), oauth_sub.as_ref(), email.as_ref())
+    {
+        use base64::Engine as _;
+        let input = format!("{}:{}:{}", p, s, e);
+        let key_bytes = fula_crypto::hashing::derive_key_argon2id("fula-files-v1", input.as_bytes());
+        let secret = SecretKey::from_bytes(&key_bytes)
+            .expect("32-byte secret from Argon2id derivation");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
+        (secret, b64, format!("derived-from-{}:{}:<email>", p, s), true)
+    } else if let Some(b64) = std::env::var("FULA_TEST_SECRET")
         .ok()
         .filter(|s| !s.is_empty())
     {
@@ -472,21 +531,149 @@ async fn fxfiles_walkable_v8_fresh_bucket_upload() {
             .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&trimmed))
             .expect("FULA_TEST_SECRET must be base64");
         let secret = SecretKey::from_bytes(&key_bytes).expect("32-byte secret");
-        (secret, trimmed)
+        (secret, trimmed, "FULA_TEST_SECRET (base64 override)".to_string(), true)
     } else {
         use base64::Engine as _;
         let secret = SecretKey::generate();
         let b64 = base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
-        (secret, b64)
+        (secret, b64, "random (SecretKey::generate)".to_string(), false)
     };
 
-    eprintln!("\n[walkable-v8-upload] master  = {}", s3_url);
-    eprintln!("[walkable-v8-upload] bucket  = {}", bucket);
-    eprintln!("[walkable-v8-upload] timeout = {}s", timeout_secs);
+    // Phase 0 (verify `images` bucket) requires the user's actual key.
+    // Both the email-derived path and the pre-derived FULA_TEST_SECRET
+    // path qualify — the latter is the most practical for users who
+    // can't easily extract their OAuth `sub` (most can't); they can
+    // copy the base64 `encryptionKey` straight out of FxFiles'
+    // SecureStorage. Random-secret runs cannot decrypt the user's
+    // forest, so they're rejected.
+    let secret_is_real_user = secret_is_user_supplied;
+    let verify_images_requested = std::env::var("FULA_VERIFY_IMAGES_BUCKET")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let images_bucket = std::env::var("FULA_IMAGES_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "images".to_string());
+
+    if verify_images_requested && !secret_is_real_user {
+        panic!(
+            "FULA_VERIFY_IMAGES_BUCKET requires a user-supplied secret. \
+             Set EITHER:\n\
+               * FULA_TEST_PROVIDER + FULA_TEST_OAUTH_SUB + FULA_TEST_EMAIL \
+                 (derives the same key FxFiles computes via \
+                 auth_service.dart:535-541), OR\n\
+               * FULA_TEST_SECRET = <base64 of your 32-byte encryption \
+                 key> (copy it directly from FxFiles' SecureStorage \
+                 `encryptionKey` entry — same bytes the app uses).\n\
+             A random secret cannot decrypt the user's existing `{}` \
+             forest, so it cannot verify Phase 0.",
+            images_bucket
+        );
+    }
+
+    eprintln!("\n[walkable-v8-upload] master       = {}", s3_url);
+    eprintln!("[walkable-v8-upload] bucket       = {}", bucket);
+    eprintln!("[walkable-v8-upload] timeout      = {}s", timeout_secs);
+    eprintln!("[walkable-v8-upload] secret src   = {}", secret_source);
+    eprintln!(
+        "[walkable-v8-upload] verify imgs  = {} (FULA_IMAGES_BUCKET = {:?})",
+        verify_images_requested, images_bucket
+    );
 
     let cache_dir = TempDir::new().expect("tempdir for upload-side block cache");
     let cache_path = cache_dir.path().join("blocks.redb");
     let files = walkable_v8_fresh_bucket_test_files();
+
+    // ─── Phase 0 — verify the user's `images` bucket has files ───────────
+    // Opt-in. Requires the real user secret (so the forest decrypts to the
+    // user's actual data). Skipped when running with random / override
+    // secrets, since neither can read the user's existing bucket.
+    if verify_images_requested {
+        eprintln!(
+            "\n[walkable-v8-upload] phase 0: verify '{}' bucket has files \
+             (mirrors FxFiles 'Cloud Files' screen)",
+            images_bucket
+        );
+        let client = build_client(
+            &s3_url,
+            &jwt,
+            &cache_path,
+            secret.clone(),
+            true,
+            timeout_secs,
+        );
+
+        // 0a — list buckets (mirrors fula_api_service.dart:368 listBuckets).
+        let buckets_result = client
+            .list_buckets()
+            .await
+            .expect("phase 0: list_buckets must succeed");
+        let bucket_names: Vec<String> =
+            buckets_result.buckets.iter().map(|b| b.name.clone()).collect();
+        eprintln!(
+            "[walkable-v8-upload]   user has {} buckets: {:?}",
+            bucket_names.len(),
+            bucket_names
+        );
+        assert!(
+            bucket_names.iter().any(|n| n == &images_bucket),
+            "FULA_VERIFY_IMAGES_BUCKET=1 but bucket '{}' not in user's \
+             list ({:?}). Either the bucket really doesn't exist for this \
+             user, or FULA_TEST_PROVIDER / FULA_TEST_OAUTH_SUB / \
+             FULA_TEST_EMAIL identify a different account than FULA_JWT \
+             was issued for. Override FULA_IMAGES_BUCKET if your default \
+             bucket isn't named 'images'.",
+            images_bucket, bucket_names
+        );
+
+        // 0b — list files in `images` (mirrors fula_api_service.dart:463
+        // listFromForest). The forest decrypts with `secret`; a wrong key
+        // produces an empty visible set, so a non-zero count proves the
+        // secret + JWT + bucket all line up with the user's master state.
+        let files_in_images = client
+            .list_files_from_forest(&images_bucket)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "phase 0: list_files_from_forest('{}') failed: {:?}.\n\
+                     If this is a master-unreachable error, retry; if it's \
+                     a decrypt error, the secret derivation inputs don't \
+                     match the master-side key.",
+                    images_bucket, e
+                )
+            });
+        assert!(
+            !files_in_images.is_empty(),
+            "phase 0: bucket '{}' has 0 files visible to this client. \
+             Either:\n\
+               (a) you genuinely have no files in this bucket — pick a \
+                   different FULA_IMAGES_BUCKET that you've populated, OR\n\
+               (b) the derived secret doesn't match your actual encryption \
+                   key. Listing decrypts the forest; wrong key ⇒ visibly \
+                   empty bucket. Cross-check FULA_TEST_PROVIDER / \
+                   FULA_TEST_OAUTH_SUB / FULA_TEST_EMAIL against what \
+                   FxFiles' AuthService used at sign-in (see \
+                   `auth_service.dart:535-541`).",
+            images_bucket
+        );
+        let sample: Vec<&str> = files_in_images
+            .iter()
+            .take(3)
+            .map(|f| f.original_key.as_str())
+            .collect();
+        eprintln!(
+            "[walkable-v8-upload]   '{}' bucket: {} files visible (first {}: {:?})",
+            images_bucket,
+            files_in_images.len(),
+            sample.len(),
+            sample
+        );
+    } else {
+        eprintln!(
+            "\n[walkable-v8-upload] phase 0 SKIPPED (FULA_VERIFY_IMAGES_BUCKET not set)"
+        );
+    }
 
     eprintln!(
         "\n[walkable-v8-upload] uploading {} files (3 small text + 1 medium + 1 chunked >768KB)",
@@ -656,6 +843,20 @@ async fn fxfiles_walkable_v8_fresh_bucket_walk() {
         );
     }
 
+    // Diagnostic mode: when targeting an EXISTING bucket (e.g. point
+    // `FULA_TEST_BUCKET` at `images` to verify cold-walk works for the
+    // user's real data), the deterministic 5-file expected set is
+    // wrong and per-file downloads have no ground-truth payloads.
+    // Setting `FULA_TEST_EXISTING_BUCKET=1` skips both: Phase B
+    // captures whatever the bucket actually contains, and Phase C/D
+    // compare cold-offline list against THAT captured set (any diff
+    // is a real walk regression). Per-file downloads still run as a
+    // smoke test but skip the byte-equality check.
+    let existing_bucket_mode = std::env::var("FULA_TEST_EXISTING_BUCKET")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+
     use base64::Engine as _;
     let trimmed = secret_b64.trim();
     let key_bytes = base64::engine::general_purpose::STANDARD
@@ -670,6 +871,144 @@ async fn fxfiles_walkable_v8_fresh_bucket_walk() {
     eprintln!("[walkable-v8-walk] mode      = {} (warm={}, cold={})", walk_mode, do_warm, do_cold);
     eprintln!("[walkable-v8-walk] timeout   = {}s", timeout_secs);
 
+    // Diagnostic: print the SDK-computed `bucket_lookup_h_hex` for the
+    // target bucket(s). Cross-reference with the per-user bucketsIndex
+    // CBOR to confirm the resolver is looking up the right entry.
+    // Compiled in only with --features test-fault-injection.
+    #[cfg(feature = "test-fault-injection")]
+    {
+        let _diag_cache = TempDir::new().expect("diag tempdir");
+        let _diag_cache_path = _diag_cache.path().join("blocks.redb");
+        let diag_client = build_client(
+            &s3_url,
+            &jwt,
+            &_diag_cache_path,
+            secret.clone(),
+            true,
+            timeout_secs,
+        );
+        let diag_buckets: Vec<&str> = vec![
+            bucket.as_str(),
+            "images",
+            "videos",
+            "documents",
+            "audio",
+            "other",
+            "website-metadata",
+            "tag-metadata",
+            "face-metadata",
+            "fula-metadata",
+            "walkable-v8-test-1778356988",
+            "walkable-v8-test-1778428540",
+        ];
+        eprintln!("\n[walkable-v8-walk] === SDK-computed bucket_lookup_h_hex (diagnostic) ===");
+        for name in &diag_buckets {
+            let h = diag_client.debug_compute_bucket_lookup_h_hex(name);
+            eprintln!("  {:<32} -> {}", name, h);
+        }
+        eprintln!("[walkable-v8-walk] === end diagnostic ===\n");
+
+        // Phase D pre-flight: decrypt the cold-fetched manifest and dump
+        // per-shard state. If all 16 shards have `root: None`, the
+        // manifest IS empty (writer-side bug). If shards are populated
+        // but cold-walk yields 0 files, the bug is in the v7-vs-v8
+        // shard root resolution or HAMT walk in cold-cache mode.
+        if do_cold {
+            eprintln!("[walkable-v8-walk] === cold-fetched manifest inspection ===");
+            // Build a cold-start-configured client (reuse the same
+            // build_client_with_cold_start that Phase D uses below) so
+            // cold_start_resolve_manifest can run.
+            let _diag_ipns_gw: Vec<String> = std::env::var("FULA_USERS_INDEX_IPNS_GATEWAY_URLS")
+                .ok()
+                .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+                .unwrap_or_default();
+            let _diag_block_gw: Vec<String> = std::env::var("FULA_BLOCK_GATEWAY_URLS")
+                .ok()
+                .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+                .unwrap_or_default();
+            let chain_rpc = std::env::var("FULA_USERS_INDEX_CHAIN_RPC_URL").unwrap_or_default();
+            let anchor    = std::env::var("FULA_USERS_INDEX_ANCHOR_ADDRESS").unwrap_or_default();
+            let ipns      = std::env::var("FULA_USERS_INDEX_IPNS_NAME").unwrap_or_default();
+            let user_key  = std::env::var("FULA_USERS_INDEX_USER_KEY").unwrap_or_default();
+            if !chain_rpc.is_empty() && !anchor.is_empty() && !ipns.is_empty() && !user_key.is_empty() {
+                let _diag_dir = TempDir::new().expect("diag-cold tempdir");
+                let _diag_path = _diag_dir.path().join("blocks.redb");
+                let cold_diag = build_client_with_cold_start(
+                    "http://127.0.0.1:1",
+                    &jwt,
+                    &_diag_path,
+                    secret.clone(),
+                    false,
+                    timeout_secs,
+                    chain_rpc,
+                    anchor,
+                    ipns,
+                    user_key,
+                    _diag_ipns_gw,
+                    _diag_block_gw,
+                );
+                match cold_diag.cold_start_resolve_manifest(&bucket).await {
+                    Ok((cid, bytes)) => {
+                        eprintln!(
+                            "  cold_start_resolve_manifest: cid={} bytes={}",
+                            cid,
+                            bytes.len()
+                        );
+                        // Decrypt + inspect
+                        match fula_crypto::private_forest::EncryptedShardManifestV7::from_bytes(&bytes) {
+                            Ok(env) => {
+                                let forest_dek =
+                                    cold_diag.encryption_config().key_manager().derive_path_key(&format!("forest:{}", bucket));
+                                match env.decrypt_v7(&forest_dek, &bucket) {
+                                    Ok((root, seq)) => {
+                                        eprintln!(
+                                            "  manifest seq={} num_shards={} format={:?}",
+                                            seq, root.num_shards, root.format
+                                        );
+                                        eprintln!(
+                                            "  page_index: {} entries (0 ⇒ empty forest, no pages ever flushed)",
+                                            root.page_index.len()
+                                        );
+                                        let mut pages_with_cid = 0usize;
+                                        for (page_id, page_ref) in &root.page_index {
+                                            let has_cid = page_ref.cid.is_some();
+                                            if has_cid { pages_with_cid += 1; }
+                                            eprintln!(
+                                                "    page[{}] etag={:?} seq={} cid={}",
+                                                page_id,
+                                                page_ref.etag.as_deref().map(|s| {
+                                                    if s.len() > 16 { format!("{}...", &s[..16]) } else { s.to_string() }
+                                                }),
+                                                page_ref.seq,
+                                                page_ref.cid.map(|c| c.to_string()).unwrap_or_else(|| "<none>".to_string())
+                                            );
+                                        }
+                                        eprintln!(
+                                            "  pages with cid (walkable-v8 stamped): {}/{}",
+                                            pages_with_cid, root.page_index.len()
+                                        );
+                                        eprintln!(
+                                            "  dir_index_etag={:?} dir_index_seq={:?} dir_index_cid={}",
+                                            root.dir_index_etag.as_deref(),
+                                            root.dir_index_seq,
+                                            root.dir_index_cid.map(|c| c.to_string()).unwrap_or_else(|| "<none>".to_string())
+                                        );
+                                    }
+                                    Err(e) => eprintln!("  decrypt_v7 failed: {:?}", e),
+                                }
+                            }
+                            Err(e) => eprintln!("  EncryptedShardManifestV7::from_bytes failed: {:?}", e),
+                        }
+                    }
+                    Err(e) => eprintln!("  cold_start_resolve_manifest failed: {:?}", e),
+                }
+            } else {
+                eprintln!("  skipped (cold-start env vars not all set)");
+            }
+            eprintln!("[walkable-v8-walk] === end manifest inspection ===\n");
+        }
+    }
+
     let files = walkable_v8_fresh_bucket_test_files();
     let expected_keys: std::collections::BTreeSet<String> =
         files.iter().map(|(k, _)| k.clone()).collect();
@@ -677,8 +1016,18 @@ async fn fxfiles_walkable_v8_fresh_bucket_walk() {
     let cache_dir = TempDir::new().expect("tempdir for warm block cache");
     let cache_path = cache_dir.path().join("blocks.redb");
 
+    // Baseline set of keys that the offline phases must reproduce.
+    // For the fresh-bucket flow this is the deterministic uploaded set
+    // (`expected_keys`). For `FULA_TEST_EXISTING_BUCKET=1` it's whatever
+    // Phase B's online list returned — captured here, populated below.
+    let mut online_keys: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+
     // ─── Phase B: online list + download — populate cache + capture baseline ──
-    eprintln!("\n[walkable-v8-walk] phase B: online list + download (baseline + cache warmup)");
+    eprintln!(
+        "\n[walkable-v8-walk] phase B: online list + download (baseline + cache warmup, existing_bucket={})",
+        existing_bucket_mode
+    );
     {
         let client = build_client(
             &s3_url,
@@ -693,63 +1042,86 @@ async fn fxfiles_walkable_v8_fresh_bucket_walk() {
             .list_files_from_forest(&bucket)
             .await
             .expect("phase B: online list must succeed");
-        let online_keys: std::collections::BTreeSet<String> =
-            listed.iter().map(|m| m.original_key.clone()).collect();
+        online_keys = listed.iter().map(|m| m.original_key.clone()).collect();
         eprintln!(
             "[walkable-v8-walk]   online list: {} files",
             listed.len()
         );
-        assert_eq!(
-            online_keys, expected_keys,
-            "online list keys must equal what the upload test wrote \
-             ({} expected, got {}).\n\
-             \n\
-             If got = 0: master has zero files for FULA_TEST_BUCKET \
-             ({}). Most likely cause: FULA_TEST_BUCKET doesn't match \
-             what the upload test created. Verify:\n\
-               (a) you ran scripts/walkable-v8-fresh-bucket-upload.ps1 \
-                   first, AND\n\
-               (b) FULA_TEST_BUCKET is the EXACT name from that script's \
-                   trailing 'copy these env vars' block (timestamp will \
-                   match roughly when upload ran), AND\n\
-               (c) FULA_TEST_SECRET also matches that block — a wrong \
-                   secret would surface as bucket_lookup_h mismatch and \
-                   master returns the empty forest for an unknown lookup_h.\n\
-             \n\
-             If 0 < got < {}: real walk regression — some HAMT entries \
-             are missing.",
-            expected_keys.len(),
-            online_keys.len(),
-            bucket,
-            expected_keys.len(),
-        );
-
-        for (key, payload) in &files {
-            let dl = client
-                .get_object_flat(&bucket, key)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!("phase B online download failed for {}: {:?}", key, e)
-                });
+        if existing_bucket_mode {
+            assert!(
+                !online_keys.is_empty(),
+                "phase B: existing-bucket mode requires the online list to \
+                 be non-empty (FULA_TEST_BUCKET={:?}). The bucket either \
+                 doesn't exist for this user or FULA_TEST_SECRET doesn't \
+                 match the user's actual encryption key.",
+                bucket
+            );
+        } else {
             assert_eq!(
-                dl.as_ref(),
-                payload.as_slice(),
-                "phase B online download bytes mismatch for {} \
-                 ({} expected, {} got). The decrypted plaintext from \
-                 master differs from what the upload test wrote — \
-                 either FULA_TEST_SECRET diverged from the upload, or \
-                 the file was rewritten between upload and walk.",
-                key,
-                payload.len(),
-                dl.len(),
+                online_keys, expected_keys,
+                "online list keys must equal what the upload test wrote \
+                 ({} expected, got {}).\n\
+                 \n\
+                 If got = 0: master has zero files for FULA_TEST_BUCKET \
+                 ({}). Most likely cause: FULA_TEST_BUCKET doesn't match \
+                 what the upload test created. Verify:\n\
+                   (a) you ran scripts/walkable-v8-fresh-bucket-upload.ps1 \
+                       first, AND\n\
+                   (b) FULA_TEST_BUCKET is the EXACT name from that script's \
+                       trailing 'copy these env vars' block (timestamp will \
+                       match roughly when upload ran), AND\n\
+                   (c) FULA_TEST_SECRET also matches that block — a wrong \
+                       secret would surface as bucket_lookup_h mismatch and \
+                       master returns the empty forest for an unknown lookup_h.\n\
+                 \n\
+                 If 0 < got < {}: real walk regression — some HAMT entries \
+                 are missing.\n\
+                 \n\
+                 To run against an EXISTING user bucket (e.g. `images`) for \
+                 cold-walk diagnostics, set FULA_TEST_EXISTING_BUCKET=1 — \
+                 the test will skip this assertion and instead compare \
+                 cold-offline list against this online list.",
+                expected_keys.len(),
+                online_keys.len(),
+                bucket,
+                expected_keys.len(),
             );
-            eprintln!(
-                "[walkable-v8-walk]   online download {:?} OK ({} bytes verified)",
-                key,
-                dl.len()
-            );
+
+            for (key, payload) in &files {
+                let dl = client
+                    .get_object_flat(&bucket, key)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("phase B online download failed for {}: {:?}", key, e)
+                    });
+                assert_eq!(
+                    dl.as_ref(),
+                    payload.as_slice(),
+                    "phase B online download bytes mismatch for {} \
+                     ({} expected, {} got). The decrypted plaintext from \
+                     master differs from what the upload test wrote — \
+                     either FULA_TEST_SECRET diverged from the upload, or \
+                     the file was rewritten between upload and walk.",
+                    key,
+                    payload.len(),
+                    dl.len(),
+                );
+                eprintln!(
+                    "[walkable-v8-walk]   online download {:?} OK ({} bytes verified)",
+                    key,
+                    dl.len()
+                );
+            }
         }
     }
+
+    // Pick the baseline set the offline phases must match. In
+    // existing-bucket mode it's whatever Phase B captured; in
+    // fresh-bucket mode it's the deterministic upload set.
+    let baseline_keys: &std::collections::BTreeSet<String> =
+        if existing_bucket_mode { &online_keys } else { &expected_keys };
+    let baseline_label: &str =
+        if existing_bucket_mode { "online list (existing bucket)" } else { "uploaded set" };
 
     // ─── Phase C: warm-cache offline list + download ──────────────────
     if do_warm {
@@ -774,38 +1146,46 @@ async fn fxfiles_walkable_v8_fresh_bucket_walk() {
             listed.len()
         );
         assert_eq!(
-            warm_keys, expected_keys,
-            "phase C warm-offline list keys must equal the uploaded set \
-             — a diff means HAMT walk silently dropped entries"
+            warm_keys, *baseline_keys,
+            "phase C warm-offline list keys must equal the {} — a diff \
+             means HAMT walk silently dropped entries",
+            baseline_label
         );
 
-        for (key, payload) in &files {
-            let dl = client
-                .get_object_flat(&bucket, key)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "phase C warm-offline download failed for {}: {:?}\n\
-                         The forest list succeeded but the chunk fetch \
-                         did not — likely a per-chunk warm-cache miss \
-                         that should have been a hit (#32 / W.9.4-A2 \
-                         regression?).",
-                        key, e
-                    )
-                });
-            assert_eq!(
-                dl.as_ref(),
-                payload.as_slice(),
-                "phase C warm-offline download bytes mismatch for {} \
-                 ({} expected, {} got)",
-                key,
-                payload.len(),
-                dl.len(),
-            );
+        if !existing_bucket_mode {
+            for (key, payload) in &files {
+                let dl = client
+                    .get_object_flat(&bucket, key)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "phase C warm-offline download failed for {}: {:?}\n\
+                             The forest list succeeded but the chunk fetch \
+                             did not — likely a per-chunk warm-cache miss \
+                             that should have been a hit (#32 / W.9.4-A2 \
+                             regression?).",
+                            key, e
+                        )
+                    });
+                assert_eq!(
+                    dl.as_ref(),
+                    payload.as_slice(),
+                    "phase C warm-offline download bytes mismatch for {} \
+                     ({} expected, {} got)",
+                    key,
+                    payload.len(),
+                    dl.len(),
+                );
+                eprintln!(
+                    "[walkable-v8-walk]   warm-offline download {:?} OK ({} bytes verified)",
+                    key,
+                    dl.len()
+                );
+            }
+        } else {
             eprintln!(
-                "[walkable-v8-walk]   warm-offline download {:?} OK ({} bytes verified)",
-                key,
-                dl.len()
+                "[walkable-v8-walk]   warm-offline downloads SKIPPED (existing-bucket mode \
+                 has no ground-truth payloads; list-parity is the meaningful check)"
             );
         }
     } else {
@@ -913,32 +1293,40 @@ async fn fxfiles_walkable_v8_fresh_bucket_walk() {
             listed.len()
         );
         assert_eq!(
-            cold_keys, expected_keys,
-            "phase D cold-offline list keys must equal the uploaded set \
-             — a diff means resolver returned the wrong CID OR HAMT \
-             walk dropped entries during gateway race"
+            cold_keys, *baseline_keys,
+            "phase D cold-offline list keys must equal the {} — a diff \
+             means resolver returned the wrong CID OR HAMT walk dropped \
+             entries during gateway race",
+            baseline_label
         );
 
-        for (key, payload) in &files {
-            let dl = client
-                .get_object_flat(&bucket, key)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!("phase D cold-offline download failed for {}: {:?}", key, e)
-                });
-            assert_eq!(
-                dl.as_ref(),
-                payload.as_slice(),
-                "phase D cold-offline download bytes mismatch for {} \
-                 ({} expected, {} got)",
-                key,
-                payload.len(),
-                dl.len(),
-            );
+        if !existing_bucket_mode {
+            for (key, payload) in &files {
+                let dl = client
+                    .get_object_flat(&bucket, key)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("phase D cold-offline download failed for {}: {:?}", key, e)
+                    });
+                assert_eq!(
+                    dl.as_ref(),
+                    payload.as_slice(),
+                    "phase D cold-offline download bytes mismatch for {} \
+                     ({} expected, {} got)",
+                    key,
+                    payload.len(),
+                    dl.len(),
+                );
+                eprintln!(
+                    "[walkable-v8-walk]   cold-offline download {:?} OK ({} bytes verified)",
+                    key,
+                    dl.len()
+                );
+            }
+        } else {
             eprintln!(
-                "[walkable-v8-walk]   cold-offline download {:?} OK ({} bytes verified)",
-                key,
-                dl.len()
+                "[walkable-v8-walk]   cold-offline downloads SKIPPED (existing-bucket mode \
+                 has no ground-truth payloads; list-parity is the meaningful check)"
             );
         }
     } else {

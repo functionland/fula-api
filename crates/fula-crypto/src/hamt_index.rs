@@ -33,6 +33,44 @@ fn hash_path(path: &str) -> [u8; 32] {
     *blake3::hash(path.as_bytes()).as_bytes()
 }
 
+/// #84 helper — normalize a caller-supplied path prefix.
+///
+/// Strips trailing slashes (so `/photos` and `/photos/` are equivalent),
+/// ensures a leading slash, treats empty input as root. Mirror of
+/// `private_forest::normalize_path_component_prefix` and
+/// `sharded_hamt_forest::normalize_dir_path`.
+fn normalize_path_component_prefix_index(prefix: &str) -> String {
+    if prefix.is_empty() || prefix == "/" {
+        return "/".to_string();
+    }
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{}", trimmed)
+    }
+}
+
+/// #84 helper — path-component-aware "is `path` under `prefix`?" check.
+///
+/// **Both operands are normalized inside the helper** (matches the v7
+/// + v1 helpers). Replaces raw `path.starts_with(prefix)` so:
+///
+/// - `iter_prefix("/photos")` no longer surfaces `/photosold/legacy`.
+/// - A legacy entry whose stored key lacks a leading slash is still
+///   surfaced by a canonical prefix query.
+///
+/// Mirror of the helpers in `private_forest.rs` and `sharded_hamt_forest.rs`.
+fn path_under_prefix_index(path: &str, prefix: &str) -> bool {
+    let normalized_prefix = normalize_path_component_prefix_index(prefix);
+    let normalized_path = normalize_path_component_prefix_index(path);
+    if normalized_prefix == "/" {
+        return true;
+    }
+    normalized_path == normalized_prefix
+        || normalized_path.starts_with(&format!("{}/", normalized_prefix))
+}
+
 /// Get the nibble (4 bits) at a specific level from a hash
 fn get_nibble(hash: &[u8; 32], level: usize) -> usize {
     let byte_index = level / 2;
@@ -45,10 +83,16 @@ fn get_nibble(hash: &[u8; 32], level: usize) -> usize {
 }
 
 /// A HAMT-based index for file entries
-/// 
+///
 /// This provides O(log N) access to file entries while allowing
 /// lazy loading and efficient serialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-rolled. The `Bucket` variant carries plaintext path
+/// keys (`Vec<(String, V)>`); a derived `Debug` would print every key
+/// in the trie at any `{:?}` log call. Serde derives are kept because
+/// the production write path AEAD-encrypts the serialized blob — only
+/// `Debug` logs would bypass that protection.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HamtIndex<V: Clone> {
     /// Version for format evolution
     pub version: u8,
@@ -58,8 +102,21 @@ pub struct HamtIndex<V: Clone> {
     pub count: usize,
 }
 
+impl<V: Clone> std::fmt::Debug for HamtIndex<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HamtIndex")
+            .field("version", &self.version)
+            .field("root", &self.root)
+            .field("count", &self.count)
+            .finish()
+    }
+}
+
 /// A node in the HAMT tree
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-rolled to redact `Bucket.entries` (plaintext path
+/// keys) and `Branch.children` (recursively contains plaintext).
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum HamtNode<V: Clone> {
     /// Empty node
@@ -75,6 +132,26 @@ pub enum HamtNode<V: Clone> {
         /// Child nodes (only for set bits in bitmap)
         children: Vec<HamtNode<V>>,
     },
+}
+
+impl<V: Clone> std::fmt::Debug for HamtNode<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HamtNode::Empty => f.write_str("Empty"),
+            HamtNode::Bucket { entries } => f
+                .debug_struct("Bucket")
+                .field("entries", &format_args!("[{} entries redacted]", entries.len()))
+                .finish(),
+            HamtNode::Branch { bitmap, children } => f
+                .debug_struct("Branch")
+                .field("bitmap", &format_args!("0x{:04x}", bitmap))
+                .field(
+                    "children",
+                    &format_args!("[{} children redacted]", children.len()),
+                )
+                .finish(),
+        }
+    }
 }
 
 impl<V: Clone> Default for HamtIndex<V> {
@@ -143,8 +220,15 @@ impl<V: Clone> HamtIndex<V> {
     }
 
     /// Iterate over entries with a path prefix
+    ///
+    /// #84: path-component-aware match. `prefix = "/photos"` yields
+    /// `/photos/...` and `/photos` itself, but never the sibling
+    /// `/photosold/...`. The pre-fix raw `starts_with` was a byte-prefix
+    /// match. See [`path_under_prefix_index`] for semantics — helper
+    /// normalizes both operands internally.
     pub fn iter_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = (&'a String, &'a V)> + 'a {
-        self.iter().filter(move |(path, _)| path.starts_with(prefix))
+        self.iter()
+            .filter(move |(path, _)| path_under_prefix_index(path, prefix))
     }
 
     /// Convert from a HashMap (for migration from FlatMapV1)
@@ -436,8 +520,11 @@ impl<V: Clone> ShardedIndex<V> {
     }
 
     /// Iterate over entries with a path prefix
+    ///
+    /// #84: path-component-aware match. See `HamtIndex::iter_prefix`.
     pub fn iter_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = (&'a String, &'a V)> + 'a {
-        self.iter().filter(move |(path, _)| path.starts_with(prefix))
+        self.iter()
+            .filter(move |(path, _)| path_under_prefix_index(path, prefix))
     }
 
     /// Convert from a HashMap
@@ -574,5 +661,83 @@ mod tests {
         // Total should match
         let total: usize = shard_sizes.iter().sum();
         assert_eq!(total, 1000);
+    }
+
+    // ----------------------------------------------------------------------
+    // #84 — `iter_prefix` overmatches sibling-prefix paths.
+    //
+    // Both `HamtIndex::iter_prefix` (line 185) and
+    // `ShardedIndex::iter_prefix` (line 478) filter via
+    // `path.starts_with(prefix)`. With prefix `/photos` and a key
+    // `/photosold/x`, the byte-prefix match wrongly includes the sibling.
+    // ----------------------------------------------------------------------
+    #[test]
+    fn hamt_index_iter_prefix_does_not_overmatch_sibling_prefix_84() {
+        let mut index: HamtIndex<u32> = HamtIndex::new();
+        index.insert("/photos/cat".to_string(), 1);
+        index.insert("/photos/dog".to_string(), 2);
+        index.insert("/photosold/legacy".to_string(), 3);
+
+        let collected: std::collections::HashSet<String> = index
+            .iter_prefix("/photos")
+            .map(|(p, _)| p.clone())
+            .collect();
+
+        assert!(
+            collected.contains("/photos/cat") && collected.contains("/photos/dog"),
+            "HamtIndex::iter_prefix('/photos') must yield /photos/cat and /photos/dog; got {:?}",
+            collected
+        );
+        assert!(
+            !collected.contains("/photosold/legacy"),
+            "HamtIndex::iter_prefix('/photos') must NOT yield /photosold/legacy \
+             (sibling-prefix overmatch). got {:?}",
+            collected
+        );
+    }
+
+    #[test]
+    fn hamt_index_iter_prefix_finds_legacy_no_leading_slash_path_84() {
+        // Legacy entry stored without leading slash. Canonical query
+        // should still surface it because path_under_prefix_index
+        // normalizes both operands.
+        let mut index: HamtIndex<u32> = HamtIndex::new();
+        index.insert("foo/cat".to_string(), 1);
+
+        let collected: std::collections::HashSet<String> = index
+            .iter_prefix("/foo")
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert!(
+            collected.contains("foo/cat"),
+            "HamtIndex::iter_prefix('/foo') must surface legacy 'foo/cat' \
+             via path normalization. got {:?}",
+            collected
+        );
+    }
+
+    #[test]
+    fn sharded_index_iter_prefix_does_not_overmatch_sibling_prefix_84() {
+        let mut index: ShardedIndex<u32> = ShardedIndex::new(16);
+        index.insert("/photos/cat".to_string(), 1);
+        index.insert("/photos/dog".to_string(), 2);
+        index.insert("/photosold/legacy".to_string(), 3);
+
+        let collected: std::collections::HashSet<String> = index
+            .iter_prefix("/photos")
+            .map(|(p, _)| p.clone())
+            .collect();
+
+        assert!(
+            collected.contains("/photos/cat") && collected.contains("/photos/dog"),
+            "ShardedIndex::iter_prefix('/photos') must yield /photos/cat and /photos/dog; got {:?}",
+            collected
+        );
+        assert!(
+            !collected.contains("/photosold/legacy"),
+            "ShardedIndex::iter_prefix('/photos') must NOT yield /photosold/legacy \
+             (sibling-prefix overmatch). got {:?}",
+            collected
+        );
     }
 }

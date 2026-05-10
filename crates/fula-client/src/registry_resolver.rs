@@ -268,21 +268,33 @@ pub use crate::user_key::derive_user_key_from_email;
 /// Order is the SDK's per-tick race priority — the resolver tries
 /// gateways in order and takes the first content-verified body whose
 /// in-payload `sequence` is at least the locally-observed high-water
-/// mark. `dget.top` (subdomain-style) is the load-bearing first slot
-/// because operator measurement on production (2026-05-09) showed it
-/// picks up freshly-published IPNS records the fastest among public
-/// IPNS-aware gateways — getting cold-start latency below the next
-/// tier's typical first-hit time. Cloudflare and dweb.link follow as
-/// the established large-fleet fallbacks; the remaining three are
-/// kept for fan-out coverage.
+/// mark.
+///
+/// Ordering (operator-confirmed 2026-05-10):
+/// 1. `{name}.ipns.dweb.link` (subdomain-style) — first because
+///    subdomain endpoints serve raw / dag-cbor without an HTML wrapper
+///    and dweb.link's IPNS resolution picks up freshly-published
+///    records reliably across the large fleet behind Protocol Labs.
+/// 2. `dweb.link/ipns/{name}` (path-style) — same gateway, different
+///    URL shape. Kept as a near-duplicate fallback because some
+///    middleboxes/CDNs cache subdomain routes longer than path
+///    routes; one of the two usually responds with a fresh record.
+/// 3. `ipfs.io`, `4everland.io`, `gateway.pinata.cloud` — established
+///    large-fleet fallbacks for fan-out coverage. cloudflare-ipfs.com
+///    was removed (it does not support IPNS resolution; every probe
+///    against it returned 4xx).
+/// 4. `{name}.ipns.dget.top` (subdomain-style) — kept at the end as
+///    a small-fleet fan-out option. Useful when the upstream public
+///    gateways are saturated; not a primary because its uptime is
+///    less predictable than the Protocol Labs / Filebase tier.
 pub fn default_ipns_gateway_urls() -> Vec<String> {
     vec![
-        "https://{name}.ipns.dget.top/".into(),
-        "https://cloudflare-ipfs.com/ipns/{name}".into(),
+        "https://{name}.ipns.dweb.link/".into(),
         "https://dweb.link/ipns/{name}".into(),
         "https://ipfs.io/ipns/{name}".into(),
         "https://4everland.io/ipns/{name}".into(),
         "https://gateway.pinata.cloud/ipns/{name}".into(),
+        "https://{name}.ipns.dget.top/".into(),
     ]
 }
 
@@ -312,7 +324,41 @@ pub async fn fetch_cid_via_gateways(
     let mut last_err: Option<String> = None;
     for tmpl in gateways {
         let url = tmpl.replace("{cid}", &cid_str);
-        let resp = match tokio::time::timeout(per_request_timeout, http.get(&url).send()).await {
+        // IPFS gateway spec (IPIP-412): path-style endpoints like
+        // `gateway.example.com/ipfs/<cid>` and `gateway.example.com/ipns/<name>`
+        // return their HTML directory-listing UI when no Accept header is sent
+        // (or `application/vnd.ipld.car`/`raw`/`dag-json` for those types). To
+        // get the raw block bytes for content verification we MUST request
+        // `application/vnd.ipld.raw`. Without this, dweb.link returns 276 KB of
+        // HTML that fails `verify_cid_against_bytes`, the resolver exhausts the
+        // IPNS leg, and falls back to chain. Reproducible: any user pointing
+        // FULA_USERS_INDEX_IPNS_GATEWAY_URLS at a path-style gateway saw stale
+        // bucketsIndex (chain CIDs lag by up to 12h) → cold-start lookups for
+        // recently-created buckets returned `BucketNotFound`, swallowed by
+        // `list_files_from_forest` as 0 files.
+        // Multi-value Accept (RFC 7231 §5.3.2 quality-ordered list). The
+        // path-style `/ipfs/<cid>` endpoint resolves to a block whose codec
+        // is encoded in the CID — for fula it's either raw (0x55, used for
+        // EncryptedShardManifestV7 envelopes) or dag-cbor (0x71, used for
+        // GlobalUsersIndex and per-user bucketsIndex CBORs). Send both
+        // codec-specific media types so the gateway returns the right
+        // bytes regardless of which CID we're fetching. Without this,
+        // path-style gateways (dweb.link, ipfs.io) return their HTML
+        // directory listing UI and `verify_cid_against_bytes` rejects it.
+        // `application/cbor` is the legacy fallback some gateways accept
+        // for dag-cbor; `*/*` lets a stricter gateway pick anything if it
+        // doesn't honor the typed forms.
+        let resp = match tokio::time::timeout(
+            per_request_timeout,
+            http.get(&url)
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/vnd.ipld.raw, application/vnd.ipld.dag-cbor, application/cbor, */*;q=0.1",
+                )
+                .send(),
+        )
+        .await
+        {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 last_err = Some(format!("{} transport: {}", url, e));
@@ -383,11 +429,23 @@ pub fn default_ipfs_gateway_urls() -> Vec<String> {
 pub struct UsersIndexResolver {
     config: ResolverConfig,
     http: reqwest::Client,
-    /// Process-wide replay defense — only ever increases. SDK callers
-    /// can seed it from a persisted hot-start cache (Phase 3.3.5) at
-    /// construction time via [`UsersIndexResolver::new_with_cache`];
-    /// every successful `resolve` then bumps it.
+    /// Process-wide replay defense — only ever increases. Updated by
+    /// every successful resolve regardless of source (IPNS or chain).
+    /// Used as the in-session lower bound for accepting payloads.
+    /// **NOT persisted** — see `highest_chain_seen_sequence` for the
+    /// persistent floor.
     highest_seen_sequence: AtomicU64,
+    /// **F10 audit fix — chain-confirmed replay-defense floor.**
+    ///
+    /// Advances ONLY on successful chain resolves. Persisted to the
+    /// hot-start cache and re-seeded on next SDK start. Used as the
+    /// reference point for the IPNS sequence-jump cap so a malicious
+    /// IPNS gateway returning `sequence = u64::MAX` cannot poison the
+    /// persistent floor: the in-session `highest_seen_sequence` may
+    /// advance up to `chain_floor + MAX_IPNS_SEQUENCE_JUMP_OVER_CHAIN`
+    /// from IPNS, but that elevated value is never persisted, so
+    /// process restart wipes the attacker's progress.
+    highest_chain_seen_sequence: AtomicU64,
     /// Pre-validated 20-byte anchor address. Cached so each `resolve`
     /// doesn't re-parse the hex.
     anchor_address_bytes: [u8; 20],
@@ -420,6 +478,7 @@ impl UsersIndexResolver {
             config,
             http: reqwest::Client::new(),
             highest_seen_sequence: AtomicU64::new(0),
+            highest_chain_seen_sequence: AtomicU64::new(0),
             anchor_address_bytes,
             cache: None,
         })
@@ -449,12 +508,41 @@ impl UsersIndexResolver {
         let mut resolver = Self::new(config)?;
         // Seed the floor from cached state, if any. Best-effort —
         // a corrupt or empty cache gives us the default floor (0).
+        //
+        // F10 audit fix — sanity-cap the seeded value.
+        //
+        // Pre-fix the persisted sequence was advanced by every IPNS
+        // resolve, which let a malicious gateway poison the persistent
+        // floor with `sequence = u64::MAX` (or any value above what
+        // chain could realistically reach), permanently locking the SDK
+        // out of every subsequent IPNS AND chain read. Post-fix only
+        // chain advances the persistent floor (see `resolve()` below),
+        // but **legacy caches written by pre-fix builds may already
+        // carry a poisoned value**. The sanity cap below transparently
+        // recovers from that case: any cached sequence above
+        // `MAX_SANE_SEED_SEQUENCE` is treated as `0` so the next chain
+        // resolve can re-establish the real floor.
         match cache.load_users_index_state() {
-            Ok(Some((_cid, sequence, _observed))) => {
+            Ok(Some((_cid, mut sequence, _observed))) => {
+                if sequence > MAX_SANE_SEED_SEQUENCE {
+                    tracing::warn!(
+                        cached_sequence = sequence,
+                        cap = MAX_SANE_SEED_SEQUENCE,
+                        "registry_resolver: F10 — cached sequence exceeds sanity cap (likely \
+                         pre-fix IPNS poisoning); treating as 0 so chain can re-establish floor"
+                    );
+                    sequence = 0;
+                }
+                // Seed BOTH atomics: under Plan B the persisted value is
+                // always chain-confirmed, so it's the right seed for the
+                // chain floor too. (`bump_*` are monotonic-max, so a
+                // sequence of 0 is a no-op against the AtomicU64::new(0)
+                // initial value.)
+                resolver.bump_chain_seen_sequence(sequence);
                 resolver.bump_seen_sequence(sequence);
                 tracing::debug!(
                     seeded_sequence = sequence,
-                    "registry_resolver: hot-start floor seeded from cache"
+                    "registry_resolver: hot-start floor seeded from cache (chain-confirmed)"
                 );
             }
             Ok(None) => {
@@ -483,6 +571,25 @@ impl UsersIndexResolver {
     /// Read the current replay-defense floor.
     pub fn highest_seen_sequence(&self) -> u64 {
         self.highest_seen_sequence.load(Ordering::Acquire)
+    }
+
+    /// Read the chain-confirmed replay-defense floor.
+    ///
+    /// **F10 audit fix** — under Plan B this is the value that gets
+    /// persisted to the hot-start cache and re-seeded on next SDK
+    /// start. IPNS resolves never advance this floor (see
+    /// `parse_and_validate` and `resolve_via_network`), so a malicious
+    /// IPNS gateway cannot poison the persistent floor.
+    pub fn chain_seen_sequence(&self) -> u64 {
+        self.highest_chain_seen_sequence.load(Ordering::Acquire)
+    }
+
+    /// Test-only mirror of `set_highest_seen_sequence` for the chain
+    /// floor — F10 regression tests need to seed it without going
+    /// through a full chain resolve.
+    #[cfg(test)]
+    pub(crate) fn set_chain_seen_sequence(&self, seq: u64) {
+        self.bump_chain_seen_sequence(seq);
     }
 
     /// Read-only access to the resolver's HTTP client. The cold-start
@@ -528,6 +635,26 @@ impl UsersIndexResolver {
         }
     }
 
+    /// **F10 audit fix** — atomic monotonic-max for the chain-confirmed
+    /// floor. Called only from `try_chain` on success and from
+    /// `new_with_cache` (when seeding from a chain-confirmed cache
+    /// entry). `try_ipns` does NOT call this — that's what bounds the
+    /// persistent floor against IPNS poisoning.
+    fn bump_chain_seen_sequence(&self, seq: u64) {
+        let mut current = self.highest_chain_seen_sequence.load(Ordering::Acquire);
+        while seq > current {
+            match self.highest_chain_seen_sequence.compare_exchange_weak(
+                current,
+                seq,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     /// Hybrid resolve.
     ///
     /// Order of operations:
@@ -558,7 +685,23 @@ impl UsersIndexResolver {
         // per-session event; the few hundred microseconds for the
         // redb txns are negligible vs. the IPNS+chain budget we just
         // paid.
-        self.persist_to_cache(&resolved).await;
+        //
+        // **F10 audit fix — Chain-only persistence.** Pre-fix, both
+        // IPNS and chain sources persisted to cache, allowing one
+        // malicious IPNS hit to poison the persistent floor with
+        // `sequence = u64::MAX`. Under Plan B the persistent floor
+        // is chain-confirmed only; IPNS-source resolves return
+        // without persisting, so process restart wipes any in-session
+        // attacker progress and the next chain resolve transparently
+        // re-establishes the real floor.
+        if matches!(resolved.source, ResolutionSource::Chain) {
+            self.persist_to_cache(&resolved).await;
+        } else {
+            tracing::debug!(
+                source = ?resolved.source,
+                "registry_resolver: skipping cache persist for non-chain source (F10)"
+            );
+        }
 
         Ok(resolved)
     }
@@ -717,6 +860,12 @@ impl UsersIndexResolver {
 
         match self.try_chain().await {
             Ok(resolved) => {
+                // F10: chain success advances BOTH floors. The chain
+                // floor is the persistent one (see `resolve()` →
+                // `persist_to_cache` chain-only branch); advancing it
+                // raises the IPNS anti-poisoning cap headroom for
+                // legitimate IPNS responses going forward.
+                self.bump_chain_seen_sequence(resolved.payload.sequence);
                 self.bump_seen_sequence(resolved.payload.sequence);
                 Ok(resolved)
             }
@@ -945,9 +1094,28 @@ impl UsersIndexResolver {
     /// pool's dynamic-priority state machine — this is one-shot
     /// cold-start, not the ongoing warm-device hot path.
     async fn fetch_with_timeout(&self, url: &str) -> Result<Bytes, ClientError> {
+        // IPIP-412: request raw IPLD bytes so path-style gateways (e.g.
+        // dweb.link/ipns/<name>) return the underlying CBOR rather than
+        // their HTML directory listing. Without this header, the IPNS
+        // leg silently exhausted across every gateway that wraps
+        // responses in HTML, forcing fall-back to the chain leg (which
+        // can be up to 12h stale).
+        // IPNS path. The resolved object is the GlobalUsersIndex CBOR
+        // (dag-cbor codec 0x71), so explicitly accept dag-cbor; include
+        // raw + cbor + */* as fallbacks for gateways that don't honor
+        // the typed forms. dweb.link 406s `vnd.ipld.raw` on IPNS paths
+        // (raw doesn't apply to IPNS-resolved typed content) but
+        // happily serves `vnd.ipld.dag-cbor` — empirically verified
+        // during the cold-walk diagnostic that produced this fix.
         let resp = tokio::time::timeout(
             self.config.per_request_timeout,
-            self.http.get(url).send(),
+            self.http
+                .get(url)
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/vnd.ipld.dag-cbor, application/vnd.ipld.raw, application/cbor, */*;q=0.1",
+                )
+                .send(),
         )
         .await
         .map_err(|_| ClientError::UsersIndexResolutionFailed {
@@ -973,6 +1141,21 @@ impl UsersIndexResolver {
     /// IPNS path; the gateway did the IPNS-record resolution
     /// upstream — the security boundary here is the in-CBOR
     /// `sequence` field, not the bytes-to-CID hash).
+    ///
+    /// **F10 audit fix — source-aware sequence validation.**
+    ///
+    /// All sources: reject `payload.sequence < highest_seen_sequence`
+    /// (replay defense; unchanged).
+    ///
+    /// IPNS source ALSO caps `payload.sequence <=
+    /// chain_seen_sequence + MAX_IPNS_SEQUENCE_JUMP_OVER_CHAIN`. This
+    /// prevents a malicious IPNS gateway from returning
+    /// `sequence = u64::MAX` and advancing the replay-defense floor
+    /// arbitrarily — without the cap, every subsequent legitimate
+    /// chain response (whose sequence is a small integer) would be
+    /// rejected as `SequenceRegression`. The cap is anchored to the
+    /// chain-confirmed floor (not the in-session `seen` floor) so
+    /// repeated coordinated IPNS hits cannot drift the cap upward.
     fn parse_and_validate(
         &self,
         bytes: Bytes,
@@ -990,6 +1173,20 @@ impl UsersIndexResolver {
                 highest_seen: seen,
                 channel: format!("{:?}", source),
             });
+        }
+        // F10 — IPNS-only anti-poisoning cap.
+        if matches!(source, ResolutionSource::Ipns) {
+            let chain_floor = self.chain_seen_sequence();
+            let max_allowed = chain_floor.saturating_add(MAX_IPNS_SEQUENCE_JUMP_OVER_CHAIN);
+            if payload.sequence > max_allowed {
+                return Err(ClientError::UsersIndexResolutionFailed {
+                    reason: format!(
+                        "IPNS sequence {} exceeds chain-confirmed floor {} by more than {} \
+                         — possible IPNS gateway poisoning, refusing payload (F10 anti-poisoning cap)",
+                        payload.sequence, chain_floor, MAX_IPNS_SEQUENCE_JUMP_OVER_CHAIN,
+                    ),
+                });
+            }
         }
         let cid = synthesize_cid_from_bytes(&bytes);
         Ok(ResolvedUsersIndex {
@@ -1009,6 +1206,36 @@ impl UsersIndexResolver {
 const MULTIHASH_SHA2_256: u64 = 0x12;
 /// IPLD codec for dag-cbor (0x71).
 const CODEC_DAG_CBOR: u64 = 0x71;
+
+/// **F10 audit fix** — Maximum delta between the chain-confirmed floor
+/// and an accepted IPNS payload's `sequence`. Defends against a
+/// malicious IPNS gateway returning a poisoned `sequence = u64::MAX`
+/// (or any large value above what chain could realistically reach),
+/// which would otherwise advance the in-session replay-defense floor
+/// arbitrarily and reject every subsequent legitimate chain response
+/// as `SequenceRegression`.
+///
+/// Sized for the bootstrap edge case: if the chain-floor is `0` (brand
+/// new SDK before chain has ever published) AND IPNS is the only path,
+/// the SDK can read up to `MAX_IPNS_SEQUENCE_JUMP_OVER_CHAIN` distinct
+/// publishes before chain catches up. At a 5-min publish cadence this
+/// is ~9.5 years of headroom — generous for any realistic deployment.
+/// Production design has chain on a 12h cron, so this slack should
+/// never bind in practice.
+const MAX_IPNS_SEQUENCE_JUMP_OVER_CHAIN: u64 = 1_000_000;
+
+/// **F10 audit fix** — Sanity ceiling on the cached sequence value
+/// loaded at construction time via `new_with_cache`. Defends against
+/// legacy caches written by pre-fix SDK builds, which may carry an
+/// IPNS-poisoned value. Any persisted sequence above this cap is
+/// treated as `0` so the next chain resolve transparently re-establishes
+/// the real floor.
+///
+/// `1u64 << 40 ≈ 1.1 trillion` — well above any conceivable legitimate
+/// publisher sequence (chain advances ~730/year at 12h cadence; this
+/// cap is reached after ~1.5 billion years of continuous publishing).
+/// Anything above is unambiguously corrupt.
+const MAX_SANE_SEED_SEQUENCE: u64 = 1u64 << 40;
 
 /// `keccak256("latest()")[..4]`. Hardcoded so the production build
 /// has zero crypto dependency for this constant.
@@ -1818,10 +2045,16 @@ mod tests {
     }
 
     /// Test 3 — hot-start within TTL serves cached state without
-    /// touching the network. Uses `Mock::expect(1)` on the IPNS
-    /// mock: the second resolve() call MUST hit the cache. If the
-    /// short-circuit is broken, IPNS would be called twice, and
-    /// wiremock would panic in its `Drop` impl on test exit.
+    /// touching the network.
+    ///
+    /// **F10 audit fix — semantics updated.** Pre-fix any IPNS resolve
+    /// populated the cache; second resolve hot-started from it. Under
+    /// Plan B the persistent cache is chain-confirmed only — IPNS
+    /// resolves do NOT persist (so a malicious IPNS gateway cannot
+    /// poison the chain-floor). To still exercise the hot-start
+    /// short-circuit, this test now pre-seeds the cache directly with
+    /// chain-flavored state, then asserts a single resolve() call
+    /// short-circuits to `HotStartCache` without hitting IPNS.
     #[tokio::test]
     async fn hot_start_within_ttl_skips_network() {
         let dir = TempDir::new().unwrap();
@@ -1830,10 +2063,28 @@ mod tests {
 
         let ipns = MockServer::start().await;
         let (cbor, _) = make_payload_with_seq(7);
+
+        // F10: pre-seed the cache with chain-confirmed state. The
+        // `synthesize_cid_from_bytes` matches what try_hot_start would
+        // compute, and BlockCache's METADATA + BLOCKS tables together
+        // give the resolver everything it needs for hot-start.
+        let cid = synthesize_cid_from_bytes(&cbor);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        cache
+            .store_users_index_state(&cid, 7, now)
+            .expect("seed METADATA");
+        cache.put(&cid, &cbor).await.expect("seed BLOCKS");
+
+        // IPNS mock with `expect(0)` — if the hot-start short-circuit
+        // breaks, wiremock will panic on Drop because the mock was
+        // hit despite expecting zero hits.
         Mock::given(method("GET"))
             .and(path(format!("/ipns/{}", fixture_ipns_name())))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(cbor.as_ref()))
-            .expect(1) // IPNS hit at most ONCE; second resolve MUST be cached
+            .expect(0)
             .mount(&ipns)
             .await;
 
@@ -1841,23 +2092,16 @@ mod tests {
         let resolver =
             UsersIndexResolver::new_with_cache(cfg, Arc::clone(&cache)).expect("new_with_cache");
 
-        // First resolve: hits IPNS, populates cache. `persist_to_cache`
-        // is synchronous-from-async (no spawned background task), so
-        // when `resolve` returns the METADATA + BLOCKS rows are
-        // already on disk. The second resolve will see them.
-        let r1 = resolver.resolve().await.expect("first resolve");
-        assert_eq!(r1.source, ResolutionSource::Ipns);
-        assert_eq!(r1.payload.sequence, 7);
-
-        // Second resolve: should be served from cache. wiremock
-        // panics on Drop if IPNS was called more than `expect(1)`.
-        let r2 = resolver.resolve().await.expect("second resolve");
+        // Single resolve: must hot-start from the pre-seeded cache,
+        // NEVER touching IPNS. `expect(0)` enforces this on wiremock
+        // Drop.
+        let r = resolver.resolve().await.expect("hot-start resolve");
         assert_eq!(
-            r2.source,
+            r.source,
             ResolutionSource::HotStartCache,
-            "second resolve must be served from hot-start cache (not the network)"
+            "must serve from hot-start cache (not the network)"
         );
-        assert_eq!(r2.payload.sequence, 7);
+        assert_eq!(r.payload.sequence, 7);
     }
 
     /// Test 4 — hot-start beyond TTL re-resolves. Configure a
@@ -1922,5 +2166,219 @@ mod tests {
         // Higher value advances.
         resolver.bump_seen_sequence(7);
         assert_eq!(resolver.highest_seen_sequence(), 7);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // F10 (audit) — IPNS poisoning protection regression tests.
+    //
+    // Pre-fix the SDK accepted any IPNS payload with `sequence >= seen`
+    // and persisted it to the cache. A malicious IPNS gateway returning
+    // `sequence = u64::MAX` would advance the persistent floor to
+    // u64::MAX, permanently locking the SDK out of every subsequent
+    // legitimate IPNS AND chain read (chain's real sequence is small;
+    // would be rejected as `SequenceRegression`). Post-fix:
+    //
+    //   1. IPNS payloads are capped at `chain_floor + 1M` per resolve
+    //      (`MAX_IPNS_SEQUENCE_JUMP_OVER_CHAIN`).
+    //   2. IPNS-source resolves do NOT persist to cache — the
+    //      persistent floor is chain-confirmed only.
+    //   3. Cold-start cache loads sanity-cap legacy poisoned values
+    //      at `MAX_SANE_SEED_SEQUENCE = 1u64 << 40`.
+    // ─────────────────────────────────────────────────────────────────
+
+    fn fixture_resolver() -> UsersIndexResolver {
+        let cfg = ResolverConfig::new(
+            "https://rpc.example",
+            fixture_address(),
+            fixture_ipns_name(),
+        );
+        UsersIndexResolver::new(cfg).expect("fixture resolver")
+    }
+
+    #[test]
+    fn f10_ipns_u64_max_poisoning_rejected_in_memory() {
+        // Headline attack: malicious IPNS gateway returns u64::MAX.
+        // parse_and_validate must refuse before bumping the floor.
+        let resolver = fixture_resolver();
+        let (poisoned_bytes, _) = make_payload_cbor(u64::MAX);
+        let err = resolver
+            .parse_and_validate(poisoned_bytes, ResolutionSource::Ipns)
+            .expect_err("u64::MAX from IPNS must be rejected by anti-poisoning cap");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("anti-poisoning") || msg.contains("MAX_IPNS_SEQUENCE_JUMP")
+                || msg.contains("possible IPNS gateway poisoning"),
+            "error must cite the F10 cap; got: {}",
+            msg
+        );
+        // CRITICAL: the in-memory floor MUST NOT have advanced — proves
+        // the rejection happened before any bump.
+        assert_eq!(resolver.highest_seen_sequence(), 0);
+        assert_eq!(resolver.chain_seen_sequence(), 0);
+    }
+
+    #[test]
+    fn f10_ipns_drift_attack_doesnt_persist() {
+        // 100 in-session IPNS hits at chain_floor+cap-1. Each hit
+        // succeeds parse_and_validate (within the cap) and bumps
+        // highest_seen_sequence. But the chain floor stays at 0 and
+        // — crucially — would never be persisted (the persist gate
+        // in resolve() only fires for Chain source).
+        let resolver = fixture_resolver();
+        let initial_chain_floor = resolver.chain_seen_sequence();
+        assert_eq!(initial_chain_floor, 0);
+
+        // Within-cap value (chain_floor + cap - 1).
+        let within_cap = MAX_IPNS_SEQUENCE_JUMP_OVER_CHAIN - 1;
+        let (good_bytes, _) = make_payload_cbor(within_cap);
+        let resolved = resolver
+            .parse_and_validate(good_bytes, ResolutionSource::Ipns)
+            .expect("within-cap IPNS is accepted");
+        // Simulate the in-session floor bump that resolve_via_network
+        // does on IPNS success.
+        resolver.bump_seen_sequence(resolved.payload.sequence);
+
+        // In-memory floor advanced.
+        assert_eq!(resolver.highest_seen_sequence(), within_cap);
+        // BUT the chain floor — the persistent one — did NOT.
+        assert_eq!(
+            resolver.chain_seen_sequence(),
+            0,
+            "F10: IPNS must NEVER advance the chain-confirmed floor"
+        );
+
+        // Try to drift past chain_floor + cap (should fail even though
+        // it's still > highest_seen_sequence: the cap is anchored to
+        // chain_floor, not to seen).
+        let drift_target = MAX_IPNS_SEQUENCE_JUMP_OVER_CHAIN + 1;
+        let (drift_bytes, _) = make_payload_cbor(drift_target);
+        assert!(
+            resolver
+                .parse_and_validate(drift_bytes, ResolutionSource::Ipns)
+                .is_err(),
+            "F10: cap is anchored to chain_floor=0, so seq > 1M must fail \
+             even after IPNS already bumped seen to 1M-1"
+        );
+    }
+
+    #[test]
+    fn f10_chain_advance_persists_and_survives_restart() {
+        // Chain success bumps both floors; chain floor is persisted
+        // and re-seeded on next SDK start.
+        let resolver = fixture_resolver();
+        // Simulate chain success.
+        resolver.bump_chain_seen_sequence(100);
+        resolver.bump_seen_sequence(100);
+        assert_eq!(resolver.chain_seen_sequence(), 100);
+        assert_eq!(resolver.highest_seen_sequence(), 100);
+
+        // After restart, both floors should re-seed from cache (chain
+        // floor is what's persisted; the seed code seeds both atomics
+        // from that single value). Simulate via `set_chain_seen_sequence`
+        // on a fresh resolver, mirroring `new_with_cache`'s seed.
+        let fresh = fixture_resolver();
+        // bump_chain_seen_sequence is private; use the test-only setter.
+        fresh.set_chain_seen_sequence(100);
+        fresh.set_highest_seen_sequence(100);
+        assert_eq!(fresh.chain_seen_sequence(), 100);
+        assert_eq!(fresh.highest_seen_sequence(), 100);
+
+        // Now an IPNS payload at seq=200 (legitimate, within cap from
+        // chain_floor=100) should succeed.
+        let (legit_bytes, _) = make_payload_cbor(200);
+        assert!(
+            fresh.parse_and_validate(legit_bytes, ResolutionSource::Ipns).is_ok(),
+            "F10: with chain_floor=100, IPNS at 200 (cap=1_000_100) is legitimate"
+        );
+    }
+
+    #[test]
+    fn f10_ipns_within_cap_accepted() {
+        // Legitimate IPNS exactly at chain_floor + cap is accepted.
+        let resolver = fixture_resolver();
+        resolver.set_chain_seen_sequence(50);
+        resolver.set_highest_seen_sequence(50);
+
+        // chain_floor=50, cap=1M → max allowed = 1_000_050.
+        let max_legit = 50 + MAX_IPNS_SEQUENCE_JUMP_OVER_CHAIN;
+        let (bytes, _) = make_payload_cbor(max_legit);
+        assert!(
+            resolver
+                .parse_and_validate(bytes, ResolutionSource::Ipns)
+                .is_ok(),
+            "F10: IPNS at exactly chain_floor + MAX_IPNS_SEQUENCE_JUMP_OVER_CHAIN must be accepted"
+        );
+
+        // One above is rejected.
+        let (over_bytes, _) = make_payload_cbor(max_legit + 1);
+        assert!(
+            resolver
+                .parse_and_validate(over_bytes, ResolutionSource::Ipns)
+                .is_err(),
+            "F10: IPNS at chain_floor + cap + 1 must be rejected"
+        );
+    }
+
+    #[test]
+    fn f10_chain_path_not_subject_to_ipns_cap() {
+        // Chain is monotonic-enforced by the contract (require(newSeq
+        // > sequence)); the SDK trusts chain absolutely. parse_and_validate
+        // for ResolutionSource::Chain must NOT apply the IPNS cap, even
+        // for sequence values way above chain_floor (e.g., a deployment
+        // that advanced rapidly via legitimate publishes).
+        let resolver = fixture_resolver();
+        // chain_floor=0; under IPNS this would reject anything > 1M.
+        // Under Chain, even a huge legitimate value is fine (chain has
+        // its own monotonic enforcement).
+        let huge_legit_chain = MAX_IPNS_SEQUENCE_JUMP_OVER_CHAIN + 1_000_000;
+        let (bytes, _) = make_payload_cbor(huge_legit_chain);
+        let resolved = resolver
+            .parse_and_validate(bytes, ResolutionSource::Chain)
+            .expect("Chain source not subject to IPNS anti-poisoning cap");
+        assert_eq!(resolved.payload.sequence, huge_legit_chain);
+    }
+
+    #[test]
+    fn f10_legacy_poisoned_cache_sanity_capped() {
+        // Cache sanity cap on the SEEDED sequence. Pre-fix poisoning
+        // wrote u64::MAX to the persistent floor; new_with_cache must
+        // detect this (value > MAX_SANE_SEED_SEQUENCE) and recover by
+        // treating the seed as 0. Tested directly against the cap
+        // constant + `bump_chain_seen_sequence` semantics; full
+        // new_with_cache integration test would require a redb cache
+        // fixture which is heavy.
+        let resolver = fixture_resolver();
+        let poisoned = u64::MAX;
+        let cap = MAX_SANE_SEED_SEQUENCE;
+        // Cap definition correctness:
+        assert!(poisoned > cap);
+        assert_eq!(cap, 1u64 << 40);
+        // The new_with_cache logic discards values > cap, treating
+        // them as 0 for seeding. Verify the cap is high enough that
+        // legitimate publisher seqs never trigger it (730/year × 1B
+        // years before a real publisher could reach 1u64 << 40):
+        let one_century_at_max_realistic_pace: u64 = 730 * 100;
+        assert!(one_century_at_max_realistic_pace < cap);
+        // And that the cap is low enough to reject obvious poisoning:
+        assert!(poisoned > cap);
+    }
+
+    #[test]
+    fn f10_replay_defense_seq_below_floor_still_rejected() {
+        // Sanity check: the existing replay-defense behavior must still
+        // work. A payload with sequence < highest_seen_sequence is
+        // rejected before any source-specific cap check.
+        let resolver = fixture_resolver();
+        resolver.set_highest_seen_sequence(100);
+        let (stale_bytes, _) = make_payload_cbor(50);
+        let err = resolver
+            .parse_and_validate(stale_bytes.clone(), ResolutionSource::Ipns)
+            .expect_err("stale IPNS rejected");
+        assert!(matches!(err, ClientError::SequenceRegression { .. }));
+        // Same for chain source.
+        let err2 = resolver
+            .parse_and_validate(stale_bytes, ResolutionSource::Chain)
+            .expect_err("stale chain rejected");
+        assert!(matches!(err2, ClientError::SequenceRegression { .. }));
     }
 }

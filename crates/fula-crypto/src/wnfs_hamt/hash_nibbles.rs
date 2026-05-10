@@ -68,13 +68,12 @@ impl Iterator for HashNibbles<'_> {
 }
 
 impl Debug for HashNibbles<'_> {
+    /// Redacts the underlying digest. The full hash is the keying material
+    /// for HAMT navigation; emitting it in logs would help an attacker
+    /// reconstruct the trie structure under a known plaintext path.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut s = String::with_capacity(MAX_HASH_NIBBLE_LENGTH);
-        for nibble in HashNibbles::with_cursor(self.digest, 0) {
-            s.push_str(&format!("{nibble:1X}"));
-        }
         f.debug_struct("HashNibbles")
-            .field("hash", &s)
+            .field("hash", &"<redacted>")
             .field("cursor", &self.cursor)
             .finish()
     }

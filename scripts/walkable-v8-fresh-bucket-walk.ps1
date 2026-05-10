@@ -84,6 +84,7 @@ Push-Location $crateDir
 try {
     cargo test -p fula-client `
         --test offline_e2e --release `
+        --features test-fault-injection `
         fxfiles_walkable_v8_fresh_bucket_walk `
         -- --ignored --nocapture
 }

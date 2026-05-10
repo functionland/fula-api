@@ -14,9 +14,20 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 /// A nonce for AEAD encryption
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `Debug` is hand-rolled to redact the raw nonce bytes. Nonces are not
+/// secret on their own, but exposing nonce + ciphertext in logs makes
+/// any future key compromise more useful to an attacker (one half of
+/// the GCM forgery prerequisite).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Nonce {
     bytes: [u8; NONCE_SIZE],
+}
+
+impl std::fmt::Debug for Nonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Nonce([{} bytes redacted])", self.bytes.len())
+    }
 }
 
 impl Nonce {
@@ -71,6 +82,31 @@ impl Nonce {
     }
 }
 
+/// **D7 audit fix — per-key message-count ceiling.**
+///
+/// Maximum number of distinct AEAD encryptions safe under a single DEK
+/// when nonces are 96-bit randomly chosen (the default for both AES-GCM
+/// and ChaCha20-Poly1305 in this stack).
+///
+/// Per NIST SP 800-38D §8.3 (AES-GCM) and equivalent guidance for
+/// ChaCha20-Poly1305, with random 96-bit nonces the birthday-collision
+/// probability becomes non-negligible (≈ 2⁻³²) at approximately 2³² ≈ 4
+/// billion encryptions per key. Beyond that bound the AEAD's
+/// confidentiality/integrity guarantees degrade.
+///
+/// **No internal counter is enforced** because adding one would change
+/// the wire format (callers persisting an `Aead` would lose the
+/// counter across restart). The value is exposed as a constant +
+/// [`Aead::message_count_ceiling`] accessor so callers operating in
+/// regimes where a single DEK could approach this bound (e.g.,
+/// extremely long-lived per-bucket DEKs encrypting billions of chunks)
+/// can implement rotation at their layer.
+///
+/// At Fula's current ~6-user / typical-bucket-size scale this bound is
+/// >>1000× over the realistic per-DEK encryption count and is not
+/// load-bearing. Document the ceiling for future scale.
+pub const MAX_MESSAGES_PER_DEK: u64 = 1u64 << 32;
+
 /// Supported AEAD ciphers
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -99,6 +135,21 @@ impl AeadCipher {
     /// Get the authentication tag size
     pub fn tag_size(&self) -> usize {
         16 // Both use 128-bit tags
+    }
+
+    /// **D7 audit fix** — Maximum recommended distinct messages
+    /// encrypted under a single AEAD key with this cipher's default
+    /// 96-bit random nonce. See [`MAX_MESSAGES_PER_DEK`].
+    ///
+    /// Both `Aes256Gcm` and `ChaCha20Poly1305` share the same bound at
+    /// this stack's nonce-generation strategy (random 96-bit nonces),
+    /// so this returns the same value for either variant. Exposed as
+    /// a method (rather than a field on `AeadCipher`) so future
+    /// nonce-misuse-resistant variants (e.g. XChaCha20-Poly1305 with
+    /// 192-bit nonces, which can safely take 2⁸⁰ messages per key)
+    /// can return a different value without changing call sites.
+    pub fn message_count_ceiling(&self) -> u64 {
+        MAX_MESSAGES_PER_DEK
     }
 }
 
@@ -129,6 +180,19 @@ impl Aead {
     /// Create with the default cipher (AES-256-GCM)
     pub fn new_default(key: &DekKey) -> Self {
         Self::new(key, AeadCipher::default())
+    }
+
+    /// **D7 audit fix** — Read the recommended per-DEK message-count
+    /// ceiling for this AEAD's cipher. See [`MAX_MESSAGES_PER_DEK`].
+    ///
+    /// Callers that operate in regimes where a single DEK could
+    /// approach 2³² distinct encryptions (extremely high-volume
+    /// workloads) should track their per-DEK message count externally
+    /// and rotate the DEK before reaching this bound. The SDK does NOT
+    /// enforce this internally — the wire format would have to change
+    /// to carry a per-key counter.
+    pub fn message_count_ceiling(&self) -> u64 {
+        self.cipher.message_count_ceiling()
     }
 
     /// Encrypt data with the given nonce
