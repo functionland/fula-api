@@ -4608,12 +4608,25 @@ mod tests {
         // typically grows ≥ 1 internal node per populated shard.
         const N: u64 = 32;
 
+        // Pin shard_salt so v7 and v8 route IDENTICALLY. `::new` would
+        // generate a fresh `OsRng`-derived salt per call, so v7's and
+        // v8's 32 entries would distribute across different subsets of
+        // shards (16 hash buckets — different salt rotates the hash),
+        // producing different total PUT counts and a flaky equality
+        // check. The W.8.4 invariant under audit here is "v7 and v8
+        // emit the same number of PUTs FOR THE SAME ROUTING DECISIONS";
+        // pinning the salt enforces "same routing" so the comparison
+        // tests only the cascade itself, not the salt entropy.
+        const FIXED_SALT: [u8; 32] = [0xA5; 32];
+
         async fn run<B>(backend: &std::sync::Arc<CountingBlobBackend<B>>, label: &str)
         where
             B: crate::wnfs_hamt::BlobBackend + 'static,
         {
+            let mut manifest = crate::private_forest::ShardManifestV7::new(16);
+            manifest.root.shard_salt = FIXED_SALT.to_vec();
             let mut forest =
-                ShardedHamtPrivateForest::new(label, test_dek(), 16);
+                ShardedHamtPrivateForest::from_manifest(manifest, label, test_dek());
             for i in 0..N {
                 forest
                     .upsert_file(file_entry(&format!("/p/f-{:03}.bin", i), i), backend)
@@ -4696,12 +4709,28 @@ mod tests {
         // reads.
         const N: u64 = 64;
 
+        // Pin shard_salt for deterministic routing across v7 and v8 —
+        // see the writer-parity test above for the rationale (same N
+        // entries, different random salt → different shard distribution
+        // → different read counts → flaky equality). Same FIXED_SALT
+        // makes the comparison test the cascade itself, not entropy.
+        const FIXED_SALT: [u8; 32] = [0xA5; 32];
+
+        fn fresh_manifest_with_fixed_salt() -> crate::private_forest::ShardManifestV7 {
+            let mut m = crate::private_forest::ShardManifestV7::new(16);
+            m.root.shard_salt = FIXED_SALT.to_vec();
+            m
+        }
+
         // ─── v7 baseline ────────────────────────────────────────────────
         let v7_inner = std::sync::Arc::new(InMemoryBackend::new());
         let v7 = std::sync::Arc::new(CountingBlobBackend::new(v7_inner));
         {
-            let mut forest =
-                ShardedHamtPrivateForest::new("rpc-walk-v7", test_dek(), 16);
+            let mut forest = ShardedHamtPrivateForest::from_manifest(
+                fresh_manifest_with_fixed_salt(),
+                "rpc-walk-v7",
+                test_dek(),
+            );
             for i in 0..N {
                 forest
                     .upsert_file(file_entry(&format!("/w/f-{:03}.bin", i), i), &v7)
@@ -4714,8 +4743,11 @@ mod tests {
         // Re-load the forest from scratch so the walk actually exercises
         // gets (in-memory cache would short-circuit otherwise).
         let v7_manifest = {
-            let mut forest =
-                ShardedHamtPrivateForest::new("rpc-walk-v7", test_dek(), 16);
+            let mut forest = ShardedHamtPrivateForest::from_manifest(
+                fresh_manifest_with_fixed_salt(),
+                "rpc-walk-v7",
+                test_dek(),
+            );
             for i in 0..N {
                 forest
                     .upsert_file(file_entry(&format!("/w/f-{:03}.bin", i), i), &v7)
@@ -4740,8 +4772,11 @@ mod tests {
         let v8_inner = std::sync::Arc::new(CidCapturingBackend::new());
         let v8 = std::sync::Arc::new(CountingBlobBackend::new(v8_inner));
         let v8_manifest = {
-            let mut forest =
-                ShardedHamtPrivateForest::new("rpc-walk-v8", test_dek(), 16);
+            let mut forest = ShardedHamtPrivateForest::from_manifest(
+                fresh_manifest_with_fixed_salt(),
+                "rpc-walk-v8",
+                test_dek(),
+            );
             for i in 0..N {
                 forest
                     .upsert_file(file_entry(&format!("/w/f-{:03}.bin", i), i), &v8)

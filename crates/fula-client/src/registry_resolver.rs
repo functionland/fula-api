@@ -268,21 +268,33 @@ pub use crate::user_key::derive_user_key_from_email;
 /// Order is the SDK's per-tick race priority — the resolver tries
 /// gateways in order and takes the first content-verified body whose
 /// in-payload `sequence` is at least the locally-observed high-water
-/// mark. `dget.top` (subdomain-style) is the load-bearing first slot
-/// because operator measurement on production (2026-05-09) showed it
-/// picks up freshly-published IPNS records the fastest among public
-/// IPNS-aware gateways — getting cold-start latency below the next
-/// tier's typical first-hit time. Cloudflare and dweb.link follow as
-/// the established large-fleet fallbacks; the remaining three are
-/// kept for fan-out coverage.
+/// mark.
+///
+/// Ordering (operator-confirmed 2026-05-10):
+/// 1. `{name}.ipns.dweb.link` (subdomain-style) — first because
+///    subdomain endpoints serve raw / dag-cbor without an HTML wrapper
+///    and dweb.link's IPNS resolution picks up freshly-published
+///    records reliably across the large fleet behind Protocol Labs.
+/// 2. `dweb.link/ipns/{name}` (path-style) — same gateway, different
+///    URL shape. Kept as a near-duplicate fallback because some
+///    middleboxes/CDNs cache subdomain routes longer than path
+///    routes; one of the two usually responds with a fresh record.
+/// 3. `ipfs.io`, `4everland.io`, `gateway.pinata.cloud` — established
+///    large-fleet fallbacks for fan-out coverage. cloudflare-ipfs.com
+///    was removed (it does not support IPNS resolution; every probe
+///    against it returned 4xx).
+/// 4. `{name}.ipns.dget.top` (subdomain-style) — kept at the end as
+///    a small-fleet fan-out option. Useful when the upstream public
+///    gateways are saturated; not a primary because its uptime is
+///    less predictable than the Protocol Labs / Filebase tier.
 pub fn default_ipns_gateway_urls() -> Vec<String> {
     vec![
-        "https://{name}.ipns.dget.top/".into(),
-        "https://cloudflare-ipfs.com/ipns/{name}".into(),
+        "https://{name}.ipns.dweb.link/".into(),
         "https://dweb.link/ipns/{name}".into(),
         "https://ipfs.io/ipns/{name}".into(),
         "https://4everland.io/ipns/{name}".into(),
         "https://gateway.pinata.cloud/ipns/{name}".into(),
+        "https://{name}.ipns.dget.top/".into(),
     ]
 }
 
