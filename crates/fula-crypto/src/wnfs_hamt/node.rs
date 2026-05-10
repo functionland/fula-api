@@ -11,10 +11,11 @@
 use super::constants::{HAMT_BITMASK_BIT_SIZE, HAMT_VALUES_BUCKET_SIZE};
 use super::hash_nibbles::HashNibbles;
 use super::pointer::{ChildPtr, Pair, Pointer, PointerWire};
-use super::store::{HamtNodeStore, StorageKey};
+use super::store::{HamtNodeStore, NodePutResult, StorageKey};
 use crate::hashing::Hasher;
 use crate::{CryptoError, Result};
 use async_recursion::async_recursion;
+use cid::Cid;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
@@ -145,10 +146,13 @@ where
 
     /// Serialize this node (recursively persisting any in-memory children)
     /// and write the resulting plaintext bytes to the store. Returns the
-    /// content-addressed key the store assigned.
+    /// content-addressed key the store assigned, alongside an optional
+    /// CID hint (W.9.2): `Some(_)` when the underlying `BlobBackend`
+    /// returned one in `BlobPutResult.cid` (e.g. master S3's `ETag`),
+    /// `None` for in-memory backends or when the etag failed to parse.
     #[cfg_attr(not(target_arch = "wasm32"), async_recursion)]
     #[cfg_attr(target_arch = "wasm32", async_recursion(?Send))]
-    pub async fn store(&self, store: &(impl HamtNodeStore + ?Sized)) -> Result<StorageKey> {
+    pub async fn store(&self, store: &(impl HamtNodeStore + ?Sized)) -> Result<NodePutResult> {
         let mut wire_pointers = Vec::with_capacity(self.pointers.len());
         for p in &self.pointers {
             wire_pointers.push(p.to_wire(store).await?);
@@ -176,6 +180,18 @@ where
     /// requirement of the AEAD node encryption model (a child's storage
     /// key is only known after its parent is decrypted). Input pointer
     /// order is preserved in the output.
+    ///
+    /// **Walkable-v8 (W.9.5 / #37) — fetch-order obfuscation.** The
+    /// per-pointer future list is shuffled before being passed to
+    /// `stream::buffered`, so a network observer watching the offline
+    /// gateway-race traffic for a single HAMT node sees an unpredictable
+    /// fetch order rather than the bitmask-order that would otherwise
+    /// leak intra-node topology. Output ordering is restored by sorting
+    /// on the original pointer index after collection — the docstring's
+    /// "input pointer order is preserved" contract is unchanged.
+    /// The cost is one `Vec::shuffle` per recursion (O(N) where N ≤ 16)
+    /// and a sort of the same size; both negligible vs. the network
+    /// fetch cost they're being interleaved with.
     #[cfg_attr(not(target_arch = "wasm32"), async_recursion)]
     #[cfg_attr(target_arch = "wasm32", async_recursion(?Send))]
     pub async fn flat_map<F, T>(
@@ -188,30 +204,49 @@ where
         T: Send,
     {
         use futures::stream::{self, StreamExt, TryStreamExt};
+        use rand::seq::SliceRandom;
         // Build the per-pointer future list with `std::iter::Iterator::map`
         // (not `StreamExt::map`) so each future's captured lifetimes bind to
         // `self` / `f` / `store` concretely. `StreamExt::map` infers an HRTB
         // that the `async_recursion` macro's rewritten body can't satisfy.
-        let per_pointer_futs: Vec<_> = self
+        //
+        // W.9.5 / #37: each future carries its `original_idx` in the
+        // tuple so we can re-sort post-fetch and preserve the
+        // declared output-ordering contract regardless of which fetch
+        // order the buffered stream actually drove.
+        let mut per_pointer_futs: Vec<_> = self
             .pointers
             .iter()
-            .map(|p| async move {
-                match p {
+            .enumerate()
+            .map(|(original_idx, p)| async move {
+                let v: Vec<T> = match p {
                     Pointer::Values(values) => {
-                        values.iter().map(f).collect::<Result<Vec<T>>>()
+                        values.iter().map(f).collect::<Result<Vec<T>>>()?
                     }
                     Pointer::Link(child_ptr) => {
                         let child = child_ptr.resolve_owned(store).await?;
-                        child.flat_map(f, store).await
+                        child.flat_map(f, store).await?
                     }
-                }
+                };
+                Ok::<(usize, Vec<T>), crate::error::CryptoError>((original_idx, v))
             })
             .collect();
-        let per_pointer: Vec<Vec<T>> = stream::iter(per_pointer_futs)
+
+        // Shuffle the future order so a network observer can't infer
+        // pointer-index ↔ fetch-time correlation. `thread_rng` works on
+        // wasm32 via the `getrandom/js` feature already enabled in
+        // `fula-crypto/Cargo.toml`'s `wasm` feature gate.
+        per_pointer_futs.shuffle(&mut rand::thread_rng());
+
+        let mut per_pointer: Vec<(usize, Vec<T>)> = stream::iter(per_pointer_futs)
             .buffered(FLAT_MAP_SIBLING_CONCURRENCY)
             .try_collect()
             .await?;
-        Ok(per_pointer.into_iter().flatten().collect())
+        // Restore original pointer order to honour the docstring
+        // contract. Stable sort over a small (≤ 16-element) Vec is
+        // cheap.
+        per_pointer.sort_by_key(|(idx, _)| *idx);
+        Ok(per_pointer.into_iter().flat_map(|(_, v)| v).collect())
     }
 
     //----------------------------------------------------------------------------------------------
@@ -421,13 +456,55 @@ where
 {
     /// Fetch and decode the node at `key`. Children remain as `Stored`
     /// references and are not pre-fetched — resolution is lazy per access.
+    ///
+    /// Test-only after W.9.4: production code paths all funnel through
+    /// [`load_with_cid_hint`] (which forwards a `None` hint when the
+    /// caller's parent pointer was a legacy `Stored` variant). The
+    /// unit-test round-trip suites in this module + `v7_store::tests`
+    /// still exercise the simpler signature, so it stays available
+    /// behind `#[cfg(test)]`.
+    #[cfg(test)]
     pub async fn load(
         key: &StorageKey,
         store: &(impl HamtNodeStore + ?Sized),
     ) -> Result<Self> {
         let bytes = store.get_node(key).await?;
+        // #81: classify postcard errors — `DeserializeBadEnum` (an
+        // unknown variant tag, e.g. v0.5 SDK reading a v0.6
+        // walkable-v8 `LinkV2` blob) maps to the typed
+        // `CryptoError::WireVersionUnsupported` so operators can
+        // filter telemetry on the variant rather than substring-
+        // matching the generic `Serialization` error.
         let wire: NodeWire<K, V> = postcard::from_bytes(&bytes)
-            .map_err(|e| CryptoError::Serialization(format!("decode hamt node: {e}")))?;
+            .map_err(|e| CryptoError::classify_postcard_decode(e, "decode hamt node"))?;
+        Ok(Self::from_wire(wire))
+    }
+
+    /// Walkable-v8 (W.9.4) — load with a content-address hint forwarded
+    /// to the storage layer. Used by `ChildPtr::resolve_owned` when the
+    /// parent's pointer is `PointerWire::LinkV2 { storage_key, cid }`,
+    /// so an offline-aware `HamtNodeStore` can fetch via gateway race
+    /// when master is unreachable. `cid_hint = None` is byte-identical
+    /// to [`load`] — used for the legacy `Stored(StorageKey)` arm
+    /// during lazy migration.
+    ///
+    /// Distinct from `load` so existing callers don't have to thread
+    /// `Option<&Cid>` through their stacks; the dispatcher in
+    /// `ChildPtr::resolve_owned` is the single load-bearing fan-out.
+    pub async fn load_with_cid_hint(
+        key: &StorageKey,
+        cid_hint: Option<&Cid>,
+        store: &(impl HamtNodeStore + ?Sized),
+    ) -> Result<Self> {
+        let bytes = store.get_node_with_cid_hint(key, cid_hint).await?;
+        // #81: classify postcard errors — `DeserializeBadEnum` (an
+        // unknown variant tag, e.g. v0.5 SDK reading a v0.6
+        // walkable-v8 `LinkV2` blob) maps to the typed
+        // `CryptoError::WireVersionUnsupported` so operators can
+        // filter telemetry on the variant rather than substring-
+        // matching the generic `Serialization` error.
+        let wire: NodeWire<K, V> = postcard::from_bytes(&bytes)
+            .map_err(|e| CryptoError::classify_postcard_decode(e, "decode hamt node"))?;
         Ok(Self::from_wire(wire))
     }
 
@@ -504,7 +581,7 @@ impl<K: Debug, V: Debug, H: Hasher> Debug for Node<K, V, H> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod round_trip_tests {
     use super::*;
-    use super::super::store::{HamtNodeBytes, HamtNodeStore, STORAGE_KEY_LEN};
+    use super::super::store::{HamtNodeBytes, HamtNodeStore, NodePutResult, STORAGE_KEY_LEN};
     use crate::hashing::Blake3Hasher;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -550,10 +627,10 @@ mod round_trip_tests {
             Ok(bytes)
         }
 
-        async fn put_node(&self, bytes: HamtNodeBytes) -> Result<StorageKey> {
+        async fn put_node(&self, bytes: HamtNodeBytes) -> Result<NodePutResult> {
             let k = Self::compute_key(&bytes);
             self.blobs.lock().unwrap().insert(k, bytes);
-            Ok(k)
+            Ok(NodePutResult { storage_key: k, cid: None })
         }
     }
 
@@ -586,7 +663,7 @@ mod round_trip_tests {
         assert_eq!(missing, None);
 
         // Persist the whole tree, reload from bytes, re-verify every lookup.
-        let root_key = root.store(&store).await.unwrap();
+        let root_key = root.store(&store).await.unwrap().storage_key;
         let loaded: TestNode = TestNode::load(&root_key, &store).await.unwrap();
         for (k, v) in &pairs {
             let got = loaded.get(k, &store).await.unwrap();
@@ -634,5 +711,147 @@ mod round_trip_tests {
         let got = root.remove(&b"absent".to_vec(), &store).await.unwrap();
         assert!(got.is_none());
         assert_eq!(root.get(&b"present".to_vec(), &store).await.unwrap(), Some(7));
+    }
+
+    /// W.9.5 / #37 — fetch-order obfuscation regression guard.
+    ///
+    /// `flat_map` shuffles the per-pointer future list to hide
+    /// intra-node topology from a network observer. The OUTPUT
+    /// ordering must still be deterministic (preserves the docstring
+    /// contract). This test pins both properties:
+    ///
+    /// 1. **Output is stable**: collect multiple times, every result
+    ///    Vec must be identical (same plaintext leaves in the same
+    ///    order regardless of which fetch order the buffered stream
+    ///    drove).
+    /// 2. **Fetch order is randomized**: an instrumented backend that
+    ///    records the ORDER it receives `get_node` calls in MUST see
+    ///    different sequences across runs (with high probability).
+    ///
+    /// Without (2), a future refactor that drops `shuffle()` would
+    /// silently regress the privacy property — the test catches it.
+    #[tokio::test]
+    async fn flat_map_shuffles_fetch_order_but_preserves_output_order() {
+        use std::sync::Mutex;
+
+        // Backend that records every `get_node` call's storage_key
+        // in receipt order — so we can compare orderings across
+        // multiple `flat_map` runs.
+        struct OrderTrackingStore {
+            inner: InMemoryStore,
+            fetch_order: Mutex<Vec<StorageKey>>,
+        }
+        impl OrderTrackingStore {
+            fn new() -> Self {
+                Self {
+                    inner: InMemoryStore::new(),
+                    fetch_order: Mutex::new(Vec::new()),
+                }
+            }
+            fn observed_order(&self) -> Vec<StorageKey> {
+                self.fetch_order.lock().unwrap().clone()
+            }
+            fn reset_order(&self) {
+                self.fetch_order.lock().unwrap().clear();
+            }
+        }
+        #[async_trait::async_trait]
+        impl HamtNodeStore for OrderTrackingStore {
+            async fn get_node(&self, key: &StorageKey) -> Result<HamtNodeBytes> {
+                self.fetch_order.lock().unwrap().push(*key);
+                self.inner.get_node(key).await
+            }
+            async fn put_node(&self, bytes: HamtNodeBytes) -> Result<NodePutResult> {
+                self.inner.put_node(bytes).await
+            }
+        }
+
+        let store = OrderTrackingStore::new();
+        let mut root: Arc<TestNode> = Arc::new(TestNode::default());
+        // Plant enough entries that several slots split into Link
+        // pointers (which is what triggers the shuffle path —
+        // Pointer::Values arms don't fetch). 64 entries across 16
+        // top-level nibbles forces at least 4 sibling Link
+        // pointers under the root; that's enough to make the
+        // observed-order distribution non-degenerate.
+        for i in 0u64..64 {
+            let k = format!("shuffle-key-{:04}", i).into_bytes();
+            root.set(k, i, &store).await.unwrap();
+        }
+        // Persist + reload from the store so subsequent flat_maps
+        // actually fetch (the in-memory tree would otherwise short-
+        // circuit through `Arc::clone` and never call `get_node`).
+        let root_key = root.store(&store).await.unwrap().storage_key;
+        let f = |pair: &Pair<Vec<u8>, u64>| Ok(pair.value);
+
+        // Capture output + fetch order across multiple runs.
+        let mut all_outputs: Vec<Vec<u64>> = Vec::new();
+        let mut all_orders: Vec<Vec<StorageKey>> = Vec::new();
+        for _ in 0..5 {
+            store.reset_order();
+            let reloaded: TestNode = TestNode::load(&root_key, &store).await.unwrap();
+            let out = reloaded.flat_map(&f, &store).await.unwrap();
+            all_outputs.push(out);
+            all_orders.push(store.observed_order());
+        }
+
+        // (1) Output ORDERING (not just multiset) is stable across
+        // runs. The shuffle affects fetch order, NOT output —
+        // `sort_by_key((original_idx, _))` after `try_collect`
+        // restores the input-pointer order before flatten. Compare
+        // unsorted outputs so a regression that drops the
+        // `sort_by_key` is caught here (with `out.sort()` applied,
+        // such a regression would still preserve the multiset and
+        // pass — Reviewer A flagged this).
+        for i in 1..all_outputs.len() {
+            assert_eq!(
+                all_outputs[0], all_outputs[i],
+                "output ORDER must be deterministic across runs (run {}); \
+                 if this fires, sort_by_key after flat_map's try_collect \
+                 was likely dropped",
+                i
+            );
+        }
+        // Sanity: every output must contain all 64 plaintexts (multiset
+        // check, independent of ordering).
+        assert_eq!(all_outputs[0].len(), 64);
+        let mut sorted = all_outputs[0].clone();
+        sorted.sort();
+        let expected: Vec<u64> = (0u64..64).collect();
+        assert_eq!(sorted, expected, "missing plaintext value(s)");
+
+        // (2) Setup must actually exercise the shuffle. If
+        // `HAMT_VALUES_BUCKET_SIZE` changes or BLAKE3 happens to
+        // cluster all 64 entries into one nibble, we'd shuffle a
+        // 1-pointer Vec and the next assertion would always pass
+        // for the wrong reason. Require a non-trivial fetch count
+        // across the runs so a regression in test setup fails loud
+        // instead of masking a regression in the shuffle.
+        let total_fetches: usize = all_orders.iter().map(|o| o.len()).sum();
+        assert!(
+            total_fetches >= 10,
+            "test setup degenerate: only {} get_node calls across 5 runs — \
+             not enough Pointer::Link splits to exercise the shuffle. \
+             Likely cause: HAMT_VALUES_BUCKET_SIZE changed or the entry \
+             count is too small for the current value. Bump entry count.",
+            total_fetches
+        );
+
+        // (3) Fetch order is randomized. Across 5 runs, at least
+        // TWO orderings must differ. For K splittable subtrees,
+        // P(5 runs all identical) = 1/(K!)^4 — vanishingly small
+        // for the K ≥ 4 we just enforced via (2). If `shuffle()`
+        // is silently removed, ALL runs produce the same bitmask-
+        // ordered fetch sequence and this fires immediately.
+        let distinct_orders: std::collections::HashSet<Vec<StorageKey>> =
+            all_orders.iter().cloned().collect();
+        assert!(
+            distinct_orders.len() >= 2,
+            "fetch-order obfuscation regression: 5 runs of flat_map produced \
+             only {} distinct fetch orderings — expected ≥ 2 from the \
+             shuffle. If `flat_map` was refactored to drop the per_pointer_futs.shuffle() \
+             call, this assertion catches it.",
+            distinct_orders.len()
+        );
     }
 }

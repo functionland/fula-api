@@ -45,6 +45,19 @@ pub struct GatewayConfig {
     /// LRU block cache capacity in MB. 0 disables the cache.
     #[serde(default = "default_block_cache_mb")]
     pub block_cache_mb: usize,
+    /// W.9.6 — durable pin queue file path. When `Some`, every PUT
+    /// enqueues its master-cluster + user-external pin requests to
+    /// this redb-backed queue and a background drainer dispatches
+    /// them with bounded concurrency + exp backoff retry. Survives
+    /// master crashes — pending pins resume on the next startup.
+    ///
+    /// When `None` (default for tests / minimal configs), the PUT
+    /// handler falls back to the legacy fire-and-forget pin path
+    /// (no retry, no crash safety). Production deploys MUST set
+    /// this; the fallback exists only to keep unit tests + dev
+    /// deployments lightweight.
+    #[serde(default)]
+    pub pin_queue_path: Option<String>,
 }
 
 fn default_block_cache_mb() -> usize {
@@ -73,6 +86,7 @@ impl Default for GatewayConfig {
             admin_jwt_secret: None,
             admin_api_enabled: false,
             block_cache_mb: default_block_cache_mb(),
+            pin_queue_path: Some("/var/lib/fula-gateway/pin_queue.redb".to_string()),
         }
     }
 }

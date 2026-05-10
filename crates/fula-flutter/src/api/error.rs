@@ -94,6 +94,21 @@ pub enum FulaError {
     #[error("Users-index resolution failed: {0}")]
     UsersIndexResolutionFailed(String),
 
+    /// **#81 (2026-05-09)** — wire format version unsupported.
+    /// Surfaced when the SDK encounters a postcard-encoded blob with
+    /// an unknown enum variant tag (e.g. an old SDK reading a newer
+    /// wire format the master upgraded to). Apps should display "this
+    /// bucket requires FxFiles vX.Y or later" to the user. The bucket
+    /// data itself is intact; the SDK just can't decode the new wire
+    /// format. Defined unconditionally so the Dart binding has the
+    /// same enum shape across native (Android, iOS, desktop) and wasm
+    /// (web).
+    #[error("Wire format version unsupported: {context}: {postcard_error}")]
+    WireVersionUnsupported {
+        context: String,
+        postcard_error: String,
+    },
+
     /// Phase 3.3 — replay defense: a payload's embedded sequence
     /// regressed below what the SDK has seen before. Dart apps
     /// should NOT silently retry; surface as a clear "stale-state"
@@ -183,13 +198,35 @@ impl From<fula_client::ClientError> for FulaError {
             ClientError::SequenceRegression { observed, highest_seen, channel } => {
                 FulaError::SequenceRegression { observed, highest_seen, channel }
             }
+            // #81 — propagate the typed variant so Dart code can
+            // pattern-match on `FulaError::WireVersionUnsupported`
+            // without parsing the generic `Encryption(...)` string.
+            ClientError::WireVersionUnsupported { context, postcard_error } => {
+                FulaError::WireVersionUnsupported { context, postcard_error }
+            }
         }
     }
 }
 
 impl From<fula_crypto::CryptoError> for FulaError {
     fn from(err: fula_crypto::CryptoError) -> Self {
-        FulaError::Encryption(err.to_string())
+        // #81 (2026-05-09) — preserve the typed variant when a raw
+        // CryptoError is converted directly (bypassing the ClientError
+        // route). Without this arm the variant gets flattened to
+        // generic `Encryption(...)` and Dart pattern-match on
+        // `FulaError.wireVersionUnsupported` misses, defeating the
+        // telemetry-stability purpose. Mirrors the `From<ClientError>`
+        // arm above.
+        match err {
+            fula_crypto::CryptoError::WireVersionUnsupported {
+                context,
+                postcard_error,
+            } => FulaError::WireVersionUnsupported {
+                context,
+                postcard_error,
+            },
+            other => FulaError::Encryption(other.to_string()),
+        }
     }
 }
 
@@ -250,6 +287,7 @@ impl FulaError {
             FulaError::CacheError(_) => "CACHE_ERROR",
             FulaError::UsersIndexResolutionFailed(_) => "USERS_INDEX_RESOLUTION_FAILED",
             FulaError::SequenceRegression { .. } => "SEQUENCE_REGRESSION",
+            FulaError::WireVersionUnsupported { .. } => "WIRE_VERSION_UNSUPPORTED",
             FulaError::Internal(_) => "INTERNAL",
         }
     }

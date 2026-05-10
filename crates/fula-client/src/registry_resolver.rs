@@ -264,8 +264,20 @@ pub use crate::user_key::derive_user_key_from_email;
 
 /// Default IPNS-aware gateway list. Excludes
 /// `trustless-gateway.link` (only serves `/ipfs/`, not `/ipns/`).
+///
+/// Order is the SDK's per-tick race priority — the resolver tries
+/// gateways in order and takes the first content-verified body whose
+/// in-payload `sequence` is at least the locally-observed high-water
+/// mark. `dget.top` (subdomain-style) is the load-bearing first slot
+/// because operator measurement on production (2026-05-09) showed it
+/// picks up freshly-published IPNS records the fastest among public
+/// IPNS-aware gateways — getting cold-start latency below the next
+/// tier's typical first-hit time. Cloudflare and dweb.link follow as
+/// the established large-fleet fallbacks; the remaining three are
+/// kept for fan-out coverage.
 pub fn default_ipns_gateway_urls() -> Vec<String> {
     vec![
+        "https://{name}.ipns.dget.top/".into(),
         "https://cloudflare-ipfs.com/ipns/{name}".into(),
         "https://dweb.link/ipns/{name}".into(),
         "https://ipfs.io/ipns/{name}".into(),

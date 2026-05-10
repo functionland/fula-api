@@ -24,9 +24,13 @@ pub enum ClientError {
     #[error("Configuration error: {0}")]
     Config(String),
 
-    /// Encryption error
+    /// Encryption error. **#81**: the `#[from]` was replaced by a
+    /// custom `From<CryptoError>` impl below so we can branch on
+    /// `CryptoError::WireVersionUnsupported` and surface it as the
+    /// typed `ClientError::WireVersionUnsupported` variant rather
+    /// than burying it inside the generic `Encryption(...)` wrapper.
     #[error("Encryption error: {0}")]
-    Encryption(#[from] fula_crypto::CryptoError),
+    Encryption(fula_crypto::CryptoError),
 
     /// IO error
     #[error("IO error: {0}")]
@@ -169,6 +173,48 @@ pub enum ClientError {
         highest_seen: u64,
         channel: String,
     },
+
+    /// **#81 (2026-05-09)** — the SDK encountered a wire format with
+    /// an unknown enum variant tag (e.g. v0.5 SDK reading a v0.6
+    /// walkable-v8 `LinkV2` blob). Surfaced as a typed variant so
+    /// operators can filter telemetry on it directly rather than
+    /// substring-matching the postcard error class buried inside
+    /// `Encryption(CryptoError::Serialization(...))`.
+    ///
+    /// `context` describes WHERE the unknown variant was encountered
+    /// (e.g. "decode hamt node"). `postcard_error` is postcard's
+    /// own stringification for diagnostic depth.
+    ///
+    /// Apps should surface as "this bucket needs FxFiles vX.Y or
+    /// later" — the bucket data itself is intact, the SDK just
+    /// can't decode the new wire format.
+    #[error("wire format version unsupported (need newer SDK): {context}: {postcard_error}")]
+    WireVersionUnsupported {
+        context: String,
+        postcard_error: String,
+    },
+}
+
+/// **#81** — custom `From<CryptoError>` (replaces the prior `#[from]`
+/// macro on the `Encryption` variant) so that
+/// [`CryptoError::WireVersionUnsupported`] surfaces as the typed
+/// [`ClientError::WireVersionUnsupported`] variant rather than being
+/// wrapped in the generic `Encryption(...)` arm. Every other
+/// `CryptoError` variant routes through `Encryption` as before —
+/// `?` semantics at all existing call sites are byte-identical.
+impl From<fula_crypto::CryptoError> for ClientError {
+    fn from(err: fula_crypto::CryptoError) -> Self {
+        match err {
+            fula_crypto::CryptoError::WireVersionUnsupported {
+                context,
+                postcard_error,
+            } => ClientError::WireVersionUnsupported {
+                context,
+                postcard_error,
+            },
+            other => ClientError::Encryption(other),
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

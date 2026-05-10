@@ -139,10 +139,13 @@ class FulaConfig {
   final String usersIndexUserKey;            // app-derived via deriveUserKeyFromEmail
   final List<String> usersIndexIpnsGatewayUrls; // default: [] → SDK defaults
   final List<String> usersIndexIpfsGatewayUrls; // default: [] → SDK defaults
+
+  // Walkable-v8 writer (#89, default-on as of v0.6.1)
+  final bool walkableV8WriterEnabled;        // default: TRUE (apps wanting v0.5-readable wire form must set false explicitly)
 }
 ```
 
-All flags default OFF — apps that don't opt in see byte-identical behavior to pre-Phase-2.x builds.
+The Phase 2.x and Phase 3.3 flags listed above default OFF — apps that don't opt in see byte-identical behavior to pre-Phase-2.x builds. The walkable-v8 writer flag is the exception: it defaults ON as of v0.6.1 (#89). Apps that need the v0.5-readable wire form must explicitly set `walkableV8WriterEnabled: false`.
 
 #### EncryptionConfig
 ```dart

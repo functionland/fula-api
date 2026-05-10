@@ -72,6 +72,7 @@
                 <li><a href="#hpke">HPKE Implementation</a></li>
                 <li><a href="#symmetric">Symmetric Encryption</a></li>
                 <li><a href="#integrity">Data Integrity</a></li>
+                <li><a href="#walkable-hamt">Walkable HAMT (v8)</a></li>
                 <li><a href="#key-management">Key Management</a></li>
                 <li><a href="#sharing">Secure Sharing</a></li>
                 <li><a href="#complete-sharing-example">Complete Sharing Example</a></li>
@@ -857,6 +858,127 @@ DEK = AES-256-GCM.decrypt(wrap_key, nonce2, wrapped_DEK)</pre>
   • Stream large files with incremental verification</pre>
                     </div>
                 </div>
+            </div>
+        </section>
+
+        <!-- Walkable HAMT (v8) -->
+        <section id="walkable-hamt" class="security-section alt-bg">
+            <h2>Walkable HAMT (v8) &mdash; Encrypted Link Integrity</h2>
+            <p class="section-intro">How Fula preserves native-IPLD-grade integrity when CIDs live <em>inside</em> encrypted parent plaintext, and how that compares to native IPLD and stock WNFS.</p>
+
+            <div class="walkable-summary">
+                <h3>Plain-English Summary</h3>
+                <p>In <strong>native IPLD</strong>, every block has a CID that is the hash of its bytes. A reader fetches by CID and re-hashes; if the bytes don't match, tampering is rejected. This single property gives IPLD self-verifying integrity.</p>
+                <p>In <strong>stock WNFS</strong>, the HAMT internal nodes are stored as <em>plaintext IPLD blocks</em> with plaintext <code>Link(cid)</code> references. Only the leaves (the encrypted PrivateNode blobs) are encrypted. So a non-keyholder with the HAMT root CID can enumerate the tree shape, count entries, and list every leaf-level encrypted-blob CID &mdash; even though they cannot decrypt content.</p>
+                <p>In <strong>Fula v7 (today)</strong>, HAMT internal nodes are AEAD-encrypted; parent &rarr; child references are 22-byte <code>StorageKey</code>s routing to master S3 paths, not CIDs. Stronger privacy than WNFS, but not walkable via public IPFS gateways without master.</p>
+                <p>In <strong>Fula v8 (walkable)</strong>, parent pointers gain an <code>Option&lt;Cid&gt;</code> <em>inside the encrypted parent's plaintext</em>, alongside the existing <code>StorageKey</code>. Keyholders can walk the tree via public IPFS gateways without master. Non-keyholders see only the manifest CID; the link graph remains hidden because the CIDs only exist behind AEAD that requires <code>forest_dek</code> to open.</p>
+            </div>
+
+            <div class="walkable-layers">
+                <h3>Three Layers of Integrity</h3>
+                <p>Walkable-v8 stacks three independent integrity binders. Layer 1 reproduces native IPLD's keyless property exactly; Layers 2 and 3 add stronger guarantees the encrypted case requires.</p>
+                <div class="layers-grid">
+                    <div class="layer-card">
+                        <div class="layer-num">1</div>
+                        <h4>CID Re-Hash on Every Gateway Fetch</h4>
+                        <p><strong>Keyless &mdash; identical to native IPLD.</strong> Every gateway fetch re-hashes the bytes and rejects on mismatch. Anyone with the CID can verify independently.</p>
+                        <p class="layer-source"><code>crates/fula-client/src/gateway_fetch.rs:116-142</code> <code>verify_cid_against_bytes</code></p>
+                        <div class="layer-check">
+                            <span class="check-icon">&#x2705;</span>
+                            <span>Detects: gateway tampering, transport corruption, wrong-block-served-for-CID</span>
+                        </div>
+                    </div>
+                    <div class="layer-card">
+                        <div class="layer-num">2</div>
+                        <h4>AEAD Tag with Bucket+Shard AAD</h4>
+                        <p><strong>Key-required &mdash; beyond native IPLD.</strong> ChaCha20-Poly1305 with AAD <code>fula:hamt-node:v7: || bucket || shard_idx</code>. Forging a tag without <code>shard_dek</code> is computationally infeasible.</p>
+                        <p class="layer-source"><code>crates/fula-crypto/src/wnfs_hamt/v7_store.rs:178-180</code> + <code>private_forest.rs:1442-1449</code></p>
+                        <div class="layer-check">
+                            <span class="check-icon">&#x2705;</span>
+                            <span>Detects: plaintext tampering, cross-bucket replay, cross-shard replay</span>
+                        </div>
+                    </div>
+                    <div class="layer-card">
+                        <div class="layer-num">3</div>
+                        <h4>Storage-Key Cross-Check</h4>
+                        <p><strong>Key-required &mdash; beyond native IPLD.</strong> After decryption, re-derive <code>BLAKE3(bucket_salt &Vert; plaintext)[..22]</code> and compare to the <code>storage_key</code> the parent committed to. Two independent integrity binders for the same node: CID over ciphertext + storage_key over plaintext.</p>
+                        <p class="layer-source"><code>crates/fula-crypto/src/wnfs_hamt/v7_store.rs:182-189</code></p>
+                        <div class="layer-check">
+                            <span class="check-icon">&#x2705;</span>
+                            <span>Detects: wrong-content-for-this-pointer (e.g. malicious master returning wrong CID at write)</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="walkable-comparison">
+                <h3>Property Comparison &mdash; Native IPLD vs WNFS vs Fula v7 vs Fula v8</h3>
+                <table class="crypto-table">
+                    <thead>
+                        <tr>
+                            <th>Property</th>
+                            <th>Native IPLD</th>
+                            <th>Stock WNFS</th>
+                            <th>Fula v7 (today)</th>
+                            <th>Fula v8 (walkable)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><code>hash(bytes) == cid</code> self-verifying</td><td>&#x2705;</td><td>&#x2705; (HAMT internal)</td><td>n/a (uses storage_key)</td><td>&#x2705; Layer 1</td></tr>
+                        <tr><td>Anyone keyless can verify integrity</td><td>&#x2705;</td><td>&#x2705;</td><td>&#x274C; (master path)</td><td>&#x2705; Layer 1</td></tr>
+                        <tr><td>Keyless observer can enumerate tree shape from root CID</td><td>n/a</td><td>&#x2705; <strong>leaks</strong></td><td>&#x274C; hidden</td><td>&#x274C; hidden</td></tr>
+                        <tr><td>Keyless observer can see leaf-encrypted-blob CID list</td><td>n/a</td><td>&#x2705; <strong>leaks</strong></td><td>&#x274C; hidden</td><td>&#x274C; hidden</td></tr>
+                        <tr><td>Keyless observer can diff snapshots / infer write locations</td><td>n/a</td><td>&#x2705; <strong>leaks</strong></td><td>&#x274C; hidden</td><td>&#x274C; hidden</td></tr>
+                        <tr><td>Keyless observer can find a specific file by path</td><td>n/a</td><td>&#x274C;</td><td>&#x274C;</td><td>&#x274C;</td></tr>
+                        <tr><td>Keyless observer can decrypt content</td><td>n/a</td><td>&#x274C;</td><td>&#x274C;</td><td>&#x274C;</td></tr>
+                        <tr><td>Plaintext tampering blocked</td><td>&#x274C; (no encryption)</td><td>per-leaf only</td><td>&#x2705; AEAD</td><td>&#x2705; AEAD (Layer 2)</td></tr>
+                        <tr><td>Cross-bucket / cross-shard replay blocked</td><td>n/a</td><td>scope-dependent</td><td>&#x2705; AAD-bound</td><td>&#x2705; AAD-bound (Layer 2)</td></tr>
+                        <tr><td>Plaintext content-address committed by parent</td><td>&#x274C;</td><td>&#x274C;</td><td>&#x2705; storage_key</td><td>&#x2705; storage_key (Layer 3)</td></tr>
+                        <tr><td>Walkable from root via public IPFS gateways alone</td><td>&#x2705;</td><td>&#x2705;</td><td>&#x274C; (master required)</td><td>&#x2705; (with <code>forest_dek</code>)</td></tr>
+                        <tr><td>Walkable from root <em>without keys</em> (= no privacy gate on tree shape)</td><td>&#x2705;</td><td>&#x2705;</td><td>n/a</td><td>&#x274C; (privacy preserved)</td></tr>
+                    </tbody>
+                </table>
+                <p class="comparison-takeaway"><strong>Two takeaways:</strong> (1) walkable-v8 reproduces native IPLD's keyless integrity property exactly via Layer 1 on every gateway fetch. (2) Walkable-v8 is strictly more private than stock WNFS at the tree-structure level &mdash; keyless observers cannot enumerate HAMT shape, count entries, see leaf CIDs, or diff snapshots, because all of that lives behind AEAD.</p>
+            </div>
+
+            <div class="walkable-attacks">
+                <h3>Tampering Walk-Through</h3>
+                <table class="crypto-table">
+                    <thead>
+                        <tr>
+                            <th>Attack class</th>
+                            <th>Defense</th>
+                            <th>Outcome</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>Gateway returns wrong bytes for the requested CID</td><td>Layer 1 re-hashes bytes; mismatch &rarr; reject</td><td>REJECT (same as native IPLD)</td></tr>
+                        <tr><td>Substitute different bytes + a forged matching CID</td><td>Forging a CID is a BLAKE3 / SHA-256 preimage attack</td><td>Computationally infeasible</td></tr>
+                        <tr><td>Compromised gateway replays a STALE parent ciphertext</td><td>Grandparent's pointer commits to specific <code>cid</code>; stale parent has different CID &rarr; Layer 1 mismatch</td><td>REJECT</td></tr>
+                        <tr><td>Cross-bucket replay (bucket A's ciphertext served as bucket B's)</td><td>Layer 2 AAD differs &rarr; ChaCha20-Poly1305 tag mismatch</td><td>REJECT</td></tr>
+                        <tr><td>Tamper parent plaintext to point at attacker-controlled child CID</td><td>Parent's plaintext is itself AEAD-protected; modifying requires forging a tag without <code>shard_dek</code></td><td>REJECT</td></tr>
+                        <tr><td>Compromised master returns WRONG CID at write time</td><td>Read fetches by wrong CID; even if attacker placed bytes there, Layer 2 fails (no <code>shard_dek</code>) and Layer 3 storage-key cross-check fails</td><td>READ FAILS (DoS); no silent corruption</td></tr>
+                        <tr><td>Rollback to an older <code>forest_manifest_cid</code></td><td>Phase 3.3 chain anchor (<code>FulaUsersIndexAnchor</code>) enforces strict-monotonic <code>require(newSequence &gt; sequence)</code></td><td>REJECT at chain layer</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="walkable-summary-end">
+                <h3>What This Means for End Users</h3>
+                <ul>
+                    <li><strong>Your data integrity is at least as strong as native IPLD</strong> for every block fetched via a gateway, even when master is offline (Layer 1).</li>
+                    <li><strong>Tampering is detected, not hidden.</strong> A malicious gateway, transport corruption, or compromised master triggers a clean error rather than silent data corruption. Even a malicious master cannot make you accept invalid bytes &mdash; the worst they can do is cause your read to fail.</li>
+                    <li><strong>Privacy of the tree structure is preserved.</strong> Unlike stock WNFS, an attacker who learns your bucket's <code>forest_manifest_cid</code> cannot enumerate your file count, observe your folder shape, or watch which subtrees you write to. Without <code>forest_dek</code> they cannot even decrypt the manifest itself; they only see one opaque ciphertext.</li>
+                    <li><strong>Walkability requires the key, by design.</strong> This is a deliberate privacy choice: walkability for keyholders, opacity for everyone else. It mirrors the intuition that <em>your filesystem is your own private structure</em>, not just <em>your file contents are your own</em>.</li>
+                    <li><strong>Chunked files (photos, videos, PDFs &gt; 768 KB) are walkable too</strong> as of v0.6.0 / W.9.4&ndash;A2 (task #32). Per-chunk CID hints in <code>ChunkedFileMetadata.chunk_cids</code> let an offline reader fetch each chunk via gateway race when master is down. Without these hints, the W.9.4 HAMT walker only reaches the file index, not the underlying chunks &mdash; the gap that #32 closed.</li>
+                </ul>
+
+                <h3>Operator-facing Caveats (must-read before flipping the writer flag)</h3>
+                <ul>
+                    <li><strong>Single-directory cliff at ~60-100k files</strong> (tracked as #72). A <code>ForestDirectoryEntry</code> with 100k+ filenames in its <code>files: Vec&lt;String&gt;</code> exceeds the 1 MiB IPFS gateway limit. Verified empirically by the W.9.7 stress test (100k entries in a single dir &rarr; 1.66 MiB blob). Typical FxFiles users distribute photos / PDFs across folders, so this affects only flat-folder enterprise edge cases. Distributed across many dirs, the same 100k test produces a max blob of 17.1 KiB &mdash; well under both the 1 MiB hard ceiling and the 64 KiB architectural early-warning threshold.</li>
+                    <li><strong>Public <code>put_object_chunked</code> debug API doesn't stamp <code>storage_cid</code></strong> (#51 still pending). FxFiles users on the production encrypted chunked path (<code>put_object_encrypted_with_type</code> &rarr; <code>put_object_chunked_internal</code>) DO get full per-chunk walkability via #32 &mdash; the gap is limited to the public unencrypted-debug API, which is rarely used in production.</li>
+                    <li><strong><code>chunk_cids</code> privacy posture: plaintext, by design.</strong> Per-chunk CID hints sit alongside <code>chunk_nonces</code>, <code>root_hash</code>, <code>num_chunks</code>, <code>total_size</code>, <code>chunk_size</code> in the encrypted index object's <code>chunked</code> JSON field. Only the <code>wrapped_key</code> and <code>private_metadata</code> siblings are AEAD-encrypted; the <code>chunked</code> block is plaintext-readable to anyone who can fetch the index object. <strong>This is not a privacy regression</strong>: every existing field in the same plaintext block was already plaintext-readable at the same level pre-v0.6.0. An attacker with the index body could already enumerate child storage paths via <code>chunk_key(storage_key, i)</code> and fetch the same encrypted chunk bytes via gateway. The hints simply make legitimate offline reads cheaper for content already addressable. Future security audits should treat <code>chunk_cids</code> as joining an existing public set, not introducing a new leak.</li>
+                </ul>
             </div>
         </section>
 

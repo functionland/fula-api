@@ -337,31 +337,244 @@ pub async fn put_object(
             ApiError::s3(S3ErrorCode::InternalError, "Failed to persist storage index. Please retry.")
         })?;
 
-    // Pin the BUCKET ROOT CID to ensure tree structure survives GC.
-    // This recursively pins all tree nodes AND all referenced object data.
-    // NOTE: Pinning is async (fire-and-forget) to avoid blocking the response.
-    {
+    // W.9.6 — pin THIS object's body CID **explicitly** in addition
+    // to the bucket-root recursive pin below. The bucket-root pin
+    // recursively walks the Prolly Tree IPLD DAG, which transitively
+    // covers leaf CIDs IF cluster's recursive-pin treats Prolly Tree
+    // leaves' `cid` field as walkable IPLD links. This is the
+    // pre-existing v7 contract; whether it holds for every leaf in
+    // every Prolly Tree implementation is a property of
+    // fula-blockstore + the cluster client. For walkable-v8 we
+    // CANNOT afford a quiet gap — every HAMT internal-node CID,
+    // every manifest-page CID, every chunk CID stamped into a
+    // `LinkV2` / `PageRef.cid` / `storage_cid` field MUST be
+    // DHT-discoverable for the W.9.4 reader's offline gateway race
+    // to find it. So we belt-and-suspenders: enqueue the body's
+    // CID directly. Cluster's pin API is idempotent at the CID
+    // level, so a CID also covered by the recursive pin gets
+    // pinned exactly once (no double work, no extra storage).
+    if let Some(queue) = state.pin_queue.as_ref() {
+        let object_pin_name = if key.starts_with("__fula_forest_v7_nodes/") {
+            // HAMT internal node — load-bearing for walkable-v8
+            // offline walks. Distinguishable in `pin ls` for
+            // operator triage.
+            format!("v8-node:{}", bucket_name)
+        } else if key.starts_with("__fula_forest_") {
+            format!("forest-meta:{}", bucket_name)
+        } else {
+            format!("object:{}/{}", bucket_name, key)
+        };
+        if let Err(e) = queue.enqueue(crate::pin_queue::PinRequest {
+            cid,
+            target: crate::pin_queue::PinTarget::MasterCluster,
+            kind: crate::pin_queue::PinKind::Add,
+            pin_name: Some(object_pin_name.clone()),
+            bearer_token: Some(session.jwt_token.clone()),
+            pinning_endpoint: None,
+        }) {
+            // Mirror the bucket-root path's fire-and-forget fallback
+            // (no asymmetry — both routes preserve walkable-v8's
+            // belt-and-suspenders guarantee). A redb commit failure
+            // shouldn't silently drop the per-object pin since the
+            // recursive bucket-root pin's transitive coverage is
+            // not architecturally guaranteed for HAMT internal-node
+            // ciphertexts.
+            tracing::warn!(
+                cid = %cid,
+                key = %key,
+                error = %e,
+                "pin_queue enqueue (per-object) failed; falling back to fire-and-forget for this PUT"
+            );
+            let block_store = Arc::clone(&state.block_store);
+            let jwt_token = session.jwt_token.clone();
+            let pn = object_pin_name;
+            tokio::spawn(async move {
+                if let Err(e) = block_store
+                    .pin_with_token(&cid, Some(&pn), &jwt_token)
+                    .await
+                {
+                    tracing::warn!(
+                        cid = %cid,
+                        error = %e,
+                        "Failed to pin per-object CID (queue-enqueue-fallback path)"
+                    );
+                }
+            });
+        }
+    }
+
+    // W.9.6 — pin the BUCKET ROOT CID through the durable queue.
+    // Cluster's recursive pin walks the bucket's Prolly Tree which
+    // covers every object referenced from the bucket. With the
+    // per-object pin above + this recursive pin, every CID gets
+    // pinned at LEAST once (and at most a few times — idempotent at
+    // cluster, so no harm).
+    //
+    // Routing:
+    //   * `state.pin_queue = Some(_)` → durable enqueue; background
+    //     drainer dispatches via `block_store.pin_with_token` with
+    //     bounded concurrency + exp backoff retry. Returns 200 to
+    //     the client immediately after the cheap redb commit.
+    //     Pending pins survive a master crash.
+    //   * `state.pin_queue = None` → legacy fire-and-forget. No
+    //     retry, no crash safety. Tests + minimal dev configs only.
+    //     Production deployments MUST set `pin_queue_path`.
+    let pin_name = format!("bucket:{}", bucket_name);
+    if let Some(queue) = state.pin_queue.as_ref() {
+        if let Err(e) = queue.enqueue(crate::pin_queue::PinRequest {
+            cid: bucket_root_cid,
+            target: crate::pin_queue::PinTarget::MasterCluster,
+            kind: crate::pin_queue::PinKind::Add,
+            pin_name: Some(pin_name.clone()),
+            bearer_token: Some(session.jwt_token.clone()),
+            pinning_endpoint: None,
+        }) {
+            // redb commit failed — log and fall back to fire-and-
+            // forget for this single request so the user's PUT
+            // doesn't fail. The next request will try the queue
+            // again; persistent failures here are an operator alert.
+            tracing::warn!(
+                cid = %bucket_root_cid,
+                error = %e,
+                "pin_queue enqueue (master) failed; falling back to fire-and-forget for this PUT"
+            );
+            let block_store = Arc::clone(&state.block_store);
+            let jwt_token = session.jwt_token.clone();
+            let pin_name_clone = pin_name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = block_store
+                    .pin_with_token(&bucket_root_cid, Some(&pin_name_clone), &jwt_token)
+                    .await
+                {
+                    tracing::warn!(
+                        cid = %bucket_root_cid,
+                        error = %e,
+                        "Failed to pin bucket root CID (queue-enqueue-fallback path)"
+                    );
+                }
+            });
+        } else {
+            tracing::debug!(
+                cid = %bucket_root_cid,
+                bucket = %pin_name,
+                "Bucket root CID enqueued for durable pin (W.9.6)"
+            );
+        }
+    } else {
+        // Legacy fire-and-forget — no queue configured.
         let block_store = Arc::clone(&state.block_store);
-        let pin_name = format!("bucket:{}", bucket_name);
+        let pin_name_clone = pin_name.clone();
         let jwt_token = session.jwt_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = block_store.pin_with_token(&bucket_root_cid, Some(&pin_name), &jwt_token).await {
+            if let Err(e) = block_store
+                .pin_with_token(&bucket_root_cid, Some(&pin_name_clone), &jwt_token)
+                .await
+            {
                 tracing::warn!(cid = %bucket_root_cid, error = %e, "Failed to pin bucket root CID");
             } else {
-                tracing::info!(cid = %bucket_root_cid, bucket = %pin_name, "Bucket root CID pinned (recursive)");
+                tracing::info!(cid = %bucket_root_cid, bucket = %pin_name_clone, "Bucket root CID pinned (recursive)");
             }
         });
     }
 
-    // Also pin to user's external pinning service if credentials provided
-    // The session JWT is used as the default token if no X-Pinning-Token header is provided
-    pin_for_user(&headers, &cid, Some(&key), state.config.pinning_service_endpoint.as_deref(), Some(&session.jwt_token)).await;
+    // Also pin THIS object's CID to the user's external pinning
+    // service if credentials are configured. W.9.6: routes through
+    // the same queue when `pin_queue_path` is set so user-external
+    // pins also get durable retry. Falls back to the legacy
+    // fire-and-forget `pin_for_user` when the queue is unconfigured.
+    pin_for_user_via_queue(
+        &state,
+        &session.jwt_token,
+        &headers,
+        &cid,
+        Some(&key),
+    )
+    .await;
 
     Ok((
         StatusCode::OK,
         [("ETag", format!("\"{}\"", etag))],
         "",
     ).into_response())
+}
+
+/// W.9.6 — pin to the user's external pinning service via the
+/// durable queue when configured, falling back to the legacy
+/// `pin_for_user` (fire-and-forget) when the queue is `None`.
+///
+/// Uses the same [`PinningCredentials::from_jwt`] header extraction
+/// as `pin_for_user` so the wire contract (which headers consult,
+/// which endpoint, which token) stays identical across the two
+/// paths. Only the dispatch differs: queue → durable + retry,
+/// legacy → fire-and-forget.
+async fn pin_for_user_via_queue(
+    state: &Arc<AppState>,
+    jwt: &str,
+    headers: &HeaderMap,
+    cid: &cid::Cid,
+    object_key: Option<&str>,
+) {
+    let queue = match state.pin_queue.as_ref() {
+        Some(q) => q,
+        None => {
+            // Legacy fire-and-forget — preserves v0.5 behavior for
+            // tests + minimal dev configs. Production should set
+            // `pin_queue_path` so this branch is never taken.
+            pin_for_user(
+                headers,
+                cid,
+                object_key,
+                state.config.pinning_service_endpoint.as_deref(),
+                Some(jwt),
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Extract user credentials with the same logic `pin_for_user`
+    // uses. When the user has no pinning configured (no headers, no
+    // server default), we skip enqueueing — there is nothing to
+    // dispatch.
+    let endpoint = state.config.pinning_service_endpoint.as_deref();
+    if jwt.is_empty() {
+        return;
+    }
+    let creds = match endpoint {
+        Some(ep) => crate::pinning::PinningCredentials::from_jwt(headers, jwt, ep),
+        None => crate::pinning::PinningCredentials::from_headers(headers),
+    };
+    let creds = match creds {
+        Some(c) => c,
+        None => return,
+    };
+
+    // Enqueue. Failure here is best-effort — a redb commit failure
+    // shouldn't fail the user's PUT, since the master-cluster pin
+    // path covers DHT availability for this CID anyway.
+    let pin_name = object_key
+        .map(|s| s.to_string())
+        .or_else(|| creds.name.clone());
+    if let Err(e) = queue.enqueue(crate::pin_queue::PinRequest {
+        cid: *cid,
+        target: crate::pin_queue::PinTarget::UserExternal,
+        kind: crate::pin_queue::PinKind::Add,
+        pin_name,
+        bearer_token: Some(creds.token.clone()),
+        pinning_endpoint: Some(creds.endpoint.clone()),
+    }) {
+        tracing::warn!(
+            cid = %cid,
+            error = %e,
+            "pin_queue enqueue (user-external) failed; pin not retained for retry"
+        );
+    } else {
+        tracing::debug!(
+            cid = %cid,
+            endpoint = %creds.endpoint,
+            "User-external pin enqueued for durable pin (W.9.6)"
+        );
+    }
 }
 
 /// GET /{bucket}/{key} - Get object with Range and conditional request support
@@ -742,6 +955,11 @@ pub async fn delete_object(
         };
 
         if !still_referenced {
+            // Master-local unpin: stays sync best-effort. The failure
+            // mode is "kubo briefly down"; the next user write
+            // re-aligns state via the bucket-root pin queue. Per
+            // #66's minimal-scope advisor brief: route only the
+            // user-external unpin through the queue, not this one.
             if let Err(e) = state.block_store.unpin(&cid).await {
                 tracing::warn!(
                     cid = %cid,
@@ -750,13 +968,61 @@ pub async fn delete_object(
                 );
             }
 
-            unpin_for_user(
-                &headers,
-                &cid,
-                state.config.pinning_service_endpoint.as_deref(),
-                Some(&session.jwt_token),
-            )
-            .await;
+            // **#66 (2026-05-09)** — durable user-external unpin via
+            // the pin queue. Replaces the prior fire-and-forget
+            // `unpin_for_user(...)` which lost unpin requests on
+            // master crash and silently leaked pin slots on the
+            // user's pinning service. Pin/unpin "latest intent
+            // wins" semantics handle the upload→delete→re-upload
+            // race (the queue collapses both into one record per
+            // (cid, target) and dispatches the most recent intent).
+            //
+            // Falls back to legacy fire-and-forget when the queue
+            // isn't configured (tests + minimal dev), matching the
+            // pin path's handling at object.rs:461-476.
+            if !session.jwt_token.is_empty() {
+                if let Some(queue) = state.pin_queue.as_ref() {
+                    let creds = match state.config.pinning_service_endpoint.as_deref() {
+                        Some(ep) => crate::pinning::PinningCredentials::from_jwt(
+                            &headers,
+                            &session.jwt_token,
+                            ep,
+                        ),
+                        None => crate::pinning::PinningCredentials::from_headers(&headers),
+                    };
+                    if let Some(creds) = creds {
+                        if let Err(e) = queue.enqueue(crate::pin_queue::PinRequest {
+                            cid,
+                            target: crate::pin_queue::PinTarget::UserExternal,
+                            kind: crate::pin_queue::PinKind::Remove,
+                            pin_name: None, // unpin doesn't need a label
+                            bearer_token: Some(creds.token.clone()),
+                            pinning_endpoint: Some(creds.endpoint.clone()),
+                        }) {
+                            tracing::warn!(
+                                cid = %cid,
+                                error = %e,
+                                "pin_queue enqueue (user-external unpin) failed; falling back to fire-and-forget"
+                            );
+                            unpin_for_user(
+                                &headers,
+                                &cid,
+                                state.config.pinning_service_endpoint.as_deref(),
+                                Some(&session.jwt_token),
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    unpin_for_user(
+                        &headers,
+                        &cid,
+                        state.config.pinning_service_endpoint.as_deref(),
+                        Some(&session.jwt_token),
+                    )
+                    .await;
+                }
+            }
         } else {
             tracing::debug!(
                 cid = %cid,

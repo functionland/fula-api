@@ -75,6 +75,14 @@ fn build_inner_config(
     inner.users_index_ipfs_gateway_urls =
         config.users_index_ipfs_gateway_urls.clone();
 
+    // Walkable-v8 (W.9.3) — writer flag. Cross-platform: works on
+    // every fula-flutter target (Android/iOS/Windows/macOS/Ubuntu)
+    // and on the wasm32 browser target. Default `false` keeps writes
+    // byte-identical to v0.5; flipping `true` activates the v8 wire
+    // surface. See `walkable_v8_writer_enabled` in `FulaConfig` for
+    // the full self-verify rationale.
+    inner.walkable_v8_writer_enabled = config.walkable_v8_writer_enabled;
+
     // Phase 19 — always wire a forwarding callback into the gate so
     // Dart-side subscribers can observe health transitions. The
     // dispatcher is per-handle, so events from this client never
@@ -640,5 +648,35 @@ mod tests {
         assert!(!inner.gateway_fallback_enabled);
         assert_eq!(inner.gateway_fallback_urls.len(), 0);
         assert_eq!(inner.gateway_race_concurrency, 3);
+        // **#89 (2026-05-09)**: walkable-v8 writer flipped to default-on
+        // per user decision ("when we roll out everyone will update").
+        // The previous test asserted default-off as the rollout-window
+        // safety; that's been retired. Now we assert the flipped default
+        // both in the Dart-side and the inner Rust-side config.
+        assert!(
+            inner.walkable_v8_writer_enabled,
+            "walkable_v8_writer_enabled must default to true post-#89 — \
+             flipping back is a deliberate operator action only"
+        );
+    }
+
+    #[test]
+    fn walkable_v8_writer_enabled_plumbs_through_to_inner_config() {
+        // W.9.3: when the Dart-side flag is on, the Rust-side flag
+        // must reflect it. Without this plumbing, FxFiles cannot
+        // activate walkable-v8 even when an operator flips the
+        // setting in the app config.
+        let cfg = FulaConfig {
+            walkable_v8_writer_enabled: true,
+            ..Default::default()
+        };
+        let handle = create_client(cfg).expect("create_client");
+        let inner = handle.inner.config();
+        assert!(
+            inner.walkable_v8_writer_enabled,
+            "Dart-side walkable_v8_writer_enabled = true must plumb to \
+             fula_client::Config — otherwise the FRB binding would silently \
+             swallow the operator's opt-in"
+        );
     }
 }

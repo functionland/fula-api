@@ -152,6 +152,37 @@ pub struct FulaConfig {
     /// Empty Vec = use SDK-shipped 6-gateway default list.
     /// Native-only.
     pub users_index_ipfs_gateway_urls: Vec<String>,
+
+    // ============================================================
+    // Walkable-v8 (W.9.3) — encrypted-tree CID stamping
+    // ============================================================
+    /// Emit walkable-v8 CID hints in HAMT internal-node pointers,
+    /// manifest pages, dir-index, and forest file-index entries from
+    /// master's PUT-response ETag (= `BLAKE3(ciphertext)` raw-codec).
+    ///
+    /// Default flipped to `true` on 2026-05-09 (#89) per user
+    /// decision ("when we roll out everyone will update"). Pre-v0.6
+    /// FxFiles installs reading newly-written buckets surface
+    /// `FulaError::WireVersionUnsupported` (Dart `error_code() ==
+    /// "WIRE_VERSION_UNSUPPORTED"`) on the `LinkV2` portions of the
+    /// tree; v7 portions still in the bucket read normally. Set this
+    /// to `false` to keep emitting the v0.5-readable wire form.
+    /// Mirrors `fula_client::Config::default()` for cross-platform
+    /// parity (non-negotiable project rule).
+    ///
+    /// Each parsed CID is **self-verified** locally before being
+    /// stamped: `BLAKE3(ciphertext)` is recomputed by the SDK and
+    /// compared to the master-returned CID. On mismatch the SDK
+    /// soft-fails to `None` (logging the divergence at warn level,
+    /// rate-limited per (bucket,key) per session) so a compromised
+    /// master cannot redirect future offline walkers to attacker-
+    /// controlled IPFS bytes.
+    ///
+    /// Cross-platform: works identically on every fula-flutter target
+    /// (Android, iOS, Windows, Ubuntu, macOS) and on the wasm32
+    /// browser target. Offline reading via these hints lands in
+    /// W.9.4; today the writer just records them for a future reader.
+    pub walkable_v8_writer_enabled: bool,
 }
 
 impl Default for FulaConfig {
@@ -184,6 +215,16 @@ impl Default for FulaConfig {
             users_index_user_key: String::new(),
             users_index_ipns_gateway_urls: Vec::new(),
             users_index_ipfs_gateway_urls: Vec::new(),
+            // Walkable-v8 (W.9.3) writer.
+            //
+            // #89 (2026-05-09): default flipped from `false` to `true`
+            // per user decision ("when we roll out everyone will
+            // update"). Mirrors `fula_client::Config::default()` for
+            // cross-platform parity (non-negotiable rule). Pre-v0.6
+            // FxFiles installs reading buckets written under this
+            // default will surface `WireVersionUnsupported` (#81 typed
+            // variant). Set explicitly to `false` to opt out.
+            walkable_v8_writer_enabled: true,
         }
     }
 }

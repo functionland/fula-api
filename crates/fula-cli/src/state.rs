@@ -42,6 +42,12 @@ pub struct AppState {
     pub users_index_publisher: Option<
         Arc<crate::handlers::users_index_publisher::UsersIndexPublisher<FlexibleBlockStore>>,
     >,
+    /// W.9.6 — durable pin queue. `Some` when `pin_queue_path` is
+    /// configured (production deploy). `None` when unset (tests,
+    /// minimal dev configs); in that case the PUT handler falls
+    /// back to the legacy fire-and-forget pin path. The drainer
+    /// task is spawned by `server::run_server` if this is `Some`.
+    pub pin_queue: Option<Arc<crate::pin_queue::PinQueue>>,
 }
 
 impl AppState {
@@ -136,6 +142,41 @@ impl AppState {
             Arc::clone(&block_store),
         );
 
+        // W.9.6 durable pin queue — opens the redb file at the
+        // configured path. The drainer is spawned in
+        // `server::run_server`; this constructor only opens the file
+        // (or surfaces an open error so the operator sees it
+        // immediately, before any PUT can land). When the path is
+        // unset the queue stays `None` and the PUT handler falls
+        // back to fire-and-forget — supported for tests + minimal
+        // dev configs, NOT recommended for production.
+        let pin_queue = match &config.pin_queue_path {
+            Some(path) => match crate::pin_queue::PinQueue::open(path) {
+                Ok(q) => {
+                    info!("✓ Pin queue (W.9.6) opened at {}", path);
+                    Some(Arc::new(q))
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to open pin queue at {} ({}); falling back to \
+                         fire-and-forget pinning. Pin retries / crash recovery \
+                         are DISABLED for this run.",
+                        path, e
+                    );
+                    None
+                }
+            },
+            None => {
+                warn!(
+                    "pin_queue_path is not configured; pinning falls back to \
+                     fire-and-forget (legacy v0.5 behavior). Set \
+                     `pin_queue_path` in the gateway config to enable \
+                     durable retry / crash recovery."
+                );
+                None
+            }
+        };
+
         Ok(Self {
             config,
             block_store,
@@ -143,6 +184,7 @@ impl AppState {
             multipart_manager,
             lock_store,
             users_index_publisher,
+            pin_queue,
         })
     }
 

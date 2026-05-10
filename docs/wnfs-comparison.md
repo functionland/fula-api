@@ -856,3 +856,165 @@ For an IPFS pinning gateway use case:
 
 - **Fula's simpler model** (no trusted setup, HPKE for sharing) is easier to deploy in a decentralized manner.
 - If asynchronous offline sharing with public exchange directories is needed, **borrow the WNFS model** for discovery while keeping Fula's HPKE wrapping for the actual key exchange.
+
+---
+
+## 9. Walkability and Link Integrity (Walkable‑v8)
+
+> **Why this section exists.** The encrypted private filesystem in Fula is intentionally NOT a drop‑in port of WNFS's HAMT. The deltas matter for two questions readers commonly ask: *(a) can a non‑keyholder walk the tree?* and *(b) how is link integrity preserved when CIDs live inside encrypted plaintext?* This section answers both with code citations.
+
+### 9.1 Plain‑English summary
+
+In **native IPLD**, every block has a CID that is the hash of its bytes. A reader fetches by CID and re‑hashes; if the bytes don't match the CID, tampering is rejected. This single property gives IPLD its self‑verifying integrity.
+
+In **stock WNFS**, the HAMT *internal nodes* are stored as **plaintext IPLD blocks** that contain plaintext `Link(cid)` references to children. Only the *leaves* (the encrypted PrivateNode blobs the HAMT points at) are encrypted. So a non‑keyholder with the HAMT root CID can:
+
+- enumerate the tree shape, count entries, see fan‑out per level;
+- list every leaf‑level encrypted‑blob CID; and
+- diff two snapshots over time to see *which subtrees changed*.
+
+What they cannot do is decrypt the leaves or look up a specific path (the namefilter accumulator depends on the ratchet key).
+
+In **Fula v7 (today)**, the HAMT internal nodes themselves are AEAD‑encrypted. Parent → child references are 22‑byte `StorageKey`s that route to master S3 paths — not CIDs — so a non‑keyholder learns nothing structural and cannot walk via IPFS gateways either.
+
+In **Fula v8 (walkable‑v8)**, parent pointers gain an `Option<Cid>` *inside the encrypted parent's plaintext*, alongside the existing `StorageKey`. Keyholders can decrypt and walk via public IPFS gateways without master. Non‑keyholders see only the manifest CID; the link graph remains hidden because the CIDs only exist in cleartext form behind AEAD that requires `forest_dek` to open.
+
+### 9.2 Three layers of integrity in Fula v8
+
+Walkable‑v8 stacks three independent integrity binders, the first of which reproduces native IPLD's property exactly:
+
+#### Layer 1 — CID re‑hash on every gateway fetch (keyless, identical to native IPLD)
+
+`crates/fula-client/src/gateway_fetch.rs:116-142`:
+
+```rust
+pub fn verify_cid_against_bytes(cid: &Cid, data: &[u8]) -> Result<(), VerifyError> {
+    let mh = cid.hash();
+    let code = mh.code();
+    let expected_digest = mh.digest();
+    match code {
+        MULTIHASH_BLAKE3 => {
+            let actual = blake3::hash(data);
+            if actual.as_bytes().as_slice() == expected_digest {
+                Ok(())
+            } else {
+                Err(VerifyError::DigestMismatch { code })
+            }
+        }
+        MULTIHASH_SHA2_256 => { /* same shape with sha2 */ }
+        other => Err(VerifyError::UnsupportedHashCode { code: other }),
+    }
+}
+```
+
+Every gateway fetch in walkable‑v8 calls this before handing the bytes to any decryption step. **Anyone with the CID can independently verify**, no keys required. This is byte‑identical to native IPLD's property.
+
+#### Layer 2 — AEAD tag check with bucket+shard AAD (key‑required)
+
+`crates/fula-crypto/src/wnfs_hamt/v7_store.rs:178-180`:
+
+```rust
+let aad = self.aad();
+let aead = Aead::new(&self.shard_dek, AeadCipher::ChaCha20Poly1305);
+let plaintext = aead.decrypt_with_aad(&nonce, ciphertext, &aad)?;  // tag check
+```
+
+`crates/fula-crypto/src/private_forest.rs:1442-1449`:
+
+```rust
+pub fn hamt_node_v7_aad(bucket: &str, shard_idx: u16) -> Vec<u8> {
+    let prefix = b"fula:hamt-node:v7:";
+    let mut aad = Vec::with_capacity(prefix.len() + bucket.len() + 2);
+    aad.extend_from_slice(prefix);
+    aad.extend_from_slice(bucket.as_bytes());
+    aad.extend_from_slice(&shard_idx.to_be_bytes());
+    aad
+}
+```
+
+ChaCha20‑Poly1305 with bucket + shard AAD catches:
+- **Plaintext tampering** — forging a tag without `shard_dek` is computationally infeasible.
+- **Cross‑bucket replay** — bucket A's ciphertext fed to bucket B's reader produces a different AAD → tag mismatch.
+- **Cross‑shard replay** — different `shard_idx` → different AAD → tag mismatch.
+
+#### Layer 3 — Storage‑key cross‑check (key‑required)
+
+`crates/fula-crypto/src/wnfs_hamt/v7_store.rs:182-189`:
+
+```rust
+// Belt-and-suspenders: AEAD already authenticated the ciphertext
+// against AAD, but re-derive the content hash from the plaintext to
+// catch any path/key mix-up in the caller.
+let recomputed = compute_v7_node_key(&self.bucket_salt, &plaintext);
+if recomputed.as_slice() != key.as_slice() {
+    return Err(CryptoError::Hamt("v7 node content-address mismatch".into()));
+}
+```
+
+After decryption, re‑derive `BLAKE3(bucket_salt ‖ plaintext)[..22]` and compare to the `storage_key` the parent committed to. The CID content‑addresses the *ciphertext*; the storage_key content‑addresses the *plaintext*. **Two independent integrity binders for the same node.** Either one alone would catch most tampering; together they cover an attacker that somehow finds bytes whose CID matches the requested one (Layer 1) but whose plaintext doesn't (Layer 3).
+
+### 9.3 Comparison table — link integrity properties
+
+| Property | Native IPLD | Stock WNFS | Fula v7 (today) | Fula v8 (walkable) |
+|---|---|---|---|---|
+| `hash(bytes) == cid` self‑verifying | ✅ | ✅ (HAMT internal) | n/a (uses storage_key) | ✅ (Layer 1) |
+| Anyone keyless can verify integrity | ✅ | ✅ | ❌ (master path only) | ✅ (Layer 1) |
+| Keyless observer with root CID can enumerate tree shape | n/a (no encryption) | ✅ **leaks** | ❌ hidden | ❌ hidden |
+| Keyless observer can see encrypted‑leaf CID list | n/a | ✅ **leaks** | ❌ hidden | ❌ hidden |
+| Keyless observer can diff snapshots and infer write locations | n/a | ✅ **leaks** | ❌ hidden | ❌ hidden |
+| Keyless observer can find a specific file by path | n/a | ❌ | ❌ | ❌ |
+| Keyless observer can decrypt content | n/a | ❌ | ❌ | ❌ |
+| Plaintext tampering blocked | ❌ (no encryption) | per‑leaf only | ✅ AEAD | ✅ AEAD (Layer 2) |
+| Cross‑bucket / cross‑shard replay blocked | n/a | scope‑dependent | ✅ AAD‑bound | ✅ AAD‑bound (Layer 2) |
+| Plaintext content‑address committed by parent | ❌ | ❌ | ✅ storage_key | ✅ storage_key (Layer 3) |
+| Walkable from root via IPFS gateways alone | ✅ | ✅ | ❌ (master required) | ✅ (with `forest_dek`) |
+| Walkable from root *without keys* (= no privacy gate on tree shape) | ✅ | ✅ | n/a | ❌ (privacy preserved) |
+
+The two key takeaways:
+
+1. **Walkable‑v8 reproduces native IPLD's integrity property (Layer 1) exactly** — the keyless `hash(bytes) == cid` check is run on every gateway fetch.
+2. **Walkable‑v8 is strictly more private than stock WNFS** at the tree‑structure level — keyless observers cannot enumerate the HAMT shape, count entries, see leaf CIDs, or diff snapshots, because all of that information lives behind AEAD. The cost (versus a hypothetical "just adopt WNFS") is the design work to weave CID into the encrypted parent's plaintext, which W.9.1a–W.9.6 implement.
+
+### 9.4 Tampering walk‑through
+
+For each attack class below, the design rejects it at one of the three layers. Citations are to current code.
+
+**Attack: gateway returns wrong bytes for the CID we asked for.**
+Layer 1 catches it. `verify_cid_against_bytes` mismatches → reject. Same defense as native IPLD.
+
+**Attack: attacker substitutes different bytes + a forged CID matching them.**
+Forging a CID is a BLAKE3/SHA‑256 preimage attack — computationally infeasible.
+
+**Attack: compromised gateway replays a STALE parent ciphertext.**
+The grandparent's pointer (in its AEAD‑protected plaintext) commits to a SPECIFIC `LinkV2 { storage_key, cid }`. SDK fetches by that exact CID. Stale parent's bytes have a different CID → Layer 1 mismatch → reject.
+
+**Attack: attacker provides bucket A's ciphertext and claims it's bucket B's node.**
+Layer 2 fails: bucket B's AAD differs from bucket A's; ChaCha20‑Poly1305 tag mismatch on decrypt → reject. (Layer 1 may or may not pass, depending on whether the attacker knows bucket A's CIDs; Layer 2 is the binding defense here.)
+
+**Attack: attacker tampers with parent plaintext to point at attacker‑controlled child CID.**
+Parent's plaintext is itself AEAD‑protected. Modifying it requires forging the tag without `shard_dek`. Layer 2 catches it.
+
+**Attack: a compromised master returns a WRONG CID at write time** (`S3BlobBackend::put` records whatever the master's PUT response says).
+Later read fetches by the wrong CID. If the attacker registered other bytes under that CID, Layer 1 passes for those bytes — but Layer 2 fails because the attacker doesn't have `shard_dek` and cannot produce a valid AEAD tag. **Result: read fails (DoS), but no silent corruption.** A future hardening (W.9.3 follow‑up) is to have the SDK self‑verify the etag CID at write time (re‑hash its own ciphertext) to detect the wrong CID at write rather than at read.
+
+**Attack: rollback to an older `forest_manifest_cid`.**
+The trusted root for cold‑start comes from the global users‑index CBOR resolved via IPNS + the `FulaUsersIndexAnchor` chain anchor (Phase 3.3). The chain contract enforces strict monotonic sequence: `require(newSequence > sequence)`. A compromised master cannot regress on‑chain state.
+
+### 9.5 What this means for end users
+
+- **Your data integrity is at least as strong as native IPLD** for every block fetched via a gateway, even when master is offline (Layer 1).
+- **Tampering is detected, not hidden.** A malicious gateway, transport corruption, or compromised master triggers a clean error rather than silent data corruption. The combination of Layer 2 + Layer 3 means even a malicious master cannot make you accept invalid bytes — the worst they can do is cause your read to fail with an error.
+- **Privacy of the tree structure is preserved.** Unlike WNFS, an attacker who learns your bucket's `forest_manifest_cid` cannot enumerate your file count, observe your folder shape, or watch which subtrees you write to. Without `forest_dek` they cannot even decrypt the manifest itself; they only see one opaque ciphertext.
+- **Walkability requires the key, by design.** This is a deliberate choice: walkability for keyholders, opacity for everyone else. It mirrors the intuition that "your filesystem is your own private structure," not just "your file contents are your own."
+
+For the implementation status, see the walkable‑v8 task series in the project plan and the v0.6.0 entry of `packages/fula_client/CHANGELOG.md`:
+
+- **W.9.1a / W.9.1b** ✅ — wire format extension + manifest/file‑index `Option<Cid>` plumbing.
+- **W.9.2** ✅ — V8 node‑store seam: `BlobBackend::put` now returns the master's PUT‑response CID via `BlobPutResult { cid: Option<Cid> }` so the cascade can stamp it into parent pointers.
+- **W.9.3** ✅ — writer integration: cascade stamps `LinkV2` and `shard.root_cid`. SDK self‑verifies master's etag against locally‑recomputed `BLAKE3(ciphertext)` before stamping; mismatches soft‑fail to `None` so a compromised master cannot redirect future offline walkers to attacker‑chosen IPFS bytes. Gated by `Config::walkable_v8_writer_enabled` (default `false` in v0.6.0; flipped to default `true` in v0.6.1 / task #89 — every new‑format‑capable client emits walkable‑v8 wire bytes by default, with the explicit acceptance that pre‑v0.6 SDK readers will surface `WireVersionUnsupported` on newly‑written buckets per the rollout plan).
+- **W.9.4** ✅ — HAMT reader integration: offline walk via gateway race + `verify_cid_against_bytes` on every fetch. `ChildPtr::resolve_owned` for `StoredV2` variant routes the embedded CID through `Node::load_with_cid_hint` → `HamtNodeStore::get_node_with_cid_hint` → `BlobBackend::get_with_cid_hint`. The reader path is **not gated on the writer flag** — the wire format itself is the gate.
+- **W.9.4‑A2 / task #32** ✅ — per‑chunk CID hints (`ChunkedFileMetadata.chunk_cids: Vec<Option<Cid>>`). Writer stamps each chunk's verified CID after PUT; reader's windowed / buffered / ranged chunked‑download paths all dispatch on `chunk_cid(i).is_some()` to engage the cold‑cache gateway race per chunk. This is what makes chunked files (the dominant FxFiles content shape — photos, PDFs, videos > 768 KB) walkable offline; without it the W.9.4 HAMT walker only reaches the file index, not the underlying chunks.
+- **W.9.5** — fetch‑order obfuscation (parallel‑batch prefetch). Privacy defense‑in‑depth; not load‑bearing for offline walkability. Deferred to a future cycle.
+- **W.9.6** ✅ — master‑side pin coverage + batched‑pin endpoint with durable queue. New `pin_queue.rs` (redb‑backed, crash‑safe) + `pin_drainer.rs` (bounded‑concurrency worker with exp‑backoff retry + dead‑letter). PUT and multipart handlers enqueue per‑object + bucket‑root + user‑external pins; drainer dispatches with retry. Verified by a 100‑pin crash‑recovery integration test that drops the queue mid‑drain and observes every pin survives.
+- **W.9.7** ✅ — scale + stress tests. Block‑size assertion at 1k (regular) + 100k / 1M (`#[ignore]`, operator‑run). 100k empirically: 12,431 HAMT‑node objects, largest blob 17.1 KiB. Architectural finding: a single directory containing 100k+ files produces a `ForestDirectoryEntry` blob exceeding the 1 MiB IPFS gateway limit (tracked as #72). Distribution across folders — the typical FxFiles user shape — keeps every blob comfortably under the soft 64 KiB warning ceiling at every scale tested.
+- **W.9.8** ✅ — documentation, CHANGELOG, release notes. See `packages/fula_client/CHANGELOG.md` v0.6.0 for the full rollup including the operational rollout matrix, compatibility matrix, and the three operator‑facing caveats (single‑directory cliff, public `put_object_chunked` partial coverage, `chunk_cids` plaintext‑posture clarification).

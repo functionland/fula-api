@@ -15,5 +15,11 @@ pub mod v7_store;
 
 pub(crate) use node::Node;
 pub(crate) use pointer::{ChildPtr, Pair, Pointer};
-pub(crate) use store::{HamtNodeBytes, HamtNodeStore, STORAGE_KEY_LEN, StorageKey};
-pub use v7_store::{BlobBackend, V7NodeStore, V7_NODE_PREFIX};
+pub(crate) use store::{HamtNodeBytes, HamtNodeStore, NodePutResult, STORAGE_KEY_LEN, StorageKey};
+pub use v7_store::{BlobBackend, BlobPutResult, V7NodeStore, V7_NODE_PREFIX};
+
+// Test-only RPC-count instrumentation (#88 — W.8.4 validation).
+// Visible to fula-crypto's own tests AND to downstream crates that opt in
+// via `features = ["test-fault-injection"]` on their fula-crypto dep.
+#[cfg(any(test, feature = "test-fault-injection"))]
+pub use v7_store::{CountSnapshot, CountingBlobBackend};

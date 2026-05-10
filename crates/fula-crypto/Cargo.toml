@@ -54,7 +54,9 @@ async-lock = "3"
 futures = { workspace = true }
 
 # IPLD/CID
-cid = { workspace = true }
+# `serde` feature enables Cid's Serialize/Deserialize impls for the
+# walkable-v8 `PointerWire::LinkV2 { storage_key, cid }` wire format.
+cid = { workspace = true, features = ["serde"] }
 multihash = { workspace = true }
 multihash-codetable = { workspace = true }
 
@@ -78,4 +80,12 @@ tokio-test = "0.4"
 
 [[bench]]
 name = "crypto_benchmarks"
+harness = false
+
+# Walkable-v8 (W.9.7) scale benchmark — measures the curves the
+# `walkable_v8_block_size_*` tests don't measure (write throughput,
+# walk time, manifest size). Manually run via:
+#   cargo bench --bench walkable_v8_scale
+[[bench]]
+name = "walkable_v8_scale"
 harness = false

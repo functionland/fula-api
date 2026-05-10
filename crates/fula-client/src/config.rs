@@ -157,6 +157,44 @@ pub struct Config {
     /// Phase 2.2/2.4 enabled.
     pub users_index_ipfs_gateway_urls: Vec<String>,
 
+    /// Walkable-v8 (W.9.3) — emit CID hints in HAMT internal-node
+    /// pointers, manifest pages, dir-index, and forest file-index
+    /// entries from master's PUT-response ETag (= `BLAKE3(ciphertext)`
+    /// raw-codec). Off by default during the v0.6.x rollout window so
+    /// every write stays byte-identical to v0.5 behaviour and old SDKs
+    /// can keep reading newly-written buckets.
+    ///
+    /// When `true`:
+    ///   * `S3BlobBackend::put` parses the master-returned ETag as a
+    ///     `Cid` and surfaces it in `BlobPutResult.cid`. The HAMT cascade
+    ///     then emits `PointerWire::LinkV2 { storage_key, cid }` for any
+    ///     re-persisted child node (legacy `Stored` siblings stay as
+    ///     `Link`).
+    ///   * Phase 1.5 (page commits), Phase 1.6 (dir-index commit), and
+    ///     forest file-index PUTs parse the response ETag and stamp it
+    ///     into `PageRef.cid`, `ManifestRoot.dir_index_cid`, and
+    ///     `ForestFileEntry.storage_cid` respectively.
+    ///   * Each parsed CID is **self-verified** locally before being
+    ///     stamped: `BLAKE3(ciphertext)` is recomputed and compared to
+    ///     the master-returned CID. On mismatch the SDK soft-fails to
+    ///     `None` (logging the divergence at warn level, rate-limited
+    ///     per (bucket,key) per session) so a compromised master cannot
+    ///     redirect future offline walkers to attacker-controlled IPFS
+    ///     bytes.
+    ///
+    /// When `false`: all CID-stamping fields stay `None` — readers
+    /// fall through to the legacy storage-key path. Wire-format
+    /// unchanged; old SDKs read newly-written buckets byte-identically
+    /// to v0.5.
+    ///
+    /// **Default flipped to `true` on 2026-05-09 (#89)**: per the user's
+    /// rollout plan ("when we roll out everyone will update"), this
+    /// bypasses the W.10 step 5 80%-adoption gate. Pre-v0.6 SDKs reading
+    /// newly-written buckets surface `WireVersionUnsupported` (#81 typed
+    /// variant). Set to `false` explicitly to opt out per-client (e.g.,
+    /// targeted regressions or backward-compat tests).
+    pub walkable_v8_writer_enabled: bool,
+
     /// Phase 19 — optional health-status callback. When set, the SDK
     /// invokes this closure on every Up↔Down transition of the
     /// master health gate (`MasterHealthEvent::Online` /
@@ -200,6 +238,7 @@ impl std::fmt::Debug for Config {
             .field("users_index_user_key", &self.users_index_user_key)
             .field("users_index_ipns_gateway_urls", &self.users_index_ipns_gateway_urls)
             .field("users_index_ipfs_gateway_urls", &self.users_index_ipfs_gateway_urls)
+            .field("walkable_v8_writer_enabled", &self.walkable_v8_writer_enabled)
             .field(
                 "health_callback",
                 &self.health_callback.as_ref().map(|_| "<callback>"),
@@ -241,6 +280,15 @@ impl Default for Config {
             users_index_user_key: None,
             users_index_ipns_gateway_urls: Vec::new(),
             users_index_ipfs_gateway_urls: Vec::new(),
+            // Walkable-v8 (W.9.3) — writer is opt-in during the v0.6.x
+            // rollout. Default `false` keeps writes byte-identical to
+            // v0.5 so old SDKs can keep reading newly-written buckets.
+            // #89 (2026-05-09): default flipped from `false` to `true`
+            // per user decision — every new-format-capable client emits
+            // walkable-v8 wire bytes by default. Operators must hold off
+            // flipping master-side gates until SDK adoption reaches the
+            // % they're comfortable with for the pre-v0.6 reader cost.
+            walkable_v8_writer_enabled: true,
             // Phase 19 — no callback by default (silent gate).
             health_callback: None,
         }

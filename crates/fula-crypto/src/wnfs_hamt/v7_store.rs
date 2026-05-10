@@ -19,13 +19,14 @@
 //
 // See plan: /root/.claude/plans/do-a-thorough-line-cheeky-taco.md (search: "V7NodeStore").
 
-use super::store::{HamtNodeBytes, HamtNodeStore, STORAGE_KEY_LEN, StorageKey};
+use super::store::{HamtNodeBytes, HamtNodeStore, NodePutResult, STORAGE_KEY_LEN, StorageKey};
 use crate::keys::DekKey;
 use crate::private_forest::{
     V7StorageKey, V7_STORAGE_KEY_LEN, compute_v7_node_key, hamt_node_v7_aad,
 };
 use crate::symmetric::{Aead, AeadCipher, Nonce};
 use crate::{CryptoError, Result};
+use cid::Cid;
 use std::sync::Arc;
 
 // The content-addressed key width used by the vendored HAMT and the v7
@@ -46,6 +47,43 @@ pub const V7_NODE_PREFIX: &str = "__fula_forest_v7_nodes/";
 /// nonces) still map to the same storage key, preserving dedup.
 const NONCE_LEN: usize = 12;
 
+/// Outcome of [`BlobBackend::put`] (walkable-v8 / W.9.2).
+///
+/// `cid` is the content-address the backend reports for the ciphertext that
+/// was just persisted. `Some(_)` when the backend exposes one (e.g. master S3
+/// returns it as the `ETag` header on PUT 200), `None` for backends that
+/// don't (in-memory test backends, bench backends) or when the etag failed
+/// to parse as a CID. **CID parse failure is always a soft-fail to `None`,
+/// never an error**: the PUT itself succeeded; the offline-walk hint just
+/// isn't available, and the v7 storage-key path serves the read.
+///
+/// Future-extension point: more fields can be added without breaking the
+/// trait surface (e.g. a `version_id` for backends with versioning).
+#[derive(Debug, Clone)]
+pub struct BlobPutResult {
+    pub cid: Option<Cid>,
+}
+
+impl BlobPutResult {
+    /// Construct a result that carries no CID hint. Suitable for in-memory
+    /// or test backends that have no notion of a master-stamped etag.
+    pub fn none() -> Self {
+        Self { cid: None }
+    }
+
+    /// Construct a result with a known CID. Currently unused (W.9.2 PUT
+    /// impls direct-construct via `BlobPutResult { cid }` because they
+    /// already have an `Option<Cid>` from `etag.parse().ok()`). Retained
+    /// for W.9.3+ writer integration where `BlobBackend` impls that
+    /// always have a definite CID (e.g. an in-memory backend that
+    /// computes the ciphertext CID locally for tests) can call this
+    /// directly instead of going through `Some(_)`.
+    #[allow(dead_code)]
+    pub fn with_cid(cid: Cid) -> Self {
+        Self { cid: Some(cid) }
+    }
+}
+
 /// Minimal storage-backend interface used by [`V7NodeStore`].
 ///
 /// Implementors provide opaque get/put by path. All crypto (AEAD + content
@@ -55,18 +93,61 @@ const NONCE_LEN: usize = 12;
 /// the plaintext hash, two honest writers producing the same plaintext will
 /// write identical objects — conflict resolution for v7 always lives at the
 /// manifest ETag level, never per node.
+///
+/// `put` returns a [`BlobPutResult`]; the `cid` field carries the master's
+/// PUT-response ETag parsed as a [`Cid`] for walkable-v8. Backends that
+/// don't have a CID (test, bench) return `BlobPutResult::none()`.
+///
+/// **Walkable-v8 (W.9.4) — `get_with_cid_hint`**: the cid-hint variant lets
+/// a caller that learned a child's `Cid` from a parent's `PointerWire::LinkV2`
+/// plaintext request the same bytes via the offline-aware path: when the
+/// backend is master-aware (e.g. `S3BlobBackend`), this routes through the
+/// gateway race so a master-down bucket walk continues over public IPFS.
+/// The default impl ignores the hint and delegates to [`get`] — backends
+/// that don't have a master/gateway distinction (in-memory test backends)
+/// keep the simpler `get` semantics. The hint is **advisory**: callers
+/// must NOT skip subsequent integrity checks (AEAD + storage_key recompute)
+/// just because a CID was supplied — those layers defend against parent-
+/// pointer manipulation independently of the gateway content-address check.
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 pub trait BlobBackend: Send + Sync {
     async fn get(&self, path: &str) -> Result<Vec<u8>>;
-    async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<()>;
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<BlobPutResult>;
+
+    /// Walkable-v8 (W.9.4) — fetch with an optional content-address
+    /// hint. Default impl ignores the hint and falls through to [`get`];
+    /// `S3BlobBackend` overrides to use the cold-cache gateway-race
+    /// fallback when `cid_hint` is `Some` and master is unreachable.
+    async fn get_with_cid_hint(
+        &self,
+        path: &str,
+        _cid_hint: Option<&Cid>,
+    ) -> Result<Vec<u8>> {
+        self.get(path).await
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
 #[async_trait::async_trait(?Send)]
 pub trait BlobBackend {
     async fn get(&self, path: &str) -> Result<Vec<u8>>;
-    async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<()>;
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<BlobPutResult>;
+
+    /// Walkable-v8 (W.9.4) — fetch with an optional content-address
+    /// hint. Default impl ignores the hint and falls through to [`get`].
+    /// On wasm32 the offline-fallback infrastructure (block_cache +
+    /// gateway race) is gated out, so the override on `S3BlobBackend`
+    /// is currently a thin no-op delegate; the trait surface stays
+    /// symmetric across targets so cross-target call sites compile
+    /// without `cfg` gating.
+    async fn get_with_cid_hint(
+        &self,
+        path: &str,
+        _cid_hint: Option<&Cid>,
+    ) -> Result<Vec<u8>> {
+        self.get(path).await
+    }
 }
 
 /// AEAD-encrypted, content-addressed node store for a v7 shard.
@@ -127,12 +208,28 @@ impl<B: BlobBackend> V7NodeStore<B> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[async_trait::async_trait]
-impl<B: BlobBackend + 'static> HamtNodeStore for V7NodeStore<B> {
-    async fn get_node(&self, key: &StorageKey) -> Result<HamtNodeBytes> {
-        let path = Self::object_path(key);
-        let blob = self.inner.get(&path).await?;
+impl<B: BlobBackend + 'static> V7NodeStore<B> {
+    /// Walkable-v8 (W.9.4) — shared decrypt + integrity-check pipeline used
+    /// by both `get_node` and `get_node_with_cid_hint`. Centralised here so
+    /// the offline cid-hint variant cannot accidentally drop the
+    /// `recomputed == key` check that defends against parent-pointer
+    /// manipulation (the third integrity layer per advisor design notes).
+    ///
+    /// Three layers, all enforced regardless of which `BlobBackend.get*`
+    /// variant supplied `blob`:
+    ///   1. AEAD decrypt under shard DEK with `(bucket, shard_idx)` AAD —
+    ///      defends cross-bucket / cross-shard replay.
+    ///   2. Recompute `BLAKE3(bucket_salt ‖ plaintext)[..22]` and compare
+    ///      to the caller-supplied `key` — defends a redirect where the
+    ///      gateway returns valid-CID bytes whose plaintext addresses a
+    ///      DIFFERENT storage_key than the parent's pointer claimed.
+    ///   3. (Out of this function: gateway content-address verify happens
+    ///      inside `get_object_with_offline_fallback_known_cid`.)
+    fn decrypt_and_verify(
+        &self,
+        key: &StorageKey,
+        blob: Vec<u8>,
+    ) -> Result<HamtNodeBytes> {
         if blob.len() < NONCE_LEN {
             return Err(CryptoError::Decryption(
                 "v7 node blob shorter than nonce".into(),
@@ -146,7 +243,9 @@ impl<B: BlobBackend + 'static> HamtNodeStore for V7NodeStore<B> {
 
         // Belt-and-suspenders: AEAD already authenticated the ciphertext
         // against AAD, but re-derive the content hash from the plaintext to
-        // catch any path/key mix-up in the caller.
+        // catch any path/key mix-up in the caller — and, on the cid-hint
+        // path, to reject a malicious parent that pointed at the right
+        // cid but the wrong storage_key.
         let recomputed = compute_v7_node_key(&self.bucket_salt, &plaintext);
         if recomputed.as_slice() != key.as_slice() {
             return Err(CryptoError::Hamt(
@@ -155,8 +254,37 @@ impl<B: BlobBackend + 'static> HamtNodeStore for V7NodeStore<B> {
         }
         Ok(plaintext)
     }
+}
 
-    async fn put_node(&self, bytes: HamtNodeBytes) -> Result<StorageKey> {
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait::async_trait]
+impl<B: BlobBackend + 'static> HamtNodeStore for V7NodeStore<B> {
+    async fn get_node(&self, key: &StorageKey) -> Result<HamtNodeBytes> {
+        let path = Self::object_path(key);
+        let blob = self.inner.get(&path).await?;
+        self.decrypt_and_verify(key, blob)
+    }
+
+    /// Walkable-v8 (W.9.4) — forward `cid_hint` to the backing
+    /// `BlobBackend::get_with_cid_hint` so the offline gateway race
+    /// engages when master is unreachable, then run the same
+    /// `decrypt_and_verify` pipeline as `get_node`. The `recomputed
+    /// == key` check is preserved verbatim — a malicious parent
+    /// pointing at `LinkV2 { storage_key: A, cid: hash_of_B }` would
+    /// pass the gateway content-address check (bytes hash to the
+    /// supplied cid) but fail at this layer (plaintext hashes to B,
+    /// not the requested A).
+    async fn get_node_with_cid_hint(
+        &self,
+        key: &StorageKey,
+        cid_hint: Option<&Cid>,
+    ) -> Result<HamtNodeBytes> {
+        let path = Self::object_path(key);
+        let blob = self.inner.get_with_cid_hint(&path, cid_hint).await?;
+        self.decrypt_and_verify(key, blob)
+    }
+
+    async fn put_node(&self, bytes: HamtNodeBytes) -> Result<NodePutResult> {
         let key_v7: V7StorageKey = compute_v7_node_key(&self.bucket_salt, &bytes);
         // V7StorageKey and StorageKey are both [u8; 22]; asserted by construction.
         let key: StorageKey = key_v7;
@@ -170,8 +298,8 @@ impl<B: BlobBackend + 'static> HamtNodeStore for V7NodeStore<B> {
         blob.extend_from_slice(&ciphertext);
 
         let path = Self::object_path(&key);
-        self.inner.put(&path, blob).await?;
-        Ok(key)
+        let put_result = self.inner.put(&path, blob).await?;
+        Ok(NodePutResult { storage_key: key, cid: put_result.cid })
     }
 }
 
@@ -181,27 +309,20 @@ impl<B: BlobBackend + 'static> HamtNodeStore for V7NodeStore<B> {
     async fn get_node(&self, key: &StorageKey) -> Result<HamtNodeBytes> {
         let path = Self::object_path(key);
         let blob = self.inner.get(&path).await?;
-        if blob.len() < NONCE_LEN {
-            return Err(CryptoError::Decryption(
-                "v7 node blob shorter than nonce".into(),
-            ));
-        }
-        let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
-        let nonce = Nonce::from_bytes(nonce_bytes)?;
-        let aad = self.aad();
-        let aead = Aead::new(&self.shard_dek, AeadCipher::ChaCha20Poly1305);
-        let plaintext = aead.decrypt_with_aad(&nonce, ciphertext, &aad)?;
-
-        let recomputed = compute_v7_node_key(&self.bucket_salt, &plaintext);
-        if recomputed.as_slice() != key.as_slice() {
-            return Err(CryptoError::Hamt(
-                "v7 node content-address mismatch".into(),
-            ));
-        }
-        Ok(plaintext)
+        self.decrypt_and_verify(key, blob)
     }
 
-    async fn put_node(&self, bytes: HamtNodeBytes) -> Result<StorageKey> {
+    async fn get_node_with_cid_hint(
+        &self,
+        key: &StorageKey,
+        cid_hint: Option<&Cid>,
+    ) -> Result<HamtNodeBytes> {
+        let path = Self::object_path(key);
+        let blob = self.inner.get_with_cid_hint(&path, cid_hint).await?;
+        self.decrypt_and_verify(key, blob)
+    }
+
+    async fn put_node(&self, bytes: HamtNodeBytes) -> Result<NodePutResult> {
         let key_v7: V7StorageKey = compute_v7_node_key(&self.bucket_salt, &bytes);
         let key: StorageKey = key_v7;
         let nonce = Nonce::generate();
@@ -214,8 +335,8 @@ impl<B: BlobBackend + 'static> HamtNodeStore for V7NodeStore<B> {
         blob.extend_from_slice(&ciphertext);
 
         let path = Self::object_path(&key);
-        self.inner.put(&path, blob).await?;
-        Ok(key)
+        let put_result = self.inner.put(&path, blob).await?;
+        Ok(NodePutResult { storage_key: key, cid: put_result.cid })
     }
 }
 
@@ -265,12 +386,14 @@ impl BlobBackend for InMemoryBackend {
             .ok_or_else(|| CryptoError::Hamt(format!("object not found: {}", path)))
     }
 
-    async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<()> {
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<BlobPutResult> {
         self.objects
             .lock()
             .unwrap()
             .insert(path.to_string(), bytes);
-        Ok(())
+        // In-memory backend does not have a master-stamped etag; v8 readers
+        // see `cid: None` and fall through to the storage_key path.
+        Ok(BlobPutResult::none())
     }
 }
 
@@ -286,12 +409,147 @@ impl BlobBackend for InMemoryBackend {
             .ok_or_else(|| CryptoError::Hamt(format!("object not found: {}", path)))
     }
 
-    async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<()> {
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<BlobPutResult> {
         self.objects
             .lock()
             .unwrap()
             .insert(path.to_string(), bytes);
-        Ok(())
+        // In-memory backend does not have a master-stamped etag; v8 readers
+        // see `cid: None` and fall through to the storage_key path.
+        Ok(BlobPutResult::none())
+    }
+}
+
+// =============================================================================
+// CountingBlobBackend — RPC-count instrumentation for #88 (W.8.4 validation).
+//
+// Wraps any [`BlobBackend`] and counts every operation atomically. Tests use
+// this to drive an identical workload through a v7-mode backend (returns
+// `BlobPutResult::none()`) and a v8-mode backend (returns
+// `BlobPutResult { cid: Some(_) }`) and assert that the `puts` and `gets`
+// counts match, validating the W.8.4 plan claim that v8 adds zero new master
+// RPCs vs v7. The `gets_with_some_hint` counter is the discriminator that
+// SHOULD differ — it's 0 under v7 (no `LinkV2` exists, no CID hints flow) and
+// non-zero under v8 (the reader resolves `LinkV2` children with `Some` hints).
+//
+// Gated on `cfg(any(test, feature = "test-fault-injection"))` so it's visible
+// to fula-crypto's own unit tests AND to fula-client integration tests that
+// pull in fula-crypto with the feature enabled.
+// =============================================================================
+
+/// Atomic operation-count snapshot for a [`CountingBlobBackend`].
+#[cfg(any(test, feature = "test-fault-injection"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CountSnapshot {
+    pub puts: u64,
+    pub gets: u64,
+    pub gets_with_hint: u64,
+    pub gets_with_some_hint: u64,
+}
+
+/// [`BlobBackend`] wrapper that counts every operation. See module-level
+/// commentary above for usage.
+#[cfg(any(test, feature = "test-fault-injection"))]
+pub struct CountingBlobBackend<B> {
+    inner: Arc<B>,
+    puts: std::sync::atomic::AtomicU64,
+    gets: std::sync::atomic::AtomicU64,
+    gets_with_hint: std::sync::atomic::AtomicU64,
+    gets_with_some_hint: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(any(test, feature = "test-fault-injection"))]
+impl<B> CountingBlobBackend<B> {
+    pub fn new(inner: Arc<B>) -> Self {
+        Self {
+            inner,
+            puts: std::sync::atomic::AtomicU64::new(0),
+            gets: std::sync::atomic::AtomicU64::new(0),
+            gets_with_hint: std::sync::atomic::AtomicU64::new(0),
+            gets_with_some_hint: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub fn snapshot(&self) -> CountSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        CountSnapshot {
+            puts: self.puts.load(Relaxed),
+            gets: self.gets.load(Relaxed),
+            gets_with_hint: self.gets_with_hint.load(Relaxed),
+            gets_with_some_hint: self.gets_with_some_hint.load(Relaxed),
+        }
+    }
+
+    pub fn reset(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.puts.store(0, Relaxed);
+        self.gets.store(0, Relaxed);
+        self.gets_with_hint.store(0, Relaxed);
+        self.gets_with_some_hint.store(0, Relaxed);
+    }
+
+    pub fn inner(&self) -> &Arc<B> {
+        &self.inner
+    }
+}
+
+#[cfg(all(any(test, feature = "test-fault-injection"), not(target_arch = "wasm32")))]
+#[async_trait::async_trait]
+impl<B: BlobBackend> BlobBackend for CountingBlobBackend<B> {
+    async fn get(&self, path: &str) -> Result<Vec<u8>> {
+        self.gets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.get(path).await
+    }
+
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<BlobPutResult> {
+        self.puts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.put(path, bytes).await
+    }
+
+    async fn get_with_cid_hint(
+        &self,
+        path: &str,
+        cid_hint: Option<&Cid>,
+    ) -> Result<Vec<u8>> {
+        self.gets_with_hint
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cid_hint.is_some() {
+            self.gets_with_some_hint
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.inner.get_with_cid_hint(path, cid_hint).await
+    }
+}
+
+#[cfg(all(any(test, feature = "test-fault-injection"), target_arch = "wasm32"))]
+#[async_trait::async_trait(?Send)]
+impl<B: BlobBackend> BlobBackend for CountingBlobBackend<B> {
+    async fn get(&self, path: &str) -> Result<Vec<u8>> {
+        self.gets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.get(path).await
+    }
+
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<BlobPutResult> {
+        self.puts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.put(path, bytes).await
+    }
+
+    async fn get_with_cid_hint(
+        &self,
+        path: &str,
+        cid_hint: Option<&Cid>,
+    ) -> Result<Vec<u8>> {
+        self.gets_with_hint
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cid_hint.is_some() {
+            self.gets_with_some_hint
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.inner.get_with_cid_hint(path, cid_hint).await
     }
 }
 
@@ -328,7 +586,7 @@ mod tests {
             root.set(k, i, &store).await.unwrap();
         }
 
-        let root_key = root.store(&store).await.unwrap();
+        let root_key = root.store(&store).await.unwrap().storage_key;
 
         // Load from a freshly-constructed store (simulates a separate reader
         // on the same bucket/shard) and confirm every entry.
@@ -360,8 +618,8 @@ mod tests {
         );
 
         let plaintext: Vec<u8> = (0..64u8).collect();
-        let key1 = store.put_node(plaintext.clone()).await.unwrap();
-        let key2 = store.put_node(plaintext.clone()).await.unwrap();
+        let key1 = store.put_node(plaintext.clone()).await.unwrap().storage_key;
+        let key2 = store.put_node(plaintext.clone()).await.unwrap().storage_key;
         assert_eq!(key1, key2, "content-addressed key must be deterministic");
 
         // The nonce is random → ciphertext differs, but the stored path is
@@ -381,7 +639,7 @@ mod tests {
             backend.clone(),
         );
         let plaintext = b"payload".to_vec();
-        let key = writer.put_node(plaintext.clone()).await.unwrap();
+        let key = writer.put_node(plaintext.clone()).await.unwrap().storage_key;
 
         // A reader that mislabels the shard index must fail AEAD.
         let wrong_shard = V7NodeStore::new(
@@ -404,7 +662,7 @@ mod tests {
             test_dek(),
             backend.clone(),
         );
-        let key = writer.put_node(b"payload".to_vec()).await.unwrap();
+        let key = writer.put_node(b"payload".to_vec()).await.unwrap().storage_key;
 
         let wrong_bucket = V7NodeStore::new(
             "bucket-b",
@@ -426,7 +684,7 @@ mod tests {
             test_dek(),
             backend.clone(),
         );
-        let key = store.put_node(b"untampered".to_vec()).await.unwrap();
+        let key = store.put_node(b"untampered".to_vec()).await.unwrap().storage_key;
 
         // Flip one byte in the ciphertext region (past the 12-byte nonce).
         let path = V7NodeStore::<InMemoryBackend>::object_path(&key);

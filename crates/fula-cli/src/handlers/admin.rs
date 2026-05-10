@@ -1070,25 +1070,71 @@ async fn sweep_one_bucket(
         }
     };
 
-    // Pin the new root locally (best-effort, fire-and-forget — same
-    // pattern as the put_object handler). No user JWT needed for the
-    // local kubo pin; the cluster will replicate via its existing
-    // pin-follower discipline. The OLD root is left as-is and becomes
-    // unreferenced once the registry persists; cluster GC reaps it
-    // eventually. We deliberately do NOT actively unpin the old root
-    // — if the registry persist fails, we'd want the old root still
-    // available for recovery.
+    // #65 — pin the new root through the durable queue (W.9.6
+    // pattern). Replaces the prior fire-and-forget `tokio::spawn`,
+    // which silently lost pins on master crash OR on operator
+    // cancel/restart of a slow sweep — the cancel/restart pattern is
+    // the load-bearing improvement here, not just full-crash
+    // durability. Mirror's object.rs:421-460's bucket-root path.
+    //
+    // Why `bearer_token: None`: admin sweep doesn't carry a user JWT
+    // (the comment block at line ~907 documents this). The drainer's
+    // dispatch path (`pin_drainer.rs:372`) reads `bearer_token` as
+    // `unwrap_or("")` and the empty-string short-circuit in
+    // `IpfsPinningBlockStore::pin_cid_with_token` (ipfs_pinning.rs:264)
+    // falls back to local-kubo `pin_cid` — byte-equivalent to today's
+    // `block_store.pin(...)` call. A single `warn!("Empty token ...")`
+    // log fires per dispatch; bounded by the sweep's bucket count.
+    //
+    // The OLD root is still left as-is (unreferenced; cluster GC
+    // reaps eventually). Active unpin would conflict with the
+    // recovery story if registry persist fails.
     {
-        let block_store = Arc::clone(&state.block_store);
         let pin_name = format!("bucket:{}", bucket_name);
         let cid = new_root_cid;
-        tokio::spawn(async move {
-            if let Err(e) = block_store.pin(&cid, Some(&pin_name)).await {
-                warn!(cid = %cid, error = %e, "PII sweep: failed to pin new bucket root");
+        if let Some(queue) = state.pin_queue.as_ref() {
+            if let Err(e) = queue.enqueue(crate::pin_queue::PinRequest {
+                cid,
+                target: crate::pin_queue::PinTarget::MasterCluster,
+                kind: crate::pin_queue::PinKind::Add,
+                pin_name: Some(pin_name.clone()),
+                bearer_token: None,
+                pinning_endpoint: None,
+            }) {
+                // redb commit failed — fall back to fire-and-forget
+                // for this single record so the sweep doesn't fail
+                // hard. Operator alert for persistent failures.
+                warn!(
+                    cid = %cid,
+                    error = %e,
+                    "PII sweep: pin_queue enqueue failed; falling back to fire-and-forget for this bucket root"
+                );
+                let block_store = Arc::clone(&state.block_store);
+                let pin_name_clone = pin_name.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = block_store.pin(&cid, Some(&pin_name_clone)).await {
+                        warn!(cid = %cid, error = %e, "PII sweep: failed to pin new bucket root (queue-fallback path)");
+                    }
+                });
             } else {
-                info!(cid = %cid, bucket = %pin_name, "PII sweep: new bucket root pinned");
+                info!(
+                    cid = %cid,
+                    bucket = %pin_name,
+                    "PII sweep: new bucket root enqueued for durable pin (#65)"
+                );
             }
-        });
+        } else {
+            // Legacy fire-and-forget — no queue configured (tests +
+            // minimal dev configs only; production sets `pin_queue_path`).
+            let block_store = Arc::clone(&state.block_store);
+            tokio::spawn(async move {
+                if let Err(e) = block_store.pin(&cid, Some(&pin_name)).await {
+                    warn!(cid = %cid, error = %e, "PII sweep: failed to pin new bucket root");
+                } else {
+                    info!(cid = %cid, bucket = %pin_name, "PII sweep: new bucket root pinned");
+                }
+            });
+        }
     }
 
     report.buckets_rewritten += 1;

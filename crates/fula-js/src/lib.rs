@@ -169,9 +169,43 @@ pub struct JsFulaConfig {
     /// at runtime.**
     #[serde(default)]
     pub users_index_ipfs_gateway_urls: Vec<String>,
+
+    // ============================================================
+    // Walkable-v8 (W.9.3) — encrypted-tree CID stamping
+    // ============================================================
+    /// Emit walkable-v8 CID hints in HAMT internal-node pointers,
+    /// manifest pages, dir-index, and forest file-index entries from
+    /// master's PUT-response ETag (= `BLAKE3(ciphertext)` raw-codec).
+    ///
+    /// **#89 (2026-05-09): default flipped to `true`** per user
+    /// decision ("when we roll out everyone will update"), mirroring
+    /// `fula_client::Config::default()` and `FulaConfig::default()`
+    /// (cross-platform parity is non-negotiable). Pre-v0.6 SDKs
+    /// reading newly-written buckets surface `WireVersionUnsupported`
+    /// (#81 typed variant; mapped to `WIRE_VERSION_UNSUPPORTED` JS
+    /// error code via `client_error_to_js_error`).
+    ///
+    /// Each parsed CID is **self-verified** locally before being
+    /// stamped: the SDK recomputes `BLAKE3(ciphertext)` and compares
+    /// to the master-returned CID. On mismatch the SDK soft-fails to
+    /// `None` (logging at warn, rate-limited per (bucket,key) per
+    /// session) so a compromised master cannot redirect future
+    /// offline walkers to attacker-controlled IPFS bytes.
+    ///
+    /// **Cross-platform.** Works identically on the wasm32 web target
+    /// and on any native `fula_client::Config` consumer. Offline
+    /// reading via these hints lands in W.9.4; today the writer just
+    /// records them for a future reader.
+    /// `#[serde(default = "default_walkable_v8_writer_enabled")]` so
+    /// JSON omitting the field gets the post-#89 default of `true`.
+    /// `#[serde(default)]` would fall back to `bool::default()` which
+    /// is `false` and would silently drift from the Rust-side defaults.
+    #[serde(default = "default_walkable_v8_writer_enabled")]
+    pub walkable_v8_writer_enabled: bool,
 }
 
 fn default_timeout() -> u64 { 30 }
+fn default_walkable_v8_writer_enabled() -> bool { true }
 fn default_health_gate_ttl() -> u64 { 30 }
 fn default_block_cache_max_bytes() -> u64 { 256 * 1024 * 1024 }
 fn default_gateway_race_concurrency() -> u32 { 3 }
@@ -579,6 +613,13 @@ fn build_inner_config(
     inner.users_index_ipns_gateway_urls = config.users_index_ipns_gateway_urls;
     inner.users_index_ipfs_gateway_urls = config.users_index_ipfs_gateway_urls;
 
+    // Walkable-v8 (W.9.3) — writer flag. Cross-platform: works on the
+    // wasm32 web target identically to native. Default `false` keeps
+    // writes byte-identical to v0.5; flipping `true` activates the
+    // v8 wire surface. See `walkable_v8_writer_enabled` in
+    // `JsFulaConfig` for the full self-verify rationale.
+    inner.walkable_v8_writer_enabled = config.walkable_v8_writer_enabled;
+
     inner
 }
 
@@ -635,6 +676,21 @@ fn client_error_to_js_error(operation: &str, e: fula_client::ClientError) -> JsE
             serde_json::json!({ "bucket": bucket, "expiresAt": expires_at }),
         ),
         ClientError::Encryption(_) => ("ENCRYPTION", serde_json::json!(null)),
+        // #81 (2026-05-09) — typed wire-version-skew variant. Without
+        // this arm the variant falls through to the `_` wildcard and
+        // surfaces as "INTERNAL", defeating the telemetry-stability
+        // purpose of the typed variant. Mirrors fula-flutter's
+        // `error_code()` returning "WIRE_VERSION_UNSUPPORTED".
+        ClientError::WireVersionUnsupported {
+            context,
+            postcard_error,
+        } => (
+            "WIRE_VERSION_UNSUPPORTED",
+            serde_json::json!({
+                "context": context,
+                "postcardError": postcard_error,
+            }),
+        ),
         ClientError::Http(_) => ("HTTP", serde_json::json!(null)),
         _ => ("INTERNAL", serde_json::json!(null)),
     };

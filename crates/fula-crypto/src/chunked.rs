@@ -23,6 +23,7 @@
 //! - Privacy: all chunks encrypted, index encrypted
 //! - Backward Compatible: `format: "streaming-v1"` distinguishes from v2
 
+use cid::Cid;
 use crate::{
     CryptoError, Result,
     hashing::Blake3Hash,
@@ -66,6 +67,47 @@ pub struct ChunkedFileMetadata {
     /// Original content type
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    /// Walkable-v8 (W.9.4-A2 / task #32): per-chunk CID hints,
+    /// populated from master's PUT-response ETag for each chunk.
+    /// Parallel to `chunk_nonces`: when non-empty, length must equal
+    /// `num_chunks` and `chunk_cids[i]` is the CID for the chunk at
+    /// `chunk_index == i`. Each entry is `Option<Cid>` so individual
+    /// chunks can have `None` (e.g. one chunk's etag failed to parse
+    /// or the writer flag was off) while siblings have valid hints.
+    ///
+    /// Empty Vec = legacy chunked metadata written before W.9.4-A2.
+    /// `#[serde(default)]` keeps existing pinned/cached
+    /// `ChunkedFileMetadata` blobs deserializing cleanly into the
+    /// new struct — no migration required.
+    ///
+    /// **Storage shape (privacy posture)**: this struct is serialized
+    /// into the index object's `chunked` JSON field alongside
+    /// `chunk_nonces`, `root_hash`, `num_chunks`, `total_size`, etc.
+    /// The index body is plaintext JSON — only the `wrapped_key` and
+    /// `private_metadata` siblings are AEAD-encrypted. So `chunk_cids`
+    /// is **plaintext-readable** by anyone who can fetch the index
+    /// object. This is **not a privacy regression**: every existing
+    /// field in the same plaintext block (`chunk_nonces`,
+    /// `chunk_size`, `num_chunks`, …) was already plaintext-readable
+    /// at the same level pre-W.9.4-A2. Adding the chunk CIDs joins
+    /// that already-public set; an attacker with the index object
+    /// could already enumerate child storage paths via
+    /// `chunk_key(storage_key, i)` and fetch the same encrypted
+    /// chunk bytes via gateway. The hints just make it cheaper for
+    /// the legitimate offline reader.
+    ///
+    /// **Read-side use**: when an offline reader resolves a chunked
+    /// `ForestFileEntry` and decodes this metadata, for each chunk
+    /// it checks `chunk_cids[i].is_some()`: if yes, fetches via
+    /// `get_object_with_offline_fallback_known_cid` (cold-cache
+    /// gateway race from Phase 2.4); otherwise falls back to the
+    /// legacy `chunk_key()` storage-path fetch. This is what makes
+    /// chunked files (the dominant FxFiles content shape — photos,
+    /// PDFs, videos) walkable offline. The W.9.4 HAMT walker only
+    /// takes the reader to the file index; without these hints, the
+    /// chunks themselves remain unreachable when master is down.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunk_cids: Vec<Option<Cid>>,
 }
 
 impl ChunkedFileMetadata {
@@ -90,7 +132,42 @@ impl ChunkedFileMetadata {
                 .map(|n| base64::engine::general_purpose::STANDARD.encode(n.as_bytes()))
                 .collect(),
             content_type,
+            // Walkable-v8 (W.9.4-A2): default to no hints. The writer
+            // populates this AFTER per-chunk PUTs return etags via
+            // `populate_chunk_cids`.
+            chunk_cids: Vec::new(),
         }
+    }
+
+    /// Walkable-v8 (W.9.4-A2): bulk-set per-chunk CID hints after
+    /// each chunk's PUT has returned an etag. Vec length must equal
+    /// `num_chunks` or this is a no-op (caller bug — the reader's
+    /// length check would otherwise reject the metadata at decode
+    /// time).
+    ///
+    /// Idempotent: calling again with the same Vec re-stamps the
+    /// same values. Calling with an empty Vec clears the hints
+    /// (returns to legacy / pre-W.9.4-A2 behaviour for this entry).
+    pub fn populate_chunk_cids(&mut self, cids: Vec<Option<Cid>>) {
+        if cids.len() == self.num_chunks as usize {
+            self.chunk_cids = cids;
+        } else if cids.is_empty() {
+            self.chunk_cids.clear();
+        }
+        // Mismatched length: no-op. The writer's caller must supply
+        // exactly num_chunks entries (with `None` for any chunks
+        // that didn't get a usable CID hint).
+    }
+
+    /// Walkable-v8 (W.9.4-A2): look up the CID hint for chunk
+    /// `index`. Returns `None` if no hints are populated (legacy
+    /// metadata) or if the specific chunk's hint is `None` (writer
+    /// flag was off for that PUT, or its etag failed to parse).
+    pub fn chunk_cid(&self, index: u32) -> Option<Cid> {
+        self.chunk_cids
+            .get(index as usize)
+            .copied()
+            .flatten()
     }
 
     /// Get the storage key for a specific chunk
@@ -740,6 +817,7 @@ mod tests {
             root_hash: "00".repeat(32),
             chunk_nonces: vec![],
             content_type: None,
+            chunk_cids: vec![],
         };
         
         // First byte of file
@@ -1087,5 +1165,138 @@ mod tests {
         assert_eq!(meta1.format, "streaming-v2");
         assert_eq!(meta1.chunk_size, MIN_CHUNK_SIZE as u32);
         assert_eq!(meta1.num_chunks, chunks1.len() as u32 + if final1.is_some() { 1 } else { 0 });
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Walkable-v8 (W.9.4-A2 / task #32) — per-chunk CID hints
+    // ─────────────────────────────────────────────────────────────────
+
+    fn walkable_v8_test_cid(seed: u8) -> Cid {
+        let digest = [seed; 32];
+        let mh = cid::multihash::Multihash::<64>::wrap(0x1e, &digest)
+            .expect("blake3 multihash wrap");
+        Cid::new_v1(0x55, mh)
+    }
+
+    #[test]
+    fn chunk_cids_round_trip_via_json() {
+        let cid_a = walkable_v8_test_cid(0xAA);
+        let cid_c = walkable_v8_test_cid(0xCC);
+        let mut meta = ChunkedFileMetadata {
+            format: "streaming-v1".to_string(),
+            chunk_size: 1024,
+            num_chunks: 3,
+            total_size: 3000,
+            root_hash: "deadbeef".to_string(),
+            chunk_nonces: vec!["n0".to_string(), "n1".to_string(), "n2".to_string()],
+            content_type: None,
+            chunk_cids: vec![],
+        };
+        meta.populate_chunk_cids(vec![Some(cid_a), None, Some(cid_c)]);
+        let json = serde_json::to_vec(&meta).expect("encode");
+        let decoded: ChunkedFileMetadata = serde_json::from_slice(&json).expect("decode");
+        assert_eq!(decoded.chunk_cid(0), Some(cid_a));
+        assert_eq!(
+            decoded.chunk_cid(1),
+            None,
+            "individual None hints survive round-trip"
+        );
+        assert_eq!(decoded.chunk_cid(2), Some(cid_c));
+    }
+
+    #[test]
+    fn chunk_cids_empty_round_trips_via_json() {
+        // Empty chunk_cids is the default + means "legacy / no hints".
+        // The `skip_serializing_if = "Vec::is_empty"` keeps the field
+        // OFF the wire so legacy readers (without the field) and
+        // post-W.9.4-A2 readers (with the field) decode identical
+        // bytes — backward-compat both ways.
+        let meta = ChunkedFileMetadata::new(
+            1024,
+            2,
+            2000,
+            Blake3Hash::new([0u8; 32]),
+            vec![Nonce::generate(), Nonce::generate()],
+            None,
+        );
+        assert!(meta.chunk_cids.is_empty());
+        let json = serde_json::to_vec(&meta).expect("encode");
+        let json_str = String::from_utf8_lossy(&json);
+        assert!(
+            !json_str.contains("chunk_cids"),
+            "empty chunk_cids must NOT appear on the wire — \
+             skip_serializing_if guards backward-compat with v0.5 SDKs. \
+             Got: {}",
+            json_str
+        );
+        let decoded: ChunkedFileMetadata = serde_json::from_slice(&json).expect("decode");
+        assert!(decoded.chunk_cids.is_empty());
+        assert_eq!(decoded.chunk_cid(0), None);
+    }
+
+    #[test]
+    fn legacy_chunked_metadata_without_chunk_cids_field_deserializes_to_none() {
+        // Backward-compat gold standard (W.4.3 hard constraint #1):
+        // existing pinned/cached `ChunkedFileMetadata` blobs from
+        // pre-W.9.4-A2 SDKs must deserialize cleanly into the new
+        // struct, with `chunk_cid()` returning `None` for every
+        // index. Production data must not break under SDK upgrade.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct LegacyChunkedFileMetadata {
+            format: String,
+            chunk_size: u32,
+            num_chunks: u32,
+            total_size: u64,
+            root_hash: String,
+            chunk_nonces: Vec<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            content_type: Option<String>,
+            // NOTE: deliberately no `chunk_cids` field — pre-W.9.4-A2 shape.
+        }
+        let legacy = LegacyChunkedFileMetadata {
+            format: "streaming-v1".to_string(),
+            chunk_size: 256 * 1024,
+            num_chunks: 3,
+            total_size: 700_000,
+            root_hash: "a".repeat(64),
+            chunk_nonces: vec!["n0".to_string(), "n1".to_string(), "n2".to_string()],
+            content_type: Some("image/jpeg".to_string()),
+        };
+        let bytes = serde_json::to_vec(&legacy).expect("encode legacy");
+        let modern: ChunkedFileMetadata =
+            serde_json::from_slice(&bytes).expect("legacy → modern");
+        assert_eq!(modern.format, "streaming-v1");
+        assert_eq!(modern.num_chunks, 3);
+        assert_eq!(modern.content_type.as_deref(), Some("image/jpeg"));
+        assert!(modern.chunk_cids.is_empty());
+        assert_eq!(modern.chunk_cid(0), None);
+        assert_eq!(modern.chunk_cid(1), None);
+        assert_eq!(modern.chunk_cid(2), None);
+    }
+
+    #[test]
+    fn populate_chunk_cids_wrong_length_is_ignored() {
+        // Defensive: caller bug should not corrupt persisted metadata.
+        let mut meta = ChunkedFileMetadata::new(
+            1024,
+            3,
+            3000,
+            Blake3Hash::new([0u8; 32]),
+            vec![Nonce::generate(), Nonce::generate(), Nonce::generate()],
+            None,
+        );
+        // Length 2, expected 3 — no-op.
+        meta.populate_chunk_cids(vec![Some(walkable_v8_test_cid(0x11)), None]);
+        assert!(meta.chunk_cids.is_empty(), "wrong-length caller bug must not stamp partial state");
+        // Correct length — stamps.
+        meta.populate_chunk_cids(vec![
+            Some(walkable_v8_test_cid(0x11)),
+            None,
+            Some(walkable_v8_test_cid(0x33)),
+        ]);
+        assert_eq!(meta.chunk_cids.len(), 3);
+        // Empty Vec — clears.
+        meta.populate_chunk_cids(vec![]);
+        assert!(meta.chunk_cids.is_empty());
     }
 }

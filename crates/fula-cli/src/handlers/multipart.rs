@@ -242,26 +242,107 @@ pub async fn complete_multipart_upload(
         tracing::warn!(error = %e, "Failed to persist bucket registry after complete_multipart_upload");
     }
 
-    // Pin the BUCKET ROOT CID to ensure tree structure survives GC.
-    // This recursively pins all tree nodes AND all referenced object data (including parts).
-    // NOTE: Pinning is async (fire-and-forget) to avoid blocking the response.
-    {
+    // W.9.6 — pin the BUCKET ROOT CID through the durable queue.
+    // Mirrors the put_object handler's enqueue path so multipart
+    // uploads get the same crash-safety + retry guarantees as
+    // single-PUTs. Without this, every large-file upload would
+    // bypass the queue and silently regress to v0.5 fire-and-forget
+    // behaviour (load-bearing W.9.6 hole).
+    let pin_name = format!("bucket:{}", bucket);
+    if let Some(queue) = state.pin_queue.as_ref() {
+        if let Err(e) = queue.enqueue(crate::pin_queue::PinRequest {
+            cid: bucket_root_cid,
+            target: crate::pin_queue::PinTarget::MasterCluster,
+            kind: crate::pin_queue::PinKind::Add,
+            pin_name: Some(pin_name.clone()),
+            bearer_token: Some(session.jwt_token.clone()),
+            pinning_endpoint: None,
+        }) {
+            // Mirror put_object's enqueue-failed fallback: spawn the
+            // pin so the user's PUT doesn't fail. Operators see the
+            // warn; persistent failures are an alert.
+            tracing::warn!(
+                cid = %bucket_root_cid,
+                error = %e,
+                "pin_queue enqueue (multipart bucket-root) failed; falling back to fire-and-forget"
+            );
+            let block_store = Arc::clone(&state.block_store);
+            let jwt_token = session.jwt_token.clone();
+            let pn = pin_name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = block_store
+                    .pin_with_token(&bucket_root_cid, Some(&pn), &jwt_token)
+                    .await
+                {
+                    tracing::warn!(
+                        cid = %bucket_root_cid,
+                        error = %e,
+                        "Failed to pin bucket root CID (multipart queue-fallback path)"
+                    );
+                }
+            });
+        }
+    } else {
+        // Legacy fire-and-forget — no queue configured.
         let block_store = Arc::clone(&state.block_store);
-        let pin_bucket = bucket.clone();
         let jwt_token = session.jwt_token.clone();
+        let pn = pin_name.clone();
         tokio::spawn(async move {
-            let pin_name = format!("bucket:{}", pin_bucket);
-            if let Err(e) = block_store.pin_with_token(&bucket_root_cid, Some(&pin_name), &jwt_token).await {
+            if let Err(e) = block_store
+                .pin_with_token(&bucket_root_cid, Some(&pn), &jwt_token)
+                .await
+            {
                 tracing::warn!(cid = %bucket_root_cid, error = %e, "Failed to pin bucket root CID");
             } else {
-                tracing::info!(cid = %bucket_root_cid, bucket = %pin_name, "Bucket root CID pinned (recursive)");
+                tracing::info!(cid = %bucket_root_cid, bucket = %pn, "Bucket root CID pinned (recursive)");
             }
         });
     }
 
-    // Also pin to user's external pinning service if credentials provided
-    // The session JWT is used as the default token if no X-Pinning-Token header is provided
-    pin_for_user(&headers, &first_part_cid, Some(&key), state.config.pinning_service_endpoint.as_deref(), Some(&session.jwt_token)).await;
+    // W.9.6 — user external pin via queue (or legacy fallback).
+    // Same routing as the put_object handler: when the queue is
+    // configured, durable + retry; otherwise legacy fire-and-forget
+    // via `pin_for_user`. The same `pin_for_user_via_queue` helper
+    // would be cleaner; for now we mirror its inline logic to
+    // avoid making `multipart.rs` depend on `object.rs`'s private
+    // helper.
+    if let Some(queue) = state.pin_queue.as_ref() {
+        if !session.jwt_token.is_empty() {
+            let creds = match state.config.pinning_service_endpoint.as_deref() {
+                Some(ep) => {
+                    crate::pinning::PinningCredentials::from_jwt(&headers, &session.jwt_token, ep)
+                }
+                None => crate::pinning::PinningCredentials::from_headers(&headers),
+            };
+            if let Some(creds) = creds {
+                let pin_name_user = Some(key.clone()).or_else(|| creds.name.clone());
+                if let Err(e) = queue.enqueue(crate::pin_queue::PinRequest {
+                    cid: first_part_cid,
+                    target: crate::pin_queue::PinTarget::UserExternal,
+                    kind: crate::pin_queue::PinKind::Add,
+                    pin_name: pin_name_user,
+                    bearer_token: Some(creds.token.clone()),
+                    pinning_endpoint: Some(creds.endpoint.clone()),
+                }) {
+                    tracing::warn!(
+                        cid = %first_part_cid,
+                        error = %e,
+                        "pin_queue enqueue (multipart user-external) failed"
+                    );
+                }
+            }
+        }
+    } else {
+        // Legacy fire-and-forget for tests / minimal dev configs.
+        pin_for_user(
+            &headers,
+            &first_part_cid,
+            Some(&key),
+            state.config.pinning_service_endpoint.as_deref(),
+            Some(&session.jwt_token),
+        )
+        .await;
+    }
 
     let location = format!("/{}/{}", bucket, key);
     let xml_response = xml::complete_multipart_upload_result(

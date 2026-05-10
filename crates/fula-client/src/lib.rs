@@ -57,6 +57,10 @@ mod types;
 mod user_key;
 #[cfg(not(target_arch = "wasm32"))]
 mod orphan_queue;
+/// Walkable-v8 (W.9.3) — SDK self-verification of master-attested CIDs.
+/// Cross-platform (wasm + native) so the dual-pointer wire format is
+/// stamped consistently regardless of which target persists the blob.
+mod walkable_v8;
 #[cfg(not(target_arch = "wasm32"))]
 mod wal;
 

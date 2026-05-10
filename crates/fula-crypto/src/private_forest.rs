@@ -50,6 +50,7 @@ use crate::{
     private_metadata::PrivateMetadata,
     hamt_index::HamtIndex,
 };
+use cid::Cid;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -143,6 +144,17 @@ pub struct ForestFileEntry {
     /// against downgrade-to-no-AAD when a bucket mixes v1/v2 legacy data).
     #[serde(default)]
     pub min_version: u8,
+    /// Walkable-v8 (W.9.1b): CID hint for the encrypted chunk/object blob,
+    /// populated from master's PUT-response ETag. `None` for legacy v7 file
+    /// entries — readers fall back to fetching the chunk via the master S3
+    /// path keyed on `storage_key`. W.9.3 wires the writer to populate this
+    /// from the ETag returned by S3BlobBackend; W.9.4 wires the offline
+    /// reader to fetch by CID via gateway race when master is unreachable.
+    /// `#[serde(default)]` keeps existing CBOR/JSON-pinned forest blobs
+    /// deserializing cleanly into the new struct (Phase 1.2-style lazy
+    /// migration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_cid: Option<Cid>,
 }
 
 impl ForestFileEntry {
@@ -163,6 +175,7 @@ impl ForestFileEntry {
             user_metadata: metadata.user_metadata.clone(),
             encrypted: false,
             min_version: 0,
+            storage_cid: None,
         }
     }
 
@@ -1028,6 +1041,17 @@ pub struct ShardV7 {
     /// each flush so top-level `file_count()` and shard-growth heuristics
     /// stay O(num_shards) without walking any HAMT.
     pub entry_count: u32,
+
+    /// Walkable-v8 (W.9.1b): CID hint for this shard's HAMT root node blob,
+    /// populated from master's PUT-response ETag (= `BLAKE3(ciphertext)`
+    /// raw-codec). `None` for legacy v7 manifests — readers fall back to
+    /// fetching the root node via master S3 at the path keyed on `root`.
+    /// W.9.3 wires the writer to stamp this from the BlobBackend's PUT
+    /// response; W.9.4 wires the offline reader to use it for the gateway
+    /// race when master is unreachable. `#[serde(default)]` keeps existing
+    /// JSON-pinned ManifestPage blobs deserializing cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_cid: Option<Cid>,
 }
 
 impl ShardV7 {
@@ -1038,6 +1062,7 @@ impl ShardV7 {
             seq: 0,
             etag: None,
             entry_count: 0,
+            root_cid: None,
         }
     }
 
@@ -1067,6 +1092,16 @@ pub struct PageRef {
     pub etag: Option<String>,
     /// Expected monotonic page sequence (≥ whichever seq the reader sees).
     pub seq: u64,
+    /// Walkable-v8 (W.9.1b): CID hint for the encrypted manifest page blob,
+    /// populated from master's PUT-response ETag (= `BLAKE3(ciphertext)`
+    /// raw-codec). `None` on legacy v7 roots — readers fall back to fetching
+    /// the page via master S3 at the path keyed on `derive_page_index_key`.
+    /// W.9.3 wires the writer to stamp this from the PUT response; W.9.4
+    /// wires the offline reader to use it for the gateway race when master
+    /// is unreachable. `#[serde(default)]` keeps existing JSON-pinned
+    /// ManifestRoot blobs deserializing cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<Cid>,
 }
 
 /// Root of the two-level manifest.
@@ -1113,6 +1148,23 @@ pub struct ManifestRoot {
     /// discards S3's HEAD ETag. `None` before the first successful flush.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir_index_seq: Option<u64>,
+    /// Walkable-v8 (W.9.3 — completes W.9.1b's wire-format extension):
+    /// CID hint for the encrypted [`DirectoryIndex`] blob, populated from
+    /// master's PUT-response ETag (= `BLAKE3(ciphertext)` raw-codec).
+    ///
+    /// `None` on legacy v7 roots and on every write where
+    /// `walkable_v8_writer_enabled = false` — readers fall back to fetching
+    /// the dir-index via master S3 at the path keyed on
+    /// `derive_dir_index_key(forest_dek, bucket)`. With the writer enabled,
+    /// W.9.4's offline reader uses this CID for the gateway race when master
+    /// is unreachable, completing the dir-index portion of cold-start
+    /// walkability.
+    ///
+    /// `#[serde(default)]` keeps every existing JSON-pinned
+    /// `EncryptedShardManifestV7` blob deserializing cleanly into the new
+    /// struct — the no-migration property for production data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir_index_cid: Option<Cid>,
 }
 
 impl ManifestRoot {
@@ -1135,6 +1187,7 @@ impl ManifestRoot {
             page_index: BTreeMap::new(),
             dir_index_etag: None,
             dir_index_seq: None,
+            dir_index_cid: None,
         }
     }
 
@@ -2271,6 +2324,7 @@ mod tests {
                 PageRef {
                     etag: Some(format!("\"etag-page-{:03}\"", page_id)),
                     seq: 1,
+                    cid: None,
                 },
             );
         }
@@ -2322,6 +2376,7 @@ mod tests {
             PageRef {
                 etag: Some("\"etag\"".to_string()),
                 seq: 5,
+                cid: None,
             },
         );
         let mut stale_page = ManifestPage::empty(0, 16);
@@ -2369,6 +2424,7 @@ mod tests {
             content_hash: None,
             encrypted: false,
             min_version: 0,
+            storage_cid: None,
         });
 
         let enc = EncryptedForest::encrypt_v4(&forest, &dek, "bucket-1", 7).unwrap();
@@ -2560,6 +2616,397 @@ mod tests {
         // resistance lives at the manifest layer (ETag + manifest shard seq).
         assert_ne!(hamt_node_v7_aad("b", 0), hamt_node_v7_aad("c", 0));
         assert_ne!(hamt_node_v7_aad("b", 0), hamt_node_v7_aad("b", 1));
+    }
+
+    // ============================================================================
+    // Walkable-v8 wire format tests (W.9.1b)
+    //
+    // Pin the on-disk contract for the new `Option<Cid>` fields on `PageRef`,
+    // `ShardV7`, and `ForestFileEntry`. The load-bearing properties:
+    //
+    //   1. `Some(cid)` round-trips through the production serializer
+    //      (serde_json — what `EncryptedShardManifestV7`/`EncryptedManifestPage`/
+    //      `EncryptedForest` use).
+    //   2. `None` round-trips losslessly (Phase 1.5/1.6/2 writers stamping
+    //      `None` until W.9.3 wires the CID-stamping seam should not produce
+    //      surprising decode failures).
+    //   3. **Backward-compat gold standard.** A "legacy" struct without the
+    //      new field, serialized as JSON, deserializes cleanly into the new
+    //      struct with the new field as `None`. This is the same pattern
+    //      `metadata.rs::LegacyBucketMetadata` uses for `bucket_lookup_h`
+    //      forward-compat (Phase 1.2's hard constraint #1: existing pinned
+    //      blobs must deserialize without migration).
+    //
+    // If anyone changes a field name or removes `#[serde(default)]`, these
+    // tests must fail loudly — that's by design.
+    // ============================================================================
+
+    /// Helper: produce a stable BLAKE3-multihash CIDv1 with raw codec — the
+    /// exact format master returns in its PUT-response ETag header. Mirrors
+    /// the helper in `wnfs_hamt::pointer::walkable_v8_wire_tests::test_cid`.
+    fn walkable_v8_test_cid(seed: u8) -> cid::Cid {
+        let digest = [seed; 32];
+        let mh = cid::multihash::Multihash::<64>::wrap(0x1e, &digest)
+            .expect("BLAKE3 multihash wrap");
+        cid::Cid::new_v1(0x55, mh)
+    }
+
+    #[test]
+    fn page_ref_v8_some_cid_round_trips_via_json() {
+        let cid = walkable_v8_test_cid(0xAB);
+        let original = PageRef {
+            etag: Some("\"some-etag\"".to_string()),
+            seq: 7,
+            cid: Some(cid),
+        };
+        let json = serde_json::to_vec(&original).expect("encode PageRef");
+        let decoded: PageRef = serde_json::from_slice(&json).expect("decode PageRef");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.cid, Some(cid));
+    }
+
+    #[test]
+    fn page_ref_v8_none_cid_round_trips_via_json() {
+        let original = PageRef {
+            etag: Some("\"e\"".to_string()),
+            seq: 1,
+            cid: None,
+        };
+        let json = serde_json::to_vec(&original).expect("encode");
+        let decoded: PageRef = serde_json::from_slice(&json).expect("decode");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.cid, None);
+    }
+
+    #[test]
+    fn page_ref_legacy_json_without_cid_field_deserializes_to_none() {
+        // BACKWARD-COMPAT GOLD STANDARD (W.4.3 hard-constraint #1):
+        // existing v7 ManifestRoot blobs pinned to IPFS BEFORE this field
+        // was added must deserialize cleanly into the new PageRef struct,
+        // with cid = None. Production data must not break.
+        #[derive(Serialize, Deserialize)]
+        struct LegacyPageRef {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            etag: Option<String>,
+            seq: u64,
+            // NOTE: deliberately no `cid` field — pre-W.9.1b shape.
+        }
+
+        let legacy = LegacyPageRef {
+            etag: Some("\"etag-page-007\"".to_string()),
+            seq: 42,
+        };
+        let bytes = serde_json::to_vec(&legacy).expect("encode legacy");
+        let modern: PageRef = serde_json::from_slice(&bytes)
+            .expect("legacy PageRef → modern PageRef");
+        assert_eq!(modern.etag.as_deref(), Some("\"etag-page-007\""));
+        assert_eq!(modern.seq, 42);
+        // The critical assertion — serde(default) preserves the
+        // no-migration property for existing JSON-pinned ManifestRoot blobs.
+        assert_eq!(modern.cid, None);
+    }
+
+    #[test]
+    fn shard_v7_v8_some_root_cid_round_trips_via_json() {
+        let cid = walkable_v8_test_cid(0xCD);
+        let original = ShardV7 {
+            root: Some([0x11; V7_STORAGE_KEY_LEN]),
+            seq: 9,
+            etag: Some("\"shard-etag\"".to_string()),
+            entry_count: 3,
+            root_cid: Some(cid),
+        };
+        let json = serde_json::to_vec(&original).expect("encode");
+        let decoded: ShardV7 = serde_json::from_slice(&json).expect("decode");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.root_cid, Some(cid));
+    }
+
+    #[test]
+    fn shard_v7_v8_none_root_cid_round_trips_via_json() {
+        let original = ShardV7::new();
+        let json = serde_json::to_vec(&original).expect("encode");
+        let decoded: ShardV7 = serde_json::from_slice(&json).expect("decode");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.root_cid, None);
+    }
+
+    #[test]
+    fn shard_v7_legacy_json_without_root_cid_deserializes_to_none() {
+        // Mirrors the LegacyBucketMetadata pattern (metadata.rs:454-523):
+        // a struct with the same shape as ShardV7 but WITHOUT the new
+        // `root_cid` field. Existing ManifestPage blobs pinned to IPFS
+        // before W.9.1b must keep deserializing into the new struct.
+        #[derive(Serialize, Deserialize)]
+        struct LegacyShardV7 {
+            #[serde(with = "v7_storage_key_serde", default)]
+            root: Option<V7StorageKey>,
+            seq: u64,
+            #[serde(skip_serializing_if = "Option::is_none", default)]
+            etag: Option<String>,
+            entry_count: u32,
+            // NOTE: deliberately no `root_cid` field — pre-W.9.1b shape.
+        }
+
+        let legacy = LegacyShardV7 {
+            root: Some([0xEF; V7_STORAGE_KEY_LEN]),
+            seq: 11,
+            etag: Some("\"e\"".to_string()),
+            entry_count: 5,
+        };
+        let bytes = serde_json::to_vec(&legacy).expect("encode legacy ShardV7");
+        let modern: ShardV7 = serde_json::from_slice(&bytes)
+            .expect("legacy ShardV7 → modern ShardV7");
+        assert_eq!(modern.root, Some([0xEF; V7_STORAGE_KEY_LEN]));
+        assert_eq!(modern.seq, 11);
+        assert_eq!(modern.entry_count, 5);
+        assert_eq!(modern.root_cid, None);
+    }
+
+    #[test]
+    fn forest_file_entry_v8_some_storage_cid_round_trips_via_json() {
+        let cid = walkable_v8_test_cid(0x12);
+        let original = ForestFileEntry {
+            path: "/a.txt".to_string(),
+            storage_key: "QmABC".to_string(),
+            size: 100,
+            content_type: Some("text/plain".to_string()),
+            created_at: 1,
+            modified_at: 2,
+            content_hash: Some("abc".to_string()),
+            user_metadata: HashMap::new(),
+            encrypted: true,
+            min_version: 4,
+            storage_cid: Some(cid),
+        };
+        let json = serde_json::to_vec(&original).expect("encode");
+        let decoded: ForestFileEntry = serde_json::from_slice(&json).expect("decode");
+        assert_eq!(decoded.storage_cid, Some(cid));
+        assert_eq!(decoded.storage_key, "QmABC");
+        assert_eq!(decoded.path, "/a.txt");
+    }
+
+    #[test]
+    fn forest_file_entry_v8_none_storage_cid_round_trips_via_json() {
+        let original = ForestFileEntry {
+            path: "/b.txt".to_string(),
+            storage_key: "QmDEF".to_string(),
+            size: 0,
+            content_type: None,
+            created_at: 0,
+            modified_at: 0,
+            content_hash: None,
+            user_metadata: HashMap::new(),
+            encrypted: false,
+            min_version: 0,
+            storage_cid: None,
+        };
+        let json = serde_json::to_vec(&original).expect("encode");
+        let decoded: ForestFileEntry = serde_json::from_slice(&json).expect("decode");
+        assert_eq!(decoded.storage_cid, None);
+    }
+
+    #[test]
+    fn forest_file_entry_legacy_json_without_storage_cid_deserializes_to_none() {
+        // BACKWARD-COMPAT GOLD STANDARD: an `EncryptedForest` (v1 monolithic
+        // mode) pinned to IPFS before W.9.1b carries `ForestFileEntry`s in
+        // their pre-walkable-v8 shape. A v8 SDK opening such a forest must
+        // get `storage_cid = None` and otherwise see all the original fields
+        // unchanged.
+        #[derive(Serialize, Deserialize)]
+        struct LegacyForestFileEntry {
+            path: String,
+            storage_key: String,
+            size: u64,
+            content_type: Option<String>,
+            created_at: i64,
+            modified_at: i64,
+            content_hash: Option<String>,
+            #[serde(default)]
+            user_metadata: HashMap<String, String>,
+            #[serde(default)]
+            encrypted: bool,
+            #[serde(default)]
+            min_version: u8,
+            // NOTE: deliberately no `storage_cid` field — pre-W.9.1b shape.
+        }
+
+        let legacy = LegacyForestFileEntry {
+            path: "/photos/cat.jpg".to_string(),
+            storage_key: "QmCat123".to_string(),
+            size: 4096,
+            content_type: Some("image/jpeg".to_string()),
+            created_at: 1_700_000_000,
+            modified_at: 1_700_000_500,
+            content_hash: Some("blake3:...".to_string()),
+            user_metadata: HashMap::new(),
+            encrypted: true,
+            min_version: 4,
+        };
+        let bytes = serde_json::to_vec(&legacy).expect("encode legacy entry");
+        let modern: ForestFileEntry = serde_json::from_slice(&bytes)
+            .expect("legacy ForestFileEntry → modern");
+        assert_eq!(modern.path, "/photos/cat.jpg");
+        assert_eq!(modern.storage_key, "QmCat123");
+        assert_eq!(modern.size, 4096);
+        assert_eq!(modern.content_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(modern.encrypted, true);
+        assert_eq!(modern.min_version, 4);
+        // The critical assertion — serde(default) preserves the
+        // no-migration property for existing pinned `EncryptedForest` blobs.
+        assert_eq!(modern.storage_cid, None);
+    }
+
+    #[test]
+    fn manifest_root_and_page_carry_walkable_v8_cid_hints_through_full_round_trip() {
+        // Integration round-trip: build a ShardManifestV7, populate every
+        // walkable-v8 surface (page_index[*].cid, shards[*].root_cid,
+        // dir_index_cid), encrypt + decrypt, assert every CID hint
+        // survives. This is the load-bearing end-to-end check that the
+        // new fields don't get lost anywhere in the encrypt/decrypt
+        // envelope path.
+        let dek = DekKey::generate();
+        let mut manifest = ShardManifestV7::new(16);
+
+        let shard0_cid = walkable_v8_test_cid(0x01);
+        let shard5_cid = walkable_v8_test_cid(0x02);
+        let page0_cid = walkable_v8_test_cid(0x03);
+        let dir_index_cid = walkable_v8_test_cid(0x04);
+
+        // Stamp the v8 hints on a few shards in page 0.
+        let p0 = manifest.pages.get_mut(&0).unwrap();
+        p0.shards[0].root = Some([0xA0; V7_STORAGE_KEY_LEN]);
+        p0.shards[0].root_cid = Some(shard0_cid);
+        p0.shards[5].root = Some([0xA5; V7_STORAGE_KEY_LEN]);
+        p0.shards[5].root_cid = Some(shard5_cid);
+
+        // Stamp a v8 hint on the page-index entry pointing at page 0.
+        manifest.root.page_index.insert(
+            0,
+            PageRef {
+                etag: Some("\"etag-page-0\"".to_string()),
+                seq: 1,
+                cid: Some(page0_cid),
+            },
+        );
+        // Stamp the dir-index v8 hint (W.9.3 — completes W.9.1b
+        // wire-format extension; previously only `dir_index_etag` +
+        // `dir_index_seq` existed).
+        manifest.root.dir_index_etag = Some("\"etag-dir\"".to_string());
+        manifest.root.dir_index_seq = Some(99);
+        manifest.root.dir_index_cid = Some(dir_index_cid);
+
+        // Round-trip the page through encrypt/decrypt.
+        let ep = EncryptedManifestPage::encrypt(p0, &dek, "bkt-w8")
+            .expect("page encrypts");
+        let decoded_page = ep.decrypt(&dek, "bkt-w8").expect("page decrypts");
+        assert_eq!(decoded_page.shards[0].root_cid, Some(shard0_cid));
+        assert_eq!(decoded_page.shards[5].root_cid, Some(shard5_cid));
+        // Untouched shards stay None.
+        assert_eq!(decoded_page.shards[1].root_cid, None);
+        assert_eq!(decoded_page.shards[15].root_cid, None);
+
+        // Round-trip the root.
+        let er = EncryptedShardManifestV7::encrypt_v7(&manifest.root, &dek, "bkt-w8", 1)
+            .expect("root encrypts");
+        let (decoded_root, _seq) = er.decrypt_v7(&dek, "bkt-w8").expect("root decrypts");
+        assert_eq!(decoded_root.page_index.get(&0).and_then(|r| r.cid), Some(page0_cid));
+        assert_eq!(decoded_root.dir_index_cid, Some(dir_index_cid));
+        // Verify dir_index_etag + dir_index_seq still round-trip alongside
+        // the new dir_index_cid field — defends against accidentally
+        // breaking a sibling field while adding the v8 hint.
+        assert_eq!(decoded_root.dir_index_etag.as_deref(), Some("\"etag-dir\""));
+        assert_eq!(decoded_root.dir_index_seq, Some(99));
+    }
+
+    #[test]
+    fn manifest_root_dir_index_cid_some_round_trips_via_json() {
+        let mut root = ManifestRoot::fresh(16);
+        let cid = walkable_v8_test_cid(0xD1);
+        root.dir_index_etag = Some("\"e\"".to_string());
+        root.dir_index_seq = Some(7);
+        root.dir_index_cid = Some(cid);
+        let json = serde_json::to_vec(&root).expect("encode");
+        let decoded: ManifestRoot = serde_json::from_slice(&json).expect("decode");
+        assert_eq!(decoded.dir_index_cid, Some(cid));
+        assert_eq!(decoded.dir_index_seq, Some(7));
+        assert_eq!(decoded.dir_index_etag.as_deref(), Some("\"e\""));
+    }
+
+    #[test]
+    fn manifest_root_dir_index_cid_none_round_trips_via_json() {
+        let root = ManifestRoot::fresh(16);
+        assert!(root.dir_index_cid.is_none(), "fresh root has no v8 hint");
+        let json = serde_json::to_vec(&root).expect("encode");
+        let decoded: ManifestRoot = serde_json::from_slice(&json).expect("decode");
+        assert_eq!(decoded.dir_index_cid, None);
+        // skip_serializing_if = "Option::is_none" should keep the field
+        // absent in the wire form so cross-version JSON stays minimal.
+        let json_str = String::from_utf8_lossy(&json);
+        assert!(
+            !json_str.contains("dir_index_cid"),
+            "None must not appear on the wire — skip_serializing_if guard \
+             prevents needless bloat (and keeps cross-version JSON byte-stable \
+             when the writer is gated off). got: {}",
+            json_str
+        );
+    }
+
+    #[test]
+    fn manifest_root_legacy_json_without_dir_index_cid_deserializes_to_none() {
+        // BACKWARD-COMPAT GOLD STANDARD (W.4.3 hard-constraint #1):
+        // existing v7 ManifestRoot blobs pinned to IPFS BEFORE this field
+        // was added must deserialize cleanly into the new ManifestRoot
+        // struct, with dir_index_cid = None. Production data must not
+        // break — same property as the PageRef + ShardV7 + ForestFileEntry
+        // legacy tests above.
+        //
+        // The legacy struct mirrors ManifestRoot's pre-W.9.3 shape, with
+        // every existing field present except `dir_index_cid`. A v8 SDK
+        // opening such a manifest must populate the new field as None.
+        #[derive(Serialize, Deserialize)]
+        struct LegacyManifestRoot {
+            version: u8,
+            format: String,
+            num_shards: usize,
+            #[serde(with = "hex_serde")]
+            shard_salt: Vec<u8>,
+            root: String,
+            created_at: i64,
+            modified_at: i64,
+            #[serde(default)]
+            page_index: BTreeMap<PageId, PageRef>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            dir_index_etag: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            dir_index_seq: Option<u64>,
+            // NOTE: deliberately no `dir_index_cid` field — pre-W.9.3 shape.
+        }
+
+        let legacy = LegacyManifestRoot {
+            version: 7,
+            format: "sharded-hamt-v7".to_string(),
+            num_shards: 64,
+            shard_salt: vec![0xAB; 32],
+            root: "/".to_string(),
+            created_at: 1_700_000_000,
+            modified_at: 1_700_000_500,
+            page_index: BTreeMap::new(),
+            dir_index_etag: Some("\"e-pre-v8\"".to_string()),
+            dir_index_seq: Some(13),
+        };
+        let bytes = serde_json::to_vec(&legacy).expect("encode legacy");
+        let modern: ManifestRoot = serde_json::from_slice(&bytes)
+            .expect("legacy ManifestRoot → modern ManifestRoot");
+        assert_eq!(modern.version, 7);
+        assert_eq!(modern.num_shards, 64);
+        assert_eq!(modern.shard_salt, vec![0xAB; 32]);
+        assert_eq!(modern.dir_index_etag.as_deref(), Some("\"e-pre-v8\""));
+        assert_eq!(modern.dir_index_seq, Some(13));
+        // The critical assertion — serde(default) preserves the
+        // no-migration property for existing JSON-pinned ManifestRoot
+        // blobs that pre-date W.9.3.
+        assert_eq!(modern.dir_index_cid, None);
     }
 
 }

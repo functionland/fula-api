@@ -26,7 +26,7 @@ use fula_crypto::{
     },
     sharing::{ShareToken, AcceptedShare, ShareRecipient},
     rotation::{KeyRotationManager, WrappedKeyInfo},
-    wnfs_hamt::BlobBackend,
+    wnfs_hamt::{BlobBackend, BlobPutResult},
     sharded_hamt_forest::ShardedHamtPrivateForest,
     ChunkedEncoder, ChunkedFileMetadata, should_use_chunked,
     CryptoError,
@@ -349,6 +349,19 @@ impl BlobBackend for S3BlobBackend {
     /// the cached `(bucket, key) → cid` mapping. When the flags are off
     /// behavior is byte-identical to pre-Phase-2.4 (single inner call,
     /// same retry policy).
+    ///
+    /// **Walkable-v8 reader (W.9.4)**: HAMT walkers that learned a
+    /// child's `Cid` from its parent's `PointerWire::LinkV2` plaintext
+    /// can call [`get_with_cid_hint`](Self::get_with_cid_hint) instead;
+    /// that variant uses the cold-cache cid-hint offline-fallback path
+    /// (`get_object_with_offline_fallback_known_cid`) so a freshly-
+    /// installed device can walk a v8 forest from the manifest root
+    /// without requiring a prior master-up read to populate the
+    /// warm-cache `(bucket, key) → cid` table. The reader path is NOT
+    /// gated on `walkable_v8_writer_enabled` — the wire-format
+    /// `LinkV2` variant itself is the gate. Buckets written entirely
+    /// under v7 produce no `LinkV2` entries, so no `cid_hint` reaches
+    /// this method, and behaviour falls through to the no-hint branch.
     async fn get(&self, path: &str) -> fula_crypto::Result<Vec<u8>> {
         let mut attempt: u32 = 0;
         loop {
@@ -388,8 +401,27 @@ impl BlobBackend for S3BlobBackend {
     /// Same retry policy as `get`. `put_object` is idempotent on v7 HAMT
     /// node keys — they are content-addressed (blake3 over the plaintext
     /// node), so re-uploading the same bytes at the same path is safe.
-    async fn put(&self, path: &str, bytes: Vec<u8>) -> fula_crypto::Result<()> {
+    ///
+    /// **Walkable-v8 (W.9.2 seam, W.9.3 self-verify):**
+    /// when `Config::walkable_v8_writer_enabled = true`, the master's
+    /// PUT-response ETag is parsed as a CID and locally re-verified
+    /// against `BLAKE3(ciphertext)` via
+    /// `walkable_v8::verify_etag_matches_ciphertext` before being
+    /// surfaced in [`BlobPutResult.cid`]. Mismatches soft-fail to `None`
+    /// (with a rate-limited `tracing::warn!`) so a compromised master
+    /// cannot redirect future offline walkers to attacker-controlled
+    /// IPFS bytes. When the flag is `false` (the default during the
+    /// v0.6.x rollout), the parse path is skipped entirely and `cid` is
+    /// always `None` — write semantics stay byte-identical to v0.5.
+    ///
+    /// Soft-fail rationale: the PUT itself succeeded, the chunk is stored
+    /// and pinned, only the offline-walk hint is missing; readers fall
+    /// back to the storage-key path. Hard-erroring on parse failure
+    /// would regress the v7 write path under any deploy where master's
+    /// etag format drifts.
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> fula_crypto::Result<BlobPutResult> {
         let mut attempt: u32 = 0;
+        let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
         loop {
             attempt += 1;
             // Clone the body each attempt: reqwest consumes the body, and we
@@ -398,7 +430,26 @@ impl BlobBackend for S3BlobBackend {
             // negligible on the happy path too.
             let body = bytes.clone();
             match self.inner.put_object(&self.bucket, path, body).await {
-                Ok(_) => return Ok(()),
+                Ok(result) => {
+                    // The CID returned here is from the *successful* PUT
+                    // attempt — the loop only reaches this `Ok` arm on a
+                    // 200 response. Stale CIDs from prior retried attempts
+                    // never propagate.
+                    let cid = if walkable_v8 {
+                        crate::walkable_v8::verify_etag_matches_ciphertext(
+                            &result.etag,
+                            &bytes,
+                            &self.bucket,
+                            path,
+                        )
+                    } else {
+                        // Writer flag off — skip the parse entirely so write
+                        // semantics stay byte-identical to v0.5. Readers fall
+                        // through to the storage-key path.
+                        None
+                    };
+                    return Ok(BlobPutResult { cid });
+                }
                 Err(e)
                     if attempt < BLOB_BACKEND_MAX_ATTEMPTS
                         && crate::multipart::is_transient(&e) =>
@@ -409,6 +460,67 @@ impl BlobBackend for S3BlobBackend {
                         attempt,
                         error = %e,
                         "S3BlobBackend::put retrying transient 5xx"
+                    );
+                    BLOB_BACKEND_RETRY_COUNT
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tokio::time::sleep(blob_backend_retry_delay()).await;
+                    continue;
+                }
+                Err(e) => return Err(client_err_to_crypto(e)),
+            }
+        }
+    }
+
+    /// Walkable-v8 reader (W.9.4) — fetch with a content-address hint
+    /// so a freshly-installed device can walk a v8 forest from a
+    /// just-decrypted parent's `LinkV2` pointer when master is
+    /// unreachable, without requiring the warm-cache `(bucket, key)
+    /// → cid` table the no-hint variant depends on.
+    ///
+    /// When `cid_hint` is `Some(_)` this routes through
+    /// [`FulaClient::get_object_with_offline_fallback_known_cid`]: master
+    /// is tried first (fast path; identical latency), and only on a
+    /// `MasterUnreachable` error does the gateway race engage with
+    /// the supplied CID. The gateway-race body is content-verified
+    /// against `cid_hint` via `verify_cid_against_bytes` before
+    /// returning, so a malicious or buggy gateway cannot inject foreign
+    /// bytes here. The post-fetch AEAD decrypt + storage_key recompute
+    /// in `V7NodeStore::decrypt_and_verify` is the additional defense
+    /// against a malicious parent that pointed `LinkV2` at the right
+    /// CID but the wrong storage_key.
+    ///
+    /// When `cid_hint` is `None` the call is byte-identical to
+    /// [`get`](Self::get): legacy `Stored(StorageKey)` parent pointers
+    /// (lazy-migration arm) take this branch and the offline path
+    /// degrades to the warm-cache lookup as before.
+    async fn get_with_cid_hint(
+        &self,
+        path: &str,
+        cid_hint: Option<&cid::Cid>,
+    ) -> fula_crypto::Result<Vec<u8>> {
+        let cid = match cid_hint {
+            Some(c) => c,
+            None => return self.get(path).await,
+        };
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match self
+                .inner
+                .get_object_with_offline_fallback_known_cid(&self.bucket, path, cid)
+                .await
+            {
+                Ok(result) => return Ok(result.inner.data.to_vec()),
+                Err(e)
+                    if attempt < BLOB_BACKEND_MAX_ATTEMPTS
+                        && crate::multipart::is_transient(&e) =>
+                {
+                    tracing::debug!(
+                        bucket = %self.bucket,
+                        path = %path,
+                        attempt,
+                        error = %e,
+                        "S3BlobBackend::get_with_cid_hint retrying transient 5xx"
                     );
                     BLOB_BACKEND_RETRY_COUNT
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -437,12 +549,48 @@ impl BlobBackend for S3BlobBackend {
         Ok(result.inner.data.to_vec())
     }
 
-    async fn put(&self, path: &str, bytes: Vec<u8>) -> fula_crypto::Result<()> {
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> fula_crypto::Result<BlobPutResult> {
+        // W.9.3: same self-verify gate as the non-wasm impl above. The
+        // wasm path has no retry loop so we clone the body up-front
+        // (the post-PUT verify needs the bytes; `put_object` consumes
+        // them) before dispatching.
+        let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
+        let body = if walkable_v8 { Some(bytes.clone()) } else { None };
+        let bucket = &self.bucket;
         self.inner
             .put_object(&self.bucket, path, bytes)
             .await
-            .map(|_| ())
+            .map(|result| {
+                let cid = if walkable_v8 {
+                    let cipher = body.as_deref().unwrap_or(&[]);
+                    crate::walkable_v8::verify_etag_matches_ciphertext(
+                        &result.etag,
+                        cipher,
+                        bucket,
+                        path,
+                    )
+                } else {
+                    None
+                };
+                BlobPutResult { cid }
+            })
             .map_err(client_err_to_crypto)
+    }
+
+    /// Walkable-v8 reader (W.9.4) on wasm32 — the offline-fallback
+    /// infrastructure (block_cache, gateway pool, parking_lot) is
+    /// compiled out on the browser target, so the cid-hint variant
+    /// degrades to the no-hint path. The trait-method signature is
+    /// preserved for API symmetry across targets so `V7NodeStore`
+    /// compiles unchanged on both. When walkable-v8 grows wasm-side
+    /// gateway-race support in a later phase this method body will
+    /// route through it; today it's a thin delegate.
+    async fn get_with_cid_hint(
+        &self,
+        path: &str,
+        _cid_hint: Option<&cid::Cid>,
+    ) -> fula_crypto::Result<Vec<u8>> {
+        self.get(path).await
     }
 }
 
@@ -1074,17 +1222,102 @@ impl EncryptedClient {
     }
 
     /// Get and decrypt an object using the storage key directly
-    /// 
+    ///
     /// Use this when you already have the obfuscated storage key
     /// (e.g., from list_objects_decrypted)
-    /// 
+    ///
     /// Handles both single-block and chunked objects automatically.
     pub async fn get_object_decrypted_by_storage_key(
         &self,
         bucket: &str,
         storage_key: &str,
     ) -> Result<Bytes> {
-        // Resolve the forest entry FIRST so we can fall back to its
+        // Public API: caller has only a storage_key, so we look up the
+        // forest entry on their behalf. v7 sharded HAMT pays the O(N)
+        // `find_by_storage_key` linear scan here — see #91.
+        //
+        // Callers that already hold the resolved `ForestFileEntry` (e.g.
+        // `get_object_flat`'s v7 branch, which walks the HAMT once via
+        // `get_file(path)` to translate a logical path into an entry)
+        // should use [`Self::get_object_decrypted_by_entry`] instead and
+        // skip this redundant scan.
+        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
+        self.get_object_decrypted_inner(bucket, storage_key, forest_entry).await
+    }
+
+    /// Entry-aware variant of [`Self::get_object_decrypted_by_storage_key`]
+    /// for callers that have already resolved the [`ForestFileEntry`]
+    /// (e.g. `get_object_flat`'s v7 branch via `get_file(path)`).
+    ///
+    /// **Why this exists** (#91): the public `_by_storage_key` API does an
+    /// O(N) `find_by_storage_key` linear scan over every shard's HAMT to
+    /// recover the entry. For v7 sharded buckets that already walked the
+    /// HAMT once to resolve the user's path, this is a redundant scan.
+    /// On large buckets — and especially on cold-cache offline reads
+    /// where each internal-node fetch is a multi-second gateway race —
+    /// the scan dwarfs the actual file fetch. Passing the entry forward
+    /// drops every encrypted GET back to O(log N) HAMT traversal cost.
+    ///
+    /// **Single-walk safety** (audited): the post-fix path acquires the
+    /// `forest_arc` read guard exactly once via `get_file(path)` in
+    /// `get_object_flat` (line 7218-7224); the pre-fix path would have
+    /// acquired a SECOND independent read guard later via
+    /// `forest_entry_lookup` → `find_by_storage_key`. The two guards
+    /// were always returning the same data because both walked the same
+    /// `forest_arc`, but a writer that interleaved between the two guard
+    /// acquisitions could have caused the second read to observe a
+    /// just-stamped `storage_cid` that the first read missed (or vice
+    /// versa). Skipping the second guard cannot produce a wrong-bytes
+    /// case: AEAD AAD `fula:v4:content:{storage_key}` binds bytes to
+    /// storage_key independently of any race; a stale `storage_cid` of
+    /// `None` just falls through to the no-hint offline-fallback path,
+    /// which is safety-equivalent to today's behavior on legacy entries.
+    ///
+    /// **Cross-platform**: shared encryption.rs path; no `cfg`-split.
+    async fn get_object_decrypted_by_entry(
+        &self,
+        bucket: &str,
+        entry: ForestFileEntry,
+    ) -> Result<Bytes> {
+        let storage_key = entry.storage_key.clone();
+        self.get_object_decrypted_inner(bucket, &storage_key, Some(entry)).await
+    }
+
+    /// Shared body of `get_object_decrypted_by_storage_key` and
+    /// `get_object_decrypted_by_entry`. Takes the (optionally pre-resolved)
+    /// `ForestFileEntry` directly so both code paths can reuse the same
+    /// decrypt + content-verify + chunk-dispatch logic.
+    ///
+    /// Pre-resolved entry: `get_object_flat`'s v7 branch already walked
+    /// the HAMT once and has the entry in hand — pass `Some(entry)` and
+    /// skip the O(N) scan.
+    ///
+    /// Lookup: `get_object_decrypted_by_storage_key` only has a
+    /// storage_key — does the lookup itself, which may cost an O(N)
+    /// scan on v7 sharded buckets. Same as today's behavior.
+    ///
+    /// `forest_entry: None` is the share-token / pre-forest-write path
+    /// where no forest entry exists; the body falls back to HTTP-header
+    /// metadata for decryption. Unchanged from the pre-#91 behavior.
+    async fn get_object_decrypted_inner(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        forest_entry: Option<ForestFileEntry>,
+    ) -> Result<Bytes> {
+        // Defense-in-depth: if the caller passed an entry, its
+        // storage_key must match the storage_key argument. Compiled out
+        // in release builds; catches caller bugs in debug.
+        debug_assert!(
+            forest_entry
+                .as_ref()
+                .map(|e| e.storage_key == storage_key)
+                .unwrap_or(true),
+            "get_object_decrypted_inner: entry.storage_key != storage_key argument"
+        );
+
+        // Forest-entry fallback rationale (preserved from pre-#91 body):
+        // when the forest entry is available, we can fall back to its
         // (privacy-preserving, AEAD-protected) `user_metadata` when the
         // HTTP `x-fula-encryption` header is unavailable — i.e. on the
         // offline / warm-cache / cold-start paths where the body is
@@ -1106,7 +1339,6 @@ impl EncryptedClient {
         //     is the canonical source-of-truth). Forest entry is the
         //     fallback that turns gateway-served bytes into something
         //     decryptable.
-        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
 
         // Phase 2.4 — route through the offline-fallback wrapper so a
         // master-down read (per `is_master_unreachable_error`) lands on
@@ -1114,6 +1346,42 @@ impl EncryptedClient {
         // path carries the same ciphertext bytes but an empty
         // `metadata` map — the lookup helpers below pick up the
         // metadata from the forest entry instead.
+        //
+        // Walkable-v8 (#90, 2026-05-09): when the forest entry carries a
+        // `storage_cid` (single-block encrypted uploads stamp this at
+        // `put_object_encrypted_with_type` after master's PUT-response
+        // self-verify), forward the CID through the `_known_cid`
+        // variant. That activates the cold-cache gateway-race path:
+        // even when both master is unreachable AND the warm block cache
+        // is empty (= cold-start scenario), the gateway race fetches
+        // the encrypted body by CID and content-verifies before handing
+        // it to the AEAD decrypt step below. Without this branch,
+        // single-block-encrypted cold-cache reads would fall through to
+        // the no-hint fallback, which only checks the warm cache by
+        // storage_key and then errors — exactly the failure mode the
+        // walkable-v8 fresh-bucket cold-walk test surfaced.
+        //
+        // Native-only: `_known_cid` is gated to non-wasm (block_cache +
+        // gateway_fetch infrastructure isn't compiled into wasm builds).
+        // wasm32 keeps the legacy no-hint path; cold-cache offline reads
+        // are not yet supported on browser SDKs.
+        #[cfg(not(target_arch = "wasm32"))]
+        let result = {
+            let cid_hint = forest_entry.as_ref().and_then(|e| e.storage_cid.as_ref());
+            match cid_hint {
+                Some(cid) => self
+                    .inner
+                    .get_object_with_offline_fallback_known_cid(bucket, storage_key, cid)
+                    .await?
+                    .inner,
+                None => self
+                    .inner
+                    .get_object_with_offline_fallback(bucket, storage_key)
+                    .await?
+                    .inner,
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
         let result = self
             .inner
             .get_object_with_offline_fallback(bucket, storage_key)
@@ -1398,6 +1666,18 @@ impl EncryptedClient {
                 let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk_index as u32);
                 let client = self.inner.clone();
                 let bucket = bucket.to_string();
+                // Walkable-v8 (W.9.4-A2 / task #32): the chunked
+                // metadata may carry a per-chunk CID hint (see
+                // `ChunkedFileMetadata.chunk_cids` — populated by the
+                // writer when `walkable_v8_writer_enabled` was on).
+                // When present, the cold-cache offline fetch can race
+                // gateways for the chunk by CID even on a fresh
+                // device with no warm-cache `(bucket, chunk_key) →
+                // cid` mapping. When absent (legacy chunked file or
+                // writer flag off), falls through to the warm-cache
+                // path which requires a prior master-up read.
+                #[cfg(not(target_arch = "wasm32"))]
+                let chunk_cid_hint = chunked_meta.chunk_cid(chunk_index as u32);
                 async move {
                     // Phase 2.4 — route per-chunk fetches through the
                     // offline-fallback wrapper. Chunks themselves carry
@@ -1408,13 +1688,29 @@ impl EncryptedClient {
                     // header round-trip needed. Bao streaming verifier
                     // catches truncation / tampering regardless of
                     // which channel served the bytes.
+                    //
+                    // Walkable-v8 (W.9.4-A2): when the chunked metadata
+                    // carries a CID hint for THIS chunk, use the cold-
+                    // cache cid-hint path so a fresh device with no
+                    // warm-cache mapping can still fetch via gateway
+                    // race when master is down. Otherwise fall through
+                    // to the warm-cache path (legacy / pre-W.9.4-A2
+                    // chunked files).
                     #[cfg(not(target_arch = "wasm32"))]
                     let data = fetch_chunk_with_timeout(
                         async {
-                            client
-                                .get_object_with_offline_fallback(&bucket, &chunk_key)
-                                .await
-                                .map(|r| r.inner.data)
+                            match chunk_cid_hint {
+                                Some(cid) => client
+                                    .get_object_with_offline_fallback_known_cid(
+                                        &bucket, &chunk_key, &cid,
+                                    )
+                                    .await
+                                    .map(|r| r.inner.data),
+                                None => client
+                                    .get_object_with_offline_fallback(&bucket, &chunk_key)
+                                    .await
+                                    .map(|r| r.inner.data),
+                            }
                         },
                         chunk_index as u32,
                         per_chunk_timeout,
@@ -2575,6 +2871,11 @@ impl EncryptedClient {
 
                         let now = chrono::Utc::now().timestamp();
                         let dir_index_etag = manifest.root.dir_index_etag.clone();
+                        // Walkable-v8 (W.9.4): pluck `dir_index_cid` from
+                        // the just-decrypted root and pass it through.
+                        // Cloned because the manifest is moved into
+                        // `from_manifest` below.
+                        let dir_index_cid = manifest.root.dir_index_cid;
                         let dir_index_seq_pin = manifest.root.dir_index_seq;
                         let mut forest = ShardedHamtPrivateForest::from_manifest(
                             manifest,
@@ -2590,6 +2891,7 @@ impl EncryptedClient {
                                 bucket,
                                 &forest_dek,
                                 dir_index_etag.as_deref(),
+                                dir_index_cid.as_ref(),
                                 dir_index_seq_pin,
                             )
                             .await?
@@ -3604,6 +3906,11 @@ impl EncryptedClient {
         // migration gap where deferred-upload paths leave a bucket on
         // legacy=true plaintext until the next root commit.
         let lookup_h_hex = self.compute_bucket_lookup_h_hex(bucket);
+        // Walkable-v8 (W.9.3): hoist the writer flag above both the page
+        // loop and the dir-index commit so every Phase 1.5/1.6 PUT in
+        // this flush sees the same Config snapshot. Reading it once up
+        // front also avoids a per-PUT atomic read of the config field.
+        let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
         for page_id in dirty_pages.iter().copied() {
             let page = manifest_snapshot.pages.get_mut(&page_id)
                 .ok_or_else(|| ClientError::Encryption(
@@ -3630,6 +3937,18 @@ impl EncryptedClient {
             let envelope = EncryptedManifestPage::encrypt(page, &forest_dek, bucket)
                 .map_err(ClientError::Encryption)?;
             let blob = envelope.to_bytes().map_err(ClientError::Encryption)?;
+            // Walkable-v8 (W.9.3): pre-compute `BLAKE3(blob)` so the
+            // post-PUT self-verify can compare master's ETag-attested CID
+            // to a CID we computed locally (defense-in-depth against a
+            // compromised master attesting an attacker-chosen CID). Cheap
+            // ~1 GB/s SIMD hash; only computed when the writer flag is on
+            // so v0.5-default behaviour stays byte-identical. `walkable_v8`
+            // hoisted to flush-loop scope above so Phase 1.6 below sees it.
+            let expected_page_cid = if walkable_v8 {
+                Some(crate::walkable_v8::local_blake3_raw_cid(&blob))
+            } else {
+                None
+            };
             let page_key = derive_manifest_page_key(&forest_dek, bucket, &shard_salt, page_id);
             let metadata = ObjectMetadata::new()
                 .with_content_type("application/octet-stream")
@@ -3714,9 +4033,24 @@ impl EncryptedClient {
             ) {
                 tracing::warn!(%bucket, page_id, error = %e, "WAL append post-PUT PageWrote failed");
             }
+            // Walkable-v8 (W.9.3): stamp the CID hint into the new
+            // PageRef when the writer flag is on AND master's etag both
+            // parses as a CID and matches our locally-computed
+            // BLAKE3(blob). On any failure, falls back to `cid: None`
+            // — readers walk via the storage_key path. The hash was
+            // pre-computed before `Bytes::from(blob)` consumed the body.
+            let page_cid = match (walkable_v8, expected_page_cid, etag.as_deref()) {
+                (true, Some(expected), Some(et)) => {
+                    crate::walkable_v8::verify_etag_against_expected_cid(
+                        et, expected, bucket, &page_key,
+                    )
+                }
+                _ => None,
+            };
             manifest_snapshot.root.page_index.insert(page_id, PageRef {
                 etag,
                 seq: page.seq,
+                cid: page_cid,
             });
         }
 
@@ -3751,6 +4085,15 @@ impl EncryptedClient {
                 next_dir_seq,
             ).map_err(ClientError::Encryption)?;
             let blob = envelope.to_bytes().map_err(ClientError::Encryption)?;
+            // Walkable-v8 (W.9.3): pre-compute `BLAKE3(dir-index blob)` for
+            // post-PUT self-verify. Reuses the same per-flush gate value
+            // captured before Phase 1.5 above (every page in this flush
+            // shares the same Config.walkable_v8_writer_enabled snapshot).
+            let expected_dir_cid = if walkable_v8 {
+                Some(crate::walkable_v8::local_blake3_raw_cid(&blob))
+            } else {
+                None
+            };
             let dir_key = derive_dir_index_key(&forest_dek, bucket);
             let metadata = ObjectMetadata::new()
                 .with_content_type("application/octet-stream")
@@ -3818,8 +4161,18 @@ impl EncryptedClient {
             ) {
                 tracing::warn!(%bucket, error = %e, "WAL append post-PUT DirIndexWrote failed");
             }
+            // Walkable-v8 (W.9.3): stamp dir_index_cid via self-verify.
+            let dir_index_cid = match (walkable_v8, expected_dir_cid, new_dir_etag.as_deref()) {
+                (true, Some(expected), Some(et)) => {
+                    crate::walkable_v8::verify_etag_against_expected_cid(
+                        et, expected, bucket, &dir_key,
+                    )
+                }
+                _ => None,
+            };
             manifest_snapshot.root.dir_index_etag = new_dir_etag;
             manifest_snapshot.root.dir_index_seq = Some(next_dir_seq);
+            manifest_snapshot.root.dir_index_cid = dir_index_cid;
             Some(next_dir_seq)
         } else {
             None
@@ -4098,11 +4451,19 @@ impl EncryptedClient {
             // and the CID-hint method itself is too. On wasm we just
             // route through the no-hint wrapper, which already handles
             // master-up (the only fetch path supported on wasm anyway).
+            // Walkable-v8 (W.9.4): prefer the explicit `page_ref.cid`
+            // field stamped by the W.9.3 writer (which self-verified
+            // the master-attested CID against `BLAKE3(page_blob)` at
+            // write time). Etag-parse fallback covers pre-W.9.3 buckets
+            // and remains correct only because master uses
+            // `cid.to_string()` as the etag — but the explicit field is
+            // strictly more trustworthy. See helper docs for the
+            // precedence rationale + the unit test that pins it.
             #[cfg(not(target_arch = "wasm32"))]
-            let cid_hint: Option<cid::Cid> = page_ref
-                .etag
-                .as_deref()
-                .and_then(|s| s.parse::<cid::Cid>().ok());
+            let cid_hint: Option<cid::Cid> = crate::walkable_v8::cid_hint_from_manifest_field_or_etag(
+                page_ref.cid.as_ref(),
+                page_ref.etag.as_deref(),
+            );
             #[cfg(not(target_arch = "wasm32"))]
             let (blob, observed_etag) = match cid_hint {
                 Some(cid) => self
@@ -4201,9 +4562,26 @@ impl EncryptedClient {
         // reflect master's actual page objects, not the manifest's possibly-
         // stale recording. Subsequent Phase 1.5 conditional PUTs use these
         // values for `If-Match` and converge with master's state.
+        //
+        // Walkable-v8 (#52): the override path previously hardcoded
+        // `cid: None`, dropping any recoverable CID hint from master's
+        // returned etag. That left the in-memory `PageRef.cid` empty
+        // until the next flush re-stamped it — degrading W.9.4 offline
+        // reads to v0.5 fidelity in the load-after-master-divergence
+        // window. Master returns `cid.to_string()` as the etag for v8
+        // page PUTs (per the W.9.3 writer contract), so the same
+        // `cid_hint_from_manifest_field_or_etag` helper that the
+        // reader uses elsewhere recovers the CID here.
         let mut root = root;
         for (page_id, etag, seq) in page_overrides {
-            root.page_index.insert(page_id, PageRef { etag, seq });
+            #[cfg(not(target_arch = "wasm32"))]
+            let cid = crate::walkable_v8::cid_hint_from_manifest_field_or_etag(
+                None,
+                etag.as_deref(),
+            );
+            #[cfg(target_arch = "wasm32")]
+            let cid: Option<cid::Cid> = None;
+            root.page_index.insert(page_id, PageRef { etag, seq, cid });
         }
         ShardManifestV7::from_root_and_pages(root, pages)
             .map_err(ClientError::Encryption)
@@ -4227,6 +4605,7 @@ impl EncryptedClient {
         bucket: &str,
         forest_dek: &fula_crypto::keys::DekKey,
         expected_etag: Option<&str>,
+        expected_cid: Option<&cid::Cid>,
         expected_seq: Option<u64>,
     ) -> std::result::Result<Option<(DirectoryIndex, u64, Option<String>)>, ClientError> {
         let key = derive_dir_index_key(forest_dek, bucket);
@@ -4244,12 +4623,26 @@ impl EncryptedClient {
         // warm-cache mapping can still race the gateway pool. The
         // master-up path is identical regardless of hint.
         //
+        // Walkable-v8 (W.9.4): the explicit `expected_cid` argument
+        // (= `manifest.root.dir_index_cid`, stamped + self-verified
+        // by the W.9.3 writer) takes precedence over `expected_etag`
+        // when present. The etag-parse fallback covers buckets
+        // committed pre-W.9.3 (when only `dir_index_etag` was
+        // populated) and remains correct because master uses
+        // `cid.to_string()` as the etag — but the explicit field is
+        // strictly more trustworthy: it survived the writer's
+        // self-verify-against-BLAKE3(blob) step, while the etag
+        // fallback only happens to be a CID by master's current
+        // convention.
+        //
         // Native-only: `cid` crate + the CID-hint method are gated to
         // non-wasm targets. wasm builds keep the no-hint wrapper
         // (master-only path).
         #[cfg(not(target_arch = "wasm32"))]
-        let cid_hint: Option<cid::Cid> =
-            expected_etag.and_then(|s| s.parse::<cid::Cid>().ok());
+        let cid_hint: Option<cid::Cid> = crate::walkable_v8::cid_hint_from_manifest_field_or_etag(
+            expected_cid,
+            expected_etag,
+        );
         // Helper: turn the offline-fallback GetObjectResult into
         // `(blob, Option<observed_etag>)`. Empty etag → None. Used by both
         // native and wasm branches below so the etag-capture stays uniform.
@@ -4672,6 +5065,15 @@ impl EncryptedClient {
                     });
                 }
             };
+            // Walkable-v8 (W.9.3): mirror the flush_forest path's pre-PUT
+            // hash so the v1→v7 migration's freshly-written pages also
+            // carry CID hints when the writer flag is on.
+            let walkable_v8_mig = self.inner.config().walkable_v8_writer_enabled;
+            let expected_page_cid = if walkable_v8_mig {
+                Some(crate::walkable_v8::local_blake3_raw_cid(&blob))
+            } else {
+                None
+            };
             let page_key = derive_manifest_page_key(forest_dek, bucket, &shard_salt, page_id);
             // If-None-Match=*: migration uses a fresh random shard_salt, so each
             // page key is first-ever on this bucket. Any 412 here means another
@@ -4714,9 +5116,20 @@ impl EncryptedClient {
             ) {
                 tracing::warn!(%bucket, page_id, error = %e, "migration: WAL append post-PUT PageWrote failed");
             }
+            // Walkable-v8 (W.9.3): same self-verify pattern as the
+            // flush_forest path above.
+            let page_cid = match (walkable_v8_mig, expected_page_cid, etag.as_deref()) {
+                (true, Some(expected), Some(et)) => {
+                    crate::walkable_v8::verify_etag_against_expected_cid(
+                        et, expected, bucket, &page_key,
+                    )
+                }
+                _ => None,
+            };
             manifest_snapshot.root.page_index.insert(page_id, PageRef {
                 etag,
                 seq: page.seq,
+                cid: page_cid,
             });
         }
 
@@ -4751,6 +5164,15 @@ impl EncryptedClient {
                     reason: format!("encrypt migration dir-index failed: {}", e),
                 });
             }
+        };
+        // Walkable-v8 (W.9.3): mirror flush_forest's pre-PUT hash for
+        // the dir-index PUT so v1→v7 migrations also stamp dir_index_cid
+        // when the writer flag is on.
+        let walkable_v8_dir_mig = self.inner.config().walkable_v8_writer_enabled;
+        let expected_dir_index_cid = if walkable_v8_dir_mig {
+            Some(crate::walkable_v8::local_blake3_raw_cid(&dir_index_blob))
+        } else {
+            None
         };
         let dir_index_key = derive_dir_index_key(forest_dek, bucket);
         // Unconditional overwrite is required: the dir-index key is stable
@@ -4790,8 +5212,23 @@ impl EncryptedClient {
         ) {
             tracing::warn!(%bucket, error = %e, "migration: WAL append post-PUT DirIndexWrote failed");
         }
+        // Walkable-v8 (W.9.3): stamp dir_index_cid via self-verify, same
+        // pattern as flush_forest's Phase 1.6 above.
+        let dir_index_cid_mig = match (
+            walkable_v8_dir_mig,
+            expected_dir_index_cid,
+            new_dir_index_etag.as_deref(),
+        ) {
+            (true, Some(expected), Some(et)) => {
+                crate::walkable_v8::verify_etag_against_expected_cid(
+                    et, expected, bucket, &dir_index_key,
+                )
+            }
+            _ => None,
+        };
         manifest_snapshot.root.dir_index_etag = new_dir_index_etag;
         manifest_snapshot.root.dir_index_seq = Some(dir_index_seq);
+        manifest_snapshot.root.dir_index_cid = dir_index_cid_mig;
 
         let manifest_seq: u64 = 1;
         let manifest_data = match EncryptedShardManifestV7::encrypt_v7(
@@ -5042,15 +5479,23 @@ impl EncryptedClient {
         let is_chunked_upload = should_use_chunked(data.len());
 
         // Check if we need chunked upload (for IPFS block size limit).
-        // Both branches return `(PutObjectResult, enc_metadata_json)` so
-        // the post-upload code below can stash the JSON onto the forest
-        // entry's `user_metadata`. That stash is the load-bearing change
-        // for offline / cold-start encrypted reads: the forest blob is
+        //
+        // Both branches return `(PutObjectResult, enc_metadata_json,
+        // Option<Cid>)`. The third element is walkable-v8 (W.9.3): the
+        // verified CID of the index/single object, which the caller
+        // stamps into `ForestFileEntry.storage_cid`.
+        //
+        // The `enc_metadata_json` stash is the load-bearing change for
+        // offline / cold-start encrypted reads: the forest blob is
         // AEAD-encrypted with `forest_dek` (derived from the user's
         // KEK), so the metadata travels privately, while making the
         // SDK self-sufficient when HTTP user-metadata headers are
         // unavailable (gateway path, warm-cache path).
-        let (result, enc_metadata_json): (PutObjectResult, String) = if is_chunked_upload {
+        let (result, enc_metadata_json, index_cid_opt): (
+            PutObjectResult,
+            String,
+            Option<cid::Cid>,
+        ) = if is_chunked_upload {
             // CHUNKED UPLOAD: Split into chunks under IPFS 1MB limit
             self.put_object_chunked_internal(
                 bucket,
@@ -5087,6 +5532,17 @@ impl EncryptedClient {
                 .with_metadata("x-fula-encrypted", "true")
                 .with_metadata("x-fula-encryption", &enc_metadata_str);
 
+            // Walkable-v8 (W.9.3): pre-compute `BLAKE3(ciphertext)` for
+            // post-PUT self-verify before `Bytes::from(ciphertext)`
+            // consumes the buffer. Skip when the flag is off so the
+            // hash isn't computed for v0.5-default writes.
+            let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
+            let expected_obj_cid = if walkable_v8 {
+                Some(crate::walkable_v8::local_blake3_raw_cid(&ciphertext))
+            } else {
+                None
+            };
+
             let put_result = if let Some(ref pinning) = self.pinning {
                 self.inner.put_object_with_metadata_and_pinning(
                     bucket,
@@ -5104,8 +5560,31 @@ impl EncryptedClient {
                     Some(metadata),
                 ).await?
             };
-            (put_result, enc_metadata_str)
+
+            // Walkable-v8 (W.9.3): verify and surface the CID for the
+            // caller to stamp into ForestFileEntry.storage_cid. None on
+            // any failure path — readers fall back to the storage_key
+            // path.
+            let cid = match (walkable_v8, expected_obj_cid) {
+                (true, Some(expected)) => crate::walkable_v8::verify_etag_against_expected_cid(
+                    &put_result.etag,
+                    expected,
+                    bucket,
+                    &storage_key,
+                ),
+                _ => None,
+            };
+            (put_result, enc_metadata_str, cid)
         };
+
+        // Walkable-v8 (W.9.3): stamp the index/single-object CID hint
+        // onto the forest entry BEFORE upsert. Offline readers walk
+        // ForestFileEntry → storage_cid → fetch via gateway race when
+        // master is down. None when the writer flag is off or
+        // self-verify failed; reads fall through to the storage_key
+        // path. Per-chunk hints are not surfaced — that needs a
+        // ChunkedFileMetadata wire-format extension (followup #32).
+        forest_entry.storage_cid = index_cid_opt;
 
         // Stash the encryption metadata onto the forest entry. The forest
         // blob is AEAD-encrypted with `forest_dek` (derived from user's
@@ -5248,6 +5727,14 @@ impl EncryptedClient {
     /// powers the offline / cold-start decrypt paths without leaking
     /// any plaintext (the JSON only travels inside the AEAD-encrypted
     /// forest blob).
+    /// Walkable-v8 (W.9.3): the third tuple element is the parsed CID
+    /// of the **index object** (the small JSON metadata blob master
+    /// returns the etag for at the bucket-key path), self-verified
+    /// against `BLAKE3(index_body)`. `Some(cid)` when the writer flag
+    /// is on and verification succeeds; `None` otherwise. Caller
+    /// stamps it into `ForestFileEntry.storage_cid`. Per-chunk CIDs
+    /// are NOT surfaced — that needs a `ChunkedFileMetadata` wire
+    /// format extension (followup task #32).
     async fn put_object_chunked_internal(
         &self,
         bucket: &str,
@@ -5257,7 +5744,7 @@ impl EncryptedClient {
         wrapped_dek: &EncryptedData,
         encrypted_meta: &EncryptedPrivateMetadata,
         kek_version: u32,
-    ) -> Result<(PutObjectResult, String)> {
+    ) -> Result<(PutObjectResult, String, Option<cid::Cid>)> {
         // Create chunked encoder with AAD binding chunks to storage key
         let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
         let mut encoder = ChunkedEncoder::with_aad(dek.clone(), aad_prefix);
@@ -5267,13 +5754,21 @@ impl EncryptedClient {
             .map_err(ClientError::Encryption)?;
         
         // Finalize to get last chunk and metadata
-        let (final_chunk, chunked_metadata, _outboard) = encoder.finalize()
+        let (final_chunk, mut chunked_metadata, _outboard) = encoder.finalize()
             .map_err(ClientError::Encryption)?;
-        
+
         if let Some(chunk) = final_chunk {
             all_chunks.push(chunk);
         }
-        
+
+        // Walkable-v8 (W.9.4-A2 / task #32): per-chunk CID hints for
+        // offline reads. Read the writer flag once up front; use it
+        // both for the per-chunk pre-PUT BLAKE3 hash and for the
+        // post-PUT verify. When off, every chunk's verified CID stays
+        // None and the metadata's `chunk_cids` Vec stays empty
+        // (skip_serializing_if keeps it off the wire).
+        let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
+
         // Upload chunks in parallel with bounded concurrency. Using
         // futures::stream::buffer_unordered rather than tokio::spawn so the
         // same code runs on wasm32 (where tokio has no multi-thread runtime).
@@ -5286,13 +5781,25 @@ impl EncryptedClient {
                 .with_metadata("x-fula-chunk", "true")
                 .with_metadata("x-fula-chunk-index", &chunk.index.to_string());
 
+            // W.9.4-A2: pre-compute the chunk's expected CID before
+            // `chunk.ciphertext` is moved into the PUT call. `Bytes`
+            // cloning is cheap (Arc-based) so the post-PUT verify
+            // doesn't re-hash the body — we already have the
+            // expected CID from this pre-computation.
+            let expected_chunk_cid = if walkable_v8 {
+                Some(crate::walkable_v8::local_blake3_raw_cid(&chunk.ciphertext))
+            } else {
+                None
+            };
+            let chunk_index_for_collect = chunk.index;
+
             let client = self.inner.clone();
             let bucket = bucket.to_string();
             let pinning = pinning.clone();
             let chunk_key_ret = chunk_key.clone();
 
             async move {
-                if let Some(ref pin) = pinning {
+                let put_result = if let Some(ref pin) = pinning {
                     client.put_object_with_metadata_and_pinning(
                         &bucket,
                         &chunk_key,
@@ -5300,31 +5807,59 @@ impl EncryptedClient {
                         Some(chunk_metadata),
                         &pin.endpoint,
                         &pin.token,
-                    ).await?;
+                    ).await?
                 } else {
                     client.put_object_with_metadata(
                         &bucket,
                         &chunk_key,
                         chunk.ciphertext,
                         Some(chunk_metadata),
-                    ).await?;
-                }
-                Ok::<String, ClientError>(chunk_key_ret)
+                    ).await?
+                };
+                // W.9.4-A2: verify master's etag-attested CID against
+                // the pre-computed BLAKE3(ciphertext). Mismatch
+                // soft-fails to None — chunk PUT succeeded, only the
+                // offline-walk hint for THIS chunk is missing; the
+                // reader falls back to storage_key for that chunk.
+                let chunk_cid = match (walkable_v8, expected_chunk_cid) {
+                    (true, Some(expected)) => crate::walkable_v8::verify_etag_against_expected_cid(
+                        &put_result.etag,
+                        expected,
+                        &bucket,
+                        &chunk_key,
+                    ),
+                    _ => None,
+                };
+                Ok::<(String, u32, Option<cid::Cid>), ClientError>((
+                    chunk_key_ret,
+                    chunk_index_for_collect,
+                    chunk_cid,
+                ))
             }
         });
 
-        let results: Vec<std::result::Result<String, ClientError>> = futures::stream::iter(futs)
-            .buffer_unordered(Self::MAX_CONCURRENT_CHUNK_UPLOADS)
-            .collect()
-            .await;
+        let results: Vec<std::result::Result<(String, u32, Option<cid::Cid>), ClientError>> =
+            futures::stream::iter(futs)
+                .buffer_unordered(Self::MAX_CONCURRENT_CHUNK_UPLOADS)
+                .collect()
+                .await;
 
         // Track successfully uploaded chunk keys so we can clean them up if
-        // any upload in the batch failed.
+        // any upload in the batch failed. W.9.4-A2: also collect per-chunk
+        // CIDs indexed by chunk_index (NOT result-iteration order — the
+        // futures stream is unordered).
         let mut uploaded_keys: Vec<String> = Vec::new();
+        let mut chunk_cids: Vec<Option<cid::Cid>> =
+            vec![None; chunked_metadata.num_chunks as usize];
         let mut upload_error: Option<ClientError> = None;
         for result in results {
             match result {
-                Ok(key) => uploaded_keys.push(key),
+                Ok((key, index, cid)) => {
+                    uploaded_keys.push(key);
+                    if let Some(slot) = chunk_cids.get_mut(index as usize) {
+                        *slot = cid;
+                    }
+                }
                 Err(e) => { if upload_error.is_none() { upload_error = Some(e); } }
             }
         }
@@ -5336,7 +5871,18 @@ impl EncryptedClient {
             }
             return Err(err);
         }
-        
+
+        // W.9.4-A2: stamp the per-chunk CID Vec into the metadata
+        // BEFORE serializing the index body. When walkable_v8 is off,
+        // chunk_cids is all-None and `populate_chunk_cids` writes an
+        // all-None Vec; the wire stays compact but a parallel-empty
+        // Vec uses ~num_chunks bytes of postcard space. To stay
+        // 100% byte-identical to v0.5 wire output when the flag is
+        // off, only populate when at least one chunk has Some(cid).
+        if walkable_v8 && chunk_cids.iter().any(|c| c.is_some()) {
+            chunked_metadata.populate_chunk_cids(chunk_cids);
+        }
+
         // Create index object with encryption metadata and chunk info
         let enc_metadata = serde_json::json!({
             "version": 4,
@@ -5356,7 +5902,18 @@ impl EncryptedClient {
             .with_metadata("x-fula-encrypted", "true")
             .with_metadata("x-fula-chunked", "true")
             .with_metadata("x-fula-encryption", &index_body);
-        
+
+        // Walkable-v8 (W.9.3): pre-compute `BLAKE3(index_body)` so the
+        // post-PUT self-verify can compare master's etag-attested CID
+        // against a CID we computed locally. Cheap; only when the
+        // writer flag is on.
+        let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
+        let expected_index_cid = if walkable_v8 {
+            Some(crate::walkable_v8::local_blake3_raw_cid(index_body.as_bytes()))
+        } else {
+            None
+        };
+
         // Upload index object. If this fails after all chunks were successfully
         // uploaded, we must compensate by deleting the chunks — otherwise the
         // upload is non-atomic and leaks storage.
@@ -5389,11 +5946,26 @@ impl EncryptedClient {
             }
         };
 
-        // Return both the upload result AND the JSON metadata the caller
-        // will stash on the forest entry. `index_body` IS the same JSON
-        // we just persisted as the index object's body and HTTP header
-        // — handing it back avoids the caller re-serializing.
-        Ok((result, index_body))
+        // Walkable-v8 (W.9.3): self-verify the index-object CID. Caller
+        // stamps it into `ForestFileEntry.storage_cid` so an offline
+        // reader can fetch this index blob via gateway race when master
+        // is down.
+        let index_cid = match (walkable_v8, expected_index_cid) {
+            (true, Some(expected)) => crate::walkable_v8::verify_etag_against_expected_cid(
+                &result.etag,
+                expected,
+                bucket,
+                storage_key,
+            ),
+            _ => None,
+        };
+
+        // Return the upload result, the JSON metadata the caller will
+        // stash on the forest entry, and the verified index-object CID.
+        // `index_body` IS the same JSON we just persisted as the index
+        // object's body and HTTP header — handing it back avoids the
+        // caller re-serializing.
+        Ok((result, index_body, index_cid))
     }
 
     /// Upload an object with resumable chunked encoding.
@@ -5415,6 +5987,13 @@ impl EncryptedClient {
     ) -> Result<PutObjectResult> {
         let data = data.into();
         let original_size = data.len() as u64;
+
+        // #82: forest must be loaded before any chunk PUT so a load
+        // failure (e.g., master unreachable) surfaces before chunks
+        // are uploaded — avoids creating orphan blobs that the
+        // caller didn't agree to. The post-upload register step
+        // below depends on this seeding.
+        self.ensure_forest_loaded(bucket).await?;
 
         let dek = self.encryption.key_manager.generate_dek();
         let encryptor = Encryptor::new(self.encryption.public_key());
@@ -5438,23 +6017,30 @@ impl EncryptedClient {
         let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
         let mut encoder = ChunkedEncoder::with_aad(dek.clone(), aad_prefix);
         let mut all_chunks = encoder.update(&data).map_err(ClientError::Encryption)?;
-        let (final_chunk, chunked_metadata, _outboard) = encoder.finalize()
+        let (final_chunk, mut chunked_metadata, _outboard) = encoder.finalize()
             .map_err(ClientError::Encryption)?;
         if let Some(chunk) = final_chunk {
             all_chunks.push(chunk);
         }
 
-        // Build the index metadata JSON (same as put_object_chunked_internal)
-        let index_metadata_json = serde_json::json!({
-            "version": 4,
-            "algorithm": "AES-256-GCM",
-            "wrapped_key": serde_json::to_value(&wrapped_dek).unwrap(),
-            "kek_version": kek_version,
-            "metadata_privacy": true,
-            "obfuscation_mode": "flat",
-            "private_metadata": encrypted_meta.to_json().map_err(ClientError::Encryption)?,
-            "chunked": serde_json::to_value(&chunked_metadata).unwrap(),
-        }).to_string();
+        // Walkable-v8 (#80 / W.9.4-A2 port to resumable): per-chunk
+        // CID hints. Mirror `put_object_chunked_internal`'s pattern —
+        // pre-compute `BLAKE3(chunk.ciphertext)` BEFORE the spawn
+        // moves the body, post-PUT verify against master's etag, and
+        // populate `chunked_metadata.chunk_cids` after the parallel
+        // upload completes. Without this, files uploaded via the
+        // resumable path land with empty `chunk_cids` → reader
+        // falls back to the warm-cache path (still works, just no
+        // cold-cache gateway race for fresh devices).
+        let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
+        let num_chunks_total = all_chunks.len();
+
+        // Build the index metadata JSON skeleton — `chunked_metadata`
+        // gets `populate_chunk_cids` BEFORE the JSON is serialized
+        // post-upload (or we hold on to the un-serialized form here
+        // and serialize after). For the resumable path the JSON
+        // lives in the persisted UploadManifest, so we serialize the
+        // CID-stamped form just before the manifest save.
 
         // Write manifest before uploading any chunks
         let manifest_chunks: Vec<ManifestChunk> = all_chunks.iter().map(|c| {
@@ -5465,13 +6051,31 @@ impl EncryptedClient {
             }
         }).collect();
 
+        // Initial manifest WITHOUT chunk_cids — they're not known
+        // until each chunk's PUT returns its etag. Serialize the
+        // pre-CID-stamped JSON for the on-disk manifest's
+        // `index_metadata_json` so a crash-mid-upload still has a
+        // resumable record. The post-upload finalize will rewrite
+        // `index_metadata_json` with the CID-stamped form before the
+        // index PUT.
+        let initial_index_metadata_json = serde_json::json!({
+            "version": 4,
+            "algorithm": "AES-256-GCM",
+            "wrapped_key": serde_json::to_value(&wrapped_dek).unwrap(),
+            "kek_version": kek_version,
+            "metadata_privacy": true,
+            "obfuscation_mode": "flat",
+            "private_metadata": encrypted_meta.to_json().map_err(ClientError::Encryption)?,
+            "chunked": serde_json::to_value(&chunked_metadata).unwrap(),
+        }).to_string();
+
         let mut manifest = UploadManifest {
             bucket: bucket.to_string(),
             storage_key: storage_key.clone(),
             original_key: key.to_string(),
             num_chunks: all_chunks.len() as u32,
             chunks: manifest_chunks,
-            index_metadata_json,
+            index_metadata_json: initial_index_metadata_json,
         };
         manifest.save(manifest_path)?;
 
@@ -5491,32 +6095,63 @@ impl EncryptedClient {
                 .with_content_type("application/octet-stream")
                 .with_metadata("x-fula-chunk-index", &chunk.index.to_string());
 
+            // W.9.4-A2 / #80: pre-compute the chunk's expected CID
+            // before `chunk.ciphertext` is moved into the spawn.
+            // `Bytes` cloning is Arc-cheap so the post-PUT verify
+            // doesn't re-hash the body.
+            let expected_chunk_cid = if walkable_v8 {
+                Some(crate::walkable_v8::local_blake3_raw_cid(&chunk.ciphertext))
+            } else {
+                None
+            };
+
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.map_err(|e|
                     ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
                 )?;
-                if let Some(ref pin) = pinning {
+                let put_result = if let Some(ref pin) = pinning {
                     client.put_object_with_metadata_and_pinning(
                         &bucket_owned, &chunk_key, chunk.ciphertext,
                         Some(chunk_metadata), &pin.endpoint, &pin.token,
-                    ).await?;
+                    ).await?
                 } else {
                     client.put_object_with_metadata(
                         &bucket_owned, &chunk_key, chunk.ciphertext, Some(chunk_metadata),
-                    ).await?;
-                }
-                Ok::<(u32, String), ClientError>((chunk_idx, chunk_key_ret))
+                    ).await?
+                };
+                // W.9.4-A2 / #80: verify master's etag-attested CID
+                // against pre-computed BLAKE3(ciphertext). Mismatch
+                // soft-fails to None for THIS chunk only; PUT still
+                // succeeded so the chunk is stored, only the
+                // offline-walk hint is missing for it.
+                let chunk_cid = match (walkable_v8, expected_chunk_cid) {
+                    (true, Some(expected)) => crate::walkable_v8::verify_etag_against_expected_cid(
+                        &put_result.etag,
+                        expected,
+                        &bucket_owned,
+                        &chunk_key,
+                    ),
+                    _ => None,
+                };
+                Ok::<(u32, String, Option<cid::Cid>), ClientError>((chunk_idx, chunk_key_ret, chunk_cid))
             });
             handles.push(handle);
         }
 
-        // Collect results, updating manifest as chunks complete
+        // Collect results, updating manifest as chunks complete.
+        // W.9.4-A2 / #80: also collect per-chunk CIDs indexed by
+        // chunk_index (NOT JoinHandle order — tokio::spawn is
+        // unordered).
         let mut upload_error: Option<ClientError> = None;
+        let mut chunk_cids: Vec<Option<cid::Cid>> = vec![None; num_chunks_total];
         for handle in handles {
             match handle.await {
-                Ok(Ok((idx, _key))) => {
+                Ok(Ok((idx, _key, cid))) => {
                     if let Some(mc) = manifest.chunks.iter_mut().find(|c| c.index == idx) {
                         mc.uploaded = true;
+                    }
+                    if let Some(slot) = chunk_cids.get_mut(idx as usize) {
+                        *slot = cid;
                     }
                     let _ = manifest.save(manifest_path);
                 }
@@ -5537,8 +6172,39 @@ impl EncryptedClient {
             return Err(err);
         }
 
-        // All chunks uploaded — finalize
-        self.finalize_resumed_upload(&manifest, manifest_path).await
+        // W.9.4-A2 / #80: stamp per-chunk CIDs into the metadata
+        // BEFORE the index PUT (which finalize_resumed_upload runs).
+        // Same gate as `put_object_chunked_internal` — only populate
+        // when at least one chunk has Some(cid), keeps wire format
+        // byte-identical to v0.5 when flag is off or all etags
+        // failed to parse.
+        if walkable_v8 && chunk_cids.iter().any(|c| c.is_some()) {
+            chunked_metadata.populate_chunk_cids(chunk_cids);
+            // Re-serialize the index_metadata_json with the
+            // CID-stamped chunked metadata. Update the manifest's
+            // on-disk record so a crash between this save and the
+            // index PUT recovers the CID-stamped form on retry.
+            let updated_index_json = serde_json::json!({
+                "version": 4,
+                "algorithm": "AES-256-GCM",
+                "wrapped_key": serde_json::to_value(&wrapped_dek).unwrap(),
+                "kek_version": kek_version,
+                "metadata_privacy": true,
+                "obfuscation_mode": "flat",
+                "private_metadata": encrypted_meta.to_json().map_err(ClientError::Encryption)?,
+                "chunked": serde_json::to_value(&chunked_metadata).unwrap(),
+            }).to_string();
+            manifest.index_metadata_json = updated_index_json;
+            // Persist the rewritten manifest so a crash here doesn't
+            // leave the chunked-CID work unrecorded.
+            let _ = manifest.save(manifest_path);
+        }
+
+        // All chunks uploaded — finalize and register in the
+        // encrypted forest (#82). `private_meta` is in scope from
+        // earlier in this function so the registration helper can
+        // build a `ForestFileEntry` mirroring the non-resumable path.
+        self.finalize_and_register_resumed_upload(&manifest, manifest_path, &private_meta).await
     }
 
     /// Upload an object from an async reader, encrypting and uploading chunks
@@ -5560,6 +6226,10 @@ impl EncryptedClient {
         total_size: u64,
         content_type: Option<&str>,
     ) -> Result<PutObjectResult> {
+        // #82: same precondition as `put_object_encrypted_resumable`
+        // — surface forest-load failure before any chunk PUT.
+        self.ensure_forest_loaded(bucket).await?;
+
         // Generate a DEK for this object
         let dek = self.encryption.key_manager.generate_dek();
 
@@ -5584,7 +6254,7 @@ impl EncryptedClient {
             .map_err(ClientError::Encryption)?;
         // H-1: grab the content hash before `finalize` consumes the encoder.
         let content_hash = encoder.content_hash_hex();
-        let (chunked_metadata, _outboard) = encoder.finalize();
+        let (mut chunked_metadata, _outboard) = encoder.finalize();
 
         // Create private metadata (deferred until after streaming so the
         // BLAKE3 content hash computed over the plaintext stream lands on
@@ -5595,6 +6265,17 @@ impl EncryptedClient {
         let encrypted_meta = EncryptedPrivateMetadata::encrypt(&private_meta, &dek)
             .map_err(ClientError::Encryption)?;
 
+        // Walkable-v8 (#80 / W.9.4-A2 port to streaming): mirror the
+        // resumable + chunked-internal pattern. Pre-compute
+        // BLAKE3(chunk.ciphertext) before each spawn moves the body,
+        // post-PUT verify, build Vec<Option<Cid>> indexed by
+        // chunk_index, populate_chunk_cids before serializing the
+        // index body. Without this, files uploaded via the streaming
+        // path land with empty `chunk_cids` and fall back to the
+        // warm-cache path on offline reads.
+        let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
+        let num_chunks_total = all_chunks.len();
+
         // Upload chunks in parallel with bounded concurrency
         let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_CHUNK_UPLOADS));
         let mut handles = Vec::with_capacity(all_chunks.len());
@@ -5602,6 +6283,7 @@ impl EncryptedClient {
         for chunk in all_chunks {
             let chunk_key = ChunkedFileMetadata::chunk_key(&storage_key, chunk.index);
             let chunk_key_ret = chunk_key.clone();
+            let chunk_idx = chunk.index;
             let sem = semaphore.clone();
             let client = self.inner.clone();
             let bucket = bucket.to_string();
@@ -5610,32 +6292,60 @@ impl EncryptedClient {
                 .with_metadata("x-fula-chunk-index", &chunk.index.to_string());
             let pinning = self.pinning.clone();
 
+            // W.9.4-A2 / #80: pre-compute the chunk's expected CID
+            // before the spawn moves `chunk.ciphertext`.
+            let expected_chunk_cid = if walkable_v8 {
+                Some(crate::walkable_v8::local_blake3_raw_cid(&chunk.ciphertext))
+            } else {
+                None
+            };
+
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.map_err(|e|
                     ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
                 )?;
-                if let Some(ref pin) = pinning {
+                let put_result = if let Some(ref pin) = pinning {
                     client.put_object_with_metadata_and_pinning(
                         &bucket, &chunk_key, chunk.ciphertext,
                         Some(chunk_metadata), &pin.endpoint, &pin.token,
-                    ).await?;
+                    ).await?
                 } else {
                     client.put_object_with_metadata(
                         &bucket, &chunk_key, chunk.ciphertext, Some(chunk_metadata),
-                    ).await?;
-                }
-                Ok::<String, ClientError>(chunk_key_ret)
+                    ).await?
+                };
+                // W.9.4-A2 / #80: post-PUT verify — same soft-fail
+                // semantics as the resumable + chunked-internal
+                // paths.
+                let chunk_cid = match (walkable_v8, expected_chunk_cid) {
+                    (true, Some(expected)) => crate::walkable_v8::verify_etag_against_expected_cid(
+                        &put_result.etag,
+                        expected,
+                        &bucket,
+                        &chunk_key,
+                    ),
+                    _ => None,
+                };
+                Ok::<(u32, String, Option<cid::Cid>), ClientError>((chunk_idx, chunk_key_ret, chunk_cid))
             });
             handles.push(handle);
         }
 
-        // Collect results — track uploaded chunk keys for cleanup on failure
+        // Collect results — track uploaded chunk keys for cleanup on
+        // failure. W.9.4-A2 / #80: also collect per-chunk CIDs
+        // indexed by chunk_index.
         let mut uploaded_keys: Vec<String> = Vec::new();
+        let mut chunk_cids: Vec<Option<cid::Cid>> = vec![None; num_chunks_total];
         let mut upload_error: Option<ClientError> = None;
 
         for handle in handles {
             match handle.await {
-                Ok(Ok(key)) => uploaded_keys.push(key),
+                Ok(Ok((idx, key, cid))) => {
+                    uploaded_keys.push(key);
+                    if let Some(slot) = chunk_cids.get_mut(idx as usize) {
+                        *slot = cid;
+                    }
+                }
                 Ok(Err(e)) => { if upload_error.is_none() { upload_error = Some(e); } }
                 Err(e) => {
                     if upload_error.is_none() {
@@ -5652,6 +6362,15 @@ impl EncryptedClient {
                 let _ = self.inner.delete_object(bucket, key).await;
             }
             return Err(err);
+        }
+
+        // W.9.4-A2 / #80: stamp per-chunk CIDs into the metadata
+        // BEFORE serializing the index body. Same gate as the
+        // sister paths — only populate when at least one chunk has
+        // Some(cid), keeps wire format byte-identical to v0.5 when
+        // flag is off or all etags failed to parse.
+        if walkable_v8 && chunk_cids.iter().any(|c| c.is_some()) {
+            chunked_metadata.populate_chunk_cids(chunk_cids);
         }
 
         // Create index object with encryption metadata
@@ -5673,6 +6392,15 @@ impl EncryptedClient {
             .with_metadata("x-fula-chunked", "true")
             .with_metadata("x-fula-encryption", &index_body);
 
+        // Walkable-v8 (#82): pre-compute BLAKE3 of the index body so
+        // we can verify against master's etag and stamp the CID into
+        // the forest entry. Same pattern as `finalize_resumed_upload`.
+        let expected_index_cid = if walkable_v8 {
+            Some(crate::walkable_v8::local_blake3_raw_cid(index_body.as_bytes()))
+        } else {
+            None
+        };
+
         let result = if let Some(ref pinning) = self.pinning {
             self.inner.put_object_with_metadata_and_pinning(
                 bucket, &storage_key, Bytes::from(index_body.clone()),
@@ -5683,6 +6411,28 @@ impl EncryptedClient {
                 bucket, &storage_key, Bytes::from(index_body.clone()), Some(metadata),
             ).await?
         };
+
+        let index_cid = match (walkable_v8, expected_index_cid) {
+            (true, Some(expected)) => crate::walkable_v8::verify_etag_against_expected_cid(
+                &result.etag,
+                expected,
+                bucket,
+                &storage_key,
+            ),
+            _ => None,
+        };
+
+        // #82: register in encrypted forest so this file appears in
+        // offline forest walks. `private_meta` is in scope from
+        // earlier in the function.
+        self.register_encrypted_chunked_upload_in_forest(
+            bucket,
+            key,
+            &storage_key,
+            index_cid,
+            &index_body,
+            &private_meta,
+        ).await?;
 
         Ok(result)
     }
@@ -5703,20 +6453,31 @@ impl EncryptedClient {
     ) -> Result<PutObjectResult> {
         let mut manifest = UploadManifest::load(manifest_path)?;
 
-        if manifest.remaining() == 0 {
-            // All chunks uploaded — just finalize the index
-            return self.finalize_resumed_upload(&manifest, manifest_path).await;
-        }
-
-        // Re-encrypt only the missing chunks.
-        // We need the same DEK and AAD, which are embedded in the index metadata.
-        // Parse the index metadata to extract the chunked metadata (nonces etc.)
+        // #82: parse index metadata once for use across paths.
+        // The wrapped_key + private_meta decrypt happen LATER (post
+        // BAO) in the main path, and inline in the early-return
+        // path. The F1 nonce-reuse-protection tests pin a contract
+        // where wrapped_key parse must NOT run before BAO for
+        // wrong-data inputs — keep that ordering strictly.
         let index_meta: serde_json::Value = serde_json::from_str(&manifest.index_metadata_json)
             .map_err(|e| ClientError::Encryption(
                 fula_crypto::CryptoError::Decryption(format!("Invalid index metadata in manifest: {}", e))
             ))?;
 
-        let chunked_meta: ChunkedFileMetadata = serde_json::from_value(
+        if manifest.remaining() == 0 {
+            // All chunks uploaded — no nonce-reuse risk so skip BAO.
+            // Decrypt private_meta and register (#82). `data` is
+            // unused here because no chunks are re-encrypted.
+            let (_, _, private_meta) = self.decrypt_resumable_private_meta(&index_meta)?;
+            self.ensure_forest_loaded(&manifest.bucket).await?;
+            return self.finalize_and_register_resumed_upload(
+                &manifest,
+                manifest_path,
+                &private_meta,
+            ).await;
+        }
+
+        let mut chunked_meta: ChunkedFileMetadata = serde_json::from_value(
             index_meta["chunked"].clone()
         ).map_err(|e| ClientError::Encryption(
             fula_crypto::CryptoError::Decryption(format!("Invalid chunked metadata in manifest: {}", e))
@@ -5751,18 +6512,29 @@ impl EncryptedClient {
             )));
         }
 
-        // Re-derive the DEK: we need the wrapped key + our secret key
-        let wrapped_dek: EncryptedData = serde_json::from_value(
-            index_meta["wrapped_key"].clone()
-        ).map_err(|e| ClientError::Encryption(
-            fula_crypto::CryptoError::Decryption(format!("Invalid wrapped key in manifest: {}", e))
-        ))?;
+        // Past F1 BAO check — now derive the DEK + private_meta.
+        // Test contract (`f1_resume_nonce_reuse_protection`):
+        // wrong-data inputs MUST fail at BAO above, not here. Don't
+        // hoist this above BAO — the F1 fixtures use placeholder
+        // wrapped_key JSON that fails parse, and the tests assert
+        // the BAO error fires first.
+        let (wrapped_dek, dek, private_meta) =
+            self.decrypt_resumable_private_meta(&index_meta)?;
 
-        let decryptor = Decryptor::new(self.encryption.key_manager.keypair());
-        let dek = decryptor.decrypt_dek(&wrapped_dek)
-            .map_err(ClientError::Encryption)?;
+        // #82: forest must be loaded before any chunk PUT so we
+        // surface a load failure (e.g., master unreachable) before
+        // re-uploading chunks. Placed AFTER wrapped_key parse so
+        // the F1 test #4 (`accepts_matching_data_past_f1_guard`)
+        // continues to fail at the wrapped_key step rather than
+        // hitting a network call first.
+        self.ensure_forest_loaded(&manifest.bucket).await?;
 
-        // Re-encrypt and upload only missing chunks
+        // Re-encrypt and upload only missing chunks.
+        // W.9.4-A2 / #80: also collect per-chunk CIDs for the
+        // chunks we re-upload here, so the rewritten index body
+        // gets the same chunk-CID hints the initial upload would
+        // have stamped.
+        let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
         let chunk_size = chunked_meta.chunk_size as usize;
         let aad_prefix = format!("fula:v4:chunk:{}", manifest.storage_key);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_CHUNK_UPLOADS));
@@ -5790,6 +6562,14 @@ impl EncryptedClient {
             let ciphertext = aead.encrypt_with_aad(&nonce, chunk_data, &aad)
                 .map_err(ClientError::Encryption)?;
 
+            // W.9.4-A2 / #80: pre-compute the chunk's expected CID
+            // before `ciphertext` moves into the spawn.
+            let expected_chunk_cid = if walkable_v8 {
+                Some(crate::walkable_v8::local_blake3_raw_cid(&ciphertext))
+            } else {
+                None
+            };
+
             let chunk_key = mc.chunk_key.clone();
             let chunk_key_ret = chunk_key.clone();
             let sem = semaphore.clone();
@@ -5805,28 +6585,61 @@ impl EncryptedClient {
                 let _permit = sem.acquire().await.map_err(|e|
                     ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
                 )?;
-                if let Some(ref pin) = pinning {
+                let put_result = if let Some(ref pin) = pinning {
                     client.put_object_with_metadata_and_pinning(
                         &bucket, &chunk_key, ciphertext_bytes,
                         Some(chunk_metadata), &pin.endpoint, &pin.token,
-                    ).await?;
+                    ).await?
                 } else {
                     client.put_object_with_metadata(
                         &bucket, &chunk_key, ciphertext_bytes, Some(chunk_metadata),
-                    ).await?;
-                }
-                Ok::<(u32, String), ClientError>((chunk_index, chunk_key_ret))
+                    ).await?
+                };
+                let chunk_cid = match (walkable_v8, expected_chunk_cid) {
+                    (true, Some(expected)) => crate::walkable_v8::verify_etag_against_expected_cid(
+                        &put_result.etag,
+                        expected,
+                        &bucket,
+                        &chunk_key,
+                    ),
+                    _ => None,
+                };
+                Ok::<(u32, String, Option<cid::Cid>), ClientError>((chunk_index, chunk_key_ret, chunk_cid))
             });
             handles.push(handle);
         }
 
-        // Collect results, updating manifest as chunks complete
+        // Collect results, updating manifest as chunks complete.
+        // W.9.4-A2 / #80: collect per-chunk CIDs for ONLY the chunks
+        // re-uploaded in this resume pass. Combine with any CID
+        // hints already in `chunked_meta.chunk_cids` from the
+        // original upload (the persisted manifest's index_metadata
+        // may already carry a partial CID set if the original
+        // upload hit some etags before crashing). Slot-merge so the
+        // final Vec covers every chunk.
         let mut upload_error: Option<ClientError> = None;
+        let total_chunks = manifest.num_chunks as usize;
+        let mut resumed_chunk_cids: Vec<Option<cid::Cid>> = vec![None; total_chunks];
+        // Seed from any pre-existing CID hints in the manifest's
+        // chunked metadata (a previous resume pass may have stamped
+        // them).
+        for i in 0..total_chunks {
+            resumed_chunk_cids[i] = chunked_meta.chunk_cid(i as u32);
+        }
         for handle in handles {
             match handle.await {
-                Ok(Ok((idx, _key))) => {
+                Ok(Ok((idx, _key, cid))) => {
                     if let Some(mc) = manifest.chunks.iter_mut().find(|c| c.index == idx) {
                         mc.uploaded = true;
+                    }
+                    if let Some(slot) = resumed_chunk_cids.get_mut(idx as usize) {
+                        // Resume always overwrites the slot — the
+                        // chunk was just re-PUT, so this fresh
+                        // verified CID supersedes any prior hint
+                        // (which would also be the same CID anyway,
+                        // since chunk ciphertext is deterministic
+                        // for a given (DEK, nonce, plaintext) tuple).
+                        *slot = cid;
                     }
                     // Persist manifest after each successful chunk for crash safety
                     let _ = manifest.save(manifest_path);
@@ -5848,8 +6661,43 @@ impl EncryptedClient {
             return Err(err);
         }
 
-        // All chunks uploaded — finalize
-        self.finalize_resumed_upload(&manifest, manifest_path).await
+        // W.9.4-A2 / #80: stamp the merged per-chunk CIDs back into
+        // the chunked metadata and re-serialize the index_metadata
+        // JSON BEFORE the index PUT inside finalize_resumed_upload.
+        // Without this, the resume path would write the index body
+        // from the stale on-disk JSON (which was serialized at the
+        // initial put_object_encrypted_resumable call and may have
+        // pre-CID-stamp content).
+        if walkable_v8 && resumed_chunk_cids.iter().any(|c| c.is_some()) {
+            chunked_meta.populate_chunk_cids(resumed_chunk_cids);
+            // Rebuild the index JSON from the parsed `index_meta`
+            // value so non-walkable-v8 fields (`kek_version`,
+            // `metadata_privacy`, `obfuscation_mode`,
+            // `private_metadata`) survive verbatim. Only the
+            // `chunked` and `wrapped_key` slots are replaced — the
+            // wrapped_key with a fresh serialization (parsed-and-
+            // re-encoded keeps its shape canonical), and the
+            // chunked block with the now-CID-stamped metadata.
+            let mut rebuilt = index_meta.clone();
+            if let Some(obj) = rebuilt.as_object_mut() {
+                obj.insert(
+                    "wrapped_key".to_string(),
+                    serde_json::to_value(&wrapped_dek).unwrap_or_else(|_| serde_json::Value::Null),
+                );
+                obj.insert(
+                    "chunked".to_string(),
+                    serde_json::to_value(&chunked_meta).unwrap_or_else(|_| serde_json::Value::Null),
+                );
+            }
+            manifest.index_metadata_json = rebuilt.to_string();
+            let _ = manifest.save(manifest_path);
+        }
+
+        // All chunks uploaded — finalize and register in the
+        // encrypted forest (#82). `private_meta` was decrypted at
+        // the top of this function from the persisted manifest's
+        // private_metadata field.
+        self.finalize_and_register_resumed_upload(&manifest, manifest_path, &private_meta).await
     }
 
     /// Upload the index object for a resumed upload and clean up the manifest.
@@ -5858,13 +6706,24 @@ impl EncryptedClient {
         &self,
         manifest: &UploadManifest,
         manifest_path: &std::path::Path,
-    ) -> Result<PutObjectResult> {
+    ) -> Result<(PutObjectResult, Option<cid::Cid>)> {
         let index_body = &manifest.index_metadata_json;
         let metadata = ObjectMetadata::new()
             .with_content_type("application/json")
             .with_metadata("x-fula-encrypted", "true")
             .with_metadata("x-fula-chunked", "true")
             .with_metadata("x-fula-encryption", index_body);
+
+        // Walkable-v8 (#53 / #82): pre-compute BLAKE3 of the index
+        // body BEFORE the PUT consumes it via Bytes::from. Skipped
+        // when the writer flag is off so v0.5-default writes don't
+        // hash extra bytes.
+        let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
+        let expected_index_cid = if walkable_v8 {
+            Some(crate::walkable_v8::local_blake3_raw_cid(index_body.as_bytes()))
+        } else {
+            None
+        };
 
         let result = if let Some(ref pinning) = self.pinning {
             self.inner.put_object_with_metadata_and_pinning(
@@ -5879,9 +6738,27 @@ impl EncryptedClient {
             ).await?
         };
 
-        // Success — delete the manifest file
-        let _ = std::fs::remove_file(manifest_path);
-        Ok(result)
+        // Walkable-v8 (#53): verify master's etag against the
+        // pre-computed BLAKE3. Soft-fails to None on mismatch — the
+        // caller stamps that into ForestFileEntry.storage_cid (None
+        // means offline reads of THIS file fall through to the
+        // storage_key path; everything else still works).
+        let index_cid = match (walkable_v8, expected_index_cid) {
+            (true, Some(expected)) => crate::walkable_v8::verify_etag_against_expected_cid(
+                &result.etag,
+                expected,
+                &manifest.bucket,
+                &manifest.storage_key,
+            ),
+            _ => None,
+        };
+
+        // NOTE: manifest deletion is INTENTIONALLY moved out — see
+        // `finalize_and_register_resumed_upload`. It runs only after
+        // forest registration succeeds, so a register failure leaves
+        // the manifest in place for `resume_upload` retry. Reviewer B
+        // flagged this exposure window during the #82 audit.
+        Ok((result, index_cid))
     }
 
     /// Abort a previously failed upload: delete all uploaded chunks and
@@ -5901,6 +6778,184 @@ impl EncryptedClient {
 
         let _ = std::fs::remove_file(manifest_path);
         Ok(())
+    }
+
+    /// #82 — Register a chunked encrypted upload (resumable / streaming /
+    /// resume) in the encrypted forest after the index PUT succeeds.
+    ///
+    /// Without this step, files written via these three paths land on
+    /// master S3 + IPFS but stay invisible to the offline forest walk
+    /// (Phase 2.4 + walkable-v8): they only resolve via direct
+    /// `storage_key` lookups while master is up. Mirrors the upsert
+    /// dance in `put_object_encrypted` (the body around lines
+    /// 5460-5598) minus orphan cleanup of overwritten storage keys
+    /// (a separate pre-existing concern, tracked outside #82).
+    ///
+    /// Caller is responsible for `ensure_forest_loaded(bucket)` BEFORE
+    /// calling — without that the v7 cache lookup below would fail.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn register_encrypted_chunked_upload_in_forest(
+        &self,
+        bucket: &str,
+        key: &str,
+        storage_key: &str,
+        index_cid: Option<cid::Cid>,
+        index_metadata_json: &str,
+        private_meta: &PrivateMetadata,
+    ) -> Result<()> {
+        let mut forest_entry = ForestFileEntry::from_metadata(private_meta, storage_key.to_string());
+        forest_entry.mark_encrypted();
+        forest_entry.storage_cid = index_cid;
+        forest_entry.user_metadata.insert(
+            "x-fula-encrypted".to_string(),
+            "true".to_string(),
+        );
+        forest_entry.user_metadata.insert(
+            "x-fula-encryption".to_string(),
+            index_metadata_json.to_string(),
+        );
+        forest_entry.user_metadata.insert(
+            "x-fula-chunked".to_string(),
+            "true".to_string(),
+        );
+
+        let now = chrono::Utc::now().timestamp();
+        // Cloned for WAL replay — `forest_entry` is moved into upsert below.
+        let wal_entry_clone = forest_entry.clone();
+        let is_v7 = self.is_forest_sharded_hamt(bucket);
+
+        if is_v7 {
+            let forest_arc = {
+                let cache_entry = self.forest_cache.get(bucket).ok_or_else(|| {
+                    ClientError::Encryption(fula_crypto::CryptoError::Decryption(format!(
+                        "forest cache missing for bucket {} during chunked-upload registration \
+                         (caller must ensure_forest_loaded first)",
+                        bucket,
+                    )))
+                })?;
+                match cache_entry.value() {
+                    ForestCacheEntry::ShardedHamt { forest, .. } => forest.clone(),
+                    _ => unreachable!("is_forest_sharded_hamt guard above"),
+                }
+            };
+            let backend: Arc<S3BlobBackend> = Arc::new(
+                S3BlobBackend::new(self.inner.clone(), bucket.to_string())
+            );
+            {
+                let mut guard = forest_arc.write().await;
+                debug_assert!(
+                    forest_entry.encrypted,
+                    "v7 upsert invariant violated: chunked-upload entry for {} has encrypted=false",
+                    forest_entry.path,
+                );
+                guard.upsert_file(forest_entry, &backend).await
+                    .map_err(ClientError::Encryption)?;
+            }
+            if let Some(mut cache_entry) = self.forest_cache.get_mut(bucket) {
+                if let ForestCacheEntry::ShardedHamt { loaded_at, .. } = cache_entry.value_mut() {
+                    *loaded_at = now;
+                }
+            }
+        } else {
+            let (mut forest, prior_etag, prior_seq) = {
+                let cache_entry = self.forest_cache.get(bucket).ok_or_else(|| {
+                    ClientError::Encryption(fula_crypto::CryptoError::Decryption(format!(
+                        "forest cache missing for bucket {} during chunked-upload registration \
+                         (caller must ensure_forest_loaded first)",
+                        bucket,
+                    )))
+                })?;
+                match cache_entry.value() {
+                    ForestCacheEntry::Monolithic { forest, index_etag, last_sequence, .. } =>
+                        (forest.clone(), index_etag.clone(), *last_sequence),
+                    ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_v7 handled above"),
+                }
+            };
+            forest.upsert_file(forest_entry);
+            self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::Monolithic {
+                forest,
+                loaded_at: now,
+                dirty: true,
+                index_etag: prior_etag,
+                last_sequence: prior_seq,
+            });
+        }
+
+        // WAL append so a crash between upsert and flush doesn't lose
+        // the entry. Mirrors the reference pattern at 5575-5585.
+        let wal_mac = wal::derive_mac_key(&self.encryption.key_manager, bucket);
+        if let Err(e) = wal::append(
+            bucket,
+            &wal_mac,
+            WalEntry::Insert { key: key.to_string(), entry: wal_entry_clone },
+        ) {
+            tracing::warn!(%bucket, error = %e, "WAL append failed (chunked-upload register); continuing");
+        }
+        Ok(())
+    }
+
+    /// #82 — Wrapper around `finalize_resumed_upload` that also
+    /// registers the entry in the encrypted forest. Both
+    /// `put_object_encrypted_resumable` and `resume_upload` go through
+    /// here so the registration step lands in exactly one spot.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn finalize_and_register_resumed_upload(
+        &self,
+        manifest: &UploadManifest,
+        manifest_path: &std::path::Path,
+        private_meta: &PrivateMetadata,
+    ) -> Result<PutObjectResult> {
+        let (result, index_cid) = self.finalize_resumed_upload(manifest, manifest_path).await?;
+        self.register_encrypted_chunked_upload_in_forest(
+            &manifest.bucket,
+            &manifest.original_key,
+            &manifest.storage_key,
+            index_cid,
+            &manifest.index_metadata_json,
+            private_meta,
+        ).await?;
+        // Crash-safety (Reviewer B audit, #82): only delete the
+        // manifest after BOTH the index PUT and forest registration
+        // succeed. If `register_encrypted_chunked_upload_in_forest`
+        // errors above, this line is skipped and the manifest stays
+        // on disk so the caller can retry via `resume_upload`.
+        let _ = std::fs::remove_file(manifest_path);
+        Ok(result)
+    }
+
+    /// #82 — Decrypt the wrapped DEK + private metadata persisted in
+    /// a resumable upload's `index_metadata_json`. Used by both
+    /// branches of `resume_upload` (early-return when all chunks
+    /// were already uploaded; main path post-BAO).
+    ///
+    /// CRITICAL: do NOT call this before the F1 BAO check on the
+    /// main path. The `f1_resume_nonce_reuse_protection` test
+    /// fixtures use a placeholder `wrapped_key` that's intentionally
+    /// invalid JSON for `EncryptedData`; their contract is that the
+    /// BAO error fires before the wrapped_key parse error.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn decrypt_resumable_private_meta(
+        &self,
+        index_meta: &serde_json::Value,
+    ) -> Result<(EncryptedData, fula_crypto::keys::DekKey, PrivateMetadata)> {
+        let wrapped_dek: EncryptedData = serde_json::from_value(
+            index_meta["wrapped_key"].clone()
+        ).map_err(|e| ClientError::Encryption(
+            fula_crypto::CryptoError::Decryption(format!("Invalid wrapped key in manifest: {}", e))
+        ))?;
+        let decryptor = Decryptor::new(self.encryption.key_manager.keypair());
+        let dek = decryptor.decrypt_dek(&wrapped_dek)
+            .map_err(ClientError::Encryption)?;
+        let encrypted_meta_str = index_meta["private_metadata"].as_str().ok_or_else(|| {
+            ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                "private_metadata field is not a string in manifest's index metadata".to_string(),
+            ))
+        })?;
+        let encrypted_private_meta = EncryptedPrivateMetadata::from_json(encrypted_meta_str)
+            .map_err(ClientError::Encryption)?;
+        let private_meta = encrypted_private_meta.decrypt(&dek)
+            .map_err(ClientError::Encryption)?;
+        Ok((wrapped_dek, dek, private_meta))
     }
 
     /// Flush the forest index to storage.
@@ -6255,7 +7310,11 @@ impl EncryptedClient {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             })?;
-            return self.get_object_decrypted_by_storage_key(bucket, &entry.storage_key).await;
+            // #91: v7 path already walked the HAMT once via `get_file(key)`
+            // above; pass the entry forward so the decrypt path skips the
+            // O(N) `find_by_storage_key` re-scan inside
+            // `get_object_decrypted_by_storage_key`.
+            return self.get_object_decrypted_by_entry(bucket, entry).await;
         }
 
         // Monolithic v1/v2: already loaded by ensure_forest_loaded
@@ -7724,6 +8783,22 @@ impl EncryptedClient {
             // H-2: entry is written under v4 AAD-bound encryption; reject
             // any later download that advertises a lower blob-format version.
             min_version: 4,
+            // Walkable-v8 (W.9.3): intentionally `None` on this path. The
+            // public `put_object_chunked` writes a literal `b"CHUNKED"`
+            // marker as the index-object body (line below this match) and
+            // carries the actual encryption metadata in the HTTP
+            // `x-fula-encryption` user-metadata header. A gateway fetch
+            // by CID would therefore return only the marker bytes, which
+            // is useless to an offline walker. Stamping
+            // `CID(b"CHUNKED")` here would also collide across every
+            // chunked file in every bucket from every user (the body is
+            // a constant), giving an ambiguous offline pointer that can't
+            // distinguish files. The sister path `put_object_chunked_
+            // internal` puts the encryption JSON IN the body and DOES
+            // stamp `storage_cid`; offline-walkability for this path
+            // requires migrating `put_object_chunked` to that design,
+            // tracked as a follow-up task.
+            storage_cid: None,
         };
 
         let v7_forest_arc = {
@@ -7907,10 +8982,41 @@ impl EncryptedClient {
         
         // Download and decrypt only needed chunks
         let mut decrypted_chunks = Vec::new();
-        
+
         let is_v2 = chunked_meta.format == "streaming-v2";
         for chunk_idx in needed_chunks {
             let chunk_key = ChunkedFileMetadata::chunk_key(&storage_key, chunk_idx);
+            // Walkable-v8 (W.9.4-A2 / task #32): same cid-hint
+            // dispatch as the windowed download path (~line 1545).
+            // Without it, partial-read paths (Flutter `get_range`,
+            // image thumbnails, video seek) bypass the offline
+            // walkable-v8 channel and fail when master is down even
+            // for files that have CID hints stamped. The reader
+            // contract is: when chunked metadata carries a CID hint
+            // for THIS chunk, route through the cold-cache cid-hint
+            // path so a fresh device with no warm-cache mapping can
+            // still fetch via gateway race.
+            #[cfg(not(target_arch = "wasm32"))]
+            let chunk_data = {
+                let chunk_cid_hint = chunked_meta.chunk_cid(chunk_idx);
+                match chunk_cid_hint {
+                    Some(cid) => self
+                        .inner
+                        .get_object_with_offline_fallback_known_cid(bucket, &chunk_key, &cid)
+                        .await
+                        .map(|r| r.inner.data)?,
+                    None => self
+                        .inner
+                        .get_object_with_offline_fallback(bucket, &chunk_key)
+                        .await
+                        .map(|r| r.inner.data)?,
+                }
+            };
+            // wasm32: no offline-fallback infrastructure compiled in;
+            // use the legacy direct path. Production wasm builds
+            // don't yet have offline support; this preserves
+            // pre-W.9.4-A2 behaviour.
+            #[cfg(target_arch = "wasm32")]
             let chunk_data = self.inner.get_object(bucket, &chunk_key).await?;
 
             let nonce = chunked_meta.get_chunk_nonce(chunk_idx)
@@ -8908,6 +10014,7 @@ mod tests {
             root_hash: "00".repeat(32),
             chunk_nonces: vec![],
             content_type: None,
+            chunk_cids: vec![],
         };
         let dek = DekKey::from_bytes(&[0x42u8; 32]).unwrap();
 
