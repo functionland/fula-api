@@ -1222,17 +1222,102 @@ impl EncryptedClient {
     }
 
     /// Get and decrypt an object using the storage key directly
-    /// 
+    ///
     /// Use this when you already have the obfuscated storage key
     /// (e.g., from list_objects_decrypted)
-    /// 
+    ///
     /// Handles both single-block and chunked objects automatically.
     pub async fn get_object_decrypted_by_storage_key(
         &self,
         bucket: &str,
         storage_key: &str,
     ) -> Result<Bytes> {
-        // Resolve the forest entry FIRST so we can fall back to its
+        // Public API: caller has only a storage_key, so we look up the
+        // forest entry on their behalf. v7 sharded HAMT pays the O(N)
+        // `find_by_storage_key` linear scan here — see #91.
+        //
+        // Callers that already hold the resolved `ForestFileEntry` (e.g.
+        // `get_object_flat`'s v7 branch, which walks the HAMT once via
+        // `get_file(path)` to translate a logical path into an entry)
+        // should use [`Self::get_object_decrypted_by_entry`] instead and
+        // skip this redundant scan.
+        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
+        self.get_object_decrypted_inner(bucket, storage_key, forest_entry).await
+    }
+
+    /// Entry-aware variant of [`Self::get_object_decrypted_by_storage_key`]
+    /// for callers that have already resolved the [`ForestFileEntry`]
+    /// (e.g. `get_object_flat`'s v7 branch via `get_file(path)`).
+    ///
+    /// **Why this exists** (#91): the public `_by_storage_key` API does an
+    /// O(N) `find_by_storage_key` linear scan over every shard's HAMT to
+    /// recover the entry. For v7 sharded buckets that already walked the
+    /// HAMT once to resolve the user's path, this is a redundant scan.
+    /// On large buckets — and especially on cold-cache offline reads
+    /// where each internal-node fetch is a multi-second gateway race —
+    /// the scan dwarfs the actual file fetch. Passing the entry forward
+    /// drops every encrypted GET back to O(log N) HAMT traversal cost.
+    ///
+    /// **Single-walk safety** (audited): the post-fix path acquires the
+    /// `forest_arc` read guard exactly once via `get_file(path)` in
+    /// `get_object_flat` (line 7218-7224); the pre-fix path would have
+    /// acquired a SECOND independent read guard later via
+    /// `forest_entry_lookup` → `find_by_storage_key`. The two guards
+    /// were always returning the same data because both walked the same
+    /// `forest_arc`, but a writer that interleaved between the two guard
+    /// acquisitions could have caused the second read to observe a
+    /// just-stamped `storage_cid` that the first read missed (or vice
+    /// versa). Skipping the second guard cannot produce a wrong-bytes
+    /// case: AEAD AAD `fula:v4:content:{storage_key}` binds bytes to
+    /// storage_key independently of any race; a stale `storage_cid` of
+    /// `None` just falls through to the no-hint offline-fallback path,
+    /// which is safety-equivalent to today's behavior on legacy entries.
+    ///
+    /// **Cross-platform**: shared encryption.rs path; no `cfg`-split.
+    async fn get_object_decrypted_by_entry(
+        &self,
+        bucket: &str,
+        entry: ForestFileEntry,
+    ) -> Result<Bytes> {
+        let storage_key = entry.storage_key.clone();
+        self.get_object_decrypted_inner(bucket, &storage_key, Some(entry)).await
+    }
+
+    /// Shared body of `get_object_decrypted_by_storage_key` and
+    /// `get_object_decrypted_by_entry`. Takes the (optionally pre-resolved)
+    /// `ForestFileEntry` directly so both code paths can reuse the same
+    /// decrypt + content-verify + chunk-dispatch logic.
+    ///
+    /// Pre-resolved entry: `get_object_flat`'s v7 branch already walked
+    /// the HAMT once and has the entry in hand — pass `Some(entry)` and
+    /// skip the O(N) scan.
+    ///
+    /// Lookup: `get_object_decrypted_by_storage_key` only has a
+    /// storage_key — does the lookup itself, which may cost an O(N)
+    /// scan on v7 sharded buckets. Same as today's behavior.
+    ///
+    /// `forest_entry: None` is the share-token / pre-forest-write path
+    /// where no forest entry exists; the body falls back to HTTP-header
+    /// metadata for decryption. Unchanged from the pre-#91 behavior.
+    async fn get_object_decrypted_inner(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        forest_entry: Option<ForestFileEntry>,
+    ) -> Result<Bytes> {
+        // Defense-in-depth: if the caller passed an entry, its
+        // storage_key must match the storage_key argument. Compiled out
+        // in release builds; catches caller bugs in debug.
+        debug_assert!(
+            forest_entry
+                .as_ref()
+                .map(|e| e.storage_key == storage_key)
+                .unwrap_or(true),
+            "get_object_decrypted_inner: entry.storage_key != storage_key argument"
+        );
+
+        // Forest-entry fallback rationale (preserved from pre-#91 body):
+        // when the forest entry is available, we can fall back to its
         // (privacy-preserving, AEAD-protected) `user_metadata` when the
         // HTTP `x-fula-encryption` header is unavailable — i.e. on the
         // offline / warm-cache / cold-start paths where the body is
@@ -1254,7 +1339,6 @@ impl EncryptedClient {
         //     is the canonical source-of-truth). Forest entry is the
         //     fallback that turns gateway-served bytes into something
         //     decryptable.
-        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
 
         // Phase 2.4 — route through the offline-fallback wrapper so a
         // master-down read (per `is_master_unreachable_error`) lands on
@@ -7226,7 +7310,11 @@ impl EncryptedClient {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             })?;
-            return self.get_object_decrypted_by_storage_key(bucket, &entry.storage_key).await;
+            // #91: v7 path already walked the HAMT once via `get_file(key)`
+            // above; pass the entry forward so the decrypt path skips the
+            // O(N) `find_by_storage_key` re-scan inside
+            // `get_object_decrypted_by_storage_key`.
+            return self.get_object_decrypted_by_entry(bucket, entry).await;
         }
 
         // Monolithic v1/v2: already loaded by ensure_forest_loaded
