@@ -49,7 +49,10 @@ pub const SECRET_LINK_VERSION: u8 = 1;
 ///
 /// The fragment is base64url-encoded and contains the full ShareToken,
 /// ensuring that gateways and servers never see the key material.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is hand-rolled so the wrapped DEK + ShareToken never appear
+/// in log output. Only the gateway URL and opaque ID are printed.
+#[derive(Clone)]
 pub struct SecretLink {
     /// The base URL of the gateway (e.g., "https://gateway.example")
     pub gateway_url: String,
@@ -59,10 +62,23 @@ pub struct SecretLink {
     pub payload: SecretLinkPayload,
 }
 
+impl std::fmt::Debug for SecretLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretLink")
+            .field("gateway_url", &self.gateway_url)
+            .field("opaque_id", &self.opaque_id)
+            .field("payload", &"<redacted>")
+            .finish()
+    }
+}
+
 /// The payload stored in the URL fragment
 ///
 /// This is base64url-encoded and contains all sensitive key material.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// `Debug` is hand-rolled to redact the embedded `token` (HPKE-wrapped
+/// DEK + recipient binding) — exposing those bytes in logs would
+/// nullify the fragment-confidentiality property.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SecretLinkPayload {
     /// Version of the payload format
     pub version: u8,
@@ -74,6 +90,17 @@ pub struct SecretLinkPayload {
     /// Optional metadata (e.g., sharer identity hint)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<String>,
+}
+
+impl std::fmt::Debug for SecretLinkPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretLinkPayload")
+            .field("version", &self.version)
+            .field("token", &"<redacted>")
+            .field("label", &self.label)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
 }
 
 impl SecretLink {

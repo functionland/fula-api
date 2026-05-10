@@ -235,7 +235,15 @@ impl std::fmt::Debug for Config {
             .field("users_index_chain_rpc_url", &self.users_index_chain_rpc_url)
             .field("users_index_anchor_address", &self.users_index_anchor_address)
             .field("users_index_ipns_name", &self.users_index_ipns_name)
-            .field("users_index_user_key", &self.users_index_user_key)
+            // Per-user routing key (`BLAKE3("fula:user_id:" || sha256(email))[..16]`).
+            // Stable per-account, used to route the cold-start resolver to a
+            // specific user's bucketsIndex CBOR. Not a secret, but a persistent
+            // user-identity correlator — redacted to match the `access_token`
+            // pattern above and avoid linking log lines to a specific user.
+            .field(
+                "users_index_user_key",
+                &self.users_index_user_key.as_ref().map(|_| "<redacted>"),
+            )
             .field("users_index_ipns_gateway_urls", &self.users_index_ipns_gateway_urls)
             .field("users_index_ipfs_gateway_urls", &self.users_index_ipfs_gateway_urls)
             .field("walkable_v8_writer_enabled", &self.walkable_v8_writer_enabled)

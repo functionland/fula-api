@@ -135,19 +135,31 @@ pub fn create_encrypted_client(
     let dispatcher = Arc::new(HealthEventDispatcher::new());
     let inner_config = build_inner_config(&config, &dispatcher);
 
-    // Create encryption config
-    let enc_config = if let Some(secret_key) = encryption.secret_key {
-        if secret_key.len() != 32 {
-            anyhow::bail!("Secret key must be exactly 32 bytes");
-        }
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(&secret_key);
-        let secret = fula_crypto::SecretKey::from_bytes(&key_bytes)
-            .context("Encryption error")?;
-        fula_client::EncryptionConfig::from_secret_key(secret)
-    } else {
-        fula_client::EncryptionConfig::new()
-    };
+    // Create encryption config.
+    //
+    // `encryption.secret_key` MUST be supplied — fula derives every per-user
+    // identifier (X25519 keypair, content_encryption_key, userKey) from a
+    // stable OAuth-derived seed so that the same user logging in on a fresh
+    // device reaches the same data. Falling back to a random keypair here
+    // (the pre-0.7 behavior) silently locks the user out of every blob they
+    // ever wrote: each session would derive a different identity. Surface the
+    // misconfiguration as a clean error instead.
+    let secret_key = encryption.secret_key.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "EncryptionConfig.secret_key is required: derive a stable 32-byte SecretKey \
+             from your OAuth-stable seed (e.g. Argon2id(provider:rawSub:email)) and pass \
+             it via FulaConfig.encryption.secretKey. A random keypair would lock the user \
+             out of all previously-uploaded data on the next session restart."
+        )
+    })?;
+    if secret_key.len() != 32 {
+        anyhow::bail!("Secret key must be exactly 32 bytes");
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(secret_key);
+    let secret = fula_crypto::SecretKey::from_bytes(&key_bytes)
+        .context("Encryption error")?;
+    let enc_config = fula_client::EncryptionConfig::from_secret_key(secret);
 
     let enc_config = enc_config.with_metadata_privacy(encryption.enable_metadata_privacy);
     #[allow(deprecated)]
@@ -183,19 +195,25 @@ pub fn create_encrypted_client_with_pinning(
     let dispatcher = Arc::new(HealthEventDispatcher::new());
     let inner_config = build_inner_config(&config, &dispatcher);
 
-    // Create encryption config
-    let enc_config = if let Some(secret_key) = encryption.secret_key {
-        if secret_key.len() != 32 {
-            anyhow::bail!("Secret key must be exactly 32 bytes");
-        }
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(&secret_key);
-        let secret = fula_crypto::SecretKey::from_bytes(&key_bytes)
-            .context("Encryption error")?;
-        fula_client::EncryptionConfig::from_secret_key(secret)
-    } else {
-        fula_client::EncryptionConfig::new()
-    };
+    // See `create_encrypted_client` for the rationale behind requiring an
+    // explicit secret_key. Random-keypair fallback was pre-0.7 behavior and
+    // silently lost user data on session restart.
+    let secret_key = encryption.secret_key.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "EncryptionConfig.secret_key is required: derive a stable 32-byte SecretKey \
+             from your OAuth-stable seed (e.g. Argon2id(provider:rawSub:email)) and pass \
+             it via FulaConfig.encryption.secretKey. A random keypair would lock the user \
+             out of all previously-uploaded data on the next session restart."
+        )
+    })?;
+    if secret_key.len() != 32 {
+        anyhow::bail!("Secret key must be exactly 32 bytes");
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(secret_key);
+    let secret = fula_crypto::SecretKey::from_bytes(&key_bytes)
+        .context("Encryption error")?;
+    let enc_config = fula_client::EncryptionConfig::from_secret_key(secret);
 
     let enc_config = enc_config.with_metadata_privacy(encryption.enable_metadata_privacy);
     #[allow(deprecated)]

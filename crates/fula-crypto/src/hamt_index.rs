@@ -45,10 +45,16 @@ fn get_nibble(hash: &[u8; 32], level: usize) -> usize {
 }
 
 /// A HAMT-based index for file entries
-/// 
+///
 /// This provides O(log N) access to file entries while allowing
 /// lazy loading and efficient serialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-rolled. The `Bucket` variant carries plaintext path
+/// keys (`Vec<(String, V)>`); a derived `Debug` would print every key
+/// in the trie at any `{:?}` log call. Serde derives are kept because
+/// the production write path AEAD-encrypts the serialized blob — only
+/// `Debug` logs would bypass that protection.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HamtIndex<V: Clone> {
     /// Version for format evolution
     pub version: u8,
@@ -58,8 +64,21 @@ pub struct HamtIndex<V: Clone> {
     pub count: usize,
 }
 
+impl<V: Clone> std::fmt::Debug for HamtIndex<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HamtIndex")
+            .field("version", &self.version)
+            .field("root", &self.root)
+            .field("count", &self.count)
+            .finish()
+    }
+}
+
 /// A node in the HAMT tree
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-rolled to redact `Bucket.entries` (plaintext path
+/// keys) and `Branch.children` (recursively contains plaintext).
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum HamtNode<V: Clone> {
     /// Empty node
@@ -75,6 +94,26 @@ pub enum HamtNode<V: Clone> {
         /// Child nodes (only for set bits in bitmap)
         children: Vec<HamtNode<V>>,
     },
+}
+
+impl<V: Clone> std::fmt::Debug for HamtNode<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HamtNode::Empty => f.write_str("Empty"),
+            HamtNode::Bucket { entries } => f
+                .debug_struct("Bucket")
+                .field("entries", &format_args!("[{} entries redacted]", entries.len()))
+                .finish(),
+            HamtNode::Branch { bitmap, children } => f
+                .debug_struct("Branch")
+                .field("bitmap", &format_args!("0x{:04x}", bitmap))
+                .field(
+                    "children",
+                    &format_args!("[{} children redacted]", children.len()),
+                )
+                .finish(),
+        }
+    }
 }
 
 impl<V: Clone> Default for HamtIndex<V> {

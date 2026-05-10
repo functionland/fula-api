@@ -660,10 +660,15 @@ pub fn forest_v4_aad(bucket: &str, sequence: u64) -> Vec<u8> {
 impl EncryptedForest {
     /// Encrypt a private forest with a DEK (legacy v1, no AAD).
     ///
-    /// Prefer [`EncryptedForest::encrypt_v4`] for new writes — it binds the
-    /// ciphertext to the bucket and a monotonic sequence counter for replay
-    /// protection. This legacy constructor is preserved so existing tests and
-    /// pre-v4 call sites compile, but new code paths go through v4.
+    /// **DEPRECATED — use [`EncryptedForest::encrypt_v4`].** v4 binds the
+    /// ciphertext to the bucket and a monotonic sequence for replay
+    /// protection. v1 is preserved for legacy round-trip / fixtures and the
+    /// few pre-v4 call sites that still compile against it; production
+    /// flushes go through v7 (sharded HAMT) which has its own AAD binding.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use EncryptedForest::encrypt_v4(forest, dek, bucket, sequence) — v1 is no-AAD and master can replay older snapshots"
+    )]
     pub fn encrypt(forest: &PrivateForest, dek: &DekKey) -> Result<Self> {
         let json = serde_json::to_vec(forest)
             .map_err(|e| CryptoError::Serialization(e.to_string()))?;
@@ -709,7 +714,22 @@ impl EncryptedForest {
     }
 
     /// Decrypt a private forest with a DEK (legacy v1/v2, no AAD).
+    ///
+    /// Errors on any v4+ blob: those formats bind the AEAD to bucket name
+    /// and a monotonic sequence and MUST be decrypted via
+    /// [`EncryptedForest::decrypt_v4`]. Without that dispatch, a caller
+    /// holding a v4 blob would either silently fail the AEAD check (today)
+    /// or — if a future legacy decrypt path was ever broadened — silently
+    /// strip the replay-protection. Failing closed here makes the
+    /// version-mismatch surface visible.
     pub fn decrypt(&self, dek: &DekKey) -> Result<PrivateForest> {
+        if self.version >= 4 {
+            return Err(CryptoError::Decryption(format!(
+                "EncryptedForest version {} requires decrypt_v4(dek, bucket) — \
+                 legacy decrypt is for versions 1 and 2 only",
+                self.version
+            )));
+        }
         let nonce = Nonce::from_bytes(&self.nonce)?;
         let aead = Aead::new_default(dek);
         let plaintext = aead.decrypt(&nonce, &self.ciphertext)?;
@@ -1891,14 +1911,39 @@ impl EncryptedDirectoryIndex {
         let json = serde_json::to_vec(index)
             .map_err(|e| CryptoError::Serialization(e.to_string()))?;
 
+        // **D1 audit fix — clearer hard-cliff error.**
+        //
+        // The IPFS-block-size cap (`MAX_MANIFEST_BLOCK_SIZE`, 1 MiB) is a
+        // hard limit: hitting it makes `flush_forest` fail and the user
+        // cannot write new files into this bucket until they delete
+        // entries. Pre-fix the error message only said the cap was hit;
+        // post-fix it tells the operator (a) what state the bucket is
+        // actually in, (b) why existing data is still readable, and
+        // (c) the two recovery paths.
+        //
+        // The proper fix is prefix-sharded directory indices ("plan D5",
+        // tracked separately) — once shipped, dir-indices grow
+        // horizontally by sharding across multiple S3 blobs instead of
+        // fitting all entries into one. Until then, this error is the
+        // load-bearing operator signal.
+        //
+        // Soft-threshold warning at 80% would be ideal, but `fula-crypto`
+        // deliberately carries no `tracing` / `log` dependency. Callers
+        // that want pre-cliff observability can sample `index.entries.len()`
+        // themselves and emit warnings at their layer.
         if json.len() >= MAX_MANIFEST_BLOCK_SIZE {
             return Err(CryptoError::Serialization(format!(
-                "directory-index plaintext size {} bytes exceeds MAX_MANIFEST_BLOCK_SIZE ({} bytes); \
-                 entry count {}. Consider prefix-sharding the index (plan D5) once this is \
-                 observed in practice.",
+                "directory-index plaintext size {} bytes exceeds the {} byte block cap \
+                 ({} entries). The bucket has accumulated more directory metadata than fits \
+                 in a single IPFS block; new file writes to this bucket will continue to \
+                 fail until either: (a) the user re-organizes existing files into fewer / \
+                 shallower directories so the dir-index shrinks below {} bytes; or (b) the \
+                 SDK ships prefix-sharded dir-indices (plan D5). Existing data in this \
+                 bucket remains readable; only NEW writes are blocked.",
                 json.len(),
                 MAX_MANIFEST_BLOCK_SIZE,
-                index.entries.len()
+                index.entries.len(),
+                MAX_MANIFEST_BLOCK_SIZE,
             )));
         }
 
@@ -1988,6 +2033,7 @@ pub fn detect_forest_format(bytes: &[u8]) -> Result<ForestOrManifest> {
 
 
 #[cfg(test)]
+#[allow(deprecated)] // F2: tests legitimately exercise the legacy v1 (no-AAD) encrypt path; deprecation targets production callers only
 mod tests {
     use super::*;
 

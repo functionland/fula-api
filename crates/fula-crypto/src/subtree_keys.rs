@@ -49,9 +49,26 @@ fn current_timestamp() -> i64 {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// An encrypted subtree DEK, stored in directory entries
-/// 
-/// The subtree DEK is encrypted with the parent's DEK (or master DEK for top-level).
-/// This creates a chain of keys where having access to a parent gives access to children.
+///
+/// The subtree DEK is encrypted with the parent's DEK (or master DEK for
+/// top-level). This creates a chain of keys where having access to a parent
+/// gives access to children.
+///
+/// Wire-format dispatch
+/// --------------------
+/// The serialized form carries two distinct version fields:
+///
+/// - `version: u32` — **rotation version** (advances on each subtree key
+///   rotation; not an AEAD-format version).
+/// - `aad_format_version: u8` (added in 0.7.0) — **AEAD wire-format version**.
+///   `0` (legacy, default for blobs serialized before 0.7.0) means the
+///   ciphertext was produced with no AAD; a storage server can swap such
+///   blobs across paths without detection. `2` means the AEAD is bound to
+///   `(path_prefix, version)` via [`EncryptedSubtreeDek::aad_v2`].
+///
+/// `#[serde(default)]` on the new field makes pre-0.7 blobs deserialize
+/// cleanly with `aad_format_version = 0`, preserving read access to all
+/// already-stored data.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EncryptedSubtreeDek {
     /// The encrypted DEK bytes
@@ -62,33 +79,135 @@ pub struct EncryptedSubtreeDek {
     pub version: u32,
     /// Creation timestamp
     pub created_at: i64,
+    /// AEAD wire-format version. `0` = legacy no-AAD; `2` = AAD bound to
+    /// `(path_prefix, version)`. `#[serde(default)]` keeps pre-0.7 blobs
+    /// readable.
+    #[serde(default)]
+    pub aad_format_version: u8,
 }
 
 impl EncryptedSubtreeDek {
-    /// Encrypt a subtree DEK with a parent DEK
+    /// Wire-format constant: current AAD-bound v2 version byte.
+    pub const AAD_FORMAT_V2: u8 = 2;
+
+    /// Build the canonical v2 AAD for a given subtree path prefix and
+    /// rotation version.
+    ///
+    /// `aad = "fula:subtree-dek:v2:" || path_prefix || ":" || version_be4`.
+    /// Including `version` in the AAD prevents a server from rolling back to
+    /// an older wrapped DEK at the same path; including the path prevents
+    /// cross-subtree swaps.
+    pub fn aad_v2(path_prefix: &str, version: u32) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(
+            b"fula:subtree-dek:v2:".len() + path_prefix.len() + 1 + 4,
+        );
+        aad.extend_from_slice(b"fula:subtree-dek:v2:");
+        aad.extend_from_slice(path_prefix.as_bytes());
+        aad.push(b':');
+        aad.extend_from_slice(&version.to_be_bytes());
+        aad
+    }
+
+    /// **DEPRECATED — use [`EncryptedSubtreeDek::encrypt_v2`].**
+    ///
+    /// Produces a legacy `aad_format_version = 0` blob (no AAD). Kept
+    /// callable for legacy round-trip / fixtures; production callers should
+    /// route to `encrypt_v2` to gain cross-path / rotation-rollback
+    /// resistance.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use encrypt_v2(subtree_dek, parent_dek, path_prefix, version) — legacy encrypt is no-AAD and master can swap blobs across paths or roll back rotations"
+    )]
     pub fn encrypt(subtree_dek: &DekKey, parent_dek: &DekKey, version: u32) -> Result<Self> {
         use crate::symmetric::{Aead, Nonce};
-        
+
         let nonce = Nonce::generate();
         let aead = Aead::new_default(parent_dek);
         let ciphertext = aead.encrypt(&nonce, subtree_dek.as_bytes())?;
-        
+
         Ok(Self {
             ciphertext,
             nonce: nonce.as_bytes().to_vec(),
             version,
             created_at: current_timestamp(),
+            aad_format_version: 0,
         })
     }
-    
-    /// Decrypt to get the subtree DEK
+
+    /// Encrypt a subtree DEK with a parent DEK and AAD bound to the
+    /// subtree path + rotation version.
+    ///
+    /// `path_prefix` MUST be the canonical subtree-prefix string (see
+    /// `SubtreeKeyManager::normalize_path`). `version` is the same rotation
+    /// version that gets stored in [`EncryptedSubtreeDek::version`]. The
+    /// caller must pass the same `(path_prefix, version)` to `decrypt_v2`;
+    /// AEAD verification fails if the wrap is moved to a different path or
+    /// downgraded to an older rotation.
+    pub fn encrypt_v2(
+        subtree_dek: &DekKey,
+        parent_dek: &DekKey,
+        path_prefix: &str,
+        version: u32,
+    ) -> Result<Self> {
+        use crate::symmetric::{Aead, Nonce};
+
+        let aad = Self::aad_v2(path_prefix, version);
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(parent_dek);
+        let ciphertext = aead.encrypt_with_aad(&nonce, subtree_dek.as_bytes(), &aad)?;
+
+        Ok(Self {
+            ciphertext,
+            nonce: nonce.as_bytes().to_vec(),
+            version,
+            created_at: current_timestamp(),
+            aad_format_version: Self::AAD_FORMAT_V2,
+        })
+    }
+
+    /// Decrypt a legacy (`aad_format_version == 0`) subtree DEK wrap.
+    ///
+    /// Errors when `aad_format_version != 0` to prevent a v2 blob from
+    /// being silently decrypted without its AAD. v2 blobs go through
+    /// [`EncryptedSubtreeDek::decrypt_v2`].
     pub fn decrypt(&self, parent_dek: &DekKey) -> Result<DekKey> {
         use crate::symmetric::{Aead, Nonce};
-        
+
+        if self.aad_format_version != 0 {
+            return Err(CryptoError::Decryption(format!(
+                "EncryptedSubtreeDek aad_format_version {} requires decrypt_v2(parent_dek, path_prefix) — \
+                 legacy decrypt is for aad_format_version 0 only",
+                self.aad_format_version
+            )));
+        }
         let nonce = Nonce::from_bytes(&self.nonce)?;
         let aead = Aead::new_default(parent_dek);
         let plaintext = aead.decrypt(&nonce, &self.ciphertext)?;
-        
+
+        DekKey::from_bytes(&plaintext)
+    }
+
+    /// Decrypt a v2 subtree DEK wrap with AAD verification.
+    ///
+    /// Caller passes the path prefix the wrap was issued for; AAD is
+    /// reconstructed via `aad_v2(path_prefix, self.version)` and checked
+    /// against the AEAD tag. Mismatched paths or rolled-back rotation
+    /// versions surface as `CryptoError::Decryption`.
+    pub fn decrypt_v2(&self, parent_dek: &DekKey, path_prefix: &str) -> Result<DekKey> {
+        use crate::symmetric::{Aead, Nonce};
+
+        if self.aad_format_version != Self::AAD_FORMAT_V2 {
+            return Err(CryptoError::Decryption(format!(
+                "decrypt_v2 requires EncryptedSubtreeDek aad_format_version {}, got {}",
+                Self::AAD_FORMAT_V2,
+                self.aad_format_version
+            )));
+        }
+        let aad = Self::aad_v2(path_prefix, self.version);
+        let nonce = Nonce::from_bytes(&self.nonce)?;
+        let aead = Aead::new_default(parent_dek);
+        let plaintext = aead.decrypt_with_aad(&nonce, &self.ciphertext, &aad)?;
+
         DekKey::from_bytes(&plaintext)
     }
 }
@@ -171,22 +290,30 @@ impl SubtreeKeyManager {
     }
     
     /// Create a new subtree with its own DEK
-    /// 
+    ///
     /// Returns the encrypted subtree DEK for storage in the directory entry.
+    /// Encrypts via [`EncryptedSubtreeDek::encrypt_v2`] (AAD bound to the
+    /// canonical path prefix and rotation version) so a server cannot move
+    /// the wrap to a different subtree path or roll back the rotation.
     pub fn create_subtree(&mut self, path_prefix: &str) -> Result<(DekKey, EncryptedSubtreeDek)> {
         let master = self.master_dek.as_ref()
             .ok_or_else(|| CryptoError::InvalidKey("Master DEK not set".into()))?;
-        
+
         // Normalize path
         let normalized = Self::normalize_path(path_prefix);
-        
+
         // Generate new subtree DEK
         let subtree_dek = DekKey::generate();
         let version = 1u32;
-        
-        // Encrypt with master DEK
-        let encrypted = EncryptedSubtreeDek::encrypt(&subtree_dek, master, version)?;
-        
+
+        // Encrypt with master DEK and AAD-bound to (path_prefix, version).
+        let encrypted = EncryptedSubtreeDek::encrypt_v2(
+            &subtree_dek,
+            master,
+            &normalized,
+            version,
+        )?;
+
         // Store in memory
         self.subtree_keys.insert(normalized.clone(), SubtreeKeyInfo {
             path_prefix: normalized,
@@ -194,25 +321,43 @@ impl SubtreeKeyManager {
             version,
             created_at: current_timestamp(),
         });
-        
+
         Ok((subtree_dek, encrypted))
     }
-    
-    /// Load an existing subtree key from encrypted storage
+
+    /// Load an existing subtree key from encrypted storage.
+    ///
+    /// Dispatches on the wrap's `aad_format_version`: legacy (`0`) blobs
+    /// (from pre-0.7 SDKs) read with the no-AAD path; v2 blobs (`2`) read
+    /// with AAD bound to the canonical path prefix and stored rotation
+    /// version. Mixed deployments — some subtrees v1, others v2 — work
+    /// because each blob carries its own version on the wire.
     pub fn load_subtree(&mut self, path_prefix: &str, encrypted: &EncryptedSubtreeDek) -> Result<DekKey> {
         let master = self.master_dek.as_ref()
             .ok_or_else(|| CryptoError::InvalidKey("Master DEK not set".into()))?;
-        
+
         let normalized = Self::normalize_path(path_prefix);
-        let subtree_dek = encrypted.decrypt(master)?;
-        
+        let subtree_dek = match encrypted.aad_format_version {
+            0 => encrypted.decrypt(master)?, // legacy v1 wrap (no AAD)
+            EncryptedSubtreeDek::AAD_FORMAT_V2 => {
+                encrypted.decrypt_v2(master, &normalized)?
+            }
+            v => {
+                return Err(CryptoError::Decryption(format!(
+                    "unsupported EncryptedSubtreeDek aad_format_version {} — \
+                     this SDK reads 0 (legacy) and 2",
+                    v
+                )));
+            }
+        };
+
         self.subtree_keys.insert(normalized.clone(), SubtreeKeyInfo {
             path_prefix: normalized,
             dek: subtree_dek.clone(),
             version: encrypted.version,
             created_at: encrypted.created_at,
         });
-        
+
         Ok(subtree_dek)
     }
     
@@ -277,10 +422,16 @@ impl SubtreeKeyManager {
             .map(|info| info.version)
             .unwrap_or(0);
         
-        // Generate new key
+        // Generate new key. v2 wrap binds the new (path_prefix, new_version)
+        // tuple into AAD so an old wrap cannot be replayed at this path.
         let new_dek = DekKey::generate();
         let new_version = current_version + 1;
-        let encrypted = EncryptedSubtreeDek::encrypt(&new_dek, master, new_version)?;
+        let encrypted = EncryptedSubtreeDek::encrypt_v2(
+            &new_dek,
+            master,
+            &normalized,
+            new_version,
+        )?;
         
         // Update in memory
         self.subtree_keys.insert(normalized.clone(), SubtreeKeyInfo {
@@ -694,6 +845,7 @@ impl AcceptedSubtreeShare {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
+#[allow(deprecated)] // F2: tests legitimately exercise the legacy v1 (no-AAD) encrypt path; deprecation targets production callers only
 mod tests {
     use super::*;
 
@@ -949,6 +1101,179 @@ mod tests {
         assert_eq!(restored.id, token.id);
         assert_eq!(restored.path_prefix, token.path_prefix);
         assert_eq!(restored.subtree_version, token.subtree_version);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // F2 (audit): EncryptedSubtreeDek wire-format v2 AAD binding +
+    // back-compat regression tests. Loads-bearing for the invariant that
+    // pre-0.7 (legacy v1 / aad_format_version=0) wraps remain readable.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_subtree_dek_v2_round_trip() {
+        let parent_dek = DekKey::generate();
+        let subtree_dek = DekKey::generate();
+
+        let encrypted = EncryptedSubtreeDek::encrypt_v2(
+            &subtree_dek,
+            &parent_dek,
+            "/photos/",
+            1,
+        )
+        .unwrap();
+        assert_eq!(encrypted.aad_format_version, EncryptedSubtreeDek::AAD_FORMAT_V2);
+        assert_eq!(encrypted.version, 1);
+
+        let decrypted = encrypted.decrypt_v2(&parent_dek, "/photos/").unwrap();
+        assert_eq!(subtree_dek.as_bytes(), decrypted.as_bytes());
+    }
+
+    #[test]
+    fn test_subtree_dek_v2_wrong_path_rejects() {
+        let parent_dek = DekKey::generate();
+        let subtree_dek = DekKey::generate();
+
+        let encrypted = EncryptedSubtreeDek::encrypt_v2(
+            &subtree_dek,
+            &parent_dek,
+            "/photos/",
+            1,
+        )
+        .unwrap();
+        assert!(
+            encrypted.decrypt_v2(&parent_dek, "/documents/").is_err(),
+            "AEAD must reject mismatched path — server cannot move wrap to a different subtree"
+        );
+    }
+
+    #[test]
+    fn test_subtree_dek_v2_wrong_version_rejects() {
+        let parent_dek = DekKey::generate();
+        let subtree_dek = DekKey::generate();
+
+        // Encrypt with version 5 (rotation version).
+        let mut encrypted = EncryptedSubtreeDek::encrypt_v2(
+            &subtree_dek,
+            &parent_dek,
+            "/photos/",
+            5,
+        )
+        .unwrap();
+        // Tamper with the version field — server attempts a rotation rollback.
+        encrypted.version = 4;
+        assert!(
+            encrypted.decrypt_v2(&parent_dek, "/photos/").is_err(),
+            "AEAD must reject mutated rotation version — server cannot roll back rotations"
+        );
+    }
+
+    #[test]
+    fn test_subtree_dek_v1_legacy_data_still_readable() {
+        // An SDK upgraded to produce v2 wraps must still read every
+        // pre-0.7 (aad_format_version=0) wrap successfully.
+        let parent_dek = DekKey::generate();
+        let subtree_dek = DekKey::generate();
+
+        let v1_blob = EncryptedSubtreeDek::encrypt(&subtree_dek, &parent_dek, 1).unwrap();
+        assert_eq!(v1_blob.aad_format_version, 0);
+
+        let decrypted = v1_blob.decrypt(&parent_dek).unwrap();
+        assert_eq!(subtree_dek.as_bytes(), decrypted.as_bytes());
+    }
+
+    #[test]
+    fn test_subtree_dek_v1_blob_serde_default() {
+        // Backward-compat: a serialized v1 blob (produced by a pre-0.7 SDK
+        // that didn't know about the `aad_format_version` field) MUST
+        // deserialize cleanly with `aad_format_version` defaulting to 0.
+        // Without `#[serde(default)]` on that field, every legacy wrap
+        // would fail to load.
+        let parent_dek = DekKey::generate();
+        let subtree_dek = DekKey::generate();
+        let v1_blob = EncryptedSubtreeDek::encrypt(&subtree_dek, &parent_dek, 1).unwrap();
+
+        // Simulate a pre-0.7 wire form by serializing without the field.
+        let json_with_field = serde_json::to_string(&v1_blob).unwrap();
+        // Strip the field to simulate older serde output:
+        let json_without = json_with_field
+            .replace(",\"aad_format_version\":0", "")
+            .replace("\"aad_format_version\":0,", "");
+
+        let deserialized: EncryptedSubtreeDek = serde_json::from_str(&json_without).unwrap();
+        assert_eq!(deserialized.aad_format_version, 0, "missing field must default to 0");
+        let decrypted = deserialized.decrypt(&parent_dek).unwrap();
+        assert_eq!(subtree_dek.as_bytes(), decrypted.as_bytes());
+    }
+
+    #[test]
+    fn test_subtree_dek_v2_rejected_by_legacy_decrypt() {
+        // A v2 wrap fed through legacy decrypt() must fail closed — it would
+        // otherwise silently bypass the AAD check.
+        let parent_dek = DekKey::generate();
+        let subtree_dek = DekKey::generate();
+        let v2_blob = EncryptedSubtreeDek::encrypt_v2(&subtree_dek, &parent_dek, "/p/", 1).unwrap();
+
+        // DekKey doesn't implement Debug (key material), so use match instead
+        // of .unwrap_err() which would require Debug on the Ok variant.
+        match v2_blob.decrypt(&parent_dek) {
+            Ok(_) => panic!("legacy decrypt() must reject v2 wrap"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("decrypt_v2"),
+                    "error must direct caller to decrypt_v2; got: {}",
+                    msg
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_subtree_dek_v1_rejected_by_v2_decrypt() {
+        // Symmetrically: v1 wrap fed through decrypt_v2 must fail closed
+        // before the AEAD layer even gets called.
+        let parent_dek = DekKey::generate();
+        let subtree_dek = DekKey::generate();
+        let v1_blob = EncryptedSubtreeDek::encrypt(&subtree_dek, &parent_dek, 1).unwrap();
+
+        assert!(v1_blob.decrypt_v2(&parent_dek, "/p/").is_err());
+    }
+
+    #[test]
+    fn test_subtree_key_manager_create_subtree_emits_v2() {
+        // create_subtree (production write path) must emit v2 wraps so the
+        // F2 caller migration is verified end-to-end, not just at unit-test
+        // level.
+        let master_dek = DekKey::generate();
+        let mut manager = SubtreeKeyManager::with_master_dek(master_dek);
+
+        let (_dek, encrypted) = manager.create_subtree("/photos/").unwrap();
+        assert_eq!(
+            encrypted.aad_format_version,
+            EncryptedSubtreeDek::AAD_FORMAT_V2,
+            "production create_subtree must emit v2 wraps"
+        );
+    }
+
+    #[test]
+    fn test_subtree_key_manager_load_subtree_dispatches_on_version() {
+        // Mixed deployment scenario: a master holds both v1 (legacy) and
+        // v2 (new) wraps. load_subtree must read both.
+        let master_dek = DekKey::generate();
+
+        // Legacy v1 wrap simulates pre-0.7 stored data.
+        let legacy_subtree = DekKey::generate();
+        let v1_wrap = EncryptedSubtreeDek::encrypt(&legacy_subtree, &master_dek, 1).unwrap();
+
+        let mut manager = SubtreeKeyManager::with_master_dek(master_dek);
+        let loaded_legacy = manager.load_subtree("/legacy/", &v1_wrap).unwrap();
+        assert_eq!(legacy_subtree.as_bytes(), loaded_legacy.as_bytes());
+
+        // New v2 subtree created in the same manager.
+        let (new_subtree, _) = manager.create_subtree("/new/").unwrap();
+        assert!(manager.has_subtree_key("/new/"));
+        let resolved = manager.resolve_dek("/new/file.txt").unwrap();
+        assert_eq!(resolved.as_bytes(), new_subtree.as_bytes());
     }
 
     // ═══════════════════════════════════════════════════════════════════════

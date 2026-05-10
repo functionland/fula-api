@@ -886,48 +886,81 @@ impl ShardedHamtPrivateForest {
                 LoadedShard::Loaded(node) => node.get(&parent_key, &reader).await?,
             };
 
-            let (new_parent_entry, freshly_created) =
-                match prior_parent.map(HamtEntry::from) {
-                    Some(HamtEntry::Dir(mut d)) => {
-                        if d.subdirs.contains(&current) {
-                            return Ok(());
-                        }
-                        d.subdirs.push(current.clone());
-                        (d, false)
-                    }
-                    Some(HamtEntry::File(_)) => {
-                        return Err(CryptoError::Hamt(format!(
-                            "directory key D:{} resolved to a File entry — type-tagged HAMT invariant violated",
-                            parent
-                        )));
-                    }
-                    None => (
-                        ForestDirectoryEntry {
-                            path: parent.clone(),
-                            files: Vec::new(),
-                            subdirs: vec![current.clone()],
-                            metadata: None,
-                            subtree_dek: None,
-                        },
-                        true,
-                    ),
-                };
+            // **E83 audit fix — symmetric subdirs cliff (#83), mirroring
+            // the #72 files-cliff fix.**
+            //
+            // Pre-fix this branch did `if d.subdirs.contains(&current)
+            // { return Ok(()) }` followed by `d.subdirs.push(current)`,
+            // growing `ForestDirectoryEntry.subdirs: Vec<String>`
+            // unbounded. At 100k+ direct subdirectories of a single
+            // parent the wrapping HamtEntry blob exceeded the 1 MiB
+            // IPFS-block cap and the dir-write failed permanently —
+            // the same cliff that #72 fixed for `dir.files`.
+            //
+            // Fix: stop pushing into `d.subdirs`. The `D:` HAMT entry
+            // for `current` is written separately by `upsert_file` (or
+            // by `upsert_directory` for empty dirs), so the directory
+            // IS in the forest after this call. Listing methods walk
+            // the HAMT for `D:` entries with parent prefix
+            // ([`list_subdirs_via_hamt_walk`]), the same way they walk
+            // `F:` entries for files post-#72. Legacy populated
+            // `dir.subdirs` continues to deserialize fine; the
+            // walk-based listing returns the same set whether the
+            // field is populated or empty. New writes don't grow the
+            // field.
+            //
+            // **Short-circuit invariant (preserves second_upsert_same_dir
+            // performance):** if `prior_parent` is `Some(Dir)`, the `D:`
+            // entry for `parent` already existed. By induction (every
+            // `D:` write is followed by `ensure_ancestor_chain` for that
+            // path — see `upsert_file` line ~1054 and `upsert_directory`
+            // line ~1134), parent's ancestors are already in the HAMT.
+            // We can stop walking — no rewrite of `parent`'s entry is
+            // needed (post-fix `subdirs` is empty so there's nothing
+            // to add) and the chain above is already pinned.
+            //
+            // Pre-fix the same short-circuit fired via the
+            // `d.subdirs.contains(&current)` check; the new sentinel
+            // is structurally simpler ("does the dir entry exist at
+            // all?") and doesn't depend on the `subdirs` field.
+            match prior_parent.map(HamtEntry::from) {
+                Some(HamtEntry::Dir(_)) => {
+                    // Parent exists; by invariant its ancestors are
+                    // pinned. Nothing to write. Stop the walk.
+                    return Ok(());
+                }
+                Some(HamtEntry::File(_)) => {
+                    return Err(CryptoError::Hamt(format!(
+                        "directory key D:{} resolved to a File entry — type-tagged HAMT invariant violated",
+                        parent
+                    )));
+                }
+                None => {
+                    // Parent doesn't exist yet. Write a fresh empty
+                    // Dir entry and continue walking up so its own
+                    // ancestors get pinned.
+                    let new_parent_entry = ForestDirectoryEntry {
+                        path: parent.clone(),
+                        files: Vec::new(),
+                        subdirs: Vec::new(),
+                        metadata: None,
+                        subtree_dek: None,
+                    };
+                    let mut root = Self::take_loaded_root_from(&mut *guard);
+                    root.set(
+                        parent_key,
+                        HamtEntryWire::from(HamtEntry::Dir(new_parent_entry)),
+                        &reader,
+                    )
+                    .await?;
+                    Self::install_loaded_root_into(&mut *guard, root);
+                    drop(guard);
 
-            let mut root = Self::take_loaded_root_from(&mut *guard);
-            root.set(
-                parent_key,
-                HamtEntryWire::from(HamtEntry::Dir(new_parent_entry)),
-                &reader,
-            )
-            .await?;
-            Self::install_loaded_root_into(&mut *guard, root);
-            drop(guard);
-
-            if freshly_created {
-                let shard = self.manifest.shard_mut(shard_idx);
-                shard.entry_count = shard.entry_count.saturating_add(1);
+                    let shard = self.manifest.shard_mut(shard_idx);
+                    shard.entry_count = shard.entry_count.saturating_add(1);
+                    self.dirty_shards[shard_idx] = true;
+                }
             }
-            self.dirty_shards[shard_idx] = true;
 
             current = parent;
         }
@@ -1085,9 +1118,20 @@ impl ShardedHamtPrivateForest {
         // 100k+ files in one directory. v7's listing methods walk the
         // HAMT for `F:` entries (which the migration's separate
         // `upsert_file` loop populates), so `dir.files` is dead weight.
-        // Other fields (path, subdirs, metadata, subtree_dek) preserve.
+        //
+        // **E83 audit fix — also strip `subdirs`.** Symmetric cliff:
+        // a v1→v7 migration of a parent directory with 100k+ direct
+        // subdirs would carry the populated Vec<String> into the v7
+        // entry, exceeding the 1 MiB block cap. The walk-based
+        // `list_subdirs` derives subdirs from `D:` HAMT entries (which
+        // the migration's separate `upsert_directory` loop populates
+        // for each leaf dir, and `ensure_ancestor_chain` populates for
+        // ancestors), so `dir.subdirs` is dead weight just like
+        // `dir.files`. Other fields (path, metadata, subtree_dek)
+        // preserve.
         let mut entry = entry;
         entry.files = Vec::new();
+        entry.subdirs = Vec::new();
         let dir_path = entry.path.clone();
         let shard_idx = self.shard_for_dir(&dir_path);
         self.ensure_shard_loaded(shard_idx, backend).await?;
@@ -1359,6 +1403,30 @@ impl ShardedHamtPrivateForest {
             }
         }
     }
+
+    // **E83 audit note — listing direct subdirs post-fix.**
+    //
+    // Pre-#83 callers read `ForestDirectoryEntry.subdirs: Vec<String>`
+    // directly off the parent's HAMT entry. That field is no longer
+    // populated on new writes (the symmetric counterpart of #72
+    // dropping `dir.files`). Use the existing sync
+    // [`Self::list_subdirs`] instead (line ~703) — it reads from the
+    // in-memory [`crate::private_forest::DirectoryIndex`], which is
+    // maintained on every upsert via `dir_index.insert_file` (line
+    // ~1092). DirectoryIndex tracks (parent → subdirs) independently
+    // of `dir.subdirs`, so the listing is authoritative regardless of
+    // the per-Dir-entry field's population state.
+    //
+    // **Why a walk-based variant doesn't fit here.** Dir-local routing
+    // routes `D:/parent/subN/` to `shard_for_dir("/parent/subN/")`,
+    // which is per-subdir — not the same as `shard_for_dir("/parent/")`.
+    // So a single-shard walk over `/parent/`'s shard would miss the
+    // subdir entries (they're scattered across many shards). A
+    // cross-shard walk would work but is O(num_shards) and defeats
+    // the dir-local optimization. The DirectoryIndex's amortized-
+    // walk-once-on-load model is the correct trade-off; D1's
+    // dir-index-cap fix surfaces operator-actionable errors when the
+    // index itself approaches its 1 MiB cap.
 
     //----------------------------------------------------------------------------------------------
     // WAL reconciliation
@@ -2216,9 +2284,23 @@ mod tests {
         assert_eq!(m1.shard(root_dir_idx).seq, 1);
 
         // A second write under a *different* top-level directory dirties
-        // its own leaf shard AND the root-dir shard (because `D:/` now
-        // also lists `/gb` in its subdirs). The `/ga` leaf shard was not
-        // re-touched, so its seq must stay at 1.
+        // its own leaf shard. The `/ga` leaf shard was not re-touched,
+        // so its seq must stay at 1.
+        //
+        // **E83 audit fix — root-dir shard is NOT re-bumped post-fix.**
+        //
+        // Pre-#83 the root-dir shard re-bumped because `ensure_ancestor_chain`
+        // rewrote `D:/` to add `/gb` to its `subdirs: Vec<String>`. That
+        // rewrite was the source of the symmetric subdirs cliff: at
+        // 100k+ top-level dirs, `D:/.subdirs` exceeded the 1 MiB block
+        // cap. Post-fix `dir.subdirs` is no longer populated, so when
+        // ensure_ancestor_chain encounters an existing parent dir
+        // (here: `D:/` already exists from /ga's write), it
+        // short-circuits — no rewrite to D:/, root shard not dirtied.
+        // Performance bonus: steady-state writes don't ripple to root.
+        // The (parent → subdirs) listing lives in the in-memory
+        // `DirectoryIndex` (which `dir_index.insert_file` populated),
+        // not in D:/'s HAMT entry.
         forest
             .upsert_file(file_entry("/gb/beta.txt", 2), &backend)
             .await
@@ -2239,10 +2321,16 @@ mod tests {
         if gb_leaf_idx != ga_leaf_idx && gb_leaf_idx != root_dir_idx {
             assert_eq!(m2.shard(gb_leaf_idx).seq, 1);
         }
-        assert_eq!(
-            m2.shard(root_dir_idx).seq, 2,
-            "root-dir shard must re-bump when a new top-level dir joins D:/'s subdirs"
-        );
+        // Post-E83: root-dir shard stays at seq=1 — D:/ already exists
+        // from /ga's write and the short-circuit prevents the rewrite.
+        if root_dir_idx != ga_leaf_idx && root_dir_idx != gb_leaf_idx {
+            assert_eq!(
+                m2.shard(root_dir_idx).seq, 1,
+                "E83: root-dir shard must NOT re-bump when a new top-level \
+                 dir is added — D:/ already exists, ensure_ancestor_chain \
+                 short-circuits, post-fix dir.subdirs is empty so no rewrite"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2333,7 +2421,13 @@ mod tests {
             .expect("/a must be pinned by ancestor-chain walk");
         assert_eq!(mid.path, "/a");
         assert!(mid.files.is_empty());
-        assert_eq!(mid.subdirs, vec!["/a/b".to_string()]);
+        // **E83 audit fix**: dir.subdirs is no longer populated on
+        // write — verify via the existing dir_index-backed
+        // `list_subdirs` (which is maintained on every upsert and
+        // returns LEAF segment names, not full paths).
+        assert!(mid.subdirs.is_empty());
+        let mid_subdirs = forest.list_subdirs("/a");
+        assert_eq!(mid_subdirs, vec!["b".to_string()]);
 
         let root = forest
             .get_directory("/", &backend)
@@ -2342,7 +2436,11 @@ mod tests {
             .expect("/ must be pinned by ancestor-chain walk");
         assert_eq!(root.path, "/");
         assert!(root.files.is_empty());
-        assert_eq!(root.subdirs, vec!["/a".to_string()]);
+        // E83: same as above — dir_index is the post-fix source.
+        // dir_index returns leaf segment names (not full paths).
+        assert!(root.subdirs.is_empty());
+        let root_subdirs = forest.list_subdirs("/");
+        assert_eq!(root_subdirs, vec!["a".to_string()]);
     }
 
     #[tokio::test]
@@ -4323,19 +4421,83 @@ mod tests {
         );
     }
 
+    /// **E83 regression — symmetric subdirs cliff fix (CI-runnable, 1k subdirs).**
+    ///
+    /// Post-fix the parent's `dir.subdirs` Vec stays empty regardless of
+    /// how many direct subdirectories exist; the in-memory
+    /// `DirectoryIndex` (separately maintained on every upsert) is the
+    /// source of truth for `list_subdirs`. At 1k subdirs the largest
+    /// HAMT-node blob stays tiny — well under the 1 MiB cap that pre-fix
+    /// would have crept toward at 100k+ via `dir.subdirs.push`. The
+    /// dir_index itself has its own cap (D1's target) but at 1k subdirs
+    /// is nowhere close. This test runs in CI on every PR.
+    #[tokio::test]
+    async fn e83_subdirs_cliff_fix_at_1k_post_fix() {
+        let backend = std::sync::Arc::new(WalkableV8RecordingBackend::new());
+        let mut forest =
+            ShardedHamtPrivateForest::new("subdirs-1k", test_dek(), 16);
+
+        // 1k direct subdirs of /parent/, each with one file inside so
+        // upsert_file's `dir_index.insert_file` populates the
+        // dir_index correctly.
+        for i in 0..1_000usize {
+            let path = format!("/parent/sub{:04}/leaf.bin", i);
+            forest.upsert_file(file_entry(&path, 0), &backend).await.unwrap();
+        }
+        forest.flush_dirty(&backend).await.unwrap();
+
+        // The parent's HAMT entry has empty subdirs (post-fix invariant).
+        let parent_entry = forest
+            .get_directory("/parent", &backend)
+            .await
+            .unwrap()
+            .expect("/parent exists after upserts");
+        assert!(
+            parent_entry.subdirs.is_empty(),
+            "E83: dir.subdirs should be empty post-fix, was {} entries",
+            parent_entry.subdirs.len()
+        );
+
+        // The dir_index returns all 1k subdirs (it's maintained
+        // independently of dir.subdirs and was populated on each
+        // upsert_file via dir_index.insert_file). Returns leaf
+        // segment names — sub0000..sub0999.
+        let subdirs = forest.list_subdirs("/parent");
+        assert_eq!(
+            subdirs.len(),
+            1_000,
+            "E83: list_subdirs must return all 1k direct subdirs via dir_index (got {})",
+            subdirs.len()
+        );
+        // Spot-check that the leaf names match the expected pattern.
+        let mut sorted = subdirs.clone();
+        sorted.sort();
+        assert_eq!(sorted[0], "sub0000");
+        assert_eq!(sorted[999], "sub0999");
+
+        // No HAMT-node blob exceeds the IPFS block cap. Pre-fix, at
+        // ~100k+ direct subdirs the wrapping HamtEntry blob for
+        // `D:/parent/` would have exceeded 1 MiB because `dir.subdirs`
+        // grew unbounded. Post-fix it stays tiny regardless.
+        let largest = backend.max_size();
+        assert!(
+            largest <= IPFS_BLOCK_LIMIT,
+            "E83 regression: largest HAMT blob {} bytes exceeds 1 MiB at 1k \
+             single-dir subdirs — the symmetric cliff returned",
+            largest
+        );
+    }
+
     /// **#72 stress test**: 100k FILES in a SINGLE directory. This
     /// is the size that empirically hit the 1 MiB cliff pre-fix
     /// (1.66 MiB Dir blob). Post-fix the Dir blob stays tiny
     /// regardless of file count. Operator-run pre-major-release;
     /// release mode required for memory headroom.
     ///
-    /// **NOTE (Reviewer B audit)**: this only verifies the FILES
-    /// cliff is gone. A symmetric `subdirs: Vec<String>` cliff
-    /// exists for directories with 100k+ direct subdirectories
-    /// (`ensure_ancestor_chain` does `d.subdirs.push(child)`
-    /// linearly). That parallel cliff is tracked separately; it
-    /// has not been observed empirically and is rarer in practice
-    /// (users with 100k subdirs at one level are uncommon).
+    /// **E83 (was Reviewer B audit note)**: the symmetric subdirs
+    /// cliff is now also fixed. The 100k variant of the subdirs
+    /// regression below complements this 100k files test. Run both
+    /// before each major release.
     ///
     /// `cargo test --release -p fula-crypto --lib -- --ignored \
     ///   walkable_v8_single_directory_at_100k_post_fix_72`

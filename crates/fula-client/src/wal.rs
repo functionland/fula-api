@@ -13,7 +13,7 @@
 //! from the user's encryption key so a local tamperer cannot cause spurious
 //! work to be replayed against the forest.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,6 +24,37 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ClientError, Result};
 
 const WAL_FILE_VERSION: u8 = 1;
+
+/// **D4 audit fix — soft cap on WAL file size.**
+///
+/// Pre-fix the WAL grew without bound: a sustained master-down condition
+/// (or persistent 412 races on flush) accumulated 1–3 entries per write
+/// forever. Two failure modes followed:
+///
+/// 1. WAL eventually fills the user's disk — application-level OOM or
+///    panic when `append` returns `EIO`.
+/// 2. WAL load (`read_to_string`, now streaming via D4) tries to allocate
+///    the whole file and OOMs at startup.
+///
+/// At 64 MB (~hundreds of thousands of file-write entries) the user has
+/// already lost reach to master long enough that something is wrong. The
+/// soft cap returns a typed error from `append` so callers can surface
+/// "your local SDK has accumulated too many pending writes; investigate
+/// master connectivity or wipe the WAL to drop unflushed work" rather
+/// than crash on `EIO` / OOM.
+///
+/// Configurable via `FULA_WAL_SOFT_CAP_BYTES` env var (operator override
+/// for unusual environments). 64 MB is a generous default — typical
+/// per-write footprint is ~500 bytes, so this represents ~130k pending
+/// writes before the cap fires.
+const WAL_SOFT_CAP_BYTES_DEFAULT: u64 = 64 * 1024 * 1024;
+
+fn wal_soft_cap_bytes() -> u64 {
+    std::env::var("FULA_WAL_SOFT_CAP_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(WAL_SOFT_CAP_BYTES_DEFAULT)
+}
 
 /// Monotonically-increasing count of `append()` invocations that entered
 /// the on-disk I/O path and returned `Err`. The no-state-dir early return
@@ -189,6 +220,36 @@ pub(crate) fn append(bucket: &str, mac_key: &DekKey, entry: WalEntry) -> Result<
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(ClientError::Io)?;
         }
+
+        // **D4 audit — soft-cap check before append.** If the WAL has
+        // already accumulated past the soft cap, surface a typed
+        // `ConcurrentModificationExhausted`-flavored error so the caller
+        // (and operator) sees a clear signal that something is wrong with
+        // master connectivity or flush coordination. Without this check,
+        // sustained master-down silently accumulates dirty WAL entries
+        // until disk fills or the load path OOMs at startup.
+        let cap = wal_soft_cap_bytes();
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > cap {
+                tracing::error!(
+                    %bucket,
+                    wal_size = meta.len(),
+                    cap,
+                    "D4: WAL exceeds soft cap — likely sustained master-down or flush failure; \
+                     refusing further appends until WAL is drained or wiped"
+                );
+                return Err(ClientError::UploadFailed(format!(
+                    "WAL for bucket {} exceeds soft cap ({} bytes > {} bytes); \
+                     master appears unreachable or flush is repeatedly losing 412 races. \
+                     Pending writes cannot be durably recorded until either: (a) master \
+                     becomes reachable and `flush_forest` succeeds (drains the WAL), or \
+                     (b) the WAL is manually deleted (drops every unflushed write). \
+                     Override the cap via FULA_WAL_SOFT_CAP_BYTES env var if intentional.",
+                    bucket, meta.len(), cap,
+                )));
+            }
+        }
+
         let record = WalRecord { version: WAL_FILE_VERSION, entry, group: None };
         let json = serde_json::to_string(&record).map_err(|e| {
             ClientError::Encryption(fula_crypto::CryptoError::Encryption(format!(
@@ -328,7 +389,18 @@ pub(crate) fn load(bucket: &str, mac_key: &DekKey) -> Result<Vec<WalEntry>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let contents = std::fs::read_to_string(&path).map_err(ClientError::Io)?;
+
+    // **D4 audit fix — streaming load instead of `read_to_string`.**
+    //
+    // Pre-fix `load` did `std::fs::read_to_string(&path)`, which allocates
+    // the entire WAL file into a single `String`. A WAL that grew large
+    // under sustained master-down (now bounded by the soft cap in
+    // `append`, but legacy WALs from pre-fix builds may already exceed
+    // the cap) caused startup-time OOMs. Switching to `BufReader::lines()`
+    // streams the file line-by-line: peak memory is one line plus the
+    // accumulator state, regardless of file size.
+    let f = std::fs::File::open(&path).map_err(ClientError::Io)?;
+    let reader = BufReader::new(f);
 
     // Two-phase load: (1) walk the file in append order and place either a
     // Direct entry or a GroupRef placeholder into `items`; accumulate group
@@ -346,7 +418,14 @@ pub(crate) fn load(bucket: &str, mac_key: &DekKey) -> Result<Vec<WalEntry>> {
     let mut items: Vec<Item> = Vec::new();
     let mut groups: HashMap<String, GroupAccum> = HashMap::new();
 
-    for (lineno, raw) in contents.lines().enumerate() {
+    for (lineno, line_result) in reader.lines().enumerate() {
+        let raw = match line_result {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(%bucket, lineno, error = %e, "WAL: read error, stopping load");
+                break;
+            }
+        };
         let line = raw.trim_end_matches('\n');
         if line.is_empty() {
             continue;
@@ -463,6 +542,7 @@ pub(crate) fn test_path(bucket: &str) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // F1: tests legitimately use KeyManager::new() (random keypair); deprecation targets production callers only
 mod tests {
     use super::*;
     use fula_crypto::private_forest::ForestFileEntry;

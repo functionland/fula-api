@@ -429,8 +429,57 @@ impl ChunkedDecoder {
         }
     }
 
-    /// Decrypt a single chunk
+    /// Decrypt a single chunk and accumulate it into the decoder's
+    /// internal buffer for later [`ChunkedDecoder::finalize`].
+    ///
+    /// **Memory cost**: every decrypted chunk is retained in
+    /// `self.chunks` until `finalize` is called. For multi-GB files this
+    /// is 2× file-size peak RAM (ciphertext fetched into S3 buffers +
+    /// plaintext buffered here). Callers reading large files on memory-
+    /// constrained devices should use [`ChunkedDecoder::decrypt_chunk_streaming`]
+    /// instead, which decrypts without buffering.
     pub fn decrypt_chunk(&mut self, index: u32, ciphertext: &[u8]) -> Result<Bytes> {
+        let plaintext = self.decrypt_chunk_inner(index, ciphertext)?;
+        self.chunks.push((index, plaintext.clone()));
+        Ok(Bytes::from(plaintext))
+    }
+
+    /// **D5 audit fix — streaming decrypt without internal buffering.**
+    ///
+    /// Decrypt a single chunk and return its plaintext WITHOUT pushing
+    /// it into `self.chunks`. Callers iterate chunks in order and write
+    /// each plaintext directly to a destination (file, HTTP response
+    /// body, async writer). Peak memory is one chunk plus the AEAD
+    /// output buffer — independent of total file size.
+    ///
+    /// This sidesteps the [`ChunkedDecoder::finalize`] memory cliff
+    /// (~2× file size) at the cost of: (a) callers are responsible for
+    /// tracking which chunks they've decrypted (no `finalize`
+    /// completeness check), and (b) Bao root-hash verification (which
+    /// `finalize` skips today — audit H-2) must be done by the caller
+    /// using the [`crate::streaming::VerifiedStreamingDecoder`] path
+    /// alongside this.
+    ///
+    /// Recommended usage pattern:
+    ///
+    /// ```rust,ignore
+    /// for index in 0..decoder.metadata().num_chunks {
+    ///     let ct = fetch_chunk_ciphertext(index).await?;
+    ///     let pt = decoder.decrypt_chunk_streaming(index, &ct)?;
+    ///     output_writer.write_all(&pt).await?;
+    /// }
+    /// ```
+    pub fn decrypt_chunk_streaming(
+        &self,
+        index: u32,
+        ciphertext: &[u8],
+    ) -> Result<Bytes> {
+        let plaintext = self.decrypt_chunk_inner(index, ciphertext)?;
+        Ok(Bytes::from(plaintext))
+    }
+
+    /// Shared decrypt body for both buffered and streaming entry points.
+    fn decrypt_chunk_inner(&self, index: u32, ciphertext: &[u8]) -> Result<Vec<u8>> {
         let nonce = self.metadata.get_chunk_nonce(index)?;
         let aead = Aead::new_default(&self.dek);
         let plaintext = if let Some(ref prefix) = self.aad_prefix {
@@ -439,10 +488,7 @@ impl ChunkedDecoder {
         } else {
             aead.decrypt(&nonce, ciphertext)?
         };
-        
-        self.chunks.push((index, plaintext.clone()));
-        
-        Ok(Bytes::from(plaintext))
+        Ok(plaintext)
     }
 
     /// Finalize and get full file content
@@ -775,12 +821,12 @@ mod tests {
     fn test_chunked_roundtrip() {
         let dek = DekKey::generate();
         let original = b"Hello, World! This is a test of chunked encryption.".repeat(100);
-        
+
         // Encode with small chunk size for testing
         let mut encoder = ChunkedEncoder::with_chunk_size(dek.clone(), MIN_CHUNK_SIZE);
         let chunks = encoder.update(&original).unwrap();
         let (final_chunk, metadata, _outboard) = encoder.finalize().unwrap();
-        
+
         // Decode
         let mut decoder = ChunkedDecoder::new(dek, metadata.clone());
         for chunk in &chunks {
@@ -789,9 +835,52 @@ mod tests {
         if let Some(chunk) = final_chunk {
             decoder.decrypt_chunk(chunk.index, &chunk.ciphertext).unwrap();
         }
-        
+
         let recovered = decoder.finalize().unwrap();
         assert_eq!(recovered.as_ref(), original.as_slice());
+    }
+
+    /// **D5 audit fix** — verify the streaming variant decrypts byte-
+    /// equivalent to the buffered variant, but never accumulates into
+    /// `decoder.chunks`. This is the load-bearing test that the new
+    /// no-buffer code path produces the same plaintext as the legacy
+    /// buffered path.
+    #[test]
+    fn test_chunked_decrypt_streaming_no_buffer() {
+        let dek = DekKey::generate();
+        let original = b"Streaming decrypt avoids the 2x file-size memory cliff.".repeat(200);
+
+        let mut encoder = ChunkedEncoder::with_chunk_size(dek.clone(), MIN_CHUNK_SIZE);
+        let chunks = encoder.update(&original).unwrap();
+        let (final_chunk, metadata, _outboard) = encoder.finalize().unwrap();
+
+        // Streaming: decoder is `&self` for `decrypt_chunk_streaming`.
+        // Caller iterates chunks in order, writing each plaintext to a
+        // sink — here we accumulate into a Vec for assertion only;
+        // production callers would write to a file or async stream.
+        let decoder = ChunkedDecoder::new(dek, metadata.clone());
+        let mut all_chunks: Vec<(u32, Vec<u8>)> = chunks
+            .iter()
+            .chain(final_chunk.as_ref().into_iter())
+            .map(|c| (c.index, c.ciphertext.to_vec()))
+            .collect();
+        all_chunks.sort_by_key(|(i, _)| *i);
+
+        let mut streamed = Vec::with_capacity(original.len());
+        for (idx, ct) in &all_chunks {
+            let pt = decoder
+                .decrypt_chunk_streaming(*idx, ct)
+                .expect("streaming decrypt");
+            streamed.extend_from_slice(&pt);
+        }
+        assert_eq!(streamed, original);
+
+        // Critical invariant: the decoder's internal chunk buffer
+        // remains EMPTY — proves no per-chunk accumulation happened.
+        assert!(
+            decoder.chunks.is_empty(),
+            "D5: decrypt_chunk_streaming must not accumulate into self.chunks"
+        );
     }
 
     #[test]

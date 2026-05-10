@@ -199,7 +199,12 @@ impl std::fmt::Debug for EncapsulatedKey {
 }
 
 /// Encrypted data with all metadata needed for decryption (RFC 9180 HPKE format)
-#[derive(Clone, Serialize, SerdeDeserialize, Debug)]
+///
+/// `Debug` is hand-rolled to redact `ciphertext`. While the bytes are
+/// AEAD-encrypted (not plaintext), exposing them in logs aids any later
+/// offline attempt to brute-force or correlate wrapped material if the
+/// recipient secret is ever leaked. Length is preserved for diagnostics.
+#[derive(Clone, Serialize, SerdeDeserialize)]
 pub struct EncryptedData {
     /// Version of the encryption format (2 = RFC 9180 HPKE)
     pub version: u8,
@@ -210,6 +215,20 @@ pub struct EncryptedData {
     /// The encrypted ciphertext (includes AEAD auth tag)
     #[serde(with = "base64_vec_serde")]
     pub ciphertext: Vec<u8>,
+}
+
+impl std::fmt::Debug for EncryptedData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptedData")
+            .field("version", &self.version)
+            .field("encapsulated_key", &self.encapsulated_key)
+            .field("cipher", &self.cipher)
+            .field(
+                "ciphertext",
+                &format_args!("[{} bytes redacted]", self.ciphertext.len()),
+            )
+            .finish()
+    }
 }
 
 impl EncryptedData {
