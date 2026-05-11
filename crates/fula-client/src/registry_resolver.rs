@@ -285,27 +285,37 @@ pub use crate::user_key::derive_user_key_from_email;
 ///    Submitting `ipfs.io` first ensures the most-recently-resolved
 ///    record arrives first and seeds the 10 s grace window with a
 ///    fresh baseline.
-/// 2. `dweb.link/ipns/{name}` (path-style) — backup. Same gateway
+/// 2. `ipfs.filebase.io/ipns/{name}` (path-style) — **second because
+///    operator-confirmed 2026-05-11 that Filebase frequently picks
+///    up freshly-published IPNS records *before* ipfs.io.** Filebase
+///    has its own cache layer (`X-Filebase-Cache: HIT` / `X-Filebase-Edge-Cache: MISS`)
+///    that is independent of Cloudflare and sometimes lags-by-less
+///    than the Protocol Labs tier. Together with `ipfs.io`, the
+///    two top gateways give two independent freshness paths — the
+///    parallel race + 10 s grace + highest-sequence selection means
+///    whichever of them resolved the freshest record wins.
+/// 3. `dweb.link/ipns/{name}` (path-style) — backup. Same gateway
 ///    family as the subdomain entry below but a different
 ///    cache-key path, so when the subdomain surface is stale the
 ///    path surface sometimes isn't (and vice versa).
-/// 3. `4everland.io/ipns/{name}`, `gateway.pinata.cloud/ipns/{name}` —
+/// 4. `4everland.io/ipns/{name}`, `gateway.pinata.cloud/ipns/{name}` —
 ///    independent fleet fallbacks for fan-out coverage.
 ///    `cloudflare-ipfs.com` is excluded (does not support IPNS
 ///    resolution; every probe against it returned 4xx).
-/// 4. `{name}.ipns.dweb.link/` (subdomain-style) — moved DOWN from
+/// 5. `{name}.ipns.dweb.link/` (subdomain-style) — moved DOWN from
 ///    position 1. The user's 2026-05-11 audit showed this surface
 ///    serving stale records for 70+ min via Cloudflare HIT. Kept
 ///    in the list because the parallel-race + sequence-max design
 ///    means even a stale response doesn't poison the result — it
 ///    just gets overridden when a fresher response arrives within
 ///    the 10 s grace.
-/// 5. `{name}.ipns.dget.top/` (subdomain-style) — small-fleet
+/// 6. `{name}.ipns.dget.top/` (subdomain-style) — small-fleet
 ///    last-resort. Less reliable uptime than the Protocol Labs /
 ///    Filebase tier.
 pub fn default_ipns_gateway_urls() -> Vec<String> {
     vec![
         "https://ipfs.io/ipns/{name}".into(),
+        "https://ipfs.filebase.io/ipns/{name}".into(),
         "https://dweb.link/ipns/{name}".into(),
         "https://4everland.io/ipns/{name}".into(),
         "https://gateway.pinata.cloud/ipns/{name}".into(),
