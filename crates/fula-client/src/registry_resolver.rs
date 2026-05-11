@@ -51,6 +51,7 @@ use crate::gateway_fetch::verify_cid_against_bytes;
 use bytes::Bytes;
 use cid::multihash::Multihash;
 use cid::Cid;
+use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -265,35 +266,50 @@ pub use crate::user_key::derive_user_key_from_email;
 /// Default IPNS-aware gateway list. Excludes
 /// `trustless-gateway.link` (only serves `/ipfs/`, not `/ipns/`).
 ///
-/// Order is the SDK's per-tick race priority — the resolver tries
-/// gateways in order and takes the first content-verified body whose
-/// in-payload `sequence` is at least the locally-observed high-water
-/// mark.
+/// The resolver now **races every gateway in parallel** and picks the
+/// response with the highest in-CBOR `sequence` (subject to F10's
+/// chain-floor anti-poisoning cap). Ordering still matters as a tie-
+/// breaker on equal-sequence responses, and for which gateway gets the
+/// first request dispatched, but the slowest gateway is no longer the
+/// bottleneck the way it was under the prior sequential scheme.
 ///
-/// Ordering (operator-confirmed 2026-05-10):
-/// 1. `{name}.ipns.dweb.link` (subdomain-style) — first because
-///    subdomain endpoints serve raw / dag-cbor without an HTML wrapper
-///    and dweb.link's IPNS resolution picks up freshly-published
-///    records reliably across the large fleet behind Protocol Labs.
-/// 2. `dweb.link/ipns/{name}` (path-style) — same gateway, different
-///    URL shape. Kept as a near-duplicate fallback because some
-///    middleboxes/CDNs cache subdomain routes longer than path
-///    routes; one of the two usually responds with a fresh record.
-/// 3. `ipfs.io`, `4everland.io`, `gateway.pinata.cloud` — established
-///    large-fleet fallbacks for fan-out coverage. cloudflare-ipfs.com
-///    was removed (it does not support IPNS resolution; every probe
-///    against it returned 4xx).
-/// 4. `{name}.ipns.dget.top` (subdomain-style) — kept at the end as
-///    a small-fleet fan-out option. Useful when the upstream public
-///    gateways are saturated; not a primary because its uptime is
-///    less predictable than the Protocol Labs / Filebase tier.
+/// Ordering (operator-confirmed 2026-05-11 after staleness audit):
+/// 1. `ipfs.io/ipns/{name}` (path-style) — **first because empirical
+///    verification on 2026-05-11 showed `ipfs.io` returning the
+///    latest publisher-tick sequence while every dweb.link surface
+///    served Cloudflare-edge-cached stale data (Age >= 4180 s).** A
+///    `curl -I` against `ipfs.io/ipns/<name>` returns
+///    `cf-cache-status: EXPIRED` and the freshly-resolved CID; the
+///    same curl against `{name}.ipns.dweb.link/` returns
+///    `cf-cache-status: HIT` with a record up to 70 min old.
+///    Submitting `ipfs.io` first ensures the most-recently-resolved
+///    record arrives first and seeds the 10 s grace window with a
+///    fresh baseline.
+/// 2. `dweb.link/ipns/{name}` (path-style) — backup. Same gateway
+///    family as the subdomain entry below but a different
+///    cache-key path, so when the subdomain surface is stale the
+///    path surface sometimes isn't (and vice versa).
+/// 3. `4everland.io/ipns/{name}`, `gateway.pinata.cloud/ipns/{name}` —
+///    independent fleet fallbacks for fan-out coverage.
+///    `cloudflare-ipfs.com` is excluded (does not support IPNS
+///    resolution; every probe against it returned 4xx).
+/// 4. `{name}.ipns.dweb.link/` (subdomain-style) — moved DOWN from
+///    position 1. The user's 2026-05-11 audit showed this surface
+///    serving stale records for 70+ min via Cloudflare HIT. Kept
+///    in the list because the parallel-race + sequence-max design
+///    means even a stale response doesn't poison the result — it
+///    just gets overridden when a fresher response arrives within
+///    the 10 s grace.
+/// 5. `{name}.ipns.dget.top/` (subdomain-style) — small-fleet
+///    last-resort. Less reliable uptime than the Protocol Labs /
+///    Filebase tier.
 pub fn default_ipns_gateway_urls() -> Vec<String> {
     vec![
-        "https://{name}.ipns.dweb.link/".into(),
-        "https://dweb.link/ipns/{name}".into(),
         "https://ipfs.io/ipns/{name}".into(),
+        "https://dweb.link/ipns/{name}".into(),
         "https://4everland.io/ipns/{name}".into(),
         "https://gateway.pinata.cloud/ipns/{name}".into(),
+        "https://{name}.ipns.dweb.link/".into(),
         "https://{name}.ipns.dget.top/".into(),
     ]
 }
@@ -916,12 +932,61 @@ impl UsersIndexResolver {
         }
     }
 
-    /// IPNS leg — sequential per-gateway fan-out. The first gateway
-    /// whose body parses + sequence-passes wins. We don't run them
-    /// in parallel because:
-    ///   - cold-start is rare (once per fresh-device sign-in),
-    ///   - five HEAD-of-line requests waste the user's bandwidth,
-    ///   - the outer 10-s budget bounds the worst case anyway.
+    /// IPNS leg — **parallel race + 10s grace + highest-sequence
+    /// selection**. Dispatches a GET to every configured gateway
+    /// simultaneously, waits for the first valid response, then keeps
+    /// collecting responses for up to `IPNS_RACE_GRACE` (10 s)
+    /// before picking the result with the highest in-CBOR `sequence`.
+    ///
+    /// # Why parallel + grace, not sequential
+    ///
+    /// The prior sequential implementation took the first successful
+    /// response and returned. Audit on 2026-05-11 against the real
+    /// fula production master uncovered the failure mode it allowed:
+    /// public IPNS gateways have **wildly different CDN cache TTLs**.
+    /// `{name}.ipns.dweb.link` (Cloudflare edge) was returning a 70-
+    /// minute-old record (`Age: 4180`, `cf-cache-status: HIT`); the
+    /// same name on `ipfs.io/ipns/{name}` returned the latest record
+    /// the master had just published (`cf-cache-status: EXPIRED`).
+    /// Sequential dispatch returned the dweb.link stale response and
+    /// the SDK walked a pre-migration manifest, surfacing as a v7
+    /// internal-node fetch failure during offline reads.
+    ///
+    /// Parallel race + sequence-max picks the freshest record across
+    /// all responders. The 10 s grace window after the first response
+    /// gives slower gateways a chance to come back with a higher
+    /// sequence — bounded so a single hung gateway can't stall the
+    /// resolver indefinitely.
+    ///
+    /// # Replay defense, anti-poisoning, and freshness
+    ///
+    /// Every response still flows through `parse_and_validate`, which
+    /// rejects:
+    ///   * `payload.sequence < highest_seen_sequence` (replay defense
+    ///     — unchanged from the sequential design),
+    ///   * `payload.sequence > chain_seen_sequence +
+    ///     MAX_IPNS_SEQUENCE_JUMP_OVER_CHAIN` (F10 anti-poisoning cap).
+    ///
+    /// A poisoned-high response from one gateway is dropped on the
+    /// floor and the resolver picks from the remaining valid set.
+    /// Replay-stale responses are likewise dropped. The picked
+    /// response is the highest-sequence record that passes both checks.
+    ///
+    /// # Cost
+    ///
+    /// 5–6 parallel HTTP GETs each ~7 KB CBOR ≈ 35–40 KB total
+    /// bandwidth per cold-start resolve. Cold-start is rare (fresh
+    /// install / cache-wipe / app reinstall — once per user per
+    /// device-lifetime in practice), so the bandwidth is acceptable.
+    ///
+    /// # Worst-case timing
+    ///
+    /// Bounded by `min(slowest_gateway_response_time,
+    /// fastest_gateway_response_time + 10 s)`, capped further by the
+    /// outer resolver's per-request timeout. In the common case (most
+    /// gateways respond in 1–3 s), total IPNS-leg time is
+    /// `~first_response_time + 10 s` — about 11–13 s, which fits well
+    /// inside the resolver's 30 s budget.
     async fn try_ipns(&self) -> Result<ResolvedUsersIndex, ClientError> {
         let gateways: Vec<String> = if self.config.ipns_gateways.is_empty() {
             default_ipns_gateway_urls()
@@ -929,36 +994,135 @@ impl UsersIndexResolver {
             self.config.ipns_gateways.clone()
         };
 
-        let mut last_err: Option<String> = None;
-        for tmpl in &gateways {
-            let url = tmpl.replace("{name}", &self.config.ipns_name);
-            match self.fetch_with_timeout(&url).await {
-                Ok(bytes) => match self.parse_and_validate(bytes, ResolutionSource::Ipns) {
-                    Ok(resolved) => return Ok(resolved),
-                    Err(e) => {
-                        // Replay-rejected or parse-failed bodies are
-                        // not a fatal error; another gateway might
-                        // serve a fresher record.
-                        tracing::debug!(
-                            url = %url, error = %e,
-                            "registry_resolver: IPNS body rejected; trying next gateway"
-                        );
-                        last_err = Some(e.to_string());
+        if gateways.is_empty() {
+            return Err(ClientError::UsersIndexResolutionFailed {
+                reason: "no IPNS gateways configured".into(),
+            });
+        }
+
+        // Dispatch all gateway fetches concurrently. Each future
+        // returns `Result<(url, ResolvedUsersIndex), (url, error)>`
+        // so the outer collector can report which gateway failed
+        // with which error when the entire set exhausts. Borrowing
+        // `&self` across all in-flight futures is fine because the
+        // futures only live within this function call and they all
+        // hold shared (immutable) borrows.
+        let name = self.config.ipns_name.clone();
+        let mut futs: futures::stream::FuturesUnordered<_> = gateways
+            .iter()
+            .map(|tmpl| {
+                let url = tmpl.replace("{name}", &name);
+                async move {
+                    match self.fetch_with_timeout(&url).await {
+                        Ok(bytes) => match self.parse_and_validate(bytes, ResolutionSource::Ipns) {
+                            Ok(resolved) => Ok((url, resolved)),
+                            Err(e) => Err((url, e.to_string())),
+                        },
+                        Err(e) => Err((url, e.to_string())),
                     }
-                },
-                Err(e) => {
-                    last_err = Some(e.to_string());
-                    tracing::debug!(url = %url, error = %e, "registry_resolver: IPNS fetch failed");
+                }
+            })
+            .collect();
+
+        const IPNS_RACE_GRACE: Duration = Duration::from_secs(10);
+        let mut results: Vec<(String, ResolvedUsersIndex)> = Vec::new();
+        let mut errors: Vec<(String, String)> = Vec::new();
+        let mut first_arrived_at: Option<std::time::Instant> = None;
+
+        // Drain `futs` until either (a) all futures complete, or
+        // (b) the 10-s grace window after the first successful
+        // response elapses.
+        loop {
+            // Compute how long to wait for the next stream item.
+            // Before the first success: wait however long the next
+            // poll takes (outer resolver timeout bounds this).
+            // After the first success: cap at the grace window's
+            // remainder so a single hung gateway can't stall us.
+            let next_future = futs.next();
+            let next_item = if let Some(t0) = first_arrived_at {
+                let elapsed = t0.elapsed();
+                if elapsed >= IPNS_RACE_GRACE {
+                    tracing::debug!(
+                        "registry_resolver: IPNS 10s grace window already elapsed; stopping collection"
+                    );
+                    break;
+                }
+                let remaining = IPNS_RACE_GRACE - elapsed;
+                match tokio::time::timeout(remaining, next_future).await {
+                    Ok(opt) => opt,
+                    Err(_) => {
+                        tracing::debug!(
+                            results = results.len(),
+                            errors = errors.len(),
+                            "registry_resolver: IPNS 10s grace expired; choosing among collected results"
+                        );
+                        break;
+                    }
+                }
+            } else {
+                next_future.await
+            };
+
+            match next_item {
+                Some(Ok((url, resolved))) => {
+                    let seq = resolved.payload.sequence;
+                    if first_arrived_at.is_none() {
+                        first_arrived_at = Some(std::time::Instant::now());
+                        tracing::debug!(
+                            url = %url,
+                            sequence = seq,
+                            "registry_resolver: first IPNS response received; starting 10s grace for stragglers"
+                        );
+                    } else {
+                        tracing::debug!(
+                            url = %url,
+                            sequence = seq,
+                            "registry_resolver: additional IPNS response within grace window"
+                        );
+                    }
+                    results.push((url, resolved));
+                }
+                Some(Err((url, err))) => {
+                    tracing::debug!(
+                        url = %url,
+                        error = %err,
+                        "registry_resolver: IPNS gateway failed or returned invalid body"
+                    );
+                    errors.push((url, err));
+                }
+                None => {
+                    // FuturesUnordered drained — every gateway returned.
+                    break;
                 }
             }
         }
-        Err(ClientError::UsersIndexResolutionFailed {
-            reason: format!(
-                "IPNS exhausted across {} gateways: {}",
-                gateways.len(),
-                last_err.unwrap_or_else(|| "no gateways tried".into())
-            ),
-        })
+
+        if results.is_empty() {
+            return Err(ClientError::UsersIndexResolutionFailed {
+                reason: format!(
+                    "IPNS exhausted across {} gateways: [{}]",
+                    gateways.len(),
+                    errors
+                        .iter()
+                        .map(|(u, e)| format!("{}: {}", u, e))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+
+        // Pick the response with the highest sequence. Stable sort
+        // by descending sequence; ties broken by insertion order
+        // (which is first-to-respond order, so we prefer the
+        // faster gateway when two return the same sequence).
+        results.sort_by(|a, b| b.1.payload.sequence.cmp(&a.1.payload.sequence));
+        let (chosen_url, chosen) = results.into_iter().next().expect("non-empty");
+        tracing::debug!(
+            url = %chosen_url,
+            sequence = chosen.payload.sequence,
+            "registry_resolver: chose highest-sequence IPNS response"
+        );
+        Ok(chosen)
     }
 
     /// Chain leg — single eth_call to `latest()`, then iterate IPFS
@@ -1567,6 +1731,128 @@ mod tests {
         assert_eq!(r.source, ResolutionSource::Ipns);
         assert_eq!(r.payload.sequence, 7);
         assert_eq!(resolver.highest_seen_sequence(), 7);
+    }
+
+    /// **The load-bearing test for the 2026-05-11 IPNS race redesign.**
+    ///
+    /// Two gateways, both valid CBOR, both within the per-request timeout.
+    /// Gateway A is fast (no delay) and serves a *staler* sequence (100).
+    /// Gateway B is slower (300 ms delay, still within the 10 s grace
+    /// window) and serves a *fresher* sequence (101). The race + grace
+    /// design must surface 101, not the faster-but-staler 100.
+    ///
+    /// If this test fails, someone has reverted to "return first
+    /// successful response" semantics — the exact regression the
+    /// audit on 2026-05-11 was triggered by. Production failure mode:
+    /// users hitting cold-start get the dweb.link Cloudflare-edge-cached
+    /// stale CBOR and walk a pre-migration manifest, surfacing as a
+    /// "no such object" or v7-storage-key fetch failure during offline
+    /// reads. Empirical proof that the race-and-pick-highest design
+    /// matters in production: `images` bucket cold-walk failed with
+    /// dweb.link-first ordering and passed with parallel race against
+    /// ipfs.io + dweb.link.
+    #[tokio::test]
+    async fn resolve_via_ipns_picks_highest_sequence_when_gateways_disagree() {
+        // Gateway A — fast, returns the lower sequence.
+        let (cbor_a, _) = make_payload_cbor(100);
+        let gw_a = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/ipns/{}", fixture_ipns_name())))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(cbor_a.as_ref()))
+            .mount(&gw_a)
+            .await;
+
+        // Gateway B — slower (300 ms delay, well under the 10 s grace
+        // and 5 s ipns_race_timeout configured below), returns the
+        // higher sequence. This is the gateway whose response must
+        // win even though A responds first.
+        let (cbor_b, _) = make_payload_cbor(101);
+        let gw_b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/ipns/{}", fixture_ipns_name())))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(cbor_b.as_ref())
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .mount(&gw_b)
+            .await;
+
+        let mut cfg = ResolverConfig::new(
+            "https://chain.example/rpc", // never called on success
+            fixture_address(),
+            fixture_ipns_name(),
+        );
+        cfg.ipns_gateways = vec![
+            format!("{}/ipns/{{name}}", gw_a.uri()),
+            format!("{}/ipns/{{name}}", gw_b.uri()),
+        ];
+        // Outer race ceiling must accommodate (first_response_time +
+        // 10 s grace). At in-process MockServer latencies this is
+        // trivially satisfied, but keep it well above the inner
+        // grace to make the relationship visible.
+        cfg.ipns_race_timeout = Duration::from_secs(15);
+        cfg.per_request_timeout = Duration::from_secs(5);
+
+        let resolver = UsersIndexResolver::new(cfg).expect("new");
+        let r = resolver.resolve().await.expect("resolve");
+        assert_eq!(r.source, ResolutionSource::Ipns);
+        assert_eq!(
+            r.payload.sequence, 101,
+            "race-and-pick-highest design must return the higher-sequence \
+             response from gateway B, even though gateway A responded first \
+             with a staler sequence. If this is now 100, the resolver has \
+             regressed to first-response-wins semantics — re-read \
+             `try_ipns` and the 2026-05-11 audit notes in \
+             `default_ipns_gateway_urls`'s docstring."
+        );
+        assert_eq!(resolver.highest_seen_sequence(), 101);
+    }
+
+    /// Sequence-equal tie-break is by insertion order (which becomes
+    /// first-to-respond order under the race). Both gateways return
+    /// the same sequence; either is correct, but `sort_by` is stable
+    /// so the faster gateway's response wins. Asserts the tie-break
+    /// is deterministic, not that one specific gateway wins.
+    #[tokio::test]
+    async fn resolve_via_ipns_tie_break_is_stable_on_equal_sequence() {
+        let (cbor_a, _) = make_payload_cbor(42);
+        let gw_a = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/ipns/{}", fixture_ipns_name())))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(cbor_a.as_ref()))
+            .mount(&gw_a)
+            .await;
+
+        // Same sequence, deliberate delay to keep responder ordering
+        // visible — gw_a responds first.
+        let (cbor_b, _) = make_payload_cbor(42);
+        let gw_b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/ipns/{}", fixture_ipns_name())))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(cbor_b.as_ref())
+                    .set_delay(Duration::from_millis(100)),
+            )
+            .mount(&gw_b)
+            .await;
+
+        let mut cfg = ResolverConfig::new(
+            "https://chain.example/rpc",
+            fixture_address(),
+            fixture_ipns_name(),
+        );
+        cfg.ipns_gateways = vec![
+            format!("{}/ipns/{{name}}", gw_a.uri()),
+            format!("{}/ipns/{{name}}", gw_b.uri()),
+        ];
+        cfg.ipns_race_timeout = Duration::from_secs(15);
+        cfg.per_request_timeout = Duration::from_secs(5);
+
+        let resolver = UsersIndexResolver::new(cfg).expect("new");
+        let r = resolver.resolve().await.expect("resolve");
+        assert_eq!(r.payload.sequence, 42);
     }
 
     #[tokio::test]

@@ -3053,3 +3053,532 @@ fn compare_fxfiles_v1_v2_key_derivations() {
         );
     }
 }
+
+// ============================================================================
+// walkable-v8 lazy-migration: rewrite an existing v7 bucket to v8 on-demand
+// ============================================================================
+
+/// **Path A migration end-to-end** — issue
+/// [functionland/fula-api#10](https://github.com/functionland/fula-api/issues/10)
+/// + FxFiles #5.
+///
+/// Reproduces the exact failure mode the operator hit on their real
+/// `images` bucket (the URL `s3.cloud.fx.land/images/__fula_forest_v7_nodes/<sk>`
+/// surfaced in the FxFiles device error log), then applies the migration,
+/// then verifies offline reads now succeed.
+///
+/// # Test phases
+///
+/// 1. **Phase A — online baseline.** Build an online client against the
+///    real master, list the target bucket via
+///    `list_files_from_forest`, assert the result is non-empty, and
+///    capture the key set. This is the "ground truth" the offline phases
+///    must reproduce. Also warms `cache_path_A` with the manifest etag
+///    + per-bucket `users_index/cid` so phase B has the resolver state
+///    needed to attempt an offline walk at all.
+///
+/// 2. **Phase B — pre-migration offline.** Build a second client at
+///    the same `cache_path_A` but with the master URL swapped to the
+///    deliberately-unresolvable `https://s33.cloud.fx.land` (the trick
+///    FxFiles' integration harness uses to force the offline-fallback
+///    path). Run `list_files_from_forest` again. For a v7-format bucket
+///    this should either error (e.g.
+///    `MasterUnreachable`/`Encryption(...)`) or return a strict subset
+///    of phase A — because HAMT internal nodes lack CID hints and the
+///    gateway race has nothing to dispatch by.
+///
+///    Phase B is recorded but **not strictly asserted to fail**: a
+///    bucket that was already migrated (e.g. user re-runs the test) is
+///    expected to succeed here. The diagnostic logs the outcome
+///    clearly so the operator can spot a re-run.
+///
+/// 3. **Phase C — migration.** Build a fresh online client at
+///    `cache_path_B` (distinct redb file — no state leaked from phase
+///    B), invoke `migrate_bucket_to_walkable_v8` against the bucket.
+///    Returns the file count touched. The cascade is bounded by the
+///    HAMT's internal-node count, so even a 100k-file bucket completes
+///    in single-digit minutes (see the method's docstring's "Cost +
+///    scaling" table).
+///
+/// 4. **Wait for publisher tick.** The post-migration `forest_manifest_cid`
+///    is freshly written on master, but the published global
+///    bucketsIndex CBOR (consumed by the warm-cache + cold-start
+///    resolvers) only refreshes on the publisher's tick interval
+///    (`FULA_USERS_INDEX_FLUSH_INTERVAL_SECS`, default 300 s = 5 min).
+///    Sleep `FULA_POST_MIGRATION_WAIT_SECS` seconds before phase E.
+///    The default is `0` (skip phase D + E entirely), so the test still
+///    proves migration succeeded without requiring a sleep on CI.
+///    Pass `FULA_POST_MIGRATION_WAIT_SECS=360` to also verify offline
+///    works post-migration (5-min tick + small buffer).
+///
+/// 5. **Phase D — re-warm cache.** Build a fresh online client at
+///    `cache_path_C` (distinct from A and B). Run an online list to
+///    warm `users_index/cid` + bucketsIndex with the post-migration
+///    state. Asserts the online list still equals phase A (migration
+///    is non-destructive at the data layer).
+///
+/// 6. **Phase E — post-migration offline.** Swap the master URL to
+///    `s33.cloud.fx.land` at the same `cache_path_C`. Run
+///    `list_files_from_forest`. **MUST succeed** with a result equal
+///    to phase A. This is the load-bearing assertion.
+///
+/// # Required env
+///
+/// * `FULA_JWT` — bearer for the master (same as other integration tests).
+/// * `FULA_S3` — real master URL (e.g. `https://s3.cloud.fx.land`).
+/// * `FULA_ALLOW_DESTRUCTIVE_MIGRATION=1` — confirms the operator
+///   knows this test mutates real data (manifest seq bump, every
+///   internal node re-PUT). Refuses to run otherwise.
+/// * `FULA_VERIFY_IMAGES_BUCKET=1` — confirms phase A is intended to
+///   verify the user's actual bucket has files; without this, the test
+///   panics on empty buckets rather than running against random
+///   master state.
+/// * Secret derivation (one of these forms, identical to
+///   `fxfiles_walkable_v8_fresh_bucket_upload`):
+///   * `FULA_TEST_PROVIDER` + `FULA_TEST_OAUTH_SUB` + `FULA_TEST_EMAIL`
+///     — derives via `Argon2id("fula-files-v1", "{p}:{s}:{e}")`,
+///     matching FxFiles `auth_service.dart:535-541` exactly.
+///   * `FULA_TEST_SECRET` — pre-derived 32-byte secret as base64.
+///
+/// # Optional env
+///
+/// * `FULA_IMAGES_BUCKET` (default `images`) — bucket to migrate.
+/// * `FULA_TIMEOUT_SECS` (default `60`) — per-request timeout. Bump
+///   for large buckets; the cascade can take minutes at 100k+ files.
+/// * `FULA_POST_MIGRATION_WAIT_SECS` (default `0`) — sleep between
+///   migration and the post-migration offline verification. Set to
+///   `≥ FULA_USERS_INDEX_FLUSH_INTERVAL_SECS` (default 300) for the
+///   warm-cache resolver to see the post-migration bucketsIndex.
+///
+/// # Running
+///
+/// ```powershell
+/// $env:FULA_JWT = "<your jwt>"
+/// $env:FULA_S3  = "https://s3.cloud.fx.land"
+/// $env:FULA_ALLOW_DESTRUCTIVE_MIGRATION = "1"
+/// $env:FULA_VERIFY_IMAGES_BUCKET = "1"
+/// $env:FULA_TEST_PROVIDER = "google"
+/// $env:FULA_TEST_OAUTH_SUB = "<raw OAuth sub>"
+/// $env:FULA_TEST_EMAIL = "ehsan@fx.land"
+/// $env:FULA_IMAGES_BUCKET = "images"
+/// $env:FULA_POST_MIGRATION_WAIT_SECS = "360"
+///
+/// cargo test -p fula-client --test offline_e2e --release `
+///   fxfiles_walkable_v8_migrate_images_bucket_e2e -- --ignored --nocapture
+/// ```
+///
+/// # Notes for the operator
+///
+/// * **Destructive.** Every populated HAMT internal node in the target
+///   bucket is re-PUT under fresh storage_keys + CIDs. The manifest's
+///   monotonic sequence advances by one. Old internal-node blobs become
+///   orphans on S3 (currently no GC — see plan §W.8.7).
+/// * **Cross-device coordination.** After migration, the bucket
+///   carries `LinkV2` pointers. v0.5-or-earlier SDKs will refuse to
+///   read it with `WireVersionUnsupported`. Make sure every device
+///   used to access this bucket is on v0.6+ (which is the default
+///   since the walkable-v8 writer default-on flip 2026-05-09 — see
+///   memory `project_walkable_v8_default_on.md`).
+/// * **Idempotent.** Re-running the test re-migrates a no-op cascade
+///   (every leaf re-upserted, every internal node already
+///   `LinkV2`-stamped). Phase B will succeed instead of fail (the
+///   bucket is already walkable-v8), and the test diagnostic logs
+///   note this rather than asserting.
+#[tokio::test]
+#[ignore]
+async fn fxfiles_walkable_v8_migrate_images_bucket_e2e() {
+    let jwt = match read_required_env("FULA_JWT") {
+        Some(v) => v,
+        None => return,
+    };
+    let s3_url = match read_required_env("FULA_S3") {
+        Some(v) => v,
+        None => return,
+    };
+
+    // Destructive-action gate. Refuse to mutate real data unless the
+    // operator opted in explicitly.
+    let destructive = std::env::var("FULA_ALLOW_DESTRUCTIVE_MIGRATION")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if !destructive {
+        eprintln!(
+            "[migrate-v8-e2e] FULA_ALLOW_DESTRUCTIVE_MIGRATION not set — skipping. \
+             This test rewrites every populated HAMT internal node in the target \
+             bucket (manifest seq bump, internal-node orphans). Re-run with \
+             FULA_ALLOW_DESTRUCTIVE_MIGRATION=1 to opt in."
+        );
+        return;
+    }
+
+    let verify_images_requested = std::env::var("FULA_VERIFY_IMAGES_BUCKET")
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if !verify_images_requested {
+        eprintln!(
+            "[migrate-v8-e2e] FULA_VERIFY_IMAGES_BUCKET not set — skipping. \
+             Migration only makes sense against a bucket you know has files; \
+             set FULA_VERIFY_IMAGES_BUCKET=1 to confirm intent."
+        );
+        return;
+    }
+
+    let images_bucket = std::env::var("FULA_IMAGES_BUCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "images".to_string());
+    let timeout_secs: u64 = std::env::var("FULA_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    let post_wait_secs: u64 = std::env::var("FULA_POST_MIGRATION_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    // Secret-source dispatch (identical pattern to
+    // fxfiles_walkable_v8_fresh_bucket_upload above).
+    let provider = std::env::var("FULA_TEST_PROVIDER").ok().filter(|s| !s.is_empty());
+    let oauth_sub = std::env::var("FULA_TEST_OAUTH_SUB").ok().filter(|s| !s.is_empty());
+    let email = std::env::var("FULA_TEST_EMAIL").ok().filter(|s| !s.is_empty());
+
+    let secret: SecretKey = if let (Some(p), Some(s), Some(e)) =
+        (provider.as_ref(), oauth_sub.as_ref(), email.as_ref())
+    {
+        let input = format!("{}:{}:{}", p, s, e);
+        let key_bytes =
+            fula_crypto::hashing::derive_key_argon2id("fula-files-v1", input.as_bytes());
+        SecretKey::from_bytes(&key_bytes).expect("32-byte secret from Argon2id derivation")
+    } else if let Some(b64) = std::env::var("FULA_TEST_SECRET").ok().filter(|s| !s.is_empty()) {
+        use base64::Engine as _;
+        let trimmed = b64.trim();
+        let key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(trimmed)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
+            .expect("FULA_TEST_SECRET must be base64");
+        SecretKey::from_bytes(&key_bytes).expect("32-byte secret")
+    } else {
+        panic!(
+            "Migration test requires the user's real encryption key — set EITHER \
+             FULA_TEST_PROVIDER + FULA_TEST_OAUTH_SUB + FULA_TEST_EMAIL (matching \
+             FxFiles' auth_service.dart:535-541 Argon2id derivation) OR FULA_TEST_SECRET \
+             (base64 of the 32-byte key from FxFiles' SecureStorage 'encryptionKey'). \
+             A random secret cannot decrypt the real bucket."
+        );
+    };
+
+    let bogus_url = "https://s33.cloud.fx.land".to_string();
+
+    eprintln!("\n[migrate-v8-e2e] master         = {}", s3_url);
+    eprintln!("[migrate-v8-e2e] bogus master   = {} (forces offline path)", bogus_url);
+    eprintln!("[migrate-v8-e2e] bucket         = {}", images_bucket);
+    eprintln!("[migrate-v8-e2e] post-wait      = {}s", post_wait_secs);
+    eprintln!("[migrate-v8-e2e] timeout        = {}s", timeout_secs);
+
+    // ─── Phase A — online baseline ─────────────────────────────────────
+    let cache_dir_a = TempDir::new().expect("tempdir for phase A cache");
+    let cache_path_a = cache_dir_a.path().join("blocks.redb");
+    let phase_a_keys: std::collections::BTreeSet<String>;
+    eprintln!("\n[migrate-v8-e2e] phase A: online baseline list of '{}'", images_bucket);
+    {
+        let client = build_client(&s3_url, &jwt, &cache_path_a, secret.clone(), true, timeout_secs);
+        let files = client
+            .list_files_from_forest(&images_bucket)
+            .await
+            .expect("phase A: online list must succeed");
+        assert!(
+            !files.is_empty(),
+            "phase A: bucket '{}' has 0 files visible to this client. Either the \
+             bucket really is empty (pick another FULA_IMAGES_BUCKET that's populated) \
+             or the derived secret doesn't match the master-side encryption key.",
+            images_bucket
+        );
+        phase_a_keys = files.iter().map(|m| m.original_key.clone()).collect();
+        eprintln!(
+            "[migrate-v8-e2e]   online list: {} files (sample: {:?})",
+            phase_a_keys.len(),
+            phase_a_keys.iter().take(3).collect::<Vec<_>>()
+        );
+    }
+
+    // ─── Phase B — pre-migration offline list (warm cache from A) ─────
+    eprintln!("\n[migrate-v8-e2e] phase B: pre-migration offline list (s3 → s33, warm cache)");
+    {
+        // Reuse cache_path_a so users_index/cid is populated; only the
+        // master URL is swapped. health_gate=false so we don't wait for
+        // the gate's two-failure threshold to flip — we want fast-fail
+        // on the bogus URL.
+        let offline_client =
+            build_client(&bogus_url, &jwt, &cache_path_a, secret.clone(), false, timeout_secs);
+        match offline_client.list_files_from_forest(&images_bucket).await {
+            Ok(files) => {
+                let off_keys: std::collections::BTreeSet<String> =
+                    files.iter().map(|m| m.original_key.clone()).collect();
+                if off_keys == phase_a_keys {
+                    eprintln!(
+                        "[migrate-v8-e2e]   pre-migration offline list returned ALL {} files — \
+                         bucket is ALREADY walkable-v8 (probably re-running this test). \
+                         Phase B is a no-op; phases C-E will still re-validate.",
+                        off_keys.len()
+                    );
+                } else {
+                    eprintln!(
+                        "[migrate-v8-e2e]   pre-migration offline list returned {}/{} files \
+                         (subset). Suggests a partial v8 migration in the bucket, OR a \
+                         v7 internal node was missed by the offline walker. Continuing.",
+                        off_keys.len(),
+                        phase_a_keys.len()
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[migrate-v8-e2e]   pre-migration offline list FAILED: {:?} \
+                     (expected for a v7-only bucket — proves the migration is needed)",
+                    e
+                );
+            }
+        }
+    }
+
+    // ─── Phase C — migration + direct manifest-stamping check ─────────
+    //
+    // After migration, fetch the encrypted manifest blob directly
+    // from master, decrypt with the forest_dek the SDK uses, and
+    // assert every flushed page carries a CID hint and the dir-index
+    // does too. This is the LOAD-BEARING correctness check — it
+    // proves the migration produced walkable-v8 wire format, without
+    // depending on the publisher tick refreshing the resolver state.
+    //
+    // Why this is stronger than "migrated count equals phase-A count":
+    // both counts come from `list_all_files`/`list_files_from_forest`
+    // walking the same in-memory forest, so an equal count is a
+    // tautology — it would hold even if the cascade emitted v7
+    // pointers throughout. The manifest inspection is the only check
+    // that observes the actual wire form on master.
+    let cache_dir_b = TempDir::new().expect("tempdir for phase C cache");
+    let cache_path_b = cache_dir_b.path().join("blocks.redb");
+    let migrated_files: usize;
+    eprintln!("\n[migrate-v8-e2e] phase C: migrate '{}' to walkable-v8", images_bucket);
+    {
+        let online_client =
+            build_client(&s3_url, &jwt, &cache_path_b, secret.clone(), true, timeout_secs);
+        let started = std::time::Instant::now();
+        migrated_files = online_client
+            .migrate_bucket_to_walkable_v8(&images_bucket)
+            .await
+            .expect("phase C: migration must succeed");
+        eprintln!(
+            "[migrate-v8-e2e]   migrated {} files in {:.1}s",
+            migrated_files,
+            started.elapsed().as_secs_f64()
+        );
+
+        // Fetch the freshly-written manifest from master and decrypt it
+        // here in the test so the assertions exercise the on-disk
+        // bytes, not the in-memory cache (which could mask a bug where
+        // the SDK's flush path produced different bytes than what
+        // master stored). Mirrors the diagnostic block at
+        // offline_e2e.rs:957-1008 but operates online (no cold-start
+        // resolver needed).
+        let forest_dek = online_client
+            .encryption_config()
+            .key_manager()
+            .derive_path_key(&format!("forest:{}", images_bucket));
+        let index_key =
+            fula_crypto::private_forest::derive_index_key(&forest_dek, &images_bucket);
+        let manifest_bytes = online_client
+            .inner()
+            .get_object(&images_bucket, &index_key)
+            .await
+            .expect("phase C: fetch manifest blob from master must succeed");
+        let env = fula_crypto::private_forest::EncryptedShardManifestV7::from_bytes(
+            &manifest_bytes,
+        )
+        .expect("phase C: manifest blob must decode as EncryptedShardManifestV7");
+        let (root, seq) = env
+            .decrypt_v7(&forest_dek, &images_bucket)
+            .expect("phase C: manifest blob must decrypt with the bucket's forest_dek");
+
+        eprintln!(
+            "[migrate-v8-e2e]   manifest: seq={} num_shards={} pages={} dir_index_cid={}",
+            seq,
+            root.num_shards,
+            root.page_index.len(),
+            root.dir_index_cid
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        );
+
+        // page_index only carries pages that have ever been flushed
+        // (per `ManifestRoot.page_index` doc — "A missing entry means
+        // the page has never been flushed, so no page blob exists in
+        // S3 yet"). Every flushed page should therefore carry a CID
+        // hint post-migration because the cascade dirty-flagged every
+        // populated shard, `shard_mut` marked their containing pages
+        // dirty, and Phase 1.5 re-encoded each dirty page with the
+        // walkable-v8 writer self-verifying the master-returned ETag
+        // back into a CID stamp.
+        // Tuple shape `(page_id, seq, etag_present)`: the third
+        // element discriminates the empty-page edge case from a real
+        // bug. A page with `etag.is_some()` had been flushed previously
+        // (so its cid:None reflects a v7 write that wasn't re-flushed
+        // by the migration — a real bug, every populated shard should
+        // have been dirtied). A page with `etag.is_none()` was never
+        // flushed at all (no real data; the cid:None is benign and
+        // shouldn't fail the test — but page_index never grows pages
+        // without a flush, so this should not occur in practice).
+        let mut pages_without_cid: Vec<(u32, u64, bool)> = Vec::new();
+        for (page_id, page_ref) in &root.page_index {
+            if page_ref.cid.is_none() {
+                pages_without_cid.push((
+                    (*page_id).into(),
+                    page_ref.seq,
+                    page_ref.etag.is_some(),
+                ));
+            }
+        }
+        // Filter to the load-bearing case: pages that were flushed
+        // before (etag is Some) but didn't gain a CID stamp in this
+        // migration. Pages with etag:None never had real data and are
+        // safe to skip.
+        let pages_with_stale_v7_state: Vec<_> = pages_without_cid
+            .iter()
+            .filter(|(_, _, etag_present)| *etag_present)
+            .collect();
+        assert!(
+            pages_with_stale_v7_state.is_empty(),
+            "phase C: {} previously-flushed pages have no CID after migration: {:?} \
+             (tuple = (page_id, seq, etag_was_present)). \
+             Either the walkable_v8_writer_enabled flag was off (Config default \
+             since v0.5 is true; check Config::default()), OR the master's PUT \
+             response ETag failed to parse as a v8 BLAKE3 raw-codec CID (the \
+             self-verify helper falls back to None on parse failure — check \
+             master's response headers). \
+             Pages with etag_was_present=false in pages_without_cid are the \
+             empty-page edge case and don't fail this assertion: {:?}",
+            pages_with_stale_v7_state.len(),
+            pages_with_stale_v7_state,
+            pages_without_cid
+                .iter()
+                .filter(|(_, _, ep)| !*ep)
+                .collect::<Vec<_>>()
+        );
+
+        // dir_index_cid: if any directories exist (which they always do
+        // after upsert_file populates D:parent entries), Phase 1.6
+        // re-encodes the dir-index and should stamp its CID. Skip the
+        // assertion only when the bucket genuinely has no dirs (no
+        // files = no parents = no dir entries; but phase A asserted
+        // files > 0 so this case shouldn't arise).
+        assert!(
+            root.dir_index_cid.is_some(),
+            "phase C: dir_index_cid is None after migration despite files > 0. \
+             Phase 1.6 should have re-encoded the dir-index and stamped its \
+             CID via verify_etag_against_expected_cid. Check the dir-index \
+             section of save_sharded_hamt_forest (~line 4220-4280)."
+        );
+
+        eprintln!(
+            "[migrate-v8-e2e]   ✓ all {} flushed pages have CID stamped",
+            root.page_index.len()
+        );
+        eprintln!("[migrate-v8-e2e]   ✓ dir_index_cid is stamped");
+    }
+
+    // Skip the post-migration offline verification unless the operator
+    // has waited for the publisher tick. Phase C succeeded, which is
+    // the load-bearing API-level proof — the warm-cache resolver
+    // freshness is a separate concern handled by the publisher cadence.
+    if post_wait_secs == 0 {
+        eprintln!(
+            "\n[migrate-v8-e2e] FULA_POST_MIGRATION_WAIT_SECS=0 — skipping phases D + E. \
+             Migration is verified; to also assert post-migration offline works, re-run \
+             with FULA_POST_MIGRATION_WAIT_SECS=360 (default publisher tick + buffer)."
+        );
+        return;
+    }
+
+    eprintln!(
+        "\n[migrate-v8-e2e] sleeping {}s for publisher tick so the warm-cache resolver \
+         picks up the new forest_manifest_cid via bucketsIndex...",
+        post_wait_secs
+    );
+    tokio::time::sleep(Duration::from_secs(post_wait_secs)).await;
+
+    // ─── Phase D — re-warm cache after migration ───────────────────────
+    let cache_dir_c = TempDir::new().expect("tempdir for phase D cache");
+    let cache_path_c = cache_dir_c.path().join("blocks.redb");
+    eprintln!("\n[migrate-v8-e2e] phase D: re-warm cache via online list");
+    {
+        let online_client =
+            build_client(&s3_url, &jwt, &cache_path_c, secret.clone(), true, timeout_secs);
+        let files = online_client
+            .list_files_from_forest(&images_bucket)
+            .await
+            .expect("phase D: online list post-migration must succeed");
+        let phase_d_keys: std::collections::BTreeSet<String> =
+            files.iter().map(|m| m.original_key.clone()).collect();
+        assert_eq!(
+            phase_d_keys, phase_a_keys,
+            "phase D: post-migration online list diverges from phase A — migration \
+             corrupted the visible key set ({} → {}).",
+            phase_a_keys.len(),
+            phase_d_keys.len()
+        );
+        eprintln!(
+            "[migrate-v8-e2e]   online list: {} files (matches phase A ✓)",
+            phase_d_keys.len()
+        );
+    }
+
+    // ─── Phase E — post-migration offline list (load-bearing) ──────────
+    eprintln!("\n[migrate-v8-e2e] phase E: post-migration offline list (s3 → s33, warm cache)");
+    {
+        let offline_client =
+            build_client(&bogus_url, &jwt, &cache_path_c, secret.clone(), false, timeout_secs);
+        let files = offline_client
+            .list_files_from_forest(&images_bucket)
+            .await
+            .expect(
+                "phase E: post-migration offline list MUST succeed. If this fails with \
+                 MasterUnreachable: the warm-cache resolver picked up the pre-migration \
+                 bucketsIndex CBOR (which references the old v7 forest_manifest_cid). \
+                 Either FULA_POST_MIGRATION_WAIT_SECS was too short for the publisher to \
+                 tick, OR the cache_path_c got the stale state somehow. If it fails with \
+                 Encryption/decode: the migration didn't actually stamp CIDs (check the \
+                 master's BlobBackend etag-parse log, walkable_v8_writer_enabled must be \
+                 on). If it returns a subset of phase A: some HAMT subtree wasn't \
+                 re-encoded by the cascade — this would surface a real correctness bug.",
+            );
+        let off_keys: std::collections::BTreeSet<String> =
+            files.iter().map(|m| m.original_key.clone()).collect();
+        assert_eq!(
+            off_keys, phase_a_keys,
+            "phase E: post-migration offline list diverges from phase A — migration \
+             didn't fully convert every internal node to LinkV2.\n\
+             phase A keys = {}\n\
+             phase E keys = {}",
+            phase_a_keys.len(),
+            off_keys.len()
+        );
+        eprintln!(
+            "[migrate-v8-e2e]   offline list: {} files (matches phase A ✓)",
+            off_keys.len()
+        );
+    }
+
+    eprintln!(
+        "\n[migrate-v8-e2e] PASS — migration end-to-end works:\n\
+         [migrate-v8-e2e]   phase A: online baseline    -> {} files\n\
+         [migrate-v8-e2e]   phase B: offline (pre)      -> failed-or-subset (expected)\n\
+         [migrate-v8-e2e]   phase C: migrate            -> {} files re-upserted + manifest stamped ✓\n\
+         [migrate-v8-e2e]   phase D: online (post)      -> equals phase A\n\
+         [migrate-v8-e2e]   phase E: offline (post)     -> equals phase A — bucket is walkable-v8 ✓",
+        phase_a_keys.len(),
+        migrated_files
+    );
+}

@@ -4414,6 +4414,253 @@ impl EncryptedClient {
         Ok(())
     }
 
+    /// Force-rewrite every populated HAMT internal node in `bucket`'s
+    /// forest under the walkable-v8 wire format. Retrofits offline-
+    /// readability onto a bucket whose internal nodes were originally
+    /// persisted as v7 `PointerWire::Link(StorageKey)` (no CID hint, so
+    /// the offline gateway race has no addressable target).
+    ///
+    /// # When to call
+    ///
+    /// Buckets written by SDKs prior to walkable-v8 (or by v8-aware SDKs
+    /// with `walkable_v8_writer_enabled = false`) have HAMT internal
+    /// nodes stamped with `Link(SK)` only. Lazy migration upgrades the
+    /// nodes along any path that gets re-written, but cold sub-trees
+    /// stay v7 indefinitely — so offline reads of those buckets still
+    /// fail. This method is the explicit one-shot migration: after a
+    /// successful return, every populated internal node carries a CID
+    /// hint and the bucket is fully offline-walkable from any device
+    /// that holds `forest_dek`.
+    ///
+    /// # Mechanic
+    ///
+    /// 1. Loads the forest via master (`ensure_forest_loaded`).
+    /// 2. Enumerates every `ForestFileEntry` via `list_all_files`
+    ///    AND every `ForestDirectoryEntry` via `list_all_directories`.
+    ///    Both are required — re-upserting only files leaves HAMT
+    ///    paths through `D:` ancestor keys unwalked, because
+    ///    `upsert_file`'s `ensure_ancestor_chain` short-circuits on
+    ///    pre-existing parents (`sharded_hamt_forest.rs:1119`). For a
+    ///    directory-only sub-tree those ancestor paths route through
+    ///    internal nodes that no `F:` upsert traverses, and those
+    ///    nodes would stay v7. Iterating directories closes the gap.
+    /// 3. Re-upserts each entry against itself. `Node::set_value`
+    ///    unconditionally replaces every descended `Pointer::Link` with
+    ///    `ChildPtr::InMemory` (`fula-crypto/src/wnfs_hamt/node.rs`
+    ///    set_value's `Pointer::Link` arm). By the HAMT invariant that
+    ///    every populated `Pointer::Link` slot has at least one leaf
+    ///    under it, re-upserting every `F:` AND `D:` leaf converts
+    ///    every populated internal node to `InMemory`.
+    /// 4. Calls `save_sharded_hamt_forest`. `flush_dirty` invokes
+    ///    `Node::store`, which walks every pointer unconditionally
+    ///    (`node.rs:155-167`). `Pointer::to_wire`'s `InMemory` arm
+    ///    emits `LinkV2 { storage_key, cid }` whenever the backend
+    ///    returns a verified CID (`pointer.rs:294-302`). Result: every
+    ///    re-encoded internal node carries the CID hint.
+    ///
+    /// # Cost and scaling
+    ///
+    /// Dominant cost is fetching every populated HAMT internal node
+    /// once (subsequent upserts on the same subtree reuse the in-memory
+    /// nodes). For a bucket of N files with average HAMT depth D and
+    /// 16-shard fan-out, approximate cost:
+    ///
+    /// | N (files) | Internal nodes | Wall-clock estimate (10 ms / fetch) |
+    /// |-----------|----------------|-------------------------------------|
+    /// | 1 k       | ~ 100          | ~ 1 s                               |
+    /// | 10 k      | ~ 1 k          | ~ 10 s                              |
+    /// | 100 k     | ~ 10 k         | ~ 100 s = 1.7 min                   |
+    /// | 1 M       | ~ 100 k        | ~ 1000 s = 17 min                   |
+    ///
+    /// Wall-clock dominated by network RTT; on a fast LAN the same
+    /// migration is 5–10× faster. Final flush is a single Phase 2
+    /// conditional PUT plus one PUT per dirty shard root and one PUT
+    /// per dirty manifest page (typically 16 + 1–2 = ~17 extra PUTs).
+    ///
+    /// # Reliability + data integrity
+    ///
+    /// - **Crash safety.** The existing WAL (`crates/fula-client/src/wal.rs`)
+    ///   appends `PageWrote` / `DirIndexWrote` entries before each
+    ///   Phase 1.5 / 1.6 PUT and after each successful PUT. A crash
+    ///   mid-cascade is recovered on next `ensure_forest_loaded` via
+    ///   `recover_wal_after_load`.
+    /// - **Atomic pivot.** The Phase 2 root commit uses `If-Match` on
+    ///   the prior etag. A concurrent writer (another device, or this
+    ///   process post-restart) that bumped the root mid-migration
+    ///   causes a 412; the cache is evicted and the caller can retry.
+    ///   Until Phase 2 succeeds, every reader still sees the pre-
+    ///   migration root (the prior etag is unchanged on master).
+    /// - **Idempotent.** Re-running the migration after a successful
+    ///   completion re-upserts identical entries, the cascade re-emits
+    ///   identical `LinkV2` variants, and Phase 2 advances the
+    ///   manifest seq by one — no data change beyond a no-op seq bump.
+    /// - **Lazy migration safety.** Buckets that mix freshly-written
+    ///   v8 nodes with legacy v7 siblings are handled transparently by
+    ///   the cascade — `to_wire`'s `Stored` arm emits the legacy
+    ///   `Link(SK)` form for unmutated siblings (`pointer.rs:289`), so
+    ///   parents containing both variants round-trip fine through
+    ///   postcard (see `mixed_link_and_link_v2_in_one_parent_round_trips`
+    ///   in pointer.rs).
+    ///
+    /// # Backward-compat
+    ///
+    /// - v0.6+ SDKs continue to read this bucket after migration.
+    /// - v0.5 and earlier SDKs refuse with
+    ///   `CryptoError::WireVersionUnsupported` on the first `LinkV2`
+    ///   they encounter — clean error, no data corruption.
+    /// - Coordinate with cross-device users: every device used to
+    ///   access this bucket must be on v0.6+ before migration.
+    ///
+    /// # Configuration
+    ///
+    /// Requires `Config::walkable_v8_writer_enabled = true` (the
+    /// default since v0.5). With the flag off the cascade re-emits v7
+    /// wire format and the migration is a no-op — returns
+    /// `ClientError::Config` to fail loudly rather than silently
+    /// wasting the round trip.
+    ///
+    /// # Returns
+    ///
+    /// The number of files re-upserted (= `list_all_files().len()`).
+    pub async fn migrate_bucket_to_walkable_v8(&self, bucket: &str) -> Result<usize> {
+        if !self.inner.config().walkable_v8_writer_enabled {
+            return Err(ClientError::Config(
+                "migrate_bucket_to_walkable_v8 requires walkable_v8_writer_enabled = true; \
+                 with the flag off the cascade re-emits PointerWire::Link (v7) and the \
+                 migration is a no-op".to_string()
+            ));
+        }
+
+        self.ensure_forest_loaded(bucket).await?;
+
+        let forest_arc = {
+            let entry = self.forest_cache.get(bucket).ok_or_else(|| {
+                ClientError::Encryption(fula_crypto::CryptoError::Encryption(format!(
+                    "migrate_bucket_to_walkable_v8: bucket {:?} not in forest cache after \
+                     ensure_forest_loaded (internal invariant violation)",
+                    bucket
+                )))
+            })?;
+            match entry.value() {
+                ForestCacheEntry::ShardedHamt { forest, .. } => forest.clone(),
+                ForestCacheEntry::Monolithic { .. } => {
+                    return Err(ClientError::Encryption(fula_crypto::CryptoError::Encryption(
+                        format!(
+                            "migrate_bucket_to_walkable_v8: bucket {:?} is on the monolithic \
+                             forest (v1 / v2 / v4); walkable-v8 only applies to sharded HAMT \
+                             v7+. Run migrate_to_sharded first, then re-run this migration.",
+                            bucket
+                        ),
+                    )));
+                }
+            }
+        };
+
+        let backend = std::sync::Arc::new(S3BlobBackend::new(
+            self.inner.clone(),
+            bucket.to_string(),
+        ));
+
+        // Acquire the forest write lock BEFORE enumeration so a
+        // concurrent sibling task in the same EncryptedClient (e.g.
+        // an FxFiles delete pipeline) cannot remove an entry between
+        // our enumeration and the cascade — which would otherwise
+        // cause us to resurrect a just-deleted file/directory. The
+        // list_all_* helpers take per-shard READ locks internally;
+        // holding the outer WRITE lock supersedes them so the
+        // enumeration runs inside this critical section without
+        // deadlock.
+        let mut guard = forest_arc.write().await;
+
+        let all_files = guard
+            .list_all_files(&backend)
+            .await
+            .map_err(ClientError::Encryption)?;
+        let all_dirs = guard
+            .list_all_directories(&backend)
+            .await
+            .map_err(ClientError::Encryption)?;
+
+        let file_count = all_files.len();
+        let dir_count = all_dirs.len();
+        tracing::info!(
+            bucket,
+            files = file_count,
+            dirs = dir_count,
+            "migrate_bucket_to_walkable_v8: starting cascade — re-upserting every F: and D: \
+             leaf to force every populated internal node to InMemory before flush"
+        );
+
+        // Cascade the re-upsert in the single write-lock acquisition.
+        // Cost is bounded by the in-memory work plus the lazy load of
+        // each populated internal node — ChildPtr::resolve_owned does
+        // this at most once per node (the first descent replaces the
+        // Stored slot with InMemory, so later descents on the same
+        // subtree don't refetch — see node.rs:330-337 Arc::make_mut +
+        // InMemory replacement).
+        //
+        // Files first, directories second: upsert_file writes both
+        // F:path AND a D:parent entry. The D:parent write preserves
+        // the prior dir entry's metadata + subtree_dek (upsert_file
+        // line 1068-1083). The dirs pass then re-asserts each D:
+        // entry with its FULL ForestDirectoryEntry, which is a no-op
+        // for content but ensures the D: keys' HAMT paths are walked
+        // (closing the ancestor-only-D: gap).
+        //
+        // Progress is logged every 100 entries at info-level so an
+        // operator running this against a 100k-bucket can verify
+        // forward progress without enabling debug-level tracing.
+        for (idx, entry) in all_files.iter().enumerate() {
+            guard
+                .upsert_file(entry.clone(), &backend)
+                .await
+                .map_err(ClientError::Encryption)?;
+            if idx > 0 && idx % 100 == 0 {
+                tracing::info!(
+                    bucket,
+                    progress = idx,
+                    total = file_count,
+                    "migrate_bucket_to_walkable_v8: file cascade progress"
+                );
+            }
+        }
+        for (idx, entry) in all_dirs.iter().enumerate() {
+            guard
+                .upsert_directory(entry.clone(), &backend)
+                .await
+                .map_err(ClientError::Encryption)?;
+            if idx > 0 && idx % 100 == 0 {
+                tracing::info!(
+                    bucket,
+                    progress = idx,
+                    total = dir_count,
+                    "migrate_bucket_to_walkable_v8: dir cascade progress"
+                );
+            }
+        }
+
+        // Release the write lock before save_sharded_hamt_forest —
+        // save itself re-acquires the lock for flush_dirty and Phase
+        // 2 root commit. Holding it across save would deadlock the
+        // re-acquire on the same task.
+        drop(guard);
+
+        // Phase 1 / 1.5 / 1.6 / 2 commit. flush_dirty re-encodes every
+        // dirty shard's HAMT bottom-up via Node::store, which is what
+        // actually stamps the LinkV2 variants. Phase 2's If-Match
+        // covers the atomic pivot — if another writer beat us to it,
+        // 412 surfaces here and the migration can be retried.
+        self.save_sharded_hamt_forest(bucket).await?;
+
+        tracing::info!(
+            bucket,
+            files = file_count,
+            "migrate_bucket_to_walkable_v8: cascade flushed — bucket is now walkable-v8"
+        );
+
+        Ok(file_count)
+    }
+
     /// Emergency fallback path for a v7 manifest that fails to decrypt.
     ///
     /// Lists the `__fula_forest_v1_backup/` prefix for this bucket, picks the
