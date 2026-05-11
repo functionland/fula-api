@@ -90,6 +90,39 @@ const META_USERS_INDEX_CID: &[u8] = b"users_index/cid";
 const META_USERS_INDEX_SEQUENCE: &[u8] = b"users_index/sequence";
 const META_USERS_INDEX_OBSERVED_AT: &[u8] = b"users_index/observed_at_unix";
 
+/// Issue #8 fix #2 — list_buckets offline cache.
+///
+/// The raw S3 list-buckets XML body stored after each successful
+/// master-up call. Served back on `MasterUnreachable` so the SDK has
+/// a working offline fallback for the top-level "what buckets exist"
+/// query, the same way it does for object reads via the cid-hint
+/// path.
+///
+/// **Per-JWT scoping (security).** Each user's cached XML lives
+/// under its own row keyed by `sha256(access_token)[..16]` (hex).
+/// A shared cache file (rare in FxFiles which uses per-app sandbox,
+/// but possible on multi-user devices) can hold cached responses
+/// for many distinct accounts without one being able to serve
+/// another's cached state. JWT rotation does invalidate the cache
+/// (new token → new key), which is acceptable — a fresh master-up
+/// call re-populates within seconds.
+///
+/// FxFiles already implements a similar Dart-side `listBucketsCached`
+/// shim — moving it into the SDK means every consumer benefits
+/// without re-implementing it.
+const META_LIST_BUCKETS_PREFIX: &str = "list_buckets/";
+const META_LIST_BUCKETS_XML_SUFFIX: &str = "/response_xml";
+const META_LIST_BUCKETS_OBSERVED_AT_SUFFIX: &str = "/observed_at_unix";
+
+/// Build the per-scope METADATA keys for the list-buckets cache.
+/// `scope` is `sha256(jwt)[..16]` hex (32 chars) — see
+/// `FulaClient::list_buckets_cache_scope`.
+fn list_buckets_keys(scope: &str) -> (Vec<u8>, Vec<u8>) {
+    let xml_key = format!("{}{}{}", META_LIST_BUCKETS_PREFIX, scope, META_LIST_BUCKETS_XML_SUFFIX);
+    let obs_key = format!("{}{}{}", META_LIST_BUCKETS_PREFIX, scope, META_LIST_BUCKETS_OBSERVED_AT_SUFFIX);
+    (xml_key.into_bytes(), obs_key.into_bytes())
+}
+
 /// Eviction low-watermark: when triggered, free space until usage is at
 /// or below this fraction of `max_bytes`. 80 % is the industry-standard
 /// "evict-once-amortize-many-puts" point.
@@ -535,6 +568,104 @@ impl BlockCache {
             u64::from_be_bytes(seq),
             u64::from_be_bytes(obs),
         )))
+    }
+
+    /// Issue #8 fix #2 — store the raw list-buckets XML body, scoped
+    /// to the JWT-derived `scope` key, so a subsequent master-down
+    /// call by the SAME user can serve it offline.
+    ///
+    /// `scope` is `sha256(access_token)[..16]` hex — see
+    /// `FulaClient::list_buckets_cache_scope`. Per-JWT scoping
+    /// prevents cross-account pollution on shared cache files: user
+    /// A's cached XML cannot be served to user B even if both share
+    /// the same redb file.
+    ///
+    /// Overwrites on each call (one row per scope). The freshness
+    /// timestamp is stored alongside so callers can surface staleness.
+    pub(crate) fn store_list_buckets_xml(
+        &self,
+        scope: &str,
+        xml: &str,
+        observed_at_unix: u64,
+    ) -> Result<(), BlockCacheError> {
+        let (xml_key, obs_key) = list_buckets_keys(scope);
+        let txn = self.inner.db.begin_write()?;
+        {
+            let mut table = txn.open_table(METADATA)?;
+
+            // Prune stale scopes: when JWTs rotate (e.g., every few
+            // hours), each new token derives a new `scope` key. Without
+            // pruning, every prior scope's rows linger forever in the
+            // METADATA table (one user × 24 rotations/day × 1 KB ≈
+            // 9 MB/year, never reclaimed since METADATA isn't LRU-evicted).
+            //
+            // Policy: keep only the current scope's two rows. Past
+            // scopes are unreachable anyway (no live JWT can derive
+            // them), so dropping them loses nothing.
+            //
+            // O(n) over METADATA where n is "JWT-rotation history" —
+            // bounded by usage pattern, but a few-hundred entries is
+            // negligible.
+            let prefix = META_LIST_BUCKETS_PREFIX.as_bytes();
+            let mut to_remove: Vec<Vec<u8>> = Vec::new();
+            for entry in table.iter()? {
+                let (k, _) = entry?;
+                let key_bytes = k.value();
+                if key_bytes.starts_with(prefix)
+                    && key_bytes != xml_key.as_slice()
+                    && key_bytes != obs_key.as_slice()
+                {
+                    to_remove.push(key_bytes.to_vec());
+                }
+            }
+            for k in to_remove {
+                table.remove(k.as_slice())?;
+            }
+
+            table.insert(xml_key.as_slice(), xml.as_bytes())?;
+            table.insert(obs_key.as_slice(), observed_at_unix.to_be_bytes().as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Issue #8 fix #2 — load the previously-cached list-buckets XML
+    /// body scoped to `scope`. Returns `None` if no entry exists for
+    /// THIS JWT. Returns the observed-at-unix timestamp alongside so
+    /// the caller can surface staleness.
+    pub(crate) fn load_list_buckets_xml(
+        &self,
+        scope: &str,
+    ) -> Result<Option<(String, u64)>, BlockCacheError> {
+        let (xml_key, obs_key) = list_buckets_keys(scope);
+        let read = self.inner.db.begin_read()?;
+        let table = read.open_table(METADATA)?;
+        let xml_bytes = match table.get(xml_key.as_slice())? {
+            Some(v) => v.value().to_vec(),
+            None => return Ok(None),
+        };
+        let xml = match String::from_utf8(xml_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "list_buckets cache: invalid UTF-8; treating as empty");
+                return Ok(None);
+            }
+        };
+        let observed_at = match table.get(obs_key.as_slice())? {
+            Some(v) => {
+                let bytes = v.value();
+                if bytes.len() != 8 {
+                    tracing::warn!("list_buckets cache: malformed observed_at length; treating as 0");
+                    0
+                } else {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(bytes);
+                    u64::from_be_bytes(buf)
+                }
+            }
+            None => 0,
+        };
+        Ok(Some((xml, observed_at)))
     }
 
     /// Evict LRU entries until `current_bytes <= target_bytes`. Caller

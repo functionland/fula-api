@@ -112,12 +112,33 @@ impl FulaClient {
             None
         };
 
-        // GatewayPool requires block_cache as a hard prereq: without
-        // a cached `(bucket, key) → cid` mapping the fallback path has
-        // no CID to fetch. If the cache failed to open we silently
-        // disable gateway fallback too.
+        // Issue #8 fix #4 — gateway_pool no longer cascades to None
+        // when block_cache is None.
+        //
+        // Old behavior: `gateway_fallback_enabled && block_cache.is_some()`.
+        // If the redb cache file failed to open (e.g., another
+        // EncryptedClient instance briefly held the lock during a
+        // FxFiles reinit), block_cache became None — and gateway_pool
+        // ALSO became None. The entire offline-fallback path was dead
+        // for the session, surfaced only by an easy-to-miss `warn!`
+        // line.
+        //
+        // New behavior: `gateway_fallback_enabled` alone gates the
+        // pool. The cid-hint variant of the offline fallback
+        // (`try_offline_fallback_with_cid_hint`) holds the CID
+        // externally (from the just-decrypted parent's `LinkV2`
+        // pointer or from `page_ref.cid`) — it does NOT need a cache
+        // to source the CID, only to (best-effort) memoize the
+        // fetched bytes. Letting the pool survive a cache-open
+        // failure means walkable-v8 offline reads still work in the
+        // degraded mode.
+        //
+        // The no-hint variant (`try_offline_fallback`) still requires
+        // a cache to translate `(bucket, key) → cid`; if cache is
+        // None there, it cleanly returns master_error without
+        // attempting the race.
         #[cfg(not(target_arch = "wasm32"))]
-        let gateway_pool = if config.gateway_fallback_enabled && block_cache.is_some() {
+        let gateway_pool = if config.gateway_fallback_enabled {
             let pool = if config.gateway_fallback_urls.is_empty() {
                 GatewayPool::default_pool()
             } else {
@@ -277,12 +298,105 @@ impl FulaClient {
 
     // ==================== Bucket Operations ====================
 
-    /// List all buckets
+    /// List all buckets.
+    ///
+    /// Issue #8 fix #2 — when master is reachable, the XML response
+    /// body is mirrored into the local BlockCache's METADATA table so
+    /// a subsequent master-down call (DNS error, connection refused,
+    /// health-gate short-circuit, etc.) can serve from cache instead
+    /// of propagating the network error.
+    ///
+    /// **Per-JWT scoping.** Each user's cached XML lives under a row
+    /// keyed by `sha256(access_token)[..16]` so a shared cache file
+    /// cannot leak one account's bucket list to another. JWT rotation
+    /// invalidates the cache (new token → new scope key); the next
+    /// master-up call re-populates.
+    ///
+    /// **No access token configured (anonymous client).** Caching is
+    /// disabled — the scope key would be empty and a non-anonymous
+    /// caller could collide with it.
+    ///
+    /// Backward compatibility: master-up behavior is byte-identical
+    /// to pre-fix. The cache write is best-effort (a redb error logs
+    /// at `debug` and is dropped).
     #[instrument(skip(self))]
     pub async fn list_buckets(&self) -> Result<ListBucketsResult> {
-        let response = self.request("GET", "/", None, None, None).await?;
+        let response = match self.request("GET", "/", None, None, None).await {
+            Ok(r) => r,
+            #[cfg(not(target_arch = "wasm32"))]
+            Err(e) if is_master_unreachable_error(&e) => {
+                // Master is unreachable. Try the cached XML body for
+                // THIS user's scope.
+                if let (Some(cache), Some(scope)) = (&self.block_cache, self.list_buckets_cache_scope()) {
+                    match cache.load_list_buckets_xml(&scope) {
+                        Ok(Some((xml, _observed_at))) => {
+                            debug!("list_buckets: master unreachable; serving from cache");
+                            return parse_list_buckets_response(&xml);
+                        }
+                        Ok(None) => {
+                            debug!("list_buckets: master unreachable; no cached entry for this JWT");
+                        }
+                        Err(cache_err) => {
+                            debug!(
+                                error = %cache_err,
+                                "list_buckets: master unreachable AND cache read failed"
+                            );
+                        }
+                    }
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         let text = response.text().await?;
-        parse_list_buckets_response(&text)
+        let parsed = parse_list_buckets_response(&text)?;
+
+        // Master-up success: mirror the body into the cache for
+        // future offline reads, scoped to this JWT. Best-effort.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let (Some(cache), Some(scope)) = (&self.block_cache, self.list_buckets_cache_scope()) {
+            let observed_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if let Err(e) = cache.store_list_buckets_xml(&scope, &text, observed_at) {
+                debug!(
+                    error = %e,
+                    "list_buckets: cache write failed (best-effort; master fetch already succeeded)"
+                );
+            }
+        }
+
+        Ok(parsed)
+    }
+
+    /// Issue #8 fix #2 — derive the per-JWT scope key for the
+    /// list-buckets cache.
+    ///
+    /// `sha256(access_token)[..16]` (32 hex chars). Returns `None`
+    /// when no access token is configured (anonymous clients don't
+    /// cache list_buckets responses; they can still serve cached
+    /// reads via the cid-hint path which has its own integrity story).
+    ///
+    /// Security note: the cache key is derived from the bearer token
+    /// rather than the OAuth-derived stable user_id because the
+    /// stable id is in `EncryptionConfig` (not on `FulaClient`).
+    /// JWT rotation does invalidate the cache as a side effect,
+    /// which is acceptable — a fresh master-up call re-populates in
+    /// seconds. The threat we're closing is cross-account
+    /// pollution on shared cache files, which the JWT-bound key
+    /// prevents whether or not it's rotation-stable.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn list_buckets_cache_scope(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let token = self.config.access_token.as_deref()?;
+        if token.is_empty() {
+            return None;
+        }
+        let digest = Sha256::digest(token.as_bytes());
+        // 16 hex chars = 8 bytes of entropy. Plenty against accidental
+        // collision; not a security-critical derivation.
+        Some(hex::encode(&digest[..8]))
     }
 
     /// Create a bucket
@@ -379,14 +493,28 @@ impl FulaClient {
             }
         }
 
+        // Clone `data` for the post-PUT cache warm. `Bytes` is
+        // refcounted (Arc<u8>) so this is O(1). The PUT consumes its
+        // Bytes; the clone gives us bytes for `cache.put(&cid, &bytes)`
+        // after we've confirmed the PUT succeeded.
+        #[cfg(not(target_arch = "wasm32"))]
+        let body_for_cache = data.clone();
+
         let response = self.request("PUT", &path, None, Some(headers), Some(data)).await?;
-        
+
         let etag = response
             .headers()
             .get("ETag")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
+
+        // Issue #8 fix #3 — warm the local BLOCKS cache with the
+        // just-PUT bytes so a subsequent offline read can serve them
+        // without depending on a follow-up master-up read or on
+        // public-IPFS-DHT propagation of the freshly-pinned CID.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.warm_block_cache_after_put(bucket, key, &etag, &body_for_cache).await;
 
         Ok(PutObjectResult {
             etag,
@@ -429,6 +557,10 @@ impl FulaClient {
             headers.insert("If-None-Match".to_string(), val);
         }
 
+        // Clone for the post-PUT cache warm (see put_object_with_metadata).
+        #[cfg(not(target_arch = "wasm32"))]
+        let body_for_cache = data.clone();
+
         let response = self.request("PUT", &path, None, Some(headers), Some(data)).await?;
 
         let etag = response
@@ -437,6 +569,14 @@ impl FulaClient {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
+
+        // Issue #8 fix #3 — warm BLOCKS for manifest pages, dir-index
+        // commits, and the Phase-2 root commit. These all flow through
+        // `put_object_with_metadata_conditional` directly (NOT through
+        // S3BlobBackend), so without warming here the offline path
+        // cannot serve them after a write.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.warm_block_cache_after_put(bucket, key, &etag, &body_for_cache).await;
 
         Ok(PutObjectResult { etag, version_id: None })
     }
@@ -467,14 +607,20 @@ impl FulaClient {
         headers.insert("X-Pinning-Service".to_string(), pinning_service.to_string());
         headers.insert("X-Pinning-Token".to_string(), pinning_token.to_string());
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let body_for_cache = data.clone();
+
         let response = self.request("PUT", &path, None, Some(headers), Some(data)).await?;
-        
+
         let etag = response
             .headers()
             .get("ETag")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        self.warm_block_cache_after_put(bucket, key, &etag, &body_for_cache).await;
 
         Ok(PutObjectResult {
             etag,
@@ -499,7 +645,7 @@ impl FulaClient {
         let data = data.into();
 
         let mut headers = HashMap::new();
-        
+
         // Add metadata headers
         if let Some(meta) = metadata {
             if let Some(ct) = meta.content_type {
@@ -509,13 +655,17 @@ impl FulaClient {
                 headers.insert(format!("x-amz-meta-{}", k), v);
             }
         }
-        
+
         // Add pinning headers
         headers.insert("X-Pinning-Service".to_string(), pinning_service.to_string());
         headers.insert("X-Pinning-Token".to_string(), pinning_token.to_string());
 
+        // Clone for the post-PUT cache warm (see put_object_with_metadata).
+        #[cfg(not(target_arch = "wasm32"))]
+        let body_for_cache = data.clone();
+
         let response = self.request("PUT", &path, None, Some(headers), Some(data)).await?;
-        
+
         let etag = response
             .headers()
             .get("ETag")
@@ -523,10 +673,130 @@ impl FulaClient {
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
 
+        // Issue #8 fix #3 — warm BLOCKS for chunked uploads and any
+        // other path that routes through the pinning variant.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.warm_block_cache_after_put(bucket, key, &etag, &body_for_cache).await;
+
         Ok(PutObjectResult {
             etag,
             version_id: None,
         })
+    }
+
+    /// Issue #8 fix #3 — best-effort cache warm-up after a successful
+    /// PUT.
+    ///
+    /// Background: every encrypted write the SDK makes is also a
+    /// content-addressed pin. Pre-fix, those bytes lived only on
+    /// master (and master's downstream IPFS-cluster pin chain) —
+    /// the SDK's LOCAL `BlockCache` was populated exclusively by
+    /// successful master-UP READS. So the user-reported flow
+    /// "upload → reinit to offline → read" would walk through:
+    /// `request()` → health-gate `MasterUnreachable` short-circuit
+    /// → `try_offline_fallback*` → `cache.get(cid)` → MISS (writes
+    /// never populated BLOCKS) → gateway race → 404 (DHT propagation
+    /// hadn't reached public gateways yet for the freshly-pinned
+    /// CID) → propagate `Master unreachable`. See issue #8 for the
+    /// full trace.
+    ///
+    /// Fix: every `put_object_*` method on `FulaClient` (and
+    /// `S3BlobBackend::put` for HAMT internal nodes) calls this
+    /// helper after a successful PUT. The helper:
+    ///
+    /// 1. No-ops when `walkable_v8_writer_enabled` is off (write
+    ///    semantics stay byte-identical to v0.5).
+    /// 2. No-ops when `block_cache` is None (offline-fallback
+    ///    infrastructure not configured).
+    /// 3. Tries to parse the master ETag as a CID. Master v0.4.4+
+    ///    returns `BLAKE3(body)` as the ETag string. On parse
+    ///    failure (legacy master, malformed response) the warm
+    ///    silently skips — the PUT itself already succeeded.
+    /// 4. Best-effort `cache.put(&cid, body)` + `cache.record_key_cid`.
+    ///    Failures (e.g., `BlockTooLarge` for a single body bigger
+    ///    than the entire cache budget) log at debug and proceed —
+    ///    the bytes are stored on master either way.
+    ///
+    /// Threat model: the helper writes ciphertext-as-given to the
+    /// local cache. The bytes are content-addressed by the parsed
+    /// CID; a malicious master that returned a wrong-CID ETag
+    /// would corrupt the SDK's own KEY_TO_CID mapping but cannot
+    /// inject foreign bytes via this path (the BLOCKS row is keyed
+    /// by the CID the SDK *parsed*, not the CID the bytes
+    /// content-address to). Subsequent offline reads through
+    /// `try_offline_fallback_with_cid_hint` would re-verify the
+    /// CID against the bytes via `verify_cid_against_bytes` if
+    /// they came from a gateway race — but a cache HIT skips that
+    /// check by design (we trust local cache contents). The
+    /// upgrade story: when `walkable_v8` is on, the same flag also
+    /// runs `verify_etag_matches_ciphertext` in `S3BlobBackend::put`
+    /// before stamping a `LinkV2.cid` — that's the authoritative
+    /// self-verify. This helper relies on that gate being on for
+    /// trustworthy cache writes.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn warm_block_cache_after_put(
+        &self,
+        bucket: &str,
+        key: &str,
+        etag: &str,
+        body: &Bytes,
+    ) {
+        // Walkable-v8 writer disabled → master might not return a
+        // parseable CID ETag (legacy v0.5 master, multipart upload
+        // returning an aggregate ETag, etc.). Skip entirely so write
+        // semantics stay byte-identical to v0.5.
+        if !self.config.walkable_v8_writer_enabled {
+            return;
+        }
+        let cache = match &self.block_cache {
+            Some(c) => c,
+            None => return,
+        };
+        if etag.is_empty() {
+            return;
+        }
+        // SECURITY: Self-verify the master-attested CID against
+        // `BLAKE3(body)` BEFORE caching. Same gate `S3BlobBackend::put`
+        // uses for `LinkV2.cid` stamping (see encryption.rs:438-450).
+        // Without this check, a malicious or buggy master could return
+        // an arbitrary CID as the ETag and the cache row would be
+        // keyed by an attacker-influenced value, weakening the trust
+        // chain that the cid-hint variant of `try_offline_fallback`
+        // relies on (it skips `verify_cid_against_bytes` on BLOCKS
+        // hits, deliberately, because BLOCKS contents are SDK-internal).
+        //
+        // On mismatch, `verify_etag_matches_ciphertext` returns None
+        // with a rate-limited per-`(bucket, path)` warn — same
+        // soft-fail-to-None policy that S3BlobBackend::put already
+        // uses for its `LinkV2.cid` stamping.
+        let cid = match crate::walkable_v8::verify_etag_matches_ciphertext(
+            etag, body, bucket, key,
+        ) {
+            Some(c) => c,
+            None => return,
+        };
+        // Best-effort writes. A BlockTooLarge error (single body
+        // bigger than the entire cache budget) is the only expected
+        // failure mode; everything else (redb I/O, lock contention)
+        // is treated identically — log at debug, proceed.
+        if let Err(e) = cache.put(&cid, body).await {
+            debug!(
+                error = %e,
+                cid = %cid,
+                bucket = %bucket,
+                key = %key,
+                "warm_block_cache_after_put: BLOCKS put failed (best-effort; PUT already succeeded)"
+            );
+        }
+        if let Err(e) = cache.record_key_cid(bucket, key, &cid) {
+            debug!(
+                error = %e,
+                cid = %cid,
+                bucket = %bucket,
+                key = %key,
+                "warm_block_cache_after_put: KEY_TO_CID record failed (best-effort)"
+            );
+        }
     }
 
     /// Get an object
@@ -921,41 +1191,51 @@ impl FulaClient {
         cid: &cid::Cid,
         master_error: ClientError,
     ) -> Result<OfflineGetResult> {
-        let (cache, pool) = match (&self.block_cache, &self.gateway_pool) {
-            (Some(c), Some(p)) => (c.clone(), p.clone()),
-            _ => return Err(master_error),
+        // Issue #8 fix #4 — the cid-hint variant works even when
+        // block_cache is None. The CID is supplied externally (from
+        // a just-decrypted parent's `LinkV2` pointer or from
+        // `page_ref.cid`), so we can race the gateway pool directly.
+        // Cache, when present, is used for BLOCKS short-circuit + post-
+        // fetch memoization; absent, those become no-ops.
+        let pool = match &self.gateway_pool {
+            Some(p) => p.clone(),
+            None => return Err(master_error),
         };
+        let cache = self.block_cache.clone();
 
         // BLOCKS hit — same short-circuit as warm-cache fallback. A
         // prior cold-start that raced this exact CID populated the
         // cache, so a follow-up read serves with no network at all.
-        if let Ok(Some(bytes)) = cache.get(cid) {
-            debug!(cid = %cid, "offline fallback (cid-hint): BLOCKS hit");
-            // Best-effort warm-cache backfill: if this is the first
-            // time we've seen this `(bucket, key)`, record the mapping
-            // so the next read can use the no-hint warm path too.
-            if let Err(e) = cache.record_key_cid(bucket, key, cid) {
-                debug!(
-                    error = %e,
-                    "block_cache: record_key_cid failed (best-effort)"
-                );
+        if let Some(c) = &cache {
+            if let Ok(Some(bytes)) = c.get(cid) {
+                debug!(cid = %cid, "offline fallback (cid-hint): BLOCKS hit");
+                // Best-effort warm-cache backfill: if this is the
+                // first time we've seen this `(bucket, key)`, record
+                // the mapping so the next read can use the no-hint
+                // warm path too.
+                if let Err(e) = c.record_key_cid(bucket, key, cid) {
+                    debug!(
+                        error = %e,
+                        "block_cache: record_key_cid failed (best-effort)"
+                    );
+                }
+                let observed_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                return Ok(OfflineGetResult {
+                    inner: GetObjectResult {
+                        content_length: bytes.len() as u64,
+                        data: bytes,
+                        etag: cid.to_string(),
+                        content_type: None,
+                        last_modified: None,
+                        metadata: HashMap::new(),
+                    },
+                    source: ReadSource::LocalCache,
+                    freshness: ReadFreshness::Cached { observed_at },
+                });
             }
-            let observed_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            return Ok(OfflineGetResult {
-                inner: GetObjectResult {
-                    content_length: bytes.len() as u64,
-                    data: bytes,
-                    etag: cid.to_string(),
-                    content_type: None,
-                    last_modified: None,
-                    metadata: HashMap::new(),
-                },
-                source: ReadSource::LocalCache,
-                freshness: ReadFreshness::Cached { observed_at },
-            });
         }
 
         // Gateway race using the supplied CID. fetch_verified verifies
@@ -969,22 +1249,23 @@ impl FulaClient {
                     gateway = %gateway_url,
                     "offline fallback (cid-hint): gateway race succeeded"
                 );
-                // Populate BLOCKS so subsequent reads skip the network.
-                if let Err(e) = cache.put(cid, &bytes).await {
-                    debug!(
-                        error = %e,
-                        "block_cache: put failed (best-effort)"
-                    );
-                }
-                // Populate KEY_TO_CID so the standard warm-cache path
-                // (which doesn't have a hint) also serves this object
-                // on the next read. Best-effort: a redb error doesn't
-                // break this fetch.
-                if let Err(e) = cache.record_key_cid(bucket, key, cid) {
-                    debug!(
-                        error = %e,
-                        "block_cache: record_key_cid failed (best-effort)"
-                    );
+                // Populate BLOCKS + KEY_TO_CID when a cache is present
+                // so subsequent reads skip the network. Best-effort —
+                // a redb error doesn't break this fetch, and an absent
+                // cache just means we re-race on the next read.
+                if let Some(c) = &cache {
+                    if let Err(e) = c.put(cid, &bytes).await {
+                        debug!(
+                            error = %e,
+                            "block_cache: put failed (best-effort)"
+                        );
+                    }
+                    if let Err(e) = c.record_key_cid(bucket, key, cid) {
+                        debug!(
+                            error = %e,
+                            "block_cache: record_key_cid failed (best-effort)"
+                        );
+                    }
                 }
                 let observed_at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

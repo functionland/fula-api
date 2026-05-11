@@ -80,8 +80,16 @@ pub(crate) const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// with the requested CID's `to_string()` form. All six gateways speak
 /// standard `/ipfs/<cid>` URL conventions.
 pub fn default_gateway_urls() -> Vec<String> {
+    // Cloudflare's `cloudflare-ipfs.com/ipfs/` gateway was retired —
+    // DNS no longer resolves (verified 2026-05-10). Keeping it in
+    // the top-K race burned a slot returning fast errors and starved
+    // real racers. Drop it.
+    //
+    // 5 working gateways in race-priority order (lower index = higher
+    // base priority). Phase 2.3 races the top-K (default 3) in
+    // parallel; the dynamic priority system lets a slow gateway drift
+    // down and recover automatically.
     vec![
-        "https://cloudflare-ipfs.com/ipfs/{cid}".to_string(),
         "https://dweb.link/ipfs/{cid}".to_string(),
         "https://ipfs.io/ipfs/{cid}".to_string(),
         "https://trustless-gateway.link/ipfs/{cid}".to_string(),
@@ -612,9 +620,28 @@ mod tests {
     // ============================================================
 
     #[test]
-    fn test_default_gateway_urls_list_is_six_entries() {
+    fn test_default_gateway_urls_list_is_five_entries() {
+        // Issue #8 fix #1 — Cloudflare's `cloudflare-ipfs.com/ipfs/`
+        // gateway was retired (DNS no longer resolves, verified
+        // 2026-05-10). Dropped from the default list; remaining 5
+        // racers are all live.
         let urls = default_gateway_urls();
-        assert_eq!(urls.len(), 6);
+        assert_eq!(urls.len(), 5);
+    }
+
+    #[test]
+    fn test_default_gateway_urls_does_not_include_cloudflare() {
+        // Issue #8 regression guard — the list must never re-include
+        // `cloudflare-ipfs.com` (DNS dead). Re-adding it would burn
+        // one of the top-K race slots returning DNS-fail errors.
+        let urls = default_gateway_urls();
+        for url in &urls {
+            assert!(
+                !url.contains("cloudflare-ipfs.com"),
+                "cloudflare-ipfs.com is retired; must not be in default list; found: {}",
+                url
+            );
+        }
     }
 
     #[test]
@@ -634,16 +661,16 @@ mod tests {
 
     #[test]
     fn test_default_gateway_urls_quality_order() {
-        // Cloudflare is slot 0 (lowest latency, generous rate limits).
-        // Pinata is the last fallback. Verify the published quality
-        // order so a reorder is a deliberate change.
+        // Post-issue-#8 quality order: dweb.link is now slot 0
+        // (lowest latency among the surviving gateways). Pinata is
+        // the last fallback. Verify the published quality order so
+        // a reorder is a deliberate change.
         let urls = default_gateway_urls();
-        assert!(urls[0].contains("cloudflare-ipfs.com"));
-        assert!(urls[1].contains("dweb.link"));
-        assert!(urls[2].contains("ipfs.io"));
-        assert!(urls[3].contains("trustless-gateway.link"));
-        assert!(urls[4].contains("4everland.io"));
-        assert!(urls[5].contains("gateway.pinata.cloud"));
+        assert!(urls[0].contains("dweb.link"));
+        assert!(urls[1].contains("ipfs.io"));
+        assert!(urls[2].contains("trustless-gateway.link"));
+        assert!(urls[3].contains("4everland.io"));
+        assert!(urls[4].contains("gateway.pinata.cloud"));
     }
 
     #[test]
@@ -738,9 +765,14 @@ mod tests {
     // ============================================================
 
     #[test]
-    fn test_default_pool_has_six_gateways() {
+    fn test_default_pool_has_five_gateways() {
+        // Issue #8 fix #1 — Cloudflare's gateway was retired, dropping
+        // the default list from 6 to 5. Race concurrency stays at 3
+        // (top-K, default 3) so we still parallel-race the same number
+        // of slots; we just lost a dead racer that was burning one of
+        // them.
         let pool = GatewayPool::default_pool();
-        assert_eq!(pool.len(), 6);
+        assert_eq!(pool.len(), 5);
         assert_eq!(pool.race_concurrency, 3);
     }
 
