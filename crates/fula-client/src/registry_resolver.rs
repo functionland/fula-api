@@ -406,13 +406,18 @@ pub fn decode_user_buckets_index(bytes: &[u8]) -> Result<UserBucketsIndex, Clien
     })
 }
 
-/// Default `/ipfs/{cid}` gateway list — same six as the warm-device
-/// pool ships in `gateway_fetch::default_gateway_urls`. Re-declared
-/// here so the resolver's chain path doesn't need to depend on the
-/// pool's state machine.
+/// Default `/ipfs/{cid}` gateway list — kept in sync with the
+/// warm-device pool's `gateway_fetch::default_gateway_urls`.
+/// Re-declared here so the resolver's chain path doesn't need to
+/// depend on the pool's state machine.
+///
+/// Issue #8 fix #1 — `cloudflare-ipfs.com/ipfs/` was retired (DNS
+/// no longer resolves, verified 2026-05-10). Dropped from both this
+/// list and from `gateway_fetch::default_gateway_urls`; keeping
+/// them in sync prevents a dead gateway from burning a slot in
+/// either race.
 pub fn default_ipfs_gateway_urls() -> Vec<String> {
     vec![
-        "https://cloudflare-ipfs.com/ipfs/{cid}".into(),
         "https://dweb.link/ipfs/{cid}".into(),
         "https://ipfs.io/ipfs/{cid}".into(),
         "https://trustless-gateway.link/ipfs/{cid}".into(),

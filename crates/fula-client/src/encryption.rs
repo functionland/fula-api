@@ -448,6 +448,16 @@ impl BlobBackend for S3BlobBackend {
                         // through to the storage-key path.
                         None
                     };
+                    // Issue #8 fix #3 cache-warm is handled by the
+                    // helper `FulaClient::warm_block_cache_after_put`,
+                    // which runs inside `inner.put_object` above and
+                    // covers ALL writers (HAMT internal nodes via this
+                    // backend, plus manifest pages / dir-index / root
+                    // commits via the conditional path, plus chunks
+                    // via the pinning path). Putting the warm here
+                    // too would duplicate the redb write — idempotent
+                    // (delta=0 per block_cache::put net-delta logic)
+                    // but wasted I/O. Single source of truth.
                     return Ok(BlobPutResult { cid });
                 }
                 Err(e)
