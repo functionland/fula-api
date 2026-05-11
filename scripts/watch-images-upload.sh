@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Run on the master, then upload an image from FxFiles. This tails the
-# gateway log filtered to lines that pinpoint where Phase 1.2 / v0.5.1
+# gateway log filtered to lines that pinpoint where Phase 1.2 / v0.5.2
 # migration is succeeding or failing for the user's `images` bucket:
 #
 #   * "Populated/updated bucket_lookup_h" — Phase 1.2 ran (good — appears on first-flush AND on key-rotation flushes)
-#   * "Populated forest_manifest_cid" — v0.5.1 ran (good — should appear on every Phase 2 root commit)
+#   * "Populated forest_manifest_cid" — v0.5.2 ran (good — should appear on every Phase 2 root commit)
 #   * "populate_bucket_lookup_h failed"
 #   * "populate_forest_manifest_cid failed"
 #   * "Failed to flush bucket"
