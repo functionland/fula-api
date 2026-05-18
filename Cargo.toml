@@ -40,6 +40,8 @@ fula-core = { path = "crates/fula-core" }
 fula-cli = { path = "crates/fula-cli" }
 fula-client = { path = "crates/fula-client", features = ["test-fault-injection"] }
 fula-crypto = { path = "crates/fula-crypto" }
+# Added by issue #11 repro test (tests/issue_11_share_token_offline_test.rs)
+fula-flutter = { path = "crates/fula-flutter" }
 chrono = { workspace = true }
 reqwest = { workspace = true, features = ["json", "multipart"] }
 axum = { workspace = true }

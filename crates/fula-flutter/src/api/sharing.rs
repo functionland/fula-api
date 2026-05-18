@@ -43,16 +43,17 @@ pub async fn create_share_token(
     // Get owner's keypair
     let keypair = enc_config.key_manager().keypair();
 
-    // Fetch object metadata to get the actual wrapped DEK
-    let head_result = guard.inner().head_object(&bucket, &storage_key).await
+    // Issue #11: fetch the wrapped-DEK metadata with offline fallback.
+    // Online: HEAD against master (unchanged from prior behavior).
+    // Offline / master unreachable: fall back to forest entry's
+    // user_metadata["x-fula-encryption"] (populated at upload by
+    // encryption.rs:5955-5968).
+    let enc_metadata_str = guard
+        .get_object_encryption_metadata_with_fallback(&bucket, &storage_key)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to fetch object metadata: {}", e))?;
 
-    // Parse encryption metadata
-    let enc_metadata_str = head_result.metadata
-        .get("x-fula-encryption")
-        .ok_or_else(|| anyhow::anyhow!("Object is not encrypted or missing encryption metadata"))?;
-
-    let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
+    let enc_metadata: serde_json::Value = serde_json::from_str(&enc_metadata_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse encryption metadata: {}", e))?;
 
     // Extract and unwrap the actual DEK used during upload
@@ -140,16 +141,17 @@ pub async fn create_share_token_with_mode(
     // Get owner's keypair
     let keypair = enc_config.key_manager().keypair();
 
-    // Fetch object metadata to get the actual wrapped DEK
-    let head_result = guard.inner().head_object(&bucket, &storage_key).await
+    // Issue #11: fetch the wrapped-DEK metadata with offline fallback.
+    // Online: HEAD against master (unchanged from prior behavior).
+    // Offline / master unreachable: fall back to forest entry's
+    // user_metadata["x-fula-encryption"] (populated at upload by
+    // encryption.rs:5955-5968).
+    let enc_metadata_str = guard
+        .get_object_encryption_metadata_with_fallback(&bucket, &storage_key)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to fetch object metadata: {}", e))?;
 
-    // Parse encryption metadata
-    let enc_metadata_str = head_result.metadata
-        .get("x-fula-encryption")
-        .ok_or_else(|| anyhow::anyhow!("Object is not encrypted or missing encryption metadata"))?;
-
-    let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
+    let enc_metadata: serde_json::Value = serde_json::from_str(&enc_metadata_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse encryption metadata: {}", e))?;
 
     // Extract and unwrap the actual DEK used during upload

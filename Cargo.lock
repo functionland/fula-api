@@ -1690,6 +1690,7 @@ dependencies = [
  "fula-client",
  "fula-core",
  "fula-crypto",
+ "fula-flutter",
  "hex",
  "jsonwebtoken",
  "md-5",

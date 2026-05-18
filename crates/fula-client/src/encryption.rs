@@ -1253,8 +1253,101 @@ impl EncryptedClient {
         self.put_object_encrypted_with_type(bucket, key, data, None).await
     }
 
+    /// Issue #11 — fetch the `x-fula-encryption` metadata JSON for an
+    /// object, with automatic fallback to the forest entry's local copy
+    /// when master is unreachable.
+    ///
+    /// Behavior:
+    /// - Tries `head_object` against the configured master first. On
+    ///   success, returns the `x-fula-encryption` HTTP response header.
+    ///   This preserves "live S3 = source of truth" for online flows.
+    /// - On a transport-layer failure (master unreachable / DNS /
+    ///   connect / timeout / health-gate-down), falls back to the
+    ///   forest entry's `user_metadata["x-fula-encryption"]`, populated
+    ///   at upload by `put_object_encrypted_*` (see `encryption.rs:5955-5968`).
+    /// - On any other error (404, AccessDenied, parse errors),
+    ///   propagates as-is — those are real failure responses, not
+    ///   master-down.
+    ///
+    /// Used by `fula-flutter::api::sharing::create_share_token` (issue
+    /// #11). Suitable for any caller that needs the encryption envelope
+    /// (wrapped DEK + nonce + version + chunked metadata) without
+    /// downloading the body.
+    ///
+    /// Limitation: post-key-rotation, the forest's `user_metadata` is
+    /// NOT kept in sync with S3 (`rewrap_object_dek` updates S3 only,
+    /// `encryption.rs:8729-8800`). Online flows fetch fresh data via
+    /// HEAD and are correct. Fully-offline flows after a rotation may
+    /// surface stale wrapped DEKs; a follow-up fix that mirrors the
+    /// rewrap into forest `user_metadata` would resolve this.
+    pub async fn get_object_encryption_metadata_with_fallback(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+    ) -> Result<String> {
+        match self.inner.head_object(bucket, storage_key).await {
+            Ok(head) => head
+                .metadata
+                .get("x-fula-encryption")
+                .cloned()
+                .ok_or_else(|| {
+                    ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                        "Object is not encrypted or missing encryption metadata"
+                            .to_string(),
+                    ))
+                }),
+            Err(err) if Self::is_master_unreachable_error(&err) => {
+                // Master unreachable — fall back to the local forest entry.
+                self.ensure_forest_loaded(bucket).await?;
+                let forest_entry = self
+                    .forest_entry_lookup(bucket, storage_key)
+                    .await?
+                    .ok_or_else(|| ClientError::NotFound {
+                        bucket: bucket.to_string(),
+                        key: storage_key.to_string(),
+                    })?;
+                forest_entry
+                    .user_metadata
+                    .get("x-fula-encryption")
+                    .cloned()
+                    .ok_or_else(|| {
+                        ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                            "Master unreachable and forest entry carries no \
+                             x-fula-encryption (legacy upload pre-issue-11; \
+                             bring master back online to repair)"
+                                .to_string(),
+                        ))
+                    })
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Issue #11 — classify a `ClientError` as a transport-layer
+    /// "master unreachable" failure that should trigger forest-entry
+    /// fallback. Excludes legitimate S3 error responses (404, 403,
+    /// etc.) which are real failures, not master-down signals.
+    fn is_master_unreachable_error(err: &ClientError) -> bool {
+        match err {
+            ClientError::MasterUnreachable { .. } => true,
+            ClientError::Http(e) => {
+                e.is_connect()
+                    || e.is_timeout()
+                    || e.is_request()
+                    // Catch DNS resolution failures explicitly — reqwest
+                    // does not classify "dns error / failed to lookup
+                    // address" as `is_connect()` on every platform.
+                    || {
+                        let s = e.to_string();
+                        s.contains("dns error") || s.contains("failed to lookup")
+                    }
+            }
+            _ => false,
+        }
+    }
+
     /// Get and decrypt an object using the original key
-    /// 
+    ///
     /// If metadata privacy is enabled, this will automatically compute the
     /// storage key from the original key using deterministic hashing.
     pub async fn get_object_decrypted(
