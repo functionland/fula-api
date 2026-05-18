@@ -16,6 +16,16 @@ pub async fn run_server(config: GatewayConfig) -> anyhow::Result<()> {
     // lives for the lifetime of the process.
     locks::start_sweeper(state.lock_store.clone());
 
+    // Audit F-A5 / issue #13: spawn the multipart-upload reaper. Drops
+    // abandoned in-memory upload sessions whose `last_activity_at` is
+    // older than `multipart_expiry_secs`. Does NOT touch the blockstore
+    // — orphan chunks are left to operator IPFS GC (deletion would be
+    // unsafe in a content-addressed store due to CID dedup).
+    crate::multipart::start_reaper(
+        Arc::clone(&state.multipart_manager),
+        state.config.multipart_reaper_interval_secs,
+    );
+
     // Phase 3.2 — spawn the users-index publisher loop iff the env
     // flag enabled the publisher at AppState construction time. When
     // disabled, this is a no-op and nothing about S3 routing changes.

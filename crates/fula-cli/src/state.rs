@@ -125,8 +125,22 @@ impl AppState {
             }
         }
 
-        // Initialize multipart manager
-        let multipart_manager = Arc::new(MultipartManager::new(config.multipart_expiry_secs));
+        // Initialize multipart manager. Audit F-A5 / issue #13: apply
+        // per-user concurrent-multipart cap so a single authenticated
+        // user cannot accumulate unbounded session state.
+        let multipart_manager = {
+            let mut mgr = MultipartManager::new(config.multipart_expiry_secs);
+            if let Some(cap) = config.multipart_per_user_cap {
+                mgr = mgr.with_per_user_cap(cap);
+                info!(per_user_cap = cap, "multipart per-user cap enforced");
+            } else {
+                warn!(
+                    "multipart per-user cap disabled (multipart_per_user_cap=None); \
+                     a single authenticated user can accumulate unbounded session state"
+                );
+            }
+            Arc::new(mgr)
+        };
 
         // Initialize empty lock store. The sweeper is spawned by `server::run_server`
         // after AppState is wrapped in an Arc.

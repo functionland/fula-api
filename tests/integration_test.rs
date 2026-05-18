@@ -311,15 +311,20 @@ fn test_bao_streaming() {
 #[test]
 fn test_multipart_manager() {
     use fula_cli::multipart::{MultipartManager, UploadPart};
-    
+    use std::collections::BTreeMap;
+
     let manager = MultipartManager::new(3600);
-    
-    // Create upload
-    let upload = manager.create_upload(
-        "bucket".to_string(),
-        "key".to_string(),
-        "owner".to_string(),
-    );
+
+    // Create upload (cap-checked path; no cap configured in this test).
+    let upload = manager
+        .try_create_upload(
+            "bucket".to_string(),
+            "key".to_string(),
+            "owner".to_string(),
+            None,
+            BTreeMap::new(),
+        )
+        .expect("create");
     
     // Add parts
     manager.add_part(&upload.upload_id, UploadPart::new(1, "etag1".to_string(), 1000, "cid1".to_string()));

@@ -28,8 +28,23 @@ pub struct GatewayConfig {
     pub max_body_size: usize,
     /// Maximum multipart upload size (bytes)
     pub max_upload_size: u64,
-    /// Multipart upload expiry (seconds)
+    /// Multipart upload expiry (seconds). Sessions whose
+    /// `last_activity_at` is older than this are reaped by the
+    /// background sweeper. Last-activity-based so slow legitimate
+    /// uploads survive long pauses between parts. See audit F-A5 /
+    /// issue #13.
     pub multipart_expiry_secs: u64,
+    /// Maximum concurrent in-flight multipart uploads per user.
+    /// `None` = unbounded (legacy). Production deploys set this to
+    /// bound a single authenticated user from accumulating session
+    /// state. Slots are released on complete / abort / reap.
+    /// See audit F-A5 / issue #13.
+    #[serde(default = "default_multipart_per_user_cap")]
+    pub multipart_per_user_cap: Option<usize>,
+    /// How often the multipart-reaper sweeps the in-memory upload
+    /// store, in seconds. See audit F-A5 / issue #13.
+    #[serde(default = "default_multipart_reaper_interval_secs")]
+    pub multipart_reaper_interval_secs: u64,
     /// Enable CORS
     pub cors_enabled: bool,
     /// CORS allowed origins
@@ -64,6 +79,14 @@ fn default_block_cache_mb() -> usize {
     256
 }
 
+fn default_multipart_per_user_cap() -> Option<usize> {
+    Some(8)
+}
+
+fn default_multipart_reaper_interval_secs() -> u64 {
+    600 // 10 minutes
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -79,6 +102,8 @@ impl Default for GatewayConfig {
             max_body_size: 5 * 1024 * 1024 * 1024, // 5 GB
             max_upload_size: 5 * 1024 * 1024 * 1024 * 1024, // 5 TB
             multipart_expiry_secs: 24 * 60 * 60, // 24 hours
+            multipart_per_user_cap: default_multipart_per_user_cap(),
+            multipart_reaper_interval_secs: default_multipart_reaper_interval_secs(),
             cors_enabled: true,
             cors_origins: vec!["*".to_string()],
             registry_cid_path: Some("/var/lib/fula-gateway/registry.cid".to_string()),

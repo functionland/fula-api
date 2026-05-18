@@ -58,14 +58,29 @@ pub async fn create_multipart_upload(
         }
     }
 
-    // Security audit fix A3: Use hashed user ID
-    let upload = state.multipart_manager.create_upload_with_metadata(
-        bucket.clone(),
-        key.clone(),
-        session.hashed_user_id.clone(),
-        content_type,
-        metadata,
-    );
+    // Security audit fix A3: Use hashed user ID. Per-user concurrent-multipart
+    // cap (audit F-A5 / issue #13) is enforced inside `try_create_upload` —
+    // returns SlowDown (HTTP 429) when the caller is at their cap.
+    let upload = state
+        .multipart_manager
+        .try_create_upload(
+            bucket.clone(),
+            key.clone(),
+            session.hashed_user_id.clone(),
+            content_type,
+            metadata,
+        )
+        .map_err(|e| match e {
+            crate::multipart::MultipartError::PerUserCapExceeded { current, cap, .. } => {
+                ApiError::s3(
+                    S3ErrorCode::SlowDown,
+                    &format!(
+                        "Too many concurrent multipart uploads ({}/{} in flight); complete or abort an existing upload first.",
+                        current, cap
+                    ),
+                )
+            }
+        })?;
 
     let xml_response = xml::initiate_multipart_upload_result(
         &bucket,
