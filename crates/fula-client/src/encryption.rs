@@ -8889,7 +8889,135 @@ impl EncryptedClient {
             Some(metadata),
         ).await?;
 
+        // Issue #12: mirror the new encryption metadata into the forest
+        // entry's `user_metadata` so offline read paths
+        // (`get_object_decrypted_inner`'s `get_meta` fallback at
+        // `encryption.rs:1453-1463`, and the issue #11
+        // `get_object_encryption_metadata_with_fallback`) see the same
+        // wrapped DEK + kek_version that's now on S3. Without this,
+        // post-rotation offline reads find the OLD wrapped DEK in the
+        // forest and attempt to unwrap with the NEW KEK → "Failed to
+        // unwrap DEK".
+        //
+        // Carried-forward limitations (deliberate, documented):
+        // - Update is in-memory; persistence requires a subsequent
+        //   `flush_forest`. A crash before flush leaves the forest stale
+        //   on disk; the next online read triggers HEAD which fetches
+        //   fresh metadata via `get_object_encryption_metadata_with_fallback`
+        //   and the upload-time mirror at `encryption.rs:5955-5968`
+        //   re-populates user_metadata.
+        // - Chunk objects (`{storage_key}.chunks/00000000`) have no
+        //   forest entry; the helper silently skips them. Their wrapped
+        //   DEK lives on the parent index object only.
+        // - Subtree DEKs (`subtree_keys.rs`) are NOT rotated by
+        //   `KeyRotationManager` and are therefore unaffected.
+        self.sync_forest_user_metadata_after_rewrap(
+            bucket,
+            storage_key,
+            enc_metadata.to_string(),
+        ).await?;
+
         Ok(rotation_manager.current_version())
+    }
+
+    /// Issue #12 — after `rewrap_object_dek` PUTs a new
+    /// `x-fula-encryption` header to S3, mirror the same JSON into the
+    /// forest entry's `user_metadata` so offline read paths stay in
+    /// sync with S3.
+    ///
+    /// Silently returns `Ok(())` when:
+    /// - No forest entry exists for `storage_key` (chunk objects;
+    ///   `forest_entry_lookup` returns `None`). Chunks share the parent's
+    ///   DEK and have no separate wrapped key to track.
+    /// - The forest cache entry can't be reached (e.g. the bucket was
+    ///   evicted between `ensure_forest_loaded` and this call); in that
+    ///   case the next online HEAD will re-populate from S3 via the
+    ///   issue #11 fallback path.
+    async fn sync_forest_user_metadata_after_rewrap(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        new_enc_json: String,
+    ) -> Result<()> {
+        self.ensure_forest_loaded(bucket).await?;
+
+        let Some(mut entry) = self.forest_entry_lookup(bucket, storage_key).await?
+        else {
+            // Chunk object or no-forest-entry — nothing to mirror.
+            return Ok(());
+        };
+
+        entry
+            .user_metadata
+            .insert("x-fula-encryption".to_string(), new_enc_json);
+
+        let now = chrono::Utc::now().timestamp();
+        let is_v7 = self.is_forest_sharded_hamt(bucket);
+
+        if is_v7 {
+            // v7 sharded-HAMT: forest is behind an async RwLock. Extract
+            // the Arc under the DashMap guard, drop the guard, then take
+            // the write lock. Mirrors the put-encrypted pattern at
+            // `encryption.rs:6085-6114`.
+            let forest_arc = {
+                let Some(cache_entry) = self.forest_cache.get(bucket) else {
+                    // Bucket evicted between ensure_forest_loaded and now.
+                    // Next online HEAD will repair via issue #11 fallback.
+                    return Ok(());
+                };
+                match cache_entry.value() {
+                    ForestCacheEntry::ShardedHamt { forest, .. } => forest.clone(),
+                    _ => return Ok(()),
+                }
+            };
+            let backend: Arc<S3BlobBackend> = Arc::new(
+                S3BlobBackend::new(self.inner.clone(), bucket.to_string()),
+            );
+            {
+                let mut guard = forest_arc.write().await;
+                guard
+                    .upsert_file(entry, &backend)
+                    .await
+                    .map_err(ClientError::Encryption)?;
+            }
+            if let Some(mut cache_entry) = self.forest_cache.get_mut(bucket) {
+                if let ForestCacheEntry::ShardedHamt { loaded_at, .. } =
+                    cache_entry.value_mut()
+                {
+                    *loaded_at = now;
+                }
+            }
+        } else {
+            // Monolithic v1: clone, mutate, re-insert with dirty=true.
+            // Mirrors `encryption.rs:6119-6136`.
+            let (mut forest, prior_etag, prior_seq) = {
+                let Some(cache_entry) = self.forest_cache.get(bucket) else {
+                    return Ok(());
+                };
+                match cache_entry.value() {
+                    ForestCacheEntry::Monolithic {
+                        forest,
+                        index_etag,
+                        last_sequence,
+                        ..
+                    } => (forest.clone(), index_etag.clone(), *last_sequence),
+                    _ => return Ok(()),
+                }
+            };
+            forest.upsert_file(entry);
+            self.forest_cache.insert(
+                bucket.to_string(),
+                ForestCacheEntry::Monolithic {
+                    forest,
+                    loaded_at: now,
+                    dirty: true,
+                    index_etag: prior_etag,
+                    last_sequence: prior_seq,
+                },
+            );
+        }
+
+        Ok(())
     }
 
     /// Rotate all objects in a bucket to use the new KEK
