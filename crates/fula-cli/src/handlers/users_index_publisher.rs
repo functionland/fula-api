@@ -273,6 +273,15 @@ pub struct BucketEntry {
 /// Global users-index CBOR. Master pins one per snapshot; the CID
 /// is published via IPNS (every flush) and to the chain anchor
 /// (every 12h).
+///
+/// **Audit F-A3 (issue #15)**: `users_v2` is the additive
+/// client-derived lookup-key map. When `users_v2` is empty (no Mode B
+/// users yet), the CBOR byte-shape is identical to the legacy v1
+/// schema thanks to `skip_serializing_if = "BTreeMap::is_empty"`.
+/// SDK clients on Mode B prefer `users_v2.get(client_derived_v2_key)`
+/// and fall back to `users.get(hashed_user_id_v1)` on miss. v1 is
+/// kept indefinitely per the design decision — never-upgrading
+/// clients keep working.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalUsersIndex {
     pub v: u32,
@@ -280,9 +289,18 @@ pub struct GlobalUsersIndex {
     /// `highest_seen_sequence`; rejects payloads with regression.
     pub sequence: u64,
     pub updated_at_unix: u64,
-    /// `userKey_hex` (32 hex chars = 16-byte hashed_user_id) →
+    /// **v1, kept indefinitely.** `hashed_user_id_hex` (32 hex chars
+    /// = 16-byte `BLAKE3("fula:user_id:" || user_id)[..16]`) →
     /// per-user bucketsIndex CID (string). BTreeMap for determinism.
     pub users: BTreeMap<String, String>,
+    /// **v2 client-derived lookup keys** (audit F-A3 / issue #15).
+    /// `client_derived_lookup_key_hex` (32 hex chars = 16-byte
+    /// `BLAKE3("fula:user-lookup-v2:" || user_id || master_KEK_public)[..16]`) →
+    /// per-user bucketsIndex CID. Populated only for users whose
+    /// client has explicitly POSTed a v2 key (Mode B + F-A3-aware
+    /// SDK). Empty by default → CBOR byte-equivalent to legacy v1.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub users_v2: BTreeMap<String, String>,
 }
 
 // ============================================================
@@ -342,20 +360,46 @@ pub fn build_user_buckets_index(
 
 /// Build the global users-index CBOR from a per-user CID map.
 /// `entries` is `userKey_hex (32 hex) → bucketsIndexCid`.
+///
+/// Convenience for the v1-only path; equivalent to
+/// `build_global_users_index_v2(entries, &BTreeMap::new(), sequence, now_unix)`.
 pub fn build_global_users_index(
     entries: &BTreeMap<String, Cid>,
     sequence: u64,
     now_unix: u64,
 ) -> GlobalUsersIndex {
-    let users: BTreeMap<String, String> = entries
+    build_global_users_index_v2(entries, &BTreeMap::new(), sequence, now_unix)
+}
+
+/// Build the global users-index CBOR including BOTH v1 and v2 lookup
+/// maps. `v2_entries` is `client_derived_v2_key_hex → bucketsIndexCid`.
+///
+/// **Audit F-A3 (issue #15)**: when `v2_entries` is empty, the
+/// resulting CBOR is byte-equivalent to the legacy v1 shape (the
+/// `users_v2` field is omitted via `skip_serializing_if`).
+pub fn build_global_users_index_v2(
+    v1_entries: &BTreeMap<String, Cid>,
+    v2_entries: &BTreeMap<String, Cid>,
+    sequence: u64,
+    now_unix: u64,
+) -> GlobalUsersIndex {
+    let users: BTreeMap<String, String> = v1_entries
+        .iter()
+        .map(|(uk, cid)| (uk.clone(), cid.to_string()))
+        .collect();
+    let users_v2: BTreeMap<String, String> = v2_entries
         .iter()
         .map(|(uk, cid)| (uk.clone(), cid.to_string()))
         .collect();
     GlobalUsersIndex {
-        v: 1,
+        // Bumped to 2 to match the schema change. SDK clients that
+        // know the v2 shape can short-circuit; old clients only read
+        // the `users` field and continue to function.
+        v: if users_v2.is_empty() { 1 } else { 2 },
         sequence,
         updated_at_unix: now_unix,
         users,
+        users_v2,
     }
 }
 

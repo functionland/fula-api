@@ -66,14 +66,25 @@ use std::time::Duration;
 /// `GlobalUsersIndex` struct in `fula-cli`'s
 /// `handlers::users_index_publisher`. The two definitions must stay
 /// in lockstep — see plan §3.2.a for the producer side.
+///
+/// **Audit F-A3 (issue #15)**: `users_v2` is the additive
+/// client-derived lookup-key map. SDK cold-start should prefer
+/// `users_v2.get(client_derived_v2_key)` and fall back to
+/// `users.get(hashed_user_id_v1)` on miss.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct GlobalUsersIndex {
     pub v: u32,
     pub sequence: u64,
     pub updated_at_unix: u64,
-    /// `userKey_hex` (32 hex chars) → bucketsIndexCid (string).
-    /// The SDK looks up its own `userKey` here on cold-start.
+    /// **v1, kept indefinitely.** `hashed_user_id_hex` (32 hex chars) →
+    /// bucketsIndexCid (string). The SDK looks up its own
+    /// `hashed_user_id_v1` here on cold-start when v2 is unavailable.
     pub users: BTreeMap<String, String>,
+    /// **v2 client-derived lookup keys** (audit F-A3 / issue #15).
+    /// `client_derived_lookup_key_hex` (32 hex chars) → bucketsIndexCid.
+    /// Empty on pre-F-A3 deploys; SDK falls through to `users` on miss.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub users_v2: BTreeMap<String, String>,
 }
 
 /// Master's per-user `bucketsIndex` CBOR — one per user per snapshot
@@ -1625,6 +1636,7 @@ mod tests {
             sequence,
             updated_at_unix: 1_700_000_000,
             users: BTreeMap::new(),
+            users_v2: BTreeMap::new(),
         };
         let bytes = serde_ipld_dagcbor::to_vec(&payload).expect("encode");
         (Bytes::from(bytes), payload)
@@ -2233,6 +2245,7 @@ mod tests {
             sequence,
             updated_at_unix: 1_700_000_000,
             users: BTreeMap::new(),
+            users_v2: BTreeMap::new(),
         };
         let bytes = serde_ipld_dagcbor::to_vec(&payload).expect("encode");
         (Bytes::from(bytes), payload)

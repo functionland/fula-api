@@ -10854,6 +10854,7 @@ mod tests {
                 sequence: 42,
                 updated_at_unix: 1_700_000_001,
                 users: users_map,
+                users_v2: std::collections::BTreeMap::new(),
             };
             let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
 
@@ -10933,6 +10934,7 @@ mod tests {
                 sequence: 5,
                 updated_at_unix: 1_700_000_000,
                 users: users_map,
+                users_v2: std::collections::BTreeMap::new(),
             };
             let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
 
@@ -11015,6 +11017,7 @@ mod tests {
                 sequence: 1,
                 updated_at_unix: 0,
                 users: users_map,
+                users_v2: std::collections::BTreeMap::new(),
             };
             let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
 
@@ -11101,6 +11104,7 @@ mod tests {
                 sequence: 1,
                 updated_at_unix: 0,
                 users: users_map,
+                users_v2: std::collections::BTreeMap::new(),
             };
             let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
 
@@ -11187,6 +11191,7 @@ mod tests {
                 sequence: 1,
                 updated_at_unix: 0,
                 users: users_map,
+                users_v2: std::collections::BTreeMap::new(),
             };
             let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
 

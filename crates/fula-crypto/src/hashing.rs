@@ -207,6 +207,48 @@ pub fn derive_key(context: &str, input: &[u8]) -> Blake3Hash {
     hasher.finalize()
 }
 
+/// Compute the **v2 client-derived user-lookup key** for the
+/// global users-index (audit F-A3 / issue #15).
+///
+/// `userKey_v2 = BLAKE3("fula:user-lookup-v2:" || user_id || master_KEK_public)[..16]`
+///
+/// The key purpose is **lookup uniqueness** (mapping a user to their
+/// bucketsIndex CID in the publicly-resolvable IPNS-published global
+/// CBOR) without exposing the mapping to enumeration by anyone who
+/// only knows `user_id` (typically email or Google `sub`).
+///
+/// Unlike the legacy `hash_user_id(user_id) = BLAKE3("fula:user_id:" || user_id)[..16]`,
+/// which is server-derivable from a public attribute alone, this v2
+/// derivation requires `master_KEK_public` — a client-derived value
+/// that the server never sees. An attacker who can resolve the
+/// global CBOR can no longer hash a target email and check membership.
+///
+/// **Effectiveness is gated by audit F-A1 (Mode B sign-up)**: if the
+/// master KEK is still identity-derived (Mode A, no user-secret
+/// entropy), `master_KEK_public` is also identity-derivable, so an
+/// attacker who can compute master KEK can also compute `userKey_v2`.
+/// The privacy improvement materialises only when paired with Mode B.
+///
+/// Domain separation: distinct from `hash_user_id` (`"fula:user_id:"`)
+/// to prevent any cross-namespace collision.
+///
+/// # Arguments
+/// * `user_id` — raw user identifier (email / Google `sub` bytes)
+/// * `kek_pub` — 32-byte X25519 public component of the master KEK
+///
+/// # Returns
+/// * 16-byte (128-bit) lookup key
+pub fn compute_user_lookup_key_v2(user_id: &[u8], kek_pub: &[u8; 32]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fula:user-lookup-v2:");
+    hasher.update(user_id);
+    hasher.update(kek_pub);
+    let h = hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&h.as_bytes()[..16]);
+    out
+}
+
 /// Derive a key from the given input and context using Argon2id
 ///
 /// This provides brute-force resistance for credential-based key derivation.
