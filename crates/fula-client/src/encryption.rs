@@ -1327,23 +1327,49 @@ impl EncryptedClient {
     /// "master unreachable" failure that should trigger forest-entry
     /// fallback. Excludes legitimate S3 error responses (404, 403,
     /// etc.) which are real failures, not master-down signals.
+    ///
+    /// `reqwest::Error::is_connect()` is only available on the native
+    /// HTTP backend; the wasm32 backend (browser fetch) does NOT expose
+    /// it, so the connect branch is cfg-gated. On wasm32 we rely on
+    /// `is_timeout()` + `is_request()` + the DNS string-match fallback;
+    /// the browser surfaces fetch-level failures as `is_request()` and
+    /// the string match catches "failed to fetch" / DNS-shape errors.
     fn is_master_unreachable_error(err: &ClientError) -> bool {
         match err {
             ClientError::MasterUnreachable { .. } => true,
             ClientError::Http(e) => {
-                e.is_connect()
+                Self::reqwest_is_connect_like(e)
                     || e.is_timeout()
                     || e.is_request()
-                    // Catch DNS resolution failures explicitly — reqwest
-                    // does not classify "dns error / failed to lookup
-                    // address" as `is_connect()` on every platform.
+                    // Catch DNS / fetch-stripping failures explicitly —
+                    // reqwest does not classify "dns error / failed to
+                    // lookup address / failed to fetch" via the typed
+                    // is_* methods on every platform.
                     || {
                         let s = e.to_string();
-                        s.contains("dns error") || s.contains("failed to lookup")
+                        s.contains("dns error")
+                            || s.contains("failed to lookup")
+                            || s.contains("failed to fetch")
                     }
             }
             _ => false,
         }
+    }
+
+    /// Native: defer to `reqwest::Error::is_connect`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reqwest_is_connect_like(e: &reqwest::Error) -> bool {
+        e.is_connect()
+    }
+
+    /// WASM: `reqwest::Error::is_connect` is not exposed by the browser
+    /// fetch backend. Browser-level connect failures land in
+    /// `is_request()`, and the string-match fallback above catches the
+    /// DNS-shape errors. Always return `false` here so the call
+    /// compiles without panicking the WASM build.
+    #[cfg(target_arch = "wasm32")]
+    fn reqwest_is_connect_like(_e: &reqwest::Error) -> bool {
+        false
     }
 
     /// Get and decrypt an object using the original key
