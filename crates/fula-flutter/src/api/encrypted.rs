@@ -275,6 +275,43 @@ pub fn derive_key(context: String, input: Vec<u8>) -> Vec<u8> {
     fula_crypto::hashing::derive_key_argon2id(&context, &input).to_vec()
 }
 
+/// Derive a 32-byte key using Argon2id with an EXPLICIT per-user salt.
+///
+/// This is the audit F-A1 / issue #14 Mode B variant. Compared to
+/// [`derive_key`], which uses the `context` bytes as the salt, this
+/// variant takes the salt as a separate parameter so callers can
+/// supply a per-user random salt — closing the F-A1 finding (the
+/// master key is no longer derivable from public identity attributes
+/// alone).
+///
+/// Cross-platform parity: the underlying
+/// `fula_crypto::hashing::derive_key_argon2id_with_salt` is pure Rust
+/// and is reachable from both native (FxFiles) and WASM (WebUI) so the
+/// derived key is byte-identical across platforms for the same
+/// (context, input, salt) triple.
+///
+/// Mode A users continue to call [`derive_key`] (legacy behavior,
+/// unchanged). Mode B users call this function with their per-user
+/// random salt.
+///
+/// # Arguments
+/// * `context` — domain-separation tag (e.g., `"fula-files-v1-google-pw"`)
+/// * `input`   — UTF-8 bytes of the identity-plus-seed string
+///               (e.g., `"google:<sub>:<email>:<seed>"`)
+/// * `salt`    — per-user random salt; minimum 8 bytes, recommended 32
+///
+/// # Returns
+/// * 32-byte derived key, or an error string if the salt is too short
+pub fn derive_key_with_salt(
+    context: String,
+    input: Vec<u8>,
+    salt: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    fula_crypto::hashing::derive_key_argon2id_with_salt_checked(&context, &input, &salt)
+        .map(|k| k.to_vec())
+        .map_err(|e| e.to_string())
+}
+
 /// Check if client uses FlatNamespace mode
 pub async fn is_flat_namespace(client: &EncryptedClientHandle) -> bool {
     let guard = client.inner.read().await;

@@ -257,6 +257,93 @@ pub fn derive_key_argon2id(context: &str, input: &[u8]) -> [u8; 32] {
     output
 }
 
+/// Derive a key from the given input, context, and an EXPLICIT salt
+/// using Argon2id.
+///
+/// Compared to [`derive_key_argon2id`], which uses the `context` bytes
+/// as the salt, this variant takes the salt as a separate parameter so
+/// callers can supply a per-user random salt. This is the load-bearing
+/// piece of the audit F-A1 fix (Mode B sign-up): a per-user random
+/// salt ensures that the master key is not derivable from public
+/// identity attributes alone, even when an attacker knows the input.
+///
+/// Salt requirements (validated):
+/// - Minimum 8 bytes (Argon2 spec)
+/// - Recommended 16+ bytes; 32 bytes is what Mode B uses
+///
+/// # Panics
+///
+/// Panics if `salt.len() < 8` (caller error — surface this in tests).
+/// Use [`derive_key_argon2id_with_salt_checked`] for a non-panicking
+/// variant.
+///
+/// # Example
+/// ```
+/// use fula_crypto::hashing::derive_key_argon2id_with_salt;
+///
+/// let salt = [0u8; 32]; // Production: 32 random bytes per user.
+/// let key = derive_key_argon2id_with_salt(
+///     "fula-files-v1-google-pw",
+///     b"google:123456:user@example.com:passphrase",
+///     &salt,
+/// );
+/// assert_eq!(key.len(), 32);
+/// ```
+pub fn derive_key_argon2id_with_salt(context: &str, input: &[u8], salt: &[u8]) -> [u8; 32] {
+    derive_key_argon2id_with_salt_checked(context, input, salt)
+        .expect("derive_key_argon2id_with_salt: salt must be >= 8 bytes")
+}
+
+/// Non-panicking variant of [`derive_key_argon2id_with_salt`].
+/// Returns `Err` if the salt is shorter than 8 bytes.
+///
+/// `context` is incorporated into the salt as a domain-separation
+/// prefix: `actual_salt = blake3_keyed("fula-argon2id-v2:"||context)(salt)[..16]`
+/// — concretely, we hash `(context || 0x00 || salt)` with BLAKE3 and
+/// take the first 16 bytes as the Argon2 salt. This way:
+///   1. Distinct contexts derive distinct keys even from the same
+///      (input, salt) pair — preserves the domain-separation property
+///      of the original `derive_key_argon2id`.
+///   2. The caller-supplied salt is consumed.
+///   3. The Argon2 salt is always exactly 16 bytes regardless of the
+///      caller's salt length, so cross-platform consistency is
+///      preserved (FxFiles is on native, WebUI on WASM).
+pub fn derive_key_argon2id_with_salt_checked(
+    context: &str,
+    input: &[u8],
+    salt: &[u8],
+) -> std::result::Result<[u8; 32], &'static str> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    if salt.len() < 8 {
+        return Err("salt must be at least 8 bytes");
+    }
+
+    let params = Params::new(65536, 3, 1, Some(32)).expect("Invalid Argon2 parameters");
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+    // Build a deterministic 16-byte effective salt that incorporates
+    // BOTH the context (domain separation) and the caller's salt. See
+    // doc comment above for the rationale.
+    let mut effective_salt = [0u8; 16];
+    let combined = {
+        let mut buf = Vec::with_capacity(context.len() + 1 + salt.len());
+        buf.extend_from_slice(context.as_bytes());
+        buf.push(0u8);
+        buf.extend_from_slice(salt);
+        buf
+    };
+    let h = blake3::hash(&combined);
+    effective_salt.copy_from_slice(&h.as_bytes()[..16]);
+
+    let mut output = [0u8; 32];
+    argon2
+        .hash_password_into(input, &effective_salt, &mut output)
+        .expect("Argon2 hashing failed");
+
+    Ok(output)
+}
+
 /// Calculate an MD5 hash for S3 ETag compatibility
 pub fn md5_hash(data: &[u8]) -> String {
     use md5::{Md5, Digest};
@@ -386,5 +473,88 @@ mod tests {
         // Test with short context (< 8 bytes) - should still work
         let key = derive_key_argon2id("short", b"input");
         assert_eq!(key.len(), 32);
+    }
+
+    // ---------------------------------------------------------------
+    // Tests for `derive_key_argon2id_with_salt` (audit F-A1 / issue #14).
+    //
+    // The Mode B fix relies on this function consuming a per-user
+    // random salt so the master key is not derivable from public
+    // identity attributes alone.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn argon2id_with_salt_basic_shape() {
+        let salt = [0u8; 32];
+        let key = derive_key_argon2id_with_salt(
+            "fula-files-v1-google-pw",
+            b"google:123:user@example.com:passphrase",
+            &salt,
+        );
+        assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn argon2id_with_salt_distinct_salts_produce_distinct_keys() {
+        let input = b"google:123:user@example.com:passphrase";
+        let salt_a = [0xAAu8; 32];
+        let salt_b = [0xBBu8; 32];
+        let key_a = derive_key_argon2id_with_salt("ctx", input, &salt_a);
+        let key_b = derive_key_argon2id_with_salt("ctx", input, &salt_b);
+        assert_ne!(
+            key_a, key_b,
+            "salt is the load-bearing parameter for the F-A1 fix"
+        );
+    }
+
+    #[test]
+    fn argon2id_with_salt_distinct_contexts_produce_distinct_keys() {
+        // Same input + same salt, different context → different key.
+        // Preserves domain separation from the legacy function.
+        let input = b"google:123:user@example.com:passphrase";
+        let salt = [0x11u8; 32];
+        let key_a = derive_key_argon2id_with_salt("ctx-a", input, &salt);
+        let key_b = derive_key_argon2id_with_salt("ctx-b", input, &salt);
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn argon2id_with_salt_deterministic() {
+        let input = b"google:123:user@example.com:passphrase";
+        let salt = [0x55u8; 32];
+        let key_a = derive_key_argon2id_with_salt("ctx", input, &salt);
+        let key_b = derive_key_argon2id_with_salt("ctx", input, &salt);
+        assert_eq!(key_a, key_b);
+    }
+
+    #[test]
+    fn argon2id_with_salt_rejects_short_salt() {
+        let res = derive_key_argon2id_with_salt_checked("ctx", b"input", &[0u8; 7]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "salt must be >= 8 bytes")]
+    fn argon2id_with_salt_panics_on_short_salt() {
+        let _ = derive_key_argon2id_with_salt("ctx", b"input", &[0u8; 7]);
+    }
+
+    #[test]
+    fn argon2id_with_salt_does_not_match_legacy_even_with_context_as_salt() {
+        // The new function applies a BLAKE3 domain-separation step to
+        // the (context, salt) pair before passing to Argon2, so it is
+        // intentionally NOT byte-equivalent to the legacy function. The
+        // legacy function is kept in place for Mode A users (unchanged).
+        let input = b"google:123:user@example.com";
+        let legacy = derive_key_argon2id("fula-files-v1", input);
+        let with_salt = derive_key_argon2id_with_salt(
+            "fula-files-v1",
+            input,
+            b"fula-files-v1\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+        );
+        assert_ne!(
+            legacy, with_salt,
+            "Mode A and Mode B derive distinct keys even given byte-equivalent inputs — Mode B users go through the rotation"
+        );
     }
 }
