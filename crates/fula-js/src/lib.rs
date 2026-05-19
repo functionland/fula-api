@@ -1022,6 +1022,104 @@ pub fn derive_public_key_from_secret(secret_key_bytes: &[u8]) -> Result<Vec<u8>,
 }
 
 // ============================================================================
+// Seed-as-identity primitives (Mode B / Mode C sign-in)
+// ============================================================================
+//
+// These mirror the FxFiles FFI surface for cross-platform parity. The
+// `effective_user_id` is the JWT `sub` for seed-derived users; the
+// signing seed feeds Ed25519 challenge-response auth against the
+// pinning-service issuer endpoints.
+//
+// All three derivations live in `fula_crypto::effective_user_id`:
+//   - `compute_effective_user_id_mode_b(provider, oauth_sub, seed) -> [u8; 16]`
+//   - `compute_effective_user_id_mode_c(seed) -> [u8; 16]`
+//   - `derive_signing_seed_from_seed(seed) -> [u8; 32]`
+//
+// Sign/public-key helpers are co-located there too so all the Ed25519
+// material is in one module.
+
+/// Compute the Mode B (OAuth + seed) `effective_user_id`.
+///
+/// 16 raw bytes. Hex-encode for the JWT `sub` / issuer payload.
+///
+/// `provider` is canonical (`"google"` or `"apple"`). `oauth_sub` is the
+/// OAuth provider's opaque `sub` claim — passed through as bytes, NOT
+/// NFC-normalized (OAuth identifiers are opaque). `seed` is the user's
+/// passphrase — NFC-normalized inside.
+#[wasm_bindgen(js_name = computeEffectiveUserIdModeB)]
+pub fn compute_effective_user_id_mode_b(
+    provider: &str,
+    oauth_sub: &str,
+    seed: &str,
+) -> Vec<u8> {
+    fula_crypto::effective_user_id::compute_effective_user_id_mode_b(
+        provider, oauth_sub, seed,
+    )
+    .to_vec()
+}
+
+/// Compute the Mode C (seed-only) `effective_user_id`. 16 raw bytes.
+///
+/// `seed` is NFC-normalized inside. Two callers with identical seeds
+/// produce identical user-ids — by design. Use a high-entropy seed.
+#[wasm_bindgen(js_name = computeEffectiveUserIdModeC)]
+pub fn compute_effective_user_id_mode_c(seed: &str) -> Vec<u8> {
+    fula_crypto::effective_user_id::compute_effective_user_id_mode_c(seed).to_vec()
+}
+
+/// Derive the 32-byte Ed25519 signing seed from the user's passphrase.
+///
+/// Domain-separated from `computeEffectiveUserId*` so leaking the
+/// 16-byte user-id does not compromise the signing key (and vice versa).
+/// Pass the result to `ed25519Sign` / `ed25519PublicKey`.
+#[wasm_bindgen(js_name = deriveSigningSeed)]
+pub fn derive_signing_seed(seed: &str) -> Vec<u8> {
+    fula_crypto::effective_user_id::derive_signing_seed_from_seed(seed).to_vec()
+}
+
+/// Sign `message` with the Ed25519 keypair derived from `signing_seed`
+/// (the 32-byte output of `deriveSigningSeed`).
+///
+/// Returns a 64-byte detached signature. Used to prove seed possession
+/// when responding to the issuer's challenge nonce on `/auth/sign-in` /
+/// `/auth/register-mode-{b,c}`.
+#[wasm_bindgen(js_name = ed25519Sign)]
+pub fn ed25519_sign(signing_seed: &[u8], message: &[u8]) -> Result<Vec<u8>, JsError> {
+    if signing_seed.len() != 32 {
+        return Err(JsError::new(&format!(
+            "signing_seed must be exactly 32 bytes, got {}",
+            signing_seed.len()
+        )));
+    }
+    let mut seed_arr = [0u8; 32];
+    seed_arr.copy_from_slice(signing_seed);
+    Ok(
+        fula_crypto::effective_user_id::sign_with_signing_seed(&seed_arr, message)
+            .to_vec(),
+    )
+}
+
+/// Derive the Ed25519 public verifying key from the 32-byte signing seed.
+///
+/// Returns 32 raw bytes — what the issuer stores at registration and
+/// uses to verify subsequent sign-in signatures.
+#[wasm_bindgen(js_name = ed25519PublicKey)]
+pub fn ed25519_public_key(signing_seed: &[u8]) -> Result<Vec<u8>, JsError> {
+    if signing_seed.len() != 32 {
+        return Err(JsError::new(&format!(
+            "signing_seed must be exactly 32 bytes, got {}",
+            signing_seed.len()
+        )));
+    }
+    let mut seed_arr = [0u8; 32];
+    seed_arr.copy_from_slice(signing_seed);
+    Ok(
+        fula_crypto::effective_user_id::public_key_from_signing_seed(&seed_arr)
+            .to_vec(),
+    )
+}
+
+// ============================================================================
 // Sharing
 // ============================================================================
 

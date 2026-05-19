@@ -152,6 +152,32 @@ pub fn derive_signing_seed_from_seed(seed: &str) -> [u8; SIGNING_KEY_SEED_LEN] {
     out
 }
 
+/// Sign a message using the seed-derived Ed25519 keypair.
+///
+/// `signing_seed` is the 32-byte output of [`derive_signing_seed_from_seed`].
+/// Returns a 64-byte detached Ed25519 signature. Used by Mode B / Mode C
+/// clients to prove possession of their seed when responding to the
+/// issuer's challenge nonce.
+pub fn sign_with_signing_seed(
+    signing_seed: &[u8; SIGNING_KEY_SEED_LEN],
+    message: &[u8],
+) -> [u8; 64] {
+    use ed25519_dalek::Signer;
+    let sk = ed25519_dalek::SigningKey::from_bytes(signing_seed);
+    sk.sign(message).to_bytes()
+}
+
+/// Derive the Ed25519 public verifying key from the 32-byte signing seed.
+///
+/// The result is what clients send to the issuer at registration time and
+/// what the issuer stores to verify subsequent sign-in signatures.
+pub fn public_key_from_signing_seed(
+    signing_seed: &[u8; SIGNING_KEY_SEED_LEN],
+) -> [u8; 32] {
+    let sk = ed25519_dalek::SigningKey::from_bytes(signing_seed);
+    sk.verifying_key().to_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
