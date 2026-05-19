@@ -105,6 +105,11 @@ sha2 = "0.10"
 md-5 = "0.10"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 ed25519-dalek = { version = "2.1", features = ["serde"] }
+# NFKC normalization for user-entered seeds (Mode B / Mode C identity).
+# Visually-identical passwords typed with different Unicode codepoints
+# (e.g., precomposed vs decomposed accents) must hash to the same
+# effective_user_id. Pure-Rust, no_std, ~100 KB.
+unicode-normalization = "0.1"
 
 # IPFS/IPLD
 cid = "0.11"

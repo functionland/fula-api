@@ -312,6 +312,60 @@ pub fn derive_key_with_salt(
         .map_err(|e| e.to_string())
 }
 
+// ============================================================================
+// Mode B / Mode C identity (audit F-A1 + F-A3 redesign, 2026-05-18)
+// ============================================================================
+
+/// Compute the **Mode B** `effective_user_id` (OAuth + seed).
+///
+/// Returns a 16-byte identifier suitable as the JWT `sub` claim (after
+/// hex encoding). The seed never leaves the device; whoever can
+/// compute this id IS that user.
+///
+/// `provider` should be a canonical lowercase tag — `"google"` or
+/// `"apple"`. `oauth_sub` is the IDP-issued opaque identifier. `seed`
+/// is the user-entered passphrase / password; it is NFKC-normalized
+/// internally before hashing.
+///
+/// See `fula_crypto::effective_user_id::compute_effective_user_id_mode_b`
+/// for the full derivation specification.
+pub fn compute_effective_user_id_mode_b(
+    provider: String,
+    oauth_sub: String,
+    seed: String,
+) -> Vec<u8> {
+    fula_crypto::effective_user_id::compute_effective_user_id_mode_b(&provider, &oauth_sub, &seed)
+        .to_vec()
+}
+
+/// Compute the **Mode C** (seed-only) `effective_user_id`.
+///
+/// Returns a 16-byte identifier suitable as the JWT `sub` claim (after
+/// hex encoding). Two callers with the same seed produce the same
+/// id — by design (the seed IS the identity). High-entropy seeds make
+/// accidental collisions infeasible.
+///
+/// `seed` is NFKC-normalized internally before hashing.
+pub fn compute_effective_user_id_mode_c(seed: String) -> Vec<u8> {
+    fula_crypto::effective_user_id::compute_effective_user_id_mode_c(&seed).to_vec()
+}
+
+/// Derive a deterministic 32-byte Ed25519 signing-key seed from the
+/// user's seed.
+///
+/// Use the returned bytes to construct an Ed25519 signing key (e.g.,
+/// in Dart via the `cryptography` package or the `ed25519` package).
+/// The corresponding public key is what the token issuer stores at
+/// registration time; subsequent sign-ins use challenge-response
+/// (issuer sends a nonce, client signs with this key, issuer verifies).
+///
+/// Domain-separated from the `effective_user_id` derivations so the
+/// signing seed and the user-id are independent functions of the
+/// user's input.
+pub fn derive_signing_seed(seed: String) -> Vec<u8> {
+    fula_crypto::effective_user_id::derive_signing_seed_from_seed(&seed).to_vec()
+}
+
 /// Check if client uses FlatNamespace mode
 pub async fn is_flat_namespace(client: &EncryptedClientHandle) -> bool {
     let guard = client.inner.read().await;

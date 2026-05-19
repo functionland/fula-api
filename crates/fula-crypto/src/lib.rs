@@ -68,6 +68,7 @@
 //! ```
 
 pub mod chunked;
+pub mod effective_user_id;
 pub mod error;
 pub mod hamt_index;
 pub mod hashing;
