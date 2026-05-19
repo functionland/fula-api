@@ -3151,12 +3151,107 @@ impl EncryptedClient {
                             }
                         }
                         let forest_arc = Arc::new(tokio::sync::RwLock::new(forest));
+                        // Hold a second handle for the issue #10 auto-trigger
+                        // pointer scan below — `forest_arc` is moved into the
+                        // cache entry, but `Arc::clone` is cheap and the read
+                        // lock is only ever acquired by the scan itself.
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let forest_arc_for_auto_trigger = Arc::clone(&forest_arc);
                         self.forest_cache.insert(bucket.to_string(), ForestCacheEntry::ShardedHamt {
                             forest: forest_arc,
                             loaded_at: now,
                             manifest_etag: observed_etag,
                             last_manifest_sequence: observed_manifest_seq,
                         });
+
+                        // Issue #10: walkable-v8 auto-migration on first
+                        // master-up load. Re-stamp pre-v0.6 (v7-only)
+                        // buckets so the entire HAMT carries CID hints
+                        // and offline reads via the gateway race work
+                        // for every populated path, not just the touched
+                        // shards from lazy per-write cascading.
+                        //
+                        // Gates:
+                        //   1. walkable_v8_writer_enabled = true (the
+                        //      migration function refuses without this).
+                        //   2. Per-device, per-bucket marker absent
+                        //      (one-shot — avoids re-running on every
+                        //      load after a successful migration).
+                        //   3. Manifest actually has v7 pointers — a
+                        //      fresh v8 bucket short-circuits here at
+                        //      zero cost beyond the O(num_shards) scan,
+                        //      and we still write the marker so future
+                        //      loads skip the scan.
+                        //
+                        // Re-entry: `migrate_bucket_to_walkable_v8` calls
+                        // `ensure_forest_loaded` which hits the cache we
+                        // just inserted — the cache fast path returns
+                        // the "forest is sharded" marker without re-
+                        // entering this ManifestV7 arm, so no infinite
+                        // recursion.
+                        //
+                        // Errors: master unreachable or 412 from a
+                        // concurrent writer leave the marker unset so
+                        // the next master-up load retries. We log and
+                        // continue rather than failing the original
+                        // `list_files_from_forest` call — the bucket is
+                        // still usable on the v7 path, the migration is
+                        // a transparent upgrade.
+                        //
+                        // WASM target: filesystem markers are no-op, so
+                        // the auto-trigger would re-run every load.
+                        // Skip it entirely — wasm users only hit this
+                        // path through `fula-js` consumers, none of
+                        // which currently exercise pre-v0.6 buckets.
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            if self.inner.config().walkable_v8_writer_enabled
+                                && !self.has_walkable_v8_migration_marker(bucket)
+                            {
+                                let needs_migration = forest_arc_for_auto_trigger
+                                    .read()
+                                    .await
+                                    .manifest_has_v7_pointers();
+                                if needs_migration {
+                                    tracing::info!(
+                                        %bucket,
+                                        "issue #10 auto-trigger: bucket has v7 pointers; running v7→v8 migration cascade"
+                                    );
+                                    // `Box::pin` breaks the static async-fn
+                                    // call cycle (load_forest_internal →
+                                    // migrate_bucket_to_walkable_v8 →
+                                    // ensure_forest_loaded → load_forest →
+                                    // load_forest_internal). The runtime cycle
+                                    // is already broken by the cache hit in
+                                    // load_forest_internal's fast path, but
+                                    // the compiler can't see that statically.
+                                    match Box::pin(self.migrate_bucket_to_walkable_v8(bucket)).await {
+                                        Ok(file_count) => {
+                                            tracing::info!(
+                                                %bucket,
+                                                file_count,
+                                                "issue #10 auto-trigger: v7→v8 migration complete; writing per-device marker"
+                                            );
+                                            self.persist_walkable_v8_migration_marker(bucket);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                %bucket,
+                                                error = %e,
+                                                "issue #10 auto-trigger: v7→v8 migration deferred (transient failure or concurrent writer); will retry next master-up load"
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    // Manifest is already fully v8 (or
+                                    // the bucket is empty / has no v7
+                                    // residue). Persist the marker so
+                                    // future loads short-circuit the
+                                    // scan cheaply.
+                                    self.persist_walkable_v8_migration_marker(bucket);
+                                }
+                            }
+                        }
 
                         Err(ClientError::Encryption(
                             fula_crypto::CryptoError::Encryption(
@@ -3234,6 +3329,26 @@ impl EncryptedClient {
         self.forest_cache.get(bucket)
             .map(|entry| matches!(entry.value(), ForestCacheEntry::ShardedHamt { .. }))
             .unwrap_or(false)
+    }
+
+    /// Returns `true` when the bucket's loaded manifest still carries
+    /// any walkable-v7 (pre-v0.6) pointers — i.e. some `page_index[*].cid`
+    /// is `None` or some populated shard has `root_cid: None`. Used by
+    /// the issue #10 auto-migration trigger and by regression tests
+    /// that assert post-migration manifest state.
+    ///
+    /// Returns `None` when the bucket isn't loaded as sharded (either
+    /// not loaded, or loaded as legacy monolithic v1). Callers that
+    /// have already verified the bucket is sharded can treat `None`
+    /// as "unknown — fall through".
+    pub fn bucket_manifest_has_v7_pointers(&self, bucket: &str) -> Option<bool> {
+        let entry = self.forest_cache.get(bucket)?;
+        if let ForestCacheEntry::ShardedHamt { forest, .. } = entry.value() {
+            let guard = forest.try_read().ok()?;
+            Some(guard.manifest_has_v7_pointers())
+        } else {
+            None
+        }
     }
 
     /// Test-only accessor: returns `(num_shards, page_count)` for a loaded
@@ -3396,6 +3511,82 @@ impl EncryptedClient {
     fn load_persisted_manifest_version(&self, _bucket: &str) -> Option<u8> { None }
     #[cfg(target_arch = "wasm32")]
     fn persist_manifest_version(&self, _bucket: &str, _version: u8) {}
+
+    /// Path to the per-bucket walkable-v8 migration marker file (issue #10).
+    ///
+    /// The marker is a single MAC-authenticated byte that records "this
+    /// device has successfully migrated this bucket from v7 to walkable-v8
+    /// — short-circuit the auto-trigger on future loads." Stored under
+    /// `FULA_STATE_DIR/fula/walkable-v8-migrated/<bucket_hash>` so it's
+    /// scoped per device (the migration cascade itself commits to master,
+    /// so other devices see the post-migration manifest and their own
+    /// auto-trigger short-circuits via `manifest_has_v7_pointers() == false`
+    /// without ever needing to read this file).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn walkable_v8_marker_path(&self, bucket: &str) -> Option<std::path::PathBuf> {
+        let base = match std::env::var("FULA_STATE_DIR") {
+            Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+            _ => dirs::state_dir().or_else(dirs::data_local_dir)?,
+        };
+        let bucket_hash = blake3::hash(bucket.as_bytes());
+        let bucket_id: String = hex::encode(&bucket_hash.as_bytes()[..16]);
+        Some(base.join("fula").join("walkable-v8-migrated").join(bucket_id))
+    }
+
+    /// True when the walkable-v8 migration marker for `bucket` is present
+    /// AND MAC-verifies. A present-but-tampered marker is treated as
+    /// absent so a local attacker editing the plaintext can't suppress
+    /// the auto-trigger from re-running and re-checking the manifest.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn has_walkable_v8_migration_marker(&self, bucket: &str) -> bool {
+        let Some(path) = self.walkable_v8_marker_path(bucket) else { return false; };
+        let Ok(bytes) = std::fs::read(&path) else { return false; };
+        let Ok(s) = std::str::from_utf8(&bytes) else { return false; };
+        let s = s.trim();
+        let Some((marker_str, mac_hex)) = s.rsplit_once('\t') else { return false; };
+        let mac_key = wal::derive_walkable_v8_marker_mac_key(
+            &self.encryption.key_manager,
+            bucket,
+        );
+        wal::verify_mac(&mac_key, marker_str, mac_hex) && marker_str == "v1"
+    }
+
+    /// Atomically write the walkable-v8 migration marker for `bucket`.
+    /// Idempotent: re-writing the marker is a no-op functionally; the file
+    /// content stays identical.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_walkable_v8_migration_marker(&self, bucket: &str) {
+        let Some(path) = self.walkable_v8_marker_path(bucket) else { return; };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mac_key = wal::derive_walkable_v8_marker_mac_key(
+            &self.encryption.key_manager,
+            bucket,
+        );
+        let marker_str = "v1";
+        let mac_hex = wal::mac_line(&mac_key, marker_str);
+        let contents = format!("{}\t{}\n", marker_str, mac_hex);
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, contents.as_bytes()).is_err() {
+            tracing::warn!(?path, "failed to write walkable-v8 marker tmp file");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            tracing::warn!(?path, error = %e, "failed to atomically rename walkable-v8 marker file");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// WASM stub: no filesystem, so the marker check always reports
+    /// "absent" — which combined with the per-load `manifest_has_v7_pointers()`
+    /// short-circuit means the auto-trigger runs at most once per bucket
+    /// per session (after the first run, the manifest is v8 and the
+    /// pointer scan returns false). Acceptable for the WASM target.
+    #[cfg(target_arch = "wasm32")]
+    fn has_walkable_v8_migration_marker(&self, _bucket: &str) -> bool { false }
+    #[cfg(target_arch = "wasm32")]
+    fn persist_walkable_v8_migration_marker(&self, _bucket: &str) {}
 
     /// Ensure the forest is loaded for a bucket (handles both monolithic and sharded)
     ///

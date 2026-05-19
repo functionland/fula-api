@@ -564,6 +564,36 @@ impl ShardedHamtPrivateForest {
         &self.manifest
     }
 
+    /// True when the manifest carries any leftover v7 (pre-walkable-v8)
+    /// state that hasn't been re-stamped with CID hints yet. Concretely:
+    ///
+    ///   - any `page_index[page_id].cid` is `None`, OR
+    ///   - any shard with a non-empty `root` has `root_cid: None`.
+    ///
+    /// Both conditions mean an offline reader walking the manifest will
+    /// hit a `None` CID and fall back to master-S3 fetch — i.e. the
+    /// bucket is not fully walkable-v8 yet. Returns `false` only when
+    /// every page_index entry AND every populated shard root carries a
+    /// CID hint.
+    ///
+    /// Used by the load-time auto-migration trigger (issue #10) and by
+    /// regression tests that assert post-migration manifest state.
+    /// Cheap: O(num_pages + num_shards) over already-decoded in-memory
+    /// state.
+    pub fn manifest_has_v7_pointers(&self) -> bool {
+        for page_ref in self.manifest.root.page_index.values() {
+            if page_ref.cid.is_none() {
+                return true;
+            }
+        }
+        for shard in self.manifest.shards_iter() {
+            if shard.root.is_some() && shard.root_cid.is_none() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Bucket identifier (used for AAD). Immutable for the life of this
     /// value.
     pub fn bucket(&self) -> &str {

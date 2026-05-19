@@ -191,6 +191,178 @@ async fn issue_10_v7_bucket_round_trips_through_walkable_v8_migration() {
     );
 }
 
+/// **Issue #10 acceptance test: auto-migration on first master-up load.**
+///
+/// Regression guard for the actual fix. Asserts that loading a v7-
+/// formatted bucket through a v8-writer-enabled `EncryptedClient`
+/// fires the auto-trigger transparently — no explicit
+/// `migrate_bucket_to_walkable_v8` call, no operator intervention.
+///
+/// **Why we don't assert `manifest_has_v7_pointers() == false`:** the
+/// in-process gateway under `spawn_server` uses `MemoryBlockStore`,
+/// whose CID computation (`fula-blockstore/src/cid_utils.rs:60-70`)
+/// wraps the BLAKE3 digest in a SHA2-256 multihash slot. The SDK's
+/// `walkable_v8::local_blake3_raw_cid` produces a BLAKE3 multihash
+/// CID (code `0x1e`). The two never agree, so
+/// `verify_etag_against_expected_cid` deterministically returns
+/// `None` against this gateway — `page_index[*].cid` stays `None` no
+/// matter how many migrations run. (Real production master uses
+/// IPFS `block/put?mhtype=blake3` which produces the matching
+/// BLAKE3-multihash CID; this is a test-fixture-only artifact.)
+///
+/// The auto-trigger's load-bearing observable side effect IS the
+/// per-device migration marker written by
+/// `EncryptedClient::persist_walkable_v8_migration_marker`. The
+/// marker is written **only** on `Ok(_)` return from
+/// `migrate_bucket_to_walkable_v8`, so its existence post-load is a
+/// faithful indicator that:
+///   1. The gate inside `load_forest_internal` ManifestV7 fired
+///      (`walkable_v8_writer_enabled` on, marker absent).
+///   2. `manifest_has_v7_pointers()` returned true.
+///   3. `migrate_bucket_to_walkable_v8` completed without error.
+///   4. The marker write succeeded.
+///
+/// Before the fix lands, this test MUST fail (no marker file). After
+/// the fix lands, it MUST pass (marker file present).
+#[tokio::test]
+async fn issue_10_v7_bucket_auto_migrates_on_first_v8_load() {
+    let base = spawn_server().await;
+    let secret = SecretKey::generate();
+    let bucket = "issue-10-auto-migrate";
+
+    // Process-isolated FULA_STATE_DIR — the marker check honours
+    // this env var, and an earlier test on the same machine could
+    // otherwise pre-populate the marker and silently mask the fix.
+    // `EnvGuard` serializes the env mutation against other tests in
+    // the same binary that swap FULA_STATE_DIR (see common/mod.rs).
+    let state_dir = std::env::temp_dir().join(format!(
+        "fula-issue10-auto-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&state_dir).expect("create state dir");
+    let _env = EnvGuard::set("FULA_STATE_DIR", &state_dir);
+
+    // Compute the marker path the fix will write to. Mirrors the
+    // production implementation in
+    // `crates/fula-client/src/encryption.rs:walkable_v8_marker_path`
+    // (BLAKE3(bucket)[..16].hex prefix under
+    // `<state>/fula/walkable-v8-migrated/`).
+    let bucket_hash = blake3::hash(bucket.as_bytes());
+    let bucket_id: String = hex::encode(&bucket_hash.as_bytes()[..16]);
+    let expected_marker_path = state_dir
+        .join("fula")
+        .join("walkable-v8-migrated")
+        .join(&bucket_id);
+
+    // Phase A: write a v7 bucket (writer flag off).
+    {
+        let mut config = Config::new(&base).with_encryption();
+        config.walkable_v8_writer_enabled = false;
+        let v7_client = EncryptedClient::new(
+            config,
+            EncryptionConfig::from_secret_key(secret.clone()),
+        )
+        .expect("v7 EncryptedClient::new");
+        v7_client.create_bucket(bucket).await.expect("create_bucket");
+        for i in 0..N_FILES {
+            let key = format!("/auto-{}.txt", i);
+            let data = format!("issue-10-auto-{}", i).into_bytes();
+            v7_client
+                .put_object_flat_deferred(bucket, &key, Bytes::from(data), None)
+                .await
+                .expect("put_object_flat_deferred");
+        }
+        v7_client
+            .flush_forest(bucket)
+            .await
+            .expect("flush_forest under v7 writer");
+    }
+
+    // Pre-condition: marker MUST be absent before the fresh v8
+    // client loads the bucket. If something on the filesystem already
+    // has it, the assertion below would pass spuriously.
+    assert!(
+        !expected_marker_path.exists(),
+        "pre-condition failure: walkable-v8 marker already exists at {:?} \
+         before the v8 client even loaded the bucket — test state leaked",
+        expected_marker_path
+    );
+
+    // Phase B: load with a fresh v8 client. The auto-trigger fires
+    // inside `load_forest_internal`'s ManifestV7 arm.
+    let mut v8_config = Config::new(&base).with_encryption();
+    v8_config.walkable_v8_writer_enabled = true;
+    let v8_client = EncryptedClient::new(
+        v8_config,
+        EncryptionConfig::from_secret_key(secret.clone()),
+    )
+    .expect("v8 EncryptedClient::new");
+
+    let files_after_load = v8_client
+        .list_files_from_forest(bucket)
+        .await
+        .expect("list_files_from_forest under v8 client against v7 bucket");
+    assert_eq!(
+        files_after_load.len(),
+        N_FILES,
+        "load must surface every file"
+    );
+
+    // Load-bearing assertion: the marker file must exist after the
+    // load. This proves the entire auto-trigger chain (gate fired →
+    // migration succeeded → marker written) ran.
+    assert!(
+        expected_marker_path.exists(),
+        "issue #10 fix not present: walkable-v8 migration marker \
+         {:?} was not written after loading a v7 bucket through a \
+         v8-writer-enabled client. The auto-trigger inside \
+         `load_forest_internal`'s ManifestV7 arm did not fire — \
+         lazy-per-shard cascade is the only migration path active.",
+        expected_marker_path
+    );
+
+    // Defense-in-depth: explicit migrate call after the auto-trigger
+    // ran must still succeed (cascade is content-idempotent).
+    let migrated_count = v8_client
+        .migrate_bucket_to_walkable_v8(bucket)
+        .await
+        .expect("explicit migrate after auto-trigger must still succeed");
+    assert_eq!(
+        migrated_count, N_FILES,
+        "migrate's re-upsert cascade counts each leaf once per invocation"
+    );
+
+    // Second load with a NEW client (cold cache) must short-circuit
+    // the auto-trigger via the marker check — no cascade, no flush,
+    // no marker rewrite (the file timestamp shouldn't bump because
+    // the persistence helper is idempotent). The simplest robust
+    // check: data still listable, marker still exists.
+    let v8_client_2 = EncryptedClient::new(
+        Config::new(&base).with_encryption(),
+        EncryptionConfig::from_secret_key(secret.clone()),
+    )
+    .expect("second v8 EncryptedClient::new");
+    let files_second_load = v8_client_2
+        .list_files_from_forest(bucket)
+        .await
+        .expect("second v8 load must succeed against the migrated bucket");
+    assert_eq!(
+        files_second_load.len(),
+        N_FILES,
+        "second cold-cache v8 load must see the same file set"
+    );
+    assert!(
+        expected_marker_path.exists(),
+        "marker must persist across subsequent loads"
+    );
+
+    // Hermeticity: clean up the marker so a re-run starts fresh.
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
 /// Counterpart test: verifies that `migrate_bucket_to_walkable_v8` returns
 /// a clean `Config` error when called against a client that has the writer
 /// flag disabled. This is a precondition the production trigger (once

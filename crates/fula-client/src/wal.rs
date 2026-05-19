@@ -534,6 +534,16 @@ pub(crate) fn derive_manifest_version_mac_key(
     km.derive_path_key(&format!("forest-manifest-version-mac:{}", bucket))
 }
 
+/// Derive a MAC key for the walkable-v8 migration marker file (issue #10).
+/// Distinct domain separator from the manifest-version pin and the WAL
+/// MAC so cross-verification is impossible.
+pub(crate) fn derive_walkable_v8_marker_mac_key(
+    km: &fula_crypto::keys::KeyManager,
+    bucket: &str,
+) -> DekKey {
+    km.derive_path_key(&format!("walkable-v8-migration-marker-mac:{}", bucket))
+}
+
 /// Test-only: expose the wal file path so tests can corrupt / inspect it.
 #[cfg(test)]
 #[allow(dead_code)]
