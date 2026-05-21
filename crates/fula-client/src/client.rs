@@ -1495,9 +1495,19 @@ impl FulaClient {
                 return Err(ClientError::MigrationLockHeld { bucket, expires_at });
             }
 
-            // For HEAD requests, S3 returns error code in x-amz-error-code header
-            // since there's no response body
-            let error_code = response
+            // S3-compat: error code lives in the `x-amz-error-code` header
+            // for HEAD responses (which carry no body) AND duplicated for
+            // every error response by our master (see fula-cli error.rs).
+            //
+            // Prefer the XML body's `<Message>` when present (it carries
+            // the master-side context, e.g., "bucket already exists: foo")
+            // and fall back to the header + a generic message only when
+            // the body is empty (HEAD response). The prior implementation
+            // unconditionally substituted `"Object not found"` whenever
+            // the header was present, swallowing every real error message
+            // and producing the famous "BucketAlreadyExists / Object not
+            // found" mismatch (filed in the 2026-05 E2E run).
+            let error_code_header = response
                 .headers()
                 .get("x-amz-error-code")
                 .and_then(|v| v.to_str().ok())
@@ -1505,11 +1515,16 @@ impl FulaClient {
 
             let text = response.text().await.unwrap_or_default();
 
-            // If we have an error code header, use it; otherwise parse XML or use status
-            if let Some(code) = error_code {
+            if !text.is_empty() {
+                return Err(ClientError::from_s3_xml(&text, status.as_u16()));
+            }
+
+            if let Some(code) = error_code_header {
                 return Err(ClientError::S3Error {
                     code,
-                    message: "Object not found".to_string(),
+                    // Empty body (typically HEAD) — synthesize a minimal
+                    // message from the HTTP status.
+                    message: status.canonical_reason().unwrap_or("error").to_string(),
                     request_id: None,
                 });
             }
