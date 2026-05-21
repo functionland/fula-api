@@ -183,6 +183,20 @@ pub struct FulaConfig {
     /// browser target. Offline reading via these hints lands in
     /// W.9.4; today the writer just records them for a future reader.
     pub walkable_v8_writer_enabled: bool,
+
+    /// E2E plan Phase 5 — 32-byte AEAD key for the encrypted
+    /// per-user bucketsIndex (`K_index` in the plan; derived
+    /// client-side from `KEK_seed` via the auth service). Empty
+    /// `Vec` is treated as `None` by the SDK and leaves the legacy
+    /// plaintext path active (Mode A behavior). Non-empty must be
+    /// exactly 32 bytes; the SDK validates length at config-build.
+    pub encrypted_user_buckets_index_key: Vec<u8>,
+
+    /// E2E plan Phase 5 — 32-byte Ed25519 seed for signing the
+    /// global-CBOR entry (`K_entry_seed` in the plan). Empty `Vec`
+    /// leaves the signed-entry writer inert. Must be exactly 32
+    /// bytes when non-empty.
+    pub user_entry_signing_seed: Vec<u8>,
 }
 
 impl Default for FulaConfig {
@@ -225,6 +239,12 @@ impl Default for FulaConfig {
             // default will surface `WireVersionUnsupported` (#81 typed
             // variant). Set explicitly to `false` to opt out.
             walkable_v8_writer_enabled: true,
+            // E2E plan Phase 5 — encrypted-bucketsIndex keys default
+            // to empty Vec (= "not set"), preserving Mode A behavior
+            // for any caller that hasn't been updated to populate
+            // them.
+            encrypted_user_buckets_index_key: Vec::new(),
+            user_entry_signing_seed: Vec::new(),
         }
     }
 }

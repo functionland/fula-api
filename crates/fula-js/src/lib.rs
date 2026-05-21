@@ -202,6 +202,34 @@ pub struct JsFulaConfig {
     /// is `false` and would silently drift from the Rust-side defaults.
     #[serde(default = "default_walkable_v8_writer_enabled")]
     pub walkable_v8_writer_enabled: bool,
+
+    /// E2E plan Phase 5 — 32-byte AEAD key for encrypting the
+    /// per-user bucketsIndex envelope (`K_index` in the plan; derived
+    /// client-side from `KEK_seed` via BLAKE3). Empty `Vec` is
+    /// treated as `None` and leaves the legacy plaintext path active
+    /// (Mode A behavior preserved). Non-empty must be exactly 32
+    /// bytes; the SDK validates and falls back to `None` on length
+    /// mismatch.
+    ///
+    /// **Note**: on the wasm32 web target the `users_index_writer`
+    /// module is not compiled (`#[cfg(not(target_arch = "wasm32"))]`),
+    /// so this field is currently inert in fula-js. The field exists
+    /// here for wire-format parity with `FulaConfig` (cross-platform
+    /// parity is non-negotiable) and to keep the JSON config shape
+    /// identical between native FxFiles and browser webui.
+    #[serde(default)]
+    pub encrypted_user_buckets_index_key: Vec<u8>,
+
+    /// E2E plan Phase 5 — 32-byte Ed25519 seed for signing the
+    /// global-CBOR per-user entry (`K_entry_seed` in the plan).
+    /// Empty `Vec` leaves the signed-entry writer inert. Must be
+    /// exactly 32 bytes when non-empty.
+    ///
+    /// Same wasm-inert caveat as `encrypted_user_buckets_index_key`
+    /// — field present for cross-platform parity, currently no-op on
+    /// the web target.
+    #[serde(default)]
+    pub user_entry_signing_seed: Vec<u8>,
 }
 
 fn default_timeout() -> u64 { 30 }
@@ -633,6 +661,23 @@ fn build_inner_config(
     // `JsFulaConfig` for the full self-verify rationale.
     inner.walkable_v8_writer_enabled = config.walkable_v8_writer_enabled;
 
+    // E2E plan Phase 5 — encrypted bucketsIndex keys (plumbed for
+    // cross-platform parity with `fula_client::Config` and
+    // `FulaConfig` even though `users_index_writer` is not compiled
+    // for the wasm32 target). Length-validated; falls back to `None`
+    // on mismatch so a misconfigured webui doesn't break.
+    inner.encrypted_user_buckets_index_key =
+        if config.encrypted_user_buckets_index_key.len() == 32 {
+            Some(config.encrypted_user_buckets_index_key)
+        } else {
+            None
+        };
+    inner.user_entry_signing_seed = if config.user_entry_signing_seed.len() == 32 {
+        Some(config.user_entry_signing_seed)
+    } else {
+        None
+    };
+
     inner
 }
 
@@ -991,6 +1036,35 @@ pub async fn get_public_key(client: &EncryptedClient) -> Vec<u8> {
 #[wasm_bindgen(js_name = deriveKey)]
 pub fn derive_key(context: &str, input: &[u8]) -> Vec<u8> {
     fula_crypto::hashing::derive_key_argon2id(context, input).to_vec()
+}
+
+/// Derive a 32-byte sub-key from a high-entropy parent key using
+/// BLAKE3's keyed-derivation mode.
+///
+/// Mirrors the native FFI helper exposed in `fula-flutter`. Used by
+/// the E2E plan Phase 5 to derive `K_index` and `K_entry_seed` from
+/// the user's `KEK_seed` (= the existing Argon2id output). BLAKE3-
+/// derive is the right primitive here: input is already key-strength,
+/// so no need for memory-hardness again, and the output is
+/// byte-identical to the Rust side's
+/// `fula_crypto::derive_user_buckets_index_key` and
+/// `fula_crypto::derive_entry_signing_seed`, which use the same
+/// `blake3::Hasher::new_derive_key(context)`.
+///
+/// Distinct from [`deriveKey`] (Argon2id, memory-hard, for stretching
+/// a user-typed passphrase into a master key).
+///
+/// ```javascript
+/// // Derive K_index from the user's existing KEK_seed (output of deriveKey):
+/// const kIndex = blake3DeriveKey('fula:user-buckets-index:v1', kekSeed);
+/// ```
+///
+/// @param context - Domain-separation tag (e.g., "fula:user-buckets-index:v1")
+/// @param input - Parent key bytes (32 bytes of `KEK_seed`)
+/// @returns 32-byte derived sub-key
+#[wasm_bindgen(js_name = blake3DeriveKey)]
+pub fn blake3_derive_key(context: &str, input: &[u8]) -> Vec<u8> {
+    fula_crypto::hashing::derive_key(context, input).as_bytes().to_vec()
 }
 
 /// Derive X25519 public key from private key bytes

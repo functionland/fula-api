@@ -275,6 +275,32 @@ pub fn derive_key(context: String, input: Vec<u8>) -> Vec<u8> {
     fula_crypto::hashing::derive_key_argon2id(&context, &input).to_vec()
 }
 
+/// Derive a 32-byte sub-key from a high-entropy parent key using
+/// BLAKE3's keyed-derivation mode (`blake3::Hasher::new_derive_key`).
+///
+/// Used by the E2E plan Phase 5 to derive `K_index` and `K_entry_seed`
+/// from the user's already-derived `KEK_seed` (= `_encryptionKey` in
+/// FxFiles, produced by Argon2id). BLAKE3-derive is the right primitive
+/// here because:
+/// 1. Input is already key-strength (32 bytes from Argon2id) — no need
+///    for memory-hardness again.
+/// 2. Output is byte-identical to the Rust side's
+///    `derive_entry_signing_seed` / `derive_user_buckets_index_key`,
+///    which use the same `blake3::Hasher::new_derive_key(context)`.
+///
+/// Distinct from [`derive_key`] (Argon2id, memory-hard, for stretching
+/// a user-typed passphrase into a master key).
+///
+/// # Arguments
+/// * `context` — domain-separation tag (e.g., `"fula:user-buckets-index:v1"`)
+/// * `input`   — parent key bytes (e.g., the 32-byte `KEK_seed`)
+///
+/// # Returns
+/// * 32-byte derived sub-key.
+pub fn blake3_derive_key(context: String, input: Vec<u8>) -> Vec<u8> {
+    fula_crypto::hashing::derive_key(&context, &input).as_bytes().to_vec()
+}
+
 /// Derive a 32-byte key using Argon2id with an EXPLICIT per-user salt.
 ///
 /// This is the audit F-A1 / issue #14 Mode B variant. Compared to

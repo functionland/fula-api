@@ -11034,6 +11034,7 @@ mod tests {
                 v: 2,
                 buckets,
                 updated_at_unix: 1_700_000_000,
+                names: BTreeMap::new(),
             };
             let user_buckets_cbor = serde_ipld_dagcbor::to_vec(&user_buckets).expect("ubi");
             let buckets_index_cid = cid_for_dag_cbor_bytes(&user_buckets_cbor);
@@ -11045,6 +11046,7 @@ mod tests {
                 sequence: 42,
                 updated_at_unix: 1_700_000_001,
                 users: users_map,
+                users_enc: BTreeMap::new(),
             };
             let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
 
@@ -11124,6 +11126,7 @@ mod tests {
                 sequence: 5,
                 updated_at_unix: 1_700_000_000,
                 users: users_map,
+                users_enc: BTreeMap::new(),
             };
             let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
 
@@ -11195,6 +11198,7 @@ mod tests {
                 v: 2,
                 buckets,
                 updated_at_unix: 0,
+                names: BTreeMap::new(),
             };
             let user_buckets_cbor = serde_ipld_dagcbor::to_vec(&user_buckets).expect("ubi");
             let buckets_index_cid = cid_for_dag_cbor_bytes(&user_buckets_cbor);
@@ -11206,6 +11210,7 @@ mod tests {
                 sequence: 1,
                 updated_at_unix: 0,
                 users: users_map,
+                users_enc: BTreeMap::new(),
             };
             let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
 
@@ -11281,6 +11286,7 @@ mod tests {
                 v: 2,
                 buckets,
                 updated_at_unix: 0,
+                names: BTreeMap::new(),
             };
             let user_buckets_cbor = serde_ipld_dagcbor::to_vec(&user_buckets).expect("ubi");
             let buckets_index_cid = cid_for_dag_cbor_bytes(&user_buckets_cbor);
@@ -11292,6 +11298,7 @@ mod tests {
                 sequence: 1,
                 updated_at_unix: 0,
                 users: users_map,
+                users_enc: BTreeMap::new(),
             };
             let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
 
@@ -11367,6 +11374,7 @@ mod tests {
                 v: 2,
                 buckets,
                 updated_at_unix: 0,
+                names: BTreeMap::new(),
             };
             let user_buckets_cbor = serde_ipld_dagcbor::to_vec(&user_buckets).expect("ubi");
             let buckets_index_cid = cid_for_dag_cbor_bytes(&user_buckets_cbor);
@@ -11378,6 +11386,7 @@ mod tests {
                 sequence: 1,
                 updated_at_unix: 0,
                 users: users_map,
+                users_enc: BTreeMap::new(),
             };
             let global_cbor = serde_ipld_dagcbor::to_vec(&global).expect("global");
 

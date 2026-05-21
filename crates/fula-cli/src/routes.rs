@@ -66,6 +66,37 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         ))
         .with_state(state.clone());
 
+    // Phase 2 E2E plan — new JSON/REST routes under `/api/v1/...`,
+    // authenticated by the same user-JWT middleware as the S3-style
+    // `private` router. These routes are LITERAL paths (not
+    // `/{bucket}` parameter routes), so they match before the S3
+    // wildcards regardless of registration order. Strictly additive:
+    // existing S3 routes and their behavior are unchanged.
+    let api_v1 = Router::new()
+        .route(
+            "/api/v1/buckets/list",
+            get(handlers::list_buckets_for_owner::list_buckets_for_owner),
+        )
+        .route(
+            "/api/v1/users-index/per-user",
+            put(handlers::encrypted_user_index::put_encrypted_bucketsindex),
+        )
+        .route(
+            "/api/v1/users-index/per-user/latest",
+            get(handlers::encrypted_user_index::get_latest_entry),
+        )
+        .route(
+            "/api/v1/users-index/entry",
+            put(handlers::user_entry_submit::put_user_entry),
+        )
+        .layer(axum_middleware::from_fn(middleware::request_id_middleware))
+        .layer(axum_middleware::from_fn(middleware::logging_middleware))
+        .layer(axum_middleware::from_fn_with_state(
+            Arc::clone(&state),
+            middleware::auth_middleware,
+        ))
+        .with_state(state.clone());
+
     // Private (authenticated) routes
     let private = Router::new()
         // Service endpoints
@@ -107,11 +138,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         ))
         .with_state(state.clone());
 
-    // Combine public, admin, internal, and private, then apply shared layers
+    // Combine public, admin, internal, api_v1, and private, then apply shared layers.
+    // `api_v1` is merged BEFORE `private` so the literal `/api/v1/...`
+    // routes are visible to axum's matcher first (also fine if it
+    // were after — literal-vs-parameter precedence resolves it).
     Router::new()
         .merge(public)
         .merge(admin)
         .merge(internal)
+        .merge(api_v1)
         .merge(private)
         .layer(cors)
         .layer(TraceLayer::new_for_http())

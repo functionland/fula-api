@@ -73,6 +73,15 @@ pub struct GatewayConfig {
     /// deployments lightweight.
     #[serde(default)]
     pub pin_queue_path: Option<String>,
+    /// Phase 2 E2E plan — JSON file path for the per-user signed-entry
+    /// store. When `Some`, master accepts encrypted bucketsIndex
+    /// entries via the new `/api/v1/users-index/entry` endpoint and
+    /// persists them here. When `None`, the new endpoints return 503
+    /// and master falls back to today's legacy `users[]` publisher
+    /// path for ALL users — strictly byte-identical to pre-Phase-2
+    /// behavior. Backward-compatible default.
+    #[serde(default)]
+    pub entries_store_path: Option<String>,
 }
 
 fn default_block_cache_mb() -> usize {
@@ -112,6 +121,7 @@ impl Default for GatewayConfig {
             admin_api_enabled: false,
             block_cache_mb: default_block_cache_mb(),
             pin_queue_path: Some("/var/lib/fula-gateway/pin_queue.redb".to_string()),
+            entries_store_path: None,
         }
     }
 }

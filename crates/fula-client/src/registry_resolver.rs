@@ -66,6 +66,13 @@ use std::time::Duration;
 /// `GlobalUsersIndex` struct in `fula-cli`'s
 /// `handlers::users_index_publisher`. The two definitions must stay
 /// in lockstep — see plan §3.2.a for the producer side.
+///
+/// Phase 4 — added `users_enc` mirror of the Phase-3 publisher field.
+/// `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]`
+/// keeps both forward AND backward compat: legacy v1 CBORs (no
+/// `users_enc` field on the wire) deserialize cleanly as `default()`;
+/// new SDKs writing back are byte-identical to legacy on the wire
+/// when the map is empty.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct GlobalUsersIndex {
     pub v: u32,
@@ -74,6 +81,30 @@ pub struct GlobalUsersIndex {
     /// `userKey_hex` (32 hex chars) → bucketsIndexCid (string).
     /// The SDK looks up its own `userKey` here on cold-start.
     pub users: BTreeMap<String, String>,
+    /// Phase 4 — Mode B/C signed-entry mirror of Phase 3's publisher
+    /// field. `userKey_hex` → [`EncryptedUserEntry`]. New SDKs prefer
+    /// the entry here over the plaintext `users[]` entry for the same
+    /// `userKey`; older SDKs ignore this field.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub users_enc: BTreeMap<String, EncryptedUserEntry>,
+}
+
+/// Per-user signed entry for the encrypted bucketsIndex architecture.
+/// Mirrors the `EncryptedUserEntry` struct in `fula-cli`'s
+/// `handlers::users_index_publisher`. Wire-compatible — must stay in
+/// lockstep.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct EncryptedUserEntry {
+    /// dag-cbor base32 CID of the encrypted bucketsIndex envelope.
+    pub cid: String,
+    /// Monotonic per-user sequence the master accepted.
+    pub seq: u64,
+    /// 32-byte Ed25519 public key, lowercase hex.
+    pub entry_pubkey_hex: String,
+    /// 64-byte Ed25519 detached signature, lowercase hex.
+    pub signature_hex: String,
+    /// Encrypted-envelope format version (currently 3).
+    pub envelope_version: u32,
 }
 
 /// Master's per-user `bucketsIndex` CBOR — one per user per snapshot
@@ -93,6 +124,17 @@ pub struct UserBucketsIndex {
     pub v: u32,
     pub buckets: BTreeMap<String, BucketEntry>,
     pub updated_at_unix: u64,
+    /// E2E plan Phase 5 — sidecar map of `blinded_bucket_id → plaintext
+    /// bucket name`, populated by Mode B/C writers from their local
+    /// SDK state. Lives INSIDE the AEAD ciphertext (the writer
+    /// encrypts the whole `UserBucketsIndex`), so master never sees
+    /// plaintext names. `#[serde(default, skip_serializing_if =
+    /// "BTreeMap::is_empty")]` keeps the on-wire CBOR byte-identical
+    /// to pre-Phase-5 when the map is empty (Mode A path, which is
+    /// produced by master's publisher and inherently has no plaintext
+    /// names to carry).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub names: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -1625,6 +1667,7 @@ mod tests {
             sequence,
             updated_at_unix: 1_700_000_000,
             users: BTreeMap::new(),
+            users_enc: BTreeMap::new(),
         };
         let bytes = serde_ipld_dagcbor::to_vec(&payload).expect("encode");
         (Bytes::from(bytes), payload)
@@ -2233,6 +2276,7 @@ mod tests {
             sequence,
             updated_at_unix: 1_700_000_000,
             users: BTreeMap::new(),
+            users_enc: BTreeMap::new(),
         };
         let bytes = serde_ipld_dagcbor::to_vec(&payload).expect("encode");
         (Bytes::from(bytes), payload)

@@ -48,6 +48,15 @@ pub struct AppState {
     /// back to the legacy fire-and-forget pin path. The drainer
     /// task is spawned by `server::run_server` if this is `Some`.
     pub pin_queue: Option<Arc<crate::pin_queue::PinQueue>>,
+    /// Per-user signed-entry store for the encrypted bucketsIndex
+    /// architecture (Phase 2 of the E2E plan). `Some` when the
+    /// `entries_store_path` config field is set (or always-present
+    /// in-memory store); `None` to fail-closed the new endpoints
+    /// with 503 in deployments that haven't opted in yet. Strictly
+    /// additive — when `None`, all existing routes and the legacy
+    /// `users[]` plaintext publisher path behave byte-identically
+    /// to pre-Phase-2 deploys.
+    pub entries_store: Option<Arc<crate::entries_store::EntriesStore>>,
 }
 
 impl AppState {
@@ -146,6 +155,34 @@ impl AppState {
         // after AppState is wrapped in an Arc.
         let lock_store = crate::handlers::locks::LockStore::new();
 
+        // Phase 2 entries store is built BEFORE the publisher so the
+        // publisher can hold a reference and emit `users_enc` at every
+        // tick (Phase 3 of the E2E plan). Backward compat: when
+        // `entries_store_path` is unset, the store is empty in-memory;
+        // when EVERY user lacks an entry, the published CBOR's
+        // `users_enc` field is empty and serializes away thanks to
+        // `skip_serializing_if`, leaving the wire-format byte-identical
+        // to pre-Phase-3 deployments.
+        let entries_store = {
+            let path = config
+                .entries_store_path
+                .as_ref()
+                .map(std::path::PathBuf::from);
+            match crate::entries_store::EntriesStore::open(path) {
+                Ok(s) => {
+                    info!(entries = s.len(), "entries store ready");
+                    Some(Arc::new(s))
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "entries store failed to open; per-user signed-entry endpoints will return 503 this run"
+                    );
+                    None
+                }
+            }
+        };
+
         // Phase 3.2 users-index publisher — env-flag-gated so day-one
         // deploys behave byte-identically to pre-Phase-3 builds.
         // Operators flip `FULA_USERS_INDEX_PUBLISHER_ENABLED=1` after
@@ -154,6 +191,7 @@ impl AppState {
             &config,
             Arc::clone(&bucket_manager),
             Arc::clone(&block_store),
+            entries_store.clone(),
         );
 
         // W.9.6 durable pin queue — opens the redb file at the
@@ -199,6 +237,7 @@ impl AppState {
             lock_store,
             users_index_publisher,
             pin_queue,
+            entries_store,
         })
     }
 
@@ -320,6 +359,7 @@ fn build_users_index_publisher(
     config: &GatewayConfig,
     bucket_manager: Arc<BucketManager<FlexibleBlockStore>>,
     block_store: Arc<FlexibleBlockStore>,
+    entries_store: Option<Arc<crate::entries_store::EntriesStore>>,
 ) -> Option<Arc<crate::handlers::users_index_publisher::UsersIndexPublisher<FlexibleBlockStore>>> {
     use crate::handlers::users_index_publisher::{
         IpnsPublisher, PublisherConfig, UsersIndexPublisher,
@@ -384,7 +424,13 @@ fn build_users_index_publisher(
         Some(IpnsPublisher::new(config.ipfs_url.clone()))
     };
 
-    match UsersIndexPublisher::open_with_ipns(pub_config, bucket_manager, block_store, ipns) {
+    match UsersIndexPublisher::open_with_ipns_and_entries(
+        pub_config,
+        bucket_manager,
+        block_store,
+        ipns,
+        entries_store,
+    ) {
         Ok(p) => {
             info!(
                 flush_interval_secs = flush_interval.as_secs(),

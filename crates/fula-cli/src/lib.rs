@@ -34,6 +34,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod entries_store;
 pub mod error;
 pub mod handlers;
 pub mod middleware;

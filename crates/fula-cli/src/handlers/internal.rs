@@ -265,6 +265,7 @@ mod tests {
             // legacy fire-and-forget path which is fine for these
             // tests (they don't trigger PUTs / pinning).
             pin_queue: None,
+            entries_store: None,
         })
     }
 
@@ -474,6 +475,7 @@ mod tests {
             // and not 403 (S3 auth would trigger if middleware leaked).
             users_index_publisher: None,
             pin_queue: None,
+            entries_store: None,
         });
 
         let _ = state_path; // silence unused; only here to mirror prod path layout
@@ -522,6 +524,7 @@ mod tests {
             lock_store: crate::handlers::locks::LockStore::new(),
             users_index_publisher: None,
             pin_queue: None,
+            entries_store: None,
         });
 
         let app = crate::routes::create_router(Arc::clone(&state));

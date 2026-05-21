@@ -205,6 +205,25 @@ pub struct Config {
     /// cross FRB / wasm-bindgen cleanly, so wasm/Flutter surface
     /// these via the typed error variants instead.
     pub health_callback: Option<HealthCallback>,
+
+    /// E2E plan Phase 4 — 32-byte AEAD key for encrypting the
+    /// per-user bucketsIndex envelope (`K_index` in the plan; derived
+    /// client-side as
+    /// `BLAKE3-derive("fula:user-buckets-index:v1", KEK_seed)`).
+    /// `None` for Mode A users (legacy plaintext path stays active).
+    /// `Some(32 bytes)` for Mode B/C users; enables the encrypted
+    /// writer + cold-start path. Strictly additive — when `None`, the
+    /// SDK behaves byte-identically to pre-Phase-4.
+    pub encrypted_user_buckets_index_key: Option<Vec<u8>>,
+
+    /// E2E plan Phase 4 — 32-byte Ed25519 seed for signing the
+    /// global-CBOR entries the master publishes (`K_entry_seed` in
+    /// the plan; derived as
+    /// `BLAKE3-derive("fula:user-entry-signing:v1", KEK_seed)`).
+    /// `None` disables the signed-entry writer; the SDK falls back to
+    /// today's behavior (no Phase-3 entry submitted, Mode-A
+    /// `users[]` published unchanged).
+    pub user_entry_signing_seed: Option<Vec<u8>>,
 }
 
 // `Config` derives `Clone` but not `Debug` because `HealthCallback`
@@ -250,6 +269,20 @@ impl std::fmt::Debug for Config {
             .field(
                 "health_callback",
                 &self.health_callback.as_ref().map(|_| "<callback>"),
+            )
+            .field(
+                "encrypted_user_buckets_index_key",
+                &self
+                    .encrypted_user_buckets_index_key
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field(
+                "user_entry_signing_seed",
+                &self
+                    .user_entry_signing_seed
+                    .as_ref()
+                    .map(|_| "<redacted>"),
             )
             .finish()
     }
@@ -299,6 +332,13 @@ impl Default for Config {
             walkable_v8_writer_enabled: true,
             // Phase 19 — no callback by default (silent gate).
             health_callback: None,
+            // E2E plan Phase 4 — Mode B/C signed-entry writer disabled
+            // by default. Setting both `Some(32 bytes)` opts the user
+            // into encrypted bucketsIndex + signed entries. Mode A
+            // (legacy plaintext) behavior is preserved when these
+            // are `None`.
+            encrypted_user_buckets_index_key: None,
+            user_entry_signing_seed: None,
         }
     }
 }

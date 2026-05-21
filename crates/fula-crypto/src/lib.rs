@@ -86,6 +86,8 @@ pub mod streaming;
 pub mod subtree_keys;
 pub mod symmetric;
 pub mod time;
+pub mod user_buckets_index_aad;
+pub mod user_entry;
 pub mod wnfs_hamt;
 
 pub use chunked::{ChunkedEncoder, ChunkedDecoder, ChunkedFileMetadata, EncryptedChunk, should_use_chunked, CHUNKED_THRESHOLD, VerifiedStreamingDecoder};
@@ -131,6 +133,21 @@ pub use sharing::{ShareToken, ShareBuilder, ShareRecipient, AcceptedShare, Folde
 pub use streaming::{BaoEncoder, BaoDecoder, BaoOutboard, VerifiedStream};
 pub use subtree_keys::{SubtreeKeyManager, EncryptedSubtreeDek, SubtreeKeyInfo, SubtreeRotationResult, SubtreeShareToken, SubtreeShareBuilder, SubtreeShareRecipient, AcceptedSubtreeShare};
 pub use symmetric::{Aead, AeadCipher, Nonce};
+pub use user_buckets_index_aad::{
+    build_aad as build_user_buckets_index_aad,
+    derive_index_key as derive_user_buckets_index_key,
+    AAD_TAG as USER_BUCKETS_INDEX_AAD_TAG,
+    ENVELOPE_VERSION as USER_BUCKETS_INDEX_ENVELOPE_VERSION,
+    INDEX_KEY_LEN as USER_BUCKETS_INDEX_KEY_LEN,
+    NONCE_LEN as USER_BUCKETS_INDEX_NONCE_LEN,
+    PAYLOAD_VERSION as USER_BUCKETS_INDEX_PAYLOAD_VERSION,
+    USER_KEY_HEX_LEN as USER_BUCKETS_INDEX_USER_KEY_HEX_LEN,
+};
+pub use user_entry::{
+    derive_entry_signing_seed, entry_pubkey_from_kek, entry_signature_payload,
+    sign_entry, verify_entry_signature, ENTRY_PUBKEY_LEN, ENTRY_SIGNATURE_LEN,
+    ENTRY_SIGNATURE_TAG, ENTRY_SIGNING_SEED_LEN,
+};
 
 /// The version of the cryptographic format
 /// - Version 1: Custom HPKE (X25519 + BLAKE3 + AEAD) [deprecated]

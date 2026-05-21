@@ -270,9 +270,50 @@ pub struct BucketEntry {
     pub legacy: bool,
 }
 
+/// Per-user signed entry for the encrypted bucketsIndex architecture
+/// (Phase 3 of the E2E plan). Emitted in `GlobalUsersIndex.users_enc`
+/// for Mode B/C users who have submitted a signed entry via the
+/// `PUT /api/v1/users-index/entry` endpoint. Master cannot forge
+/// these — the `signature` is produced client-side by the user's
+/// seed-derived Ed25519 key (master has no copy of the private half).
+///
+/// Wire shape designed to be cheap (each entry ≈ 200 bytes hex-encoded)
+/// and to deserialize on legacy SDKs as an opaque value they can
+/// ignore. Backward compat: when the `users_enc` map is empty (or
+/// absent on the wire), the CBOR bytes match the pre-Phase-3 format
+/// exactly thanks to `skip_serializing_if = "BTreeMap::is_empty"`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedUserEntry {
+    /// dag-cbor base32 CID of the encrypted bucketsIndex envelope.
+    pub cid: String,
+    /// Monotonic per-user sequence number. Used by clients for replay
+    /// defense and by master for the sequence-monotonicity check at
+    /// submit time.
+    pub seq: u64,
+    /// 32-byte Ed25519 public key, lowercase hex. TOFU-bound at submit
+    /// time; included in the published CBOR so clients on a fresh
+    /// device can verify the signature against the SAME pubkey master
+    /// recorded — defense-in-depth even if master is hostile.
+    pub entry_pubkey_hex: String,
+    /// 64-byte Ed25519 detached signature, lowercase hex. Computed
+    /// over the plan-defined payload (see
+    /// [`fula_crypto::entry_signature_payload`]); verifiable by anyone
+    /// reading the CBOR.
+    pub signature_hex: String,
+    /// Encrypted-envelope format version this signature is bound to
+    /// (currently always 3; surfaced as an explicit field so future
+    /// envelope versions can co-exist without ambiguity).
+    pub envelope_version: u32,
+}
+
 /// Global users-index CBOR. Master pins one per snapshot; the CID
 /// is published via IPNS (every flush) and to the chain anchor
 /// (every 12h).
+///
+/// Phase 3 added the `users_enc` map for Mode B/C signed entries.
+/// `v` stays at `1` because the change is additive: pre-Phase-3
+/// SDKs read `users` and ignore the new `users_enc` field; they see
+/// byte-identical CBOR when no client has submitted an entry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalUsersIndex {
     pub v: u32,
@@ -282,7 +323,20 @@ pub struct GlobalUsersIndex {
     pub updated_at_unix: u64,
     /// `userKey_hex` (32 hex chars = 16-byte hashed_user_id) →
     /// per-user bucketsIndex CID (string). BTreeMap for determinism.
+    ///
+    /// Mode A users (and Mode B/C users who have not yet submitted a
+    /// signed encrypted entry) appear here. The publisher keeps
+    /// emitting this map for ALL users so cold-start on pre-Phase-4
+    /// SDKs continues to work even after Mode B/C adoption.
     pub users: BTreeMap<String, String>,
+    /// Phase 3 — Mode B/C signed entries. `userKey_hex` (same key
+    /// space as `users`) → [`EncryptedUserEntry`]. Backward-compat:
+    /// `skip_serializing_if = "BTreeMap::is_empty"` keeps the CBOR
+    /// byte-identical to the pre-Phase-3 format when no client has
+    /// submitted an entry; `#[serde(default)]` lets old serialized
+    /// CBORs that never had this field deserialize cleanly.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub users_enc: BTreeMap<String, EncryptedUserEntry>,
 }
 
 // ============================================================
@@ -342,8 +396,113 @@ pub fn build_user_buckets_index(
 
 /// Build the global users-index CBOR from a per-user CID map.
 /// `entries` is `userKey_hex (32 hex) → bucketsIndexCid`.
+///
+/// Backward-compat shim: produces the SAME CBOR shape as pre-Phase-3,
+/// because `users_enc` is empty and serializes away thanks to
+/// `skip_serializing_if`. Old tests and callers that don't deal with
+/// signed entries can keep using this signature unchanged.
 pub fn build_global_users_index(
     entries: &BTreeMap<String, Cid>,
+    sequence: u64,
+    now_unix: u64,
+) -> GlobalUsersIndex {
+    build_global_users_index_v2(entries, &BTreeMap::new(), sequence, now_unix)
+}
+
+/// Phase 3 — snapshot the per-user signed-entry store and return
+/// only those entries whose signatures still verify against their
+/// stored pubkeys. Defense-in-depth gate on the publisher hot path:
+/// a stored entry that has been corrupted (DB tampering, partial
+/// write) is dropped from this tick's published CBOR rather than
+/// served to clients. The dropped user's PREVIOUS published entry
+/// (or their legacy `users[]` entry) remains the source of truth
+/// until they re-submit a valid signed entry.
+///
+/// Returns an empty map when `store` is `None` — pre-Phase-3
+/// behavior; the resulting `GlobalUsersIndex` serializes without
+/// the `users_enc` field thanks to `skip_serializing_if`.
+pub fn build_users_enc_snapshot(
+    store: Option<&Arc<crate::entries_store::EntriesStore>>,
+) -> BTreeMap<String, EncryptedUserEntry> {
+    let Some(store) = store else {
+        return BTreeMap::new();
+    };
+    let snapshot = store.snapshot_all();
+    let mut verified: BTreeMap<String, EncryptedUserEntry> = BTreeMap::new();
+    for (user_key_hex, record) in snapshot {
+        // Decode the pubkey + signature for verification. Bad encoding
+        // is treated as "drop this entry from this tick" rather than
+        // a hard failure, so a single corrupt row doesn't break the
+        // tick for every other user.
+        let pubkey_bytes: [u8; fula_crypto::ENTRY_PUBKEY_LEN] =
+            match hex::decode(&record.entry_pubkey_hex)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+            {
+                Some(b) => b,
+                None => {
+                    tracing::warn!(
+                        user_key = %user_key_hex,
+                        "users-index publisher: dropped entry with malformed entry_pubkey_hex"
+                    );
+                    continue;
+                }
+            };
+        let sig_bytes: [u8; fula_crypto::ENTRY_SIGNATURE_LEN] =
+            match hex::decode(&record.signature_hex)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+            {
+                Some(b) => b,
+                None => {
+                    tracing::warn!(
+                        user_key = %user_key_hex,
+                        "users-index publisher: dropped entry with malformed signature_hex"
+                    );
+                    continue;
+                }
+            };
+        if !fula_crypto::verify_entry_signature(
+            &pubkey_bytes,
+            &user_key_hex,
+            &record.cid,
+            record.sequence,
+            record.envelope_version,
+            &sig_bytes,
+        ) {
+            tracing::warn!(
+                user_key = %user_key_hex,
+                "users-index publisher: dropped entry with invalid signature (defense-in-depth)"
+            );
+            continue;
+        }
+        verified.insert(
+            user_key_hex,
+            EncryptedUserEntry {
+                cid: record.cid,
+                seq: record.sequence,
+                entry_pubkey_hex: record.entry_pubkey_hex,
+                signature_hex: record.signature_hex,
+                envelope_version: record.envelope_version,
+            },
+        );
+    }
+    verified
+}
+
+/// Phase 3 — build the global users-index CBOR with both the legacy
+/// `users` map AND the new `users_enc` map. `entries_enc` is
+/// `userKey_hex → EncryptedUserEntry` from the master's per-user
+/// `EntriesStore`.
+///
+/// Backward-compat property: when `entries_enc` is empty, the
+/// produced CBOR is byte-identical to what [`build_global_users_index`]
+/// would have produced before Phase 3 — the new field disappears
+/// from the serialization. This is what makes the on-wire format
+/// invisible to legacy SDKs until at least one client opts in.
+pub fn build_global_users_index_v2(
+    entries: &BTreeMap<String, Cid>,
+    entries_enc: &BTreeMap<String, EncryptedUserEntry>,
     sequence: u64,
     now_unix: u64,
 ) -> GlobalUsersIndex {
@@ -356,6 +515,7 @@ pub fn build_global_users_index(
         sequence,
         updated_at_unix: now_unix,
         users,
+        users_enc: entries_enc.clone(),
     }
 }
 
@@ -613,6 +773,12 @@ pub struct UsersIndexPublisher<S: BlockStore + PinStore + 'static> {
     /// underlying state. Tokio mutex (not parking_lot) because the tick
     /// holds it across `await`s on the pin chain.
     tick_lock: tokio::sync::Mutex<()>,
+    /// Phase 3 — handle to the per-user signed-entry store. `None`
+    /// preserves pre-Phase-3 behavior (no `users_enc` in the global
+    /// CBOR). `Some` populates the new map at every tick from the
+    /// current snapshot of the store. The store itself is owned by
+    /// `AppState`; the publisher just reads.
+    entries_store: Option<Arc<crate::entries_store::EntriesStore>>,
 }
 
 /// Outcome of a single `run_tick` call. Useful for tests and for
@@ -683,12 +849,34 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
     }
 
     /// Internal constructor — also used by tests to inject a
-    /// wiremock-backed IPNS client.
+    /// wiremock-backed IPNS client. Equivalent to
+    /// [`open_with_ipns_and_entries`] with `entries_store = None`,
+    /// preserving the pre-Phase-3 behavior for callers that haven't
+    /// been updated yet.
     pub fn open_with_ipns(
         config: PublisherConfig,
         bucket_manager: Arc<BucketManager<S>>,
         block_store: Arc<S>,
         ipns_publisher: Option<IpnsPublisher>,
+    ) -> Result<Self, PersistError> {
+        Self::open_with_ipns_and_entries(
+            config,
+            bucket_manager,
+            block_store,
+            ipns_publisher,
+            None,
+        )
+    }
+
+    /// Phase 3 — construct with an [`EntriesStore`] handle so the
+    /// publisher can populate `users_enc` in the global CBOR at every
+    /// tick.
+    pub fn open_with_ipns_and_entries(
+        config: PublisherConfig,
+        bucket_manager: Arc<BucketManager<S>>,
+        block_store: Arc<S>,
+        ipns_publisher: Option<IpnsPublisher>,
+        entries_store: Option<Arc<crate::entries_store::EntriesStore>>,
     ) -> Result<Self, PersistError> {
         let persisted = PersistedState::load(&config.state_file_path)?;
         let latest = LatestPublished::from(&persisted);
@@ -700,6 +888,7 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
             diff_cache: Mutex::new(HashMap::new()),
             latest: RwLock::new(latest),
             tick_lock: tokio::sync::Mutex::new(()),
+            entries_store,
         })
     }
 
@@ -932,8 +1121,17 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
         // 6. Build + pin global users-index CBOR. Sequence increments
         //    relative to the last persisted state; new state is committed
         //    only after the pin succeeds.
+        //
+        // Phase 3: also snapshot the per-user signed-entry store and
+        // emit it as `users_enc` alongside the legacy `users` map.
+        // Defense-in-depth: verify each entry's signature here BEFORE
+        // publishing it — if a stored entry has somehow been corrupted
+        // (DB tampering, partial-write bug), we'd rather skip that one
+        // user this tick than serve an unverifiable record to clients.
         let next_sequence = prior.sequence.saturating_add(1);
-        let global = build_global_users_index(&user_to_cid, next_sequence, now);
+        let entries_enc = build_users_enc_snapshot(self.entries_store.as_ref());
+        let global =
+            build_global_users_index_v2(&user_to_cid, &entries_enc, next_sequence, now);
         let global_cid = self.block_store.put_ipld(&global).await?;
         self.block_store
             .pin(&global_cid, Some("fula-users-index-global"))
@@ -2429,5 +2627,219 @@ mod tests {
             second_global.users.contains_key("alice"),
             "alice still present (unchanged across the two ticks)"
         );
+    }
+
+    // ================================================================
+    // Phase 3 — `users_enc` (encrypted signed entries) tests.
+    // These verify the new `GlobalUsersIndex.users_enc` field shape +
+    // the defense-in-depth signature gate in `build_users_enc_snapshot`.
+    // Backward compatibility is verified by `users_enc_empty_produces_legacy_byte_shape`.
+    // ================================================================
+
+    use crate::entries_store::{EntriesStore, EntryRecord};
+    use fula_crypto::{entry_pubkey_from_kek, sign_entry};
+
+    /// Backward-compat load-bearing test: when no client has submitted
+    /// an entry, the CBOR pin produced by Phase 3's v2 builder yields
+    /// the SAME CID as the pre-Phase-3 v1 builder. CID equality ⇒
+    /// byte equality (content-addressed). This is what keeps legacy
+    /// SDK readers happy across the Phase 3 deploy.
+    #[tokio::test]
+    async fn users_enc_empty_produces_legacy_byte_shape() {
+        let mut entries = BTreeMap::new();
+        entries.insert("alice".to_string(), fixture_cid(1));
+        entries.insert("bob".to_string(), fixture_cid(2));
+
+        let v1 = build_global_users_index(&entries, 5, 1_700_000_000);
+        let v2 =
+            build_global_users_index_v2(&entries, &BTreeMap::new(), 5, 1_700_000_000);
+
+        assert_eq!(v1, v2);
+
+        let store = MemoryBlockStore::new();
+        let cid_v1 = store.put_ipld(&v1).await.expect("encode v1");
+        let cid_v2 = store.put_ipld(&v2).await.expect("encode v2");
+        assert_eq!(
+            cid_v1, cid_v2,
+            "empty users_enc must produce byte-identical CBOR (same CID) to pre-Phase-3"
+        );
+    }
+
+    /// `users_enc` present round-trips through pin + fetch and
+    /// preserves every field of every entry.
+    #[tokio::test]
+    async fn users_enc_populated_round_trips() {
+        const KEK_A: [u8; 32] = [0xA5; 32];
+        let user_key_hex = "0123456789abcdef0123456789abcdef";
+        let cid_str = fixture_cid(7).to_string();
+        let pubkey = entry_pubkey_from_kek(&KEK_A);
+        let sig = sign_entry(&KEK_A, user_key_hex, &cid_str, 1, 3);
+
+        let mut entries_enc = BTreeMap::new();
+        entries_enc.insert(
+            user_key_hex.to_string(),
+            EncryptedUserEntry {
+                cid: cid_str.clone(),
+                seq: 1,
+                entry_pubkey_hex: hex::encode(pubkey),
+                signature_hex: hex::encode(sig),
+                envelope_version: 3,
+            },
+        );
+
+        let global = build_global_users_index_v2(
+            &BTreeMap::new(),
+            &entries_enc,
+            42,
+            1_700_000_000,
+        );
+
+        let store = MemoryBlockStore::new();
+        let cid = store.put_ipld(&global).await.expect("encode");
+        let decoded: GlobalUsersIndex = store.get_ipld(&cid).await.expect("decode");
+        assert_eq!(decoded, global);
+        assert_eq!(decoded.users_enc.len(), 1);
+        assert_eq!(decoded.users_enc.get(user_key_hex).unwrap().seq, 1);
+    }
+
+    /// `build_users_enc_snapshot(None)` returns empty — the legacy
+    /// path. Confirms the publisher remains pre-Phase-3 byte-identical
+    /// when entries_store is not configured.
+    #[test]
+    fn build_users_enc_snapshot_none_returns_empty() {
+        let snap = build_users_enc_snapshot(None);
+        assert!(snap.is_empty());
+    }
+
+    /// Valid entries flow through. This is the happy path the publisher
+    /// hot loop relies on.
+    #[test]
+    fn build_users_enc_snapshot_includes_valid_entries() {
+        const KEK_A: [u8; 32] = [0xA5; 32];
+        let store = Arc::new(EntriesStore::open(None).unwrap());
+        let user_key_hex = "0123456789abcdef0123456789abcdef";
+        let cid_str = fixture_cid(11).to_string();
+        let pubkey = entry_pubkey_from_kek(&KEK_A);
+        let sig = sign_entry(&KEK_A, user_key_hex, &cid_str, 1, 3);
+
+        store.try_submit(
+            user_key_hex,
+            EntryRecord {
+                entry_pubkey_hex: hex::encode(pubkey),
+                cid: cid_str.clone(),
+                sequence: 1,
+                signature_hex: hex::encode(sig),
+                envelope_version: 3,
+                updated_at_unix: 1_700_000_000,
+                highest_seq_ever_accepted: 1,
+            },
+        );
+
+        let snap = build_users_enc_snapshot(Some(&store));
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap.get(user_key_hex).unwrap().cid, cid_str);
+    }
+
+    /// Defense-in-depth: a stored entry whose signature doesn't verify
+    /// against its stored pubkey is DROPPED from the published CBOR.
+    /// The publisher never serves an unverifiable record to clients
+    /// even if the underlying store has been tampered with.
+    #[test]
+    fn build_users_enc_snapshot_drops_invalid_signature() {
+        const KEK_A: [u8; 32] = [0xA5; 32];
+        let store = Arc::new(EntriesStore::open(None).unwrap());
+        let user_key_hex = "0123456789abcdef0123456789abcdef";
+        let cid_str = fixture_cid(11).to_string();
+        let pubkey = entry_pubkey_from_kek(&KEK_A);
+        // Sign with the WRONG sequence — the published record claims
+        // seq=1 but the signature was bound to seq=999. Verification
+        // must fail.
+        let bad_sig = sign_entry(&KEK_A, user_key_hex, &cid_str, 999, 3);
+
+        store.try_submit(
+            user_key_hex,
+            EntryRecord {
+                entry_pubkey_hex: hex::encode(pubkey),
+                cid: cid_str,
+                sequence: 1,
+                signature_hex: hex::encode(bad_sig),
+                envelope_version: 3,
+                updated_at_unix: 1_700_000_000,
+                highest_seq_ever_accepted: 1,
+            },
+        );
+
+        let snap = build_users_enc_snapshot(Some(&store));
+        assert!(
+            snap.is_empty(),
+            "entry with invalid signature must be dropped from publish"
+        );
+    }
+
+    /// Malformed hex in pubkey or signature is dropped — no panic.
+    #[test]
+    fn build_users_enc_snapshot_drops_malformed_hex() {
+        let store = Arc::new(EntriesStore::open(None).unwrap());
+        let user_key_hex = "0123456789abcdef0123456789abcdef";
+        store.try_submit(
+            user_key_hex,
+            EntryRecord {
+                entry_pubkey_hex: "not_hex_zzzzz".to_string(),
+                cid: fixture_cid(11).to_string(),
+                sequence: 1,
+                signature_hex: hex::encode([0u8; 64]),
+                envelope_version: 3,
+                updated_at_unix: 1_700_000_000,
+                highest_seq_ever_accepted: 1,
+            },
+        );
+
+        let snap = build_users_enc_snapshot(Some(&store));
+        assert!(snap.is_empty());
+    }
+
+    /// Mixed-tenancy test: Mode A users land in `users[]`, Mode B/C
+    /// signed entries land in `users_enc[]`. Both maps populate the
+    /// same global CBOR. This is the steady-state Phase 3 shape.
+    #[tokio::test]
+    async fn build_global_users_index_v2_with_both_modes() {
+        const KEK_BC: [u8; 32] = [0xBC; 32];
+        let mode_a_user = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mode_bc_user = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let mut users_a = BTreeMap::new();
+        users_a.insert(mode_a_user.to_string(), fixture_cid(1));
+
+        let mode_bc_cid = fixture_cid(2).to_string();
+        let pubkey = entry_pubkey_from_kek(&KEK_BC);
+        let sig = sign_entry(&KEK_BC, mode_bc_user, &mode_bc_cid, 1, 3);
+        let mut entries_enc = BTreeMap::new();
+        entries_enc.insert(
+            mode_bc_user.to_string(),
+            EncryptedUserEntry {
+                cid: mode_bc_cid,
+                seq: 1,
+                entry_pubkey_hex: hex::encode(pubkey),
+                signature_hex: hex::encode(sig),
+                envelope_version: 3,
+            },
+        );
+
+        let global =
+            build_global_users_index_v2(&users_a, &entries_enc, 1, 1_700_000_000);
+
+        // Mode A user only in `users`.
+        assert!(global.users.contains_key(mode_a_user));
+        assert!(!global.users_enc.contains_key(mode_a_user));
+
+        // Mode B/C user only in `users_enc`.
+        assert!(global.users_enc.contains_key(mode_bc_user));
+        assert!(!global.users.contains_key(mode_bc_user));
+
+        // CBOR survives a round-trip via pin + fetch.
+        let store = MemoryBlockStore::new();
+        let cid = store.put_ipld(&global).await.expect("encode");
+        let decoded: GlobalUsersIndex = store.get_ipld(&cid).await.expect("decode");
+        assert_eq!(decoded, global);
     }
 }

@@ -83,6 +83,24 @@ fn build_inner_config(
     // the full self-verify rationale.
     inner.walkable_v8_writer_enabled = config.walkable_v8_writer_enabled;
 
+    // E2E plan Phase 5 — encrypted bucketsIndex keys. Empty Vec is
+    // treated as `None` (Mode A behavior preserved). Non-empty must
+    // be exactly 32 bytes; on length mismatch we silently fall back
+    // to `None` so the SDK keeps working in legacy mode rather than
+    // failing the constructor. Callers building the FFI config are
+    // responsible for passing exactly 32-byte arrays.
+    inner.encrypted_user_buckets_index_key =
+        if config.encrypted_user_buckets_index_key.len() == 32 {
+            Some(config.encrypted_user_buckets_index_key.clone())
+        } else {
+            None
+        };
+    inner.user_entry_signing_seed = if config.user_entry_signing_seed.len() == 32 {
+        Some(config.user_entry_signing_seed.clone())
+    } else {
+        None
+    };
+
     // Phase 19 — always wire a forwarding callback into the gate so
     // Dart-side subscribers can observe health transitions. The
     // dispatcher is per-handle, so events from this client never

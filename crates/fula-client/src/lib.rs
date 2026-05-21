@@ -50,6 +50,13 @@ mod multipart;
 #[cfg(not(target_arch = "wasm32"))]
 mod registry_resolver;
 mod types;
+/// E2E plan Phase 4 — encrypted bucketsIndex writer + envelope
+/// encrypt/decrypt helpers. Native-only because it relies on the
+/// reqwest blocking HTTP client and the same dag-cbor codec the
+/// resolver uses. wasm target can add a separate browser-friendly
+/// variant later if needed.
+#[cfg(not(target_arch = "wasm32"))]
+mod users_index_writer;
 /// Phase 3.3 helper module — wasm-friendly userKey derivation
 /// extracted from `registry_resolver.rs` so the wasm-bindgen
 /// binding can expose it. Source-of-truth lives here; the
@@ -74,6 +81,11 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 
 pub use client::FulaClient;
 pub use config::Config;
+#[cfg(not(target_arch = "wasm32"))]
+pub use users_index_writer::{
+    build_payload_from_buckets_list, EncryptedBucketsIndexEnvelope, LatestEntryResponse,
+    PublishOutcome, ServerBucketEntry, UsersIndexWriter,
+};
 pub use encryption::{EncryptedClient, EncryptionConfig, DecryptedObjectInfo, FileMetadata, DirectoryListing, PinningCredentials, S3BlobBackend};
 
 /// Crash-injection atomics used by the workspace integration tests to

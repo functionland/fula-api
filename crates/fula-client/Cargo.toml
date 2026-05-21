@@ -68,6 +68,11 @@ parking_lot = { workspace = true }
 # `serde_json` for the chain-side eth_call request body is already
 # pulled in via the cross-platform top-level deps.
 serde_ipld_dagcbor = { workspace = true }
+# E2E plan Phase 4 — used by `users_index_writer` to serialize the
+# encrypted-envelope CBOR with proper byte-string (major type 2)
+# encoding for the nonce + ciphertext fields. dag-cbor requires this
+# distinction; plain `Vec<u8>` would encode as an array.
+serde_bytes = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # WASM: disable default features (no tokio), enable wasm feature
@@ -88,6 +93,11 @@ cid = { workspace = true }
 tokio = { workspace = true }
 tokio-test = "0.4"
 wiremock = { workspace = true }
+# E2E tests reproduce FxFiles' Mode B/C `canonical_kek_input` encoding
+# which applies NFC normalization to the seed string (audit fix #2,
+# 2026-05-18). Reusing the workspace's unicode-normalization crate.
+unicode-normalization = { workspace = true }
+chrono = { workspace = true }
 tempfile = { workspace = true }
 # Phase 3.3 — verifies the hardcoded `latest()` ABI selector matches
 # `Keccak256("latest()")[..4]`. Tests-only; the prod build hardcodes

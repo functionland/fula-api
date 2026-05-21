@@ -79,7 +79,7 @@ name = "encrypted_upload_test"
 path = "examples/encrypted_upload_test.rs"
 
 [workspace.package]
-version = "0.5.7"
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/functionland/fula-api"
