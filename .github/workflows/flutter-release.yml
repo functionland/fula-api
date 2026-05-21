@@ -361,10 +361,34 @@ jobs:
         working-directory: packages/fula_client
         run: flutter pub publish --force
 
-  # Publish to npm
+  # Publish to npm via Trusted Publishing (OIDC, no long-lived token).
+  #
+  # Configured against npm's trusted-publisher entry on the
+  # @functionland/fula-client package (npmjs.com → package settings →
+  # Publishing → Trusted Publishers). The matching parameters are:
+  #   * Organization or username: functionland
+  #   * Repository:               fula-api
+  #   * Workflow filename:        flutter-release.yml
+  #   * Environment name:         NPM_TOKEN   (must equal `environment:` below)
+  #
+  # The `id-token: write` permission lets this job mint a GitHub-issued
+  # OIDC token; npm validates it against the trusted-publisher rule and
+  # issues a one-shot publish credential. There is no NPM_TOKEN secret
+  # to rotate; the May 2026 "Mini Shai-Hulud" rotation that broke the
+  # previous run cannot affect this path.
   publish-npm:
     needs: [build-wasm]
     runs-on: ubuntu-latest
+    # MUST match the Environment name configured in the npm trusted-
+    # publisher entry. The npm side stores it as a string compare; any
+    # drift here re-introduces the 404-from-PUT we just fixed. Also
+    # requires a GitHub Environment named `NPM_TOKEN` to exist under
+    # repo Settings → Environments (create it without protection rules
+    # — the OIDC binding is the security control).
+    environment: NPM_TOKEN
+    permissions:
+      id-token: write   # mint OIDC token for npm trusted publishing
+      contents: read    # default; explicit for clarity
     steps:
       - name: Download WASM package
         uses: actions/download-artifact@v4
@@ -375,8 +399,22 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # Node 22 LTS ships npm 10.9+; OIDC trusted publishing
+          # requires npm ≥ 11.5, so we explicitly install latest npm
+          # below regardless of the Node version's bundled npm.
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+          always-auth: true
+
+      - name: Install latest npm (OIDC support — needs >= 11.5)
+        run: npm install --global npm@latest
+
+      - name: Verify npm + OIDC readiness
+        run: |
+          echo "npm version: $(npm --version)"
+          echo "node version: $(node --version)"
+          # Trusted publishing needs npm ≥ 11.5. Fail fast if older.
+          npm --version | awk -F. '$1*1000 + $2 < 11005 { exit 1 }'
 
       - name: Verify package contents
         run: |
@@ -384,11 +422,13 @@ jobs:
           ls -la wasm-package/
           cat wasm-package/package.json
 
-      - name: Publish to npm
+      - name: Publish to npm (OIDC, no token)
         working-directory: wasm-package
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # npm publish detects OIDC automatically when the action env
+        # exposes ACTIONS_ID_TOKEN_REQUEST_URL + ACTIONS_ID_TOKEN_REQUEST_TOKEN,
+        # which the `id-token: write` permission above provides. No
+        # NODE_AUTH_TOKEN env var, no secrets.NPM_TOKEN reference.
+        run: npm publish --access public --provenance
 
   # Upload artifacts to GitHub Release (created automatically from tag)
   upload-release-assets:
