@@ -953,6 +953,38 @@ pub struct EncryptedClient {
     /// Write lock: migration (migrate_to_sharded). Prevents concurrent reads from
     /// seeing stale monolithic data while migration is replacing the cache entry.
     migration_locks: DashMap<String, Arc<tokio::sync::RwLock<()>>>,
+    /// Per-bucket write serialization (issues #16 + #17).
+    ///
+    /// Serializes every same-bucket write path that mutates the forest +
+    /// touches the WAL + flushes / finalize-registers:
+    ///
+    ///   * `put_object_flat`
+    ///   * `put_object_flat_deferred`
+    ///   * `flush_forest`
+    ///   * `delete_object_flat`
+    ///   * `migrate_to_sharded`
+    ///   * `migrate_bucket_to_walkable_v8` (via `_locked` + try_lock auto-trigger)
+    ///   * `put_object_encrypted_resumable` (issue #17 — chunked-resumable path)
+    ///   * `resume_upload` (issue #17 — mutex taken AFTER `UploadManifest::load`
+    ///     since the bucket name lives in the manifest)
+    ///
+    /// Closes the lost-update race in `save_sharded_hamt_forest` where the
+    /// manifest snapshot → release lock → network PUTs → reconcile-with-
+    /// stale-snapshot sequence could clobber concurrent in-memory upserts.
+    ///
+    /// Lock-ordering: this mutex is the OUTERMOST per-bucket lock. Always
+    /// acquire it BEFORE `migration_lock`, BEFORE any `forest_cache` shard
+    /// guard, BEFORE `forest_arc.write().await`. Internal `_locked` helpers
+    /// assume the caller already holds this; public entry points acquire it
+    /// once and call the `_locked` body to avoid reentrancy on this
+    /// non-reentrant `tokio::sync::Mutex`.
+    ///
+    /// Granularity: per-bucket, so different buckets continue to flush in
+    /// parallel. Cross-`EncryptedClient` races (separate processes / separate
+    /// client instances against the same bucket) are still handled by the
+    /// existing NEW-7.2 412+WAL retry path — this mutex only covers
+    /// in-process same-client concurrency.
+    bucket_write_mutex: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Optional per-bucket minimum-acceptable forest sequence (C-AUDIT-008).
     /// Populated via `set_forest_sequence_floor`. When set, a forest load whose
     /// decrypted sequence is below the floor is rejected as a replay. Opt-in —
@@ -1007,6 +1039,7 @@ impl EncryptedClient {
             forest_cache: DashMap::new(),
             pinning: None,
             migration_locks: DashMap::new(),
+            bucket_write_mutex: DashMap::new(),
             seq_floors: DashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             wal_recovered_buckets: DashMap::new(),
@@ -1020,6 +1053,20 @@ impl EncryptedClient {
         self.migration_locks
             .entry(bucket.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
+    }
+
+    /// Get or create the per-bucket write-serialization mutex (issue #16).
+    ///
+    /// Public entry points (`put_object_flat`, `put_object_flat_deferred`,
+    /// `flush_forest`, `delete_object_flat`, `migrate_to_sharded`) acquire
+    /// this BEFORE any other per-bucket lock. The mutex is `tokio::sync`
+    /// (yields executor on contention) because the holders await network
+    /// I/O for hundreds of ms during flush.
+    fn bucket_write_lock(&self, bucket: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.bucket_write_mutex
+            .entry(bucket.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
 
@@ -1041,6 +1088,7 @@ impl EncryptedClient {
             forest_cache: DashMap::new(),
             pinning: Some(pinning),
             migration_locks: DashMap::new(),
+            bucket_write_mutex: DashMap::new(),
             seq_floors: DashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             wal_recovered_buckets: DashMap::new(),
@@ -3217,15 +3265,51 @@ impl EncryptedClient {
                                         %bucket,
                                         "issue #10 auto-trigger: bucket has v7 pointers; running v7→v8 migration cascade"
                                     );
+                                    // Issue #16: gate the cascade behind a
+                                    // non-blocking acquire of the per-bucket
+                                    // write mutex. If the mutex is free, run
+                                    // the cascade under it (covers the
+                                    // snapshot/reconcile race shape in
+                                    // `save_sharded_hamt_forest`). If it's
+                                    // held by another task — or by THIS task
+                                    // via an outer write path — skip the
+                                    // cascade. The marker stays unset, so a
+                                    // subsequent master-up load retries.
+                                    // Eventually one of those attempts
+                                    // lands a free mutex and completes the
+                                    // migration.
+                                    let bucket_lock = self.bucket_write_lock(bucket);
+                                    let bucket_guard = bucket_lock.try_lock();
+                                    let _bucket_guard = match bucket_guard {
+                                        Ok(g) => g,
+                                        Err(_) => {
+                                            tracing::debug!(
+                                                %bucket,
+                                                "issue #10 auto-trigger: bucket write mutex \
+                                                 held; deferring walkable-v8 cascade to a later \
+                                                 load"
+                                            );
+                                            // Fall through to the standard "forest is sharded"
+                                            // marker return below — the v7 forest is in cache
+                                            // and fully usable; the v7→v8 migration just
+                                            // didn't run this time.
+                                            return Err(ClientError::Encryption(
+                                                fula_crypto::CryptoError::Encryption(
+                                                    "forest is sharded; use sharded API methods"
+                                                        .to_string(),
+                                                ),
+                                            ));
+                                        }
+                                    };
                                     // `Box::pin` breaks the static async-fn
                                     // call cycle (load_forest_internal →
-                                    // migrate_bucket_to_walkable_v8 →
+                                    // migrate_bucket_to_walkable_v8_locked →
                                     // ensure_forest_loaded → load_forest →
                                     // load_forest_internal). The runtime cycle
                                     // is already broken by the cache hit in
                                     // load_forest_internal's fast path, but
                                     // the compiler can't see that statically.
-                                    match Box::pin(self.migrate_bucket_to_walkable_v8(bucket)).await {
+                                    match Box::pin(self.migrate_bucket_to_walkable_v8_locked(bucket)).await {
                                         Ok(file_count) => {
                                             tracing::info!(
                                                 %bucket,
@@ -3643,7 +3727,44 @@ impl EncryptedClient {
         // `ensure_forest_loaded → recover_wal_after_load → flush_forest →
         // ensure_forest_loaded` at the type level — the `wal_recovered_buckets`
         // flag prevents actual runtime recursion.
-        Box::pin(self.flush_forest(bucket)).await
+        //
+        // Issue #16: this is called from `ensure_forest_loaded`, which may be
+        // invoked from a context that ALREADY holds the per-bucket write
+        // mutex (e.g. a `put_object_flat` triggered the very first load for
+        // this bucket) — or from a context that doesn't (a read path), in
+        // which case another concurrent writer on this client may hold it.
+        // `tokio::sync::Mutex` is non-reentrant, so we can't unconditionally
+        // re-acquire here. `try_lock` resolves both cases without deadlock:
+        //
+        //   * Mutex free → no concurrent writer is active (or any prior one
+        //     has exited). Acquire it and flush the replayed entries to the
+        //     server. Typical cold-start path when a read
+        //     (`list_directory`, `get_object_flat`) triggers the very first
+        //     `ensure_forest_loaded` for the bucket.
+        //   * Mutex held → some writer (this task via an outer write path,
+        //     or another task) owns it. We've already merged the WAL
+        //     entries into the in-memory forest via `replay_wal_entries`
+        //     above. Skip the redundant flush; the WAL stays on disk and
+        //     persists on the NEXT successful flush for this bucket
+        //     (whether that's the current holder's flush or a later one).
+        //     No data loss — the WAL is durable until the flush succeeds.
+        //
+        // Either way replayed entries do not get lost — the WAL acts as the
+        // recovery substrate until a flush successfully clears it.
+        let lock = self.bucket_write_lock(bucket);
+        let result = match lock.try_lock() {
+            Ok(_guard) => Box::pin(self.flush_forest_locked(bucket)).await,
+            Err(_) => {
+                tracing::debug!(
+                    %bucket,
+                    "WAL recovery: bucket mutex held by a writer; replayed \
+                     entries are in-memory and durable in the WAL until the \
+                     next successful flush clears them"
+                );
+                Ok(())
+            }
+        };
+        result
     }
 
     /// Check whether the forest has an entry for `storage_key` that was
@@ -4833,6 +4954,38 @@ impl EncryptedClient {
     ///
     /// The number of files re-upserted (= `list_all_files().len()`).
     pub async fn migrate_bucket_to_walkable_v8(&self, bucket: &str) -> Result<usize> {
+        // Issue #16: acquire the bucket write mutex around the cascade
+        // when called from the public entry point, so concurrent puts
+        // can't race the cascade's `save_sharded_hamt_forest` snapshot
+        // + reconcile. Lock-ordering: bucket_write_mutex → migration_lock
+        // → forest_cache → forest_arc.write().
+        let lock = self.bucket_write_lock(bucket);
+        let _guard = lock.lock().await;
+        self.migrate_bucket_to_walkable_v8_locked(bucket).await
+    }
+
+    /// Mutex-already-held variant of `migrate_bucket_to_walkable_v8`.
+    ///
+    /// Internal entry used by `load_forest_internal`'s walkable-v8 auto-
+    /// trigger. That call site already runs underneath a caller's
+    /// bucket_write_mutex when invoked from a write path (e.g.,
+    /// `put_object_flat` → `ensure_forest_loaded` → cache-miss → trigger).
+    /// `tokio::sync::Mutex` is non-reentrant, so the trigger uses
+    /// `try_lock` to gate the cascade:
+    ///
+    ///   * `try_lock` succeeds → no concurrent writer; safe to run the
+    ///     cascade under the just-acquired mutex.
+    ///   * `try_lock` fails → mutex held (either by this task's outer
+    ///     write call, or by another task's concurrent write). Skip the
+    ///     cascade entirely. The marker stays unset so the next master-up
+    ///     load retries the migration — eventually one of the load
+    ///     attempts will see a free mutex and complete the cascade. The
+    ///     bucket remains fully readable/writable in v7 form in the
+    ///     meantime.
+    pub(crate) async fn migrate_bucket_to_walkable_v8_locked(
+        &self,
+        bucket: &str,
+    ) -> Result<usize> {
         if !self.inner.config().walkable_v8_writer_enabled {
             return Err(ClientError::Config(
                 "migrate_bucket_to_walkable_v8 requires walkable_v8_writer_enabled = true; \
@@ -5428,7 +5581,17 @@ impl EncryptedClient {
     ///
     /// **Idempotency.** If the bucket is already v7 when this method is called,
     /// returns `Ok(MigrationCompleted { duration_ms: 0, .. })`.
+    ///
+    /// **Issue #16:** acquires the per-bucket write mutex around the entire
+    /// migration. Otherwise a concurrent `put_object_flat` could complete its
+    /// own flush + WAL clear between the migration's `replay_wal_entries` and
+    /// its `wal::clear`, losing the put's WAL entry. Serializing migration
+    /// against puts means a put waiting on the mutex sees the migrated v7
+    /// forest when it eventually acquires.
     pub async fn migrate_to_sharded(&self, bucket: &str) -> Result<ForestEvent> {
+        let lock = self.bucket_write_lock(bucket);
+        let _guard = lock.lock().await;
+
         // Try to load as monolithic v1. If the forest is already sharded, the
         // internal load returns a "forest is sharded" error — treat that as
         // "already migrated" for idempotency.
@@ -6033,6 +6196,12 @@ impl EncryptedClient {
     ///
     /// This automatically updates AND SAVES the forest index after each file.
     /// For bulk uploads, use `put_object_flat_deferred` + `flush_forest` instead.
+    ///
+    /// Acquires the per-bucket write mutex (issue #16) and holds it across
+    /// the deferred upsert + flush so concurrent same-bucket calls can't
+    /// race on the manifest snapshot/reconcile flow in
+    /// `save_sharded_hamt_forest`. Different buckets continue to flush in
+    /// parallel.
     pub async fn put_object_flat(
         &self,
         bucket: &str,
@@ -6040,16 +6209,27 @@ impl EncryptedClient {
         data: impl Into<Bytes>,
         content_type: Option<&str>,
     ) -> Result<PutObjectResult> {
-        let result = self.put_object_flat_deferred(bucket, key, data, content_type).await?;
-        self.flush_forest(bucket).await?;
+        let lock = self.bucket_write_lock(bucket);
+        let _guard = lock.lock().await;
+        let result = self
+            .put_object_flat_deferred_locked(bucket, key, data, content_type)
+            .await?;
+        self.flush_forest_locked(bucket).await?;
         Ok(result)
     }
 
     /// Put an encrypted object using FlatNamespace mode WITHOUT saving forest
-    /// 
+    ///
     /// Use this for bulk uploads. Call `flush_forest` after uploading all files
     /// to persist the forest index. This is much more efficient for many files.
-    /// 
+    ///
+    /// Acquires the per-bucket write mutex (issue #16). The mutex covers the
+    /// in-memory upsert AND the WAL `Insert` append at the end of this
+    /// function — without it, a concurrent flush from another writer could
+    /// clear the WAL out from under us and clobber the in-memory mutation
+    /// via `reconcile_flush`. The mutex is brief (no network I/O in this
+    /// function) so single-threaded bulk-upload throughput is unaffected.
+    ///
     /// # Example
     /// ```ignore
     /// // Upload 100 files efficiently
@@ -6060,6 +6240,26 @@ impl EncryptedClient {
     /// client.flush_forest(bucket).await?;
     /// ```
     pub async fn put_object_flat_deferred(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        content_type: Option<&str>,
+    ) -> Result<PutObjectResult> {
+        let lock = self.bucket_write_lock(bucket);
+        let _guard = lock.lock().await;
+        self.put_object_flat_deferred_locked(bucket, key, data, content_type)
+            .await
+    }
+
+    /// Mutex-already-held variant of `put_object_flat_deferred`. Public
+    /// callers must use `put_object_flat_deferred`; this internal entry
+    /// point exists so `put_object_flat` (and `delete_object_flat`,
+    /// `migrate_to_sharded` commit paths) can compose multiple
+    /// forest-write steps under a single acquisition of the per-bucket
+    /// mutex without deadlocking on `tokio::sync::Mutex`'s
+    /// non-reentrancy.
+    pub(crate) async fn put_object_flat_deferred_locked(
         &self,
         bucket: &str,
         key: &str,
@@ -6646,6 +6846,54 @@ impl EncryptedClient {
         content_type: Option<&str>,
         manifest_path: &std::path::Path,
     ) -> Result<PutObjectResult> {
+        // Existing non-cancellable variant — delegates to the
+        // cancellable variant with `cancel = None`. Keeps backward
+        // compat for direct fula-client consumers that don't need
+        // cooperative cancellation (issue #18).
+        self.put_object_encrypted_resumable_with_cancel(
+            bucket,
+            key,
+            data,
+            content_type,
+            manifest_path,
+            None,
+        )
+        .await
+    }
+
+    /// Resumable encrypted upload with cooperative cancellation (issue #18).
+    ///
+    /// `cancel` is checked inside each chunk's spawned task BEFORE the
+    /// chunk's PUT. When the caller flips the flag:
+    ///   * Tasks already past the check finish their PUTs (up to
+    ///     `MAX_CONCURRENT_CHUNK_UPLOADS` concurrent — currently 16).
+    ///   * All later tasks short-circuit with `ClientError::Cancelled`.
+    ///   * The manifest on disk records exactly the chunks whose PUT
+    ///     completed, so a subsequent `resume_upload` (or
+    ///     `resume_upload_with_cancel`) picks up cleanly from there.
+    /// Pass `None` for non-cancellable behaviour identical to
+    /// `put_object_encrypted_resumable`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn put_object_encrypted_resumable_with_cancel(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        content_type: Option<&str>,
+        manifest_path: &std::path::Path,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<PutObjectResult> {
+        // Issue #16 extension: serialize the resumable write path against
+        // other same-bucket writers (`put_object_flat`, `flush_forest`,
+        // `delete_object_flat`, `migrate_to_sharded`,
+        // `migrate_bucket_to_walkable_v8`, `resume_upload`). Without this
+        // the chunked upload + manifest save + final forest-register step
+        // could interleave with a concurrent `flush_forest` whose
+        // reconcile clobbers our in-memory entries (same race shape as
+        // #16 in the non-resumable path).
+        let lock = self.bucket_write_lock(bucket);
+        let _guard = lock.lock().await;
+
         let data = data.into();
         let original_size = data.len() as u64;
 
@@ -6769,10 +7017,32 @@ impl EncryptedClient {
                 None
             };
 
+            // Issue #18: clone the cancel flag for this spawned task so
+            // each chunk's PUT can short-circuit cooperatively.
+            let cancel_for_task = cancel.clone();
+
             let handle = tokio::spawn(async move {
+                // Issue #18: check BEFORE acquiring the permit so cancelled
+                // chunks don't even hold a concurrency slot. Tasks already
+                // past this check (up to MAX_CONCURRENT_CHUNK_UPLOADS = 16)
+                // complete their PUTs; later tasks short-circuit. Manifest
+                // saves below only mark `uploaded = true` on chunks whose
+                // PUT actually completed, so resume picks up correctly.
+                if let Some(ref c) = cancel_for_task {
+                    if c.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(ClientError::Cancelled);
+                    }
+                }
                 let _permit = sem.acquire().await.map_err(|e|
                     ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
                 )?;
+                // Re-check after acquiring the permit — a long wait for
+                // the semaphore could span a cancel trigger.
+                if let Some(ref c) = cancel_for_task {
+                    if c.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(ClientError::Cancelled);
+                    }
+                }
                 let put_result = if let Some(ref pin) = pinning {
                     client.put_object_with_metadata_and_pinning(
                         &bucket_owned, &chunk_key, chunk.ciphertext,
@@ -7118,7 +7388,68 @@ impl EncryptedClient {
         manifest_path: &std::path::Path,
         data: &[u8],
     ) -> Result<PutObjectResult> {
-        let mut manifest = UploadManifest::load(manifest_path)?;
+        // Existing non-cancellable variant — delegates to the
+        // cancellable variant with `cancel = None`. Issue #18.
+        self.resume_upload_with_cancel(manifest_path, data, None).await
+    }
+
+    /// Resume a chunked upload from a manifest with cooperative
+    /// cancellation (issue #18).
+    ///
+    /// Semantics mirror `put_object_encrypted_resumable_with_cancel`:
+    ///   * `cancel` is checked at the start of each spawned chunk-PUT
+    ///     task (and again after permit acquisition).
+    ///   * Tasks already past the check finish their PUTs.
+    ///   * Later tasks short-circuit with `ClientError::Cancelled`.
+    ///   * The manifest stays on disk (existing resumable behavior).
+    /// Pass `None` for non-cancellable behaviour identical to
+    /// `resume_upload`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn resume_upload_with_cancel(
+        &self,
+        manifest_path: &std::path::Path,
+        data: &[u8],
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<PutObjectResult> {
+        // Issue #16 + #17: acquire the per-bucket write mutex AFTER an
+        // initial load to identify the bucket (the name lives in the
+        // manifest, so we can't lock at function entry like other write
+        // paths). Then RELOAD the manifest under the lock — a concurrent
+        // caller may have finalized + deleted the manifest between our
+        // initial load and our lock acquisition, and we must observe
+        // their work rather than re-uploading from our stale copy.
+        let manifest_for_bucket = UploadManifest::load(manifest_path)?;
+        let lock = self.bucket_write_lock(&manifest_for_bucket.bucket);
+        let _guard = lock.lock().await;
+        // Concurrent caller may have deleted the manifest after we
+        // observed the bucket name. Surface that cleanly as a typed
+        // error rather than re-uploading from stale state.
+        let mut manifest = UploadManifest::load(manifest_path).map_err(|e| {
+            // Preserve the original SDK error shape; the typical case is
+            // ClientError::IO/Encryption with "manifest not found" or
+            // similar.
+            tracing::debug!(
+                bucket = %manifest_for_bucket.bucket,
+                error = %e,
+                "resume_upload: manifest disappeared between bucket-name read and lock \
+                 acquisition (a concurrent resume on the same manifest likely finalized it)"
+            );
+            e
+        })?;
+        // Defensive: manifests are SDK-created and not meant to be
+        // externally rewritten, but if the file on disk was swapped for a
+        // manifest pointing at a DIFFERENT bucket between our two loads,
+        // we'd be holding the wrong bucket's mutex. Reject the resume
+        // rather than process under the wrong lock.
+        if manifest.bucket != manifest_for_bucket.bucket {
+            return Err(ClientError::Encryption(
+                fula_crypto::CryptoError::Encryption(format!(
+                    "resume_upload: manifest bucket changed between loads \
+                     ({} → {}); refusing to process under the wrong bucket lock",
+                    manifest_for_bucket.bucket, manifest.bucket,
+                )),
+            ));
+        }
 
         // #82: parse index metadata once for use across paths.
         // The wrapped_key + private_meta decrypt happen LATER (post
@@ -7249,10 +7580,27 @@ impl EncryptedClient {
                 .with_content_type("application/octet-stream")
                 .with_metadata("x-fula-chunk-index", &chunk_index.to_string());
 
+            // Issue #18: clone the cancel flag for this spawned task so
+            // each chunk's PUT can short-circuit cooperatively.
+            let cancel_for_task = cancel.clone();
+
             let handle = tokio::spawn(async move {
+                // Issue #18: check BEFORE acquiring the permit so cancelled
+                // chunks don't even hold a concurrency slot. Same semantics
+                // as the put_object_encrypted_resumable_with_cancel loop.
+                if let Some(ref c) = cancel_for_task {
+                    if c.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(ClientError::Cancelled);
+                    }
+                }
                 let _permit = sem.acquire().await.map_err(|e|
                     ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
                 )?;
+                if let Some(ref c) = cancel_for_task {
+                    if c.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(ClientError::Cancelled);
+                    }
+                }
                 let put_result = if let Some(ref pin) = pinning {
                     client.put_object_with_metadata_and_pinning(
                         &bucket, &chunk_key, ciphertext_bytes,
@@ -7665,7 +8013,24 @@ impl EncryptedClient {
     /// the flush up to `MAX_FLUSH_RETRIES` times. If all retries lose the
     /// race, surfaces `ClientError::ConcurrentModificationExhausted` with the
     /// WAL path so the caller can inspect / recover pending work.
+    ///
+    /// Acquires the per-bucket write mutex (issue #16) and holds it across
+    /// the retry loop. The mutex prevents same-`EncryptedClient` concurrent
+    /// flushes from clobbering each other's in-memory state via
+    /// `save_sharded_hamt_forest`'s snapshot/reconcile flow. Cross-client
+    /// 412 races are still handled by the existing WAL-replay retry path.
     pub async fn flush_forest(&self, bucket: &str) -> Result<()> {
+        let lock = self.bucket_write_lock(bucket);
+        let _guard = lock.lock().await;
+        self.flush_forest_locked(bucket).await
+    }
+
+    /// Mutex-already-held variant of `flush_forest`. Internal entry point
+    /// used by `put_object_flat`, `delete_object_flat`, and the migration
+    /// commit paths so they can compose deferred-upsert + flush under one
+    /// mutex acquisition without deadlocking on `tokio::sync::Mutex`'s
+    /// non-reentrancy.
+    pub(crate) async fn flush_forest_locked(&self, bucket: &str) -> Result<()> {
         #[cfg(target_arch = "wasm32")]
         {
             // On WASM we have no WAL / no file state, so fall back to the old
@@ -8572,7 +8937,24 @@ impl EncryptedClient {
     ///
     /// Removes from storage and updates forest index.
     /// For chunked files, also deletes all chunk objects.
+    ///
+    /// Acquires the per-bucket write mutex (issue #16) for the same reason
+    /// as `put_object_flat`: the function mutates the forest, appends WAL,
+    /// and flushes. Without serialization a concurrent put could clobber
+    /// the in-memory remove or the WAL entry via `save_sharded_hamt_forest`'s
+    /// snapshot/reconcile flow.
     pub async fn delete_object_flat(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<()> {
+        let lock = self.bucket_write_lock(bucket);
+        let _guard = lock.lock().await;
+        self.delete_object_flat_locked(bucket, key).await
+    }
+
+    /// Mutex-already-held variant of `delete_object_flat`.
+    pub(crate) async fn delete_object_flat_locked(
         &self,
         bucket: &str,
         key: &str,
@@ -8622,7 +9004,10 @@ impl EncryptedClient {
                 }
             }
 
-            self.flush_forest(bucket).await?;
+            // Caller (`delete_object_flat`) already holds the per-bucket
+            // write mutex; use the locked variant to avoid reentrancy on
+            // the non-reentrant `tokio::sync::Mutex`.
+            self.flush_forest_locked(bucket).await?;
 
             if let Some(n) = num_chunks {
                 self.delete_chunk_objects(bucket, &storage_key, n).await;
@@ -8673,7 +9058,10 @@ impl EncryptedClient {
                 index_etag: prior_etag,
                 last_sequence: prior_seq,
             });
-            self.flush_forest(bucket).await?;
+            // Caller (`delete_object_flat`) already holds the per-bucket
+            // write mutex; use the locked variant (same reasoning as the
+            // v7 branch above).
+            self.flush_forest_locked(bucket).await?;
 
             // Delete chunk objects if this was a chunked file (best-effort)
             if let Some(n) = num_chunks {

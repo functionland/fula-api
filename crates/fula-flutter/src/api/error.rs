@@ -220,6 +220,17 @@ impl From<fula_client::ClientError> for FulaError {
                  of {}; increase multipart_chunk_size to at least {} bytes",
                 computed_parts, max, suggested_chunk_size
             )),
+            // Issue #18 — cooperative cancellation from the chunked
+            // resumable path. Mapped to UploadFailed for now to keep the
+            // FRB binding surface small; the message starts with
+            // "cancelled by caller" so Dart-side error handlers can
+            // pattern-match by substring without a new variant. If FxFiles
+            // later needs a typed match (e.g., to distinguish "user cancel"
+            // from "network upload failed" in UI flows), promote to a new
+            // FulaError::Cancelled variant.
+            ClientError::Cancelled => FulaError::UploadFailed(
+                "upload cancelled by caller".to_string(),
+            ),
         }
     }
 }

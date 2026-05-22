@@ -88,6 +88,20 @@ pub use forest::{
     put_flat_from_path,
     put_flat_from_path_deferred,
     get_file_size,
+    // Resumable variants (issue #17): write a manifest mid-upload; on
+    // failure the manifest stays on disk and `resume_flat_upload_from_path`
+    // picks up where the previous attempt left off.
+    put_flat_resumable_from_path,
+    resume_flat_upload_from_path,
+    // Cancellation token + cancellable resumable variants (issue #18).
+    // Cooperative cancel: chunks already in flight finish, no NEW
+    // chunks start; manifest survives so the caller can resume later.
+    CancelHandle,
+    create_cancel_handle,
+    cancel_handle_trigger,
+    cancel_handle_is_cancelled,
+    put_flat_resumable_from_path_cancellable,
+    resume_flat_upload_from_path_cancellable,
 };
 
 // Re-export sharing functions

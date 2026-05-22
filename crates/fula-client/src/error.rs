@@ -86,6 +86,20 @@ pub enum ClientError {
         wal_path: String,
     },
 
+    /// Upload cancelled cooperatively by the caller (issue #18).
+    ///
+    /// Raised by chunked-resumable upload paths when the caller triggers
+    /// the `Arc<AtomicBool>` cancel flag passed to
+    /// `put_object_encrypted_resumable_with_cancel` /
+    /// `resume_upload_with_cancel`. Cooperative semantics: chunks already
+    /// in flight (up to `MAX_CONCURRENT_CHUNK_UPLOADS`) complete their
+    /// PUTs before the error propagates; no NEW chunks start after the
+    /// cancel is observed. The manifest stays on disk so the caller can
+    /// resume later (file unchanged → resume picks up from the not-
+    /// cancelled chunks) or explicitly `abort_upload` to clean up.
+    #[error("upload cancelled by caller")]
+    Cancelled,
+
     /// Another rotation is already running against the same journal path.
     ///
     /// `rotate_bucket_with_journal` acquires an exclusive OS file lock on the
@@ -280,6 +294,16 @@ impl ClientError {
     pub fn is_access_denied(&self) -> bool {
         matches!(self, Self::AccessDenied(_))
             || matches!(self, Self::S3Error { code, .. } if code == "AccessDenied")
+    }
+
+    /// Check if this is a cancelled-by-caller error (issue #18).
+    ///
+    /// Used by chunked-resumable wrappers to distinguish caller-initiated
+    /// cancel from genuine I/O failures, so the cancel path can preserve
+    /// the manifest + already-uploaded chunks while error paths still
+    /// clean up.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
     }
 
     /// Check if this is a concurrent-modification / precondition-failed error.
