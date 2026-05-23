@@ -79,11 +79,11 @@ name = "encrypted_upload_test"
 path = "examples/encrypted_upload_test.rs"
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/functionland/fula-api"
-authors = ["Functionland <contact@functionland.com>"]
+authors = ["Functionland <hi@fx.land>"]
 rust-version = "1.83"
 
 [workspace.dependencies]
