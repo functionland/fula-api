@@ -235,56 +235,36 @@ async fn test_resume_bridge_shape_smoke() {
         "manifest must persist after a mid-upload failure"
     );
 
-    // Bring up a fresh gateway at the same endpoint? Can't easily —
-    // the listener was on a random port. Spin up a NEW gateway and
-    // build a fresh client pointing at it. Same secret key so the
-    // resume sees the same key derivation.
-    let (endpoint_resumed, _server2) = spawn_gateway().await;
-    let resumed_client = create_encrypted_client(
-        flutter_config(&endpoint_resumed),
-        enc_config("resume"),
-    )
-    .expect("create encrypted client (resume)");
-    enc_create_bucket(&resumed_client, bucket.clone())
-        .await
-        .expect("re-create bucket on the new gateway");
-
-    let resume_result = resume_flat_upload_from_path(
-        &resumed_client,
-        manifest_path.clone(),
-        file_path.clone(),
-    )
-    .await;
-
-    // The resume against a FRESH server is best-effort: some uploaded
-    // chunks landed on the first gateway and are gone; the SDK should
-    // re-upload them transparently. Either Ok (full resume) or a
-    // graceful Err (specific class) is acceptable for the bridge
-    // contract — what we're proving here is the BRIDGE SHAPE works:
-    // it forwards the manifest path and file bytes, gets a result
-    // back, and the result is not a panic / type error.
-    match resume_result {
-        Ok(_) => {
-            // Best case: SDK re-uploaded the lost chunks and completed.
-            assert!(
-                !std::path::Path::new(&manifest_path).exists(),
-                "manifest must be deleted after successful resume"
-            );
-            let readback = get_flat(&resumed_client, bucket, key)
-                .await
-                .expect("read back");
-            assert_eq!(readback, payload, "resumed content must match original");
-        }
-        Err(e) => {
-            // Acceptable fallback: the resume legitimately couldn't
-            // recover (chunks from the dead gateway aren't on the new
-            // one). The bridge SHAPE is still proven by the typed
-            // error propagating cleanly.
-            eprintln!(
-                "[note] resume against fresh gateway returned Err (expected for cross-gateway): {e}"
-            );
-        }
-    }
+    // SHAPE smoke (per the test name) — we've already proven the bridge's
+    // contract under mid-upload failure: the call errored, the manifest
+    // persists, the caller has the state needed to resume. That IS the
+    // value of this test.
+    //
+    // Driving the resume against a FRESH gateway from here was the source
+    // of issue #22's CI flakiness:
+    //
+    //   * The SDK's `resume_upload` trusts `manifest.chunks[i].uploaded`
+    //     — chunks marked uploaded against gateway 1 are NOT re-PUT.
+    //   * Gateway 2 has none of those chunks.
+    //   * Resume writes the final index pointing at chunks that exist
+    //     only on gateway 1 (now dead) — returns Ok.
+    //   * A subsequent readback against gateway 2 fails because the
+    //     chunks aren't there.
+    //   * Whether the SDK returns Ok or Err depends on how many chunks
+    //     landed before the abort fired — flaky timing.
+    //
+    // The real-world contract is "resume on the SAME backend the upload
+    // started on." That's covered deterministically by
+    // `v3_cancellable_upload_bridge_tests::test_cancel_mid_upload_stops_further_chunks`,
+    // which uses issue #18's CancelHandle to interrupt the upload
+    // mid-flight without killing the gateway — same backend across
+    // abort+resume, chunks are still on the backend, round-trip readback
+    // is deterministic. That test already covers what the cross-gateway
+    // follow-up here was trying (and failing) to test.
+    //
+    // `key` was only consumed by the discarded readback; bind it to `_`
+    // so removing the readback doesn't leave a dead-code warning.
+    let _ = key;
 }
 
 // ════════════════════════════════════════════════════════════════════════
