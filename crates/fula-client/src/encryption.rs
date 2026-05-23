@@ -7160,9 +7160,61 @@ impl EncryptedClient {
         total_size: u64,
         content_type: Option<&str>,
     ) -> Result<PutObjectResult> {
+        // Existing non-cancellable variant — delegates to the
+        // cancellable variant with `cancel = None`. Issue #19.
+        self.put_object_encrypted_streaming_with_cancel(
+            bucket,
+            key,
+            reader,
+            total_size,
+            content_type,
+            None,
+        )
+        .await
+    }
+
+    /// Streaming encrypted upload with cooperative cancellation (issue #19).
+    ///
+    /// Mirror of `put_object_encrypted_resumable_with_cancel` for the
+    /// AsyncRead-based streaming path. Same two-check pattern inside
+    /// each chunk's spawned task — before semaphore acquire AND after.
+    ///
+    /// **Cleanup semantics** differ from the resumable path: streaming
+    /// has NO MANIFEST, so cancel mid-upload throws partial work away
+    /// (existing chunk-cleanup-on-error branch runs unchanged). There's
+    /// nothing to resume from. For uploads the caller may want to
+    /// resume, use [`put_object_encrypted_resumable_with_cancel`] instead.
+    ///
+    /// **Cancel during encoding** (the `AsyncStreamingEncoder` consuming
+    /// `reader`): only observed at the next async boundary. The pre-
+    /// spawn-loop check catches cancels that fired before encoding
+    /// started; the per-chunk spawn checks catch cancels during PUT
+    /// scheduling. Cancels during encoding (e.g. mid-read of a slow
+    /// AsyncRead) propagate at the next `.await` boundary inside the
+    /// encoder.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn put_object_encrypted_streaming_with_cancel<R: tokio::io::AsyncRead + Unpin + Send>(
+        &self,
+        bucket: &str,
+        key: &str,
+        reader: R,
+        total_size: u64,
+        content_type: Option<&str>,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<PutObjectResult> {
         // #82: same precondition as `put_object_encrypted_resumable`
         // — surface forest-load failure before any chunk PUT.
         self.ensure_forest_loaded(bucket).await?;
+
+        // Issue #19: early-out if cancel fired before the upload even
+        // started. Saves a forest-load round-trip when the user cancels
+        // immediately after queuing, and gives a fast path for tests
+        // that pre-trigger the cancel flag.
+        if let Some(ref c) = cancel {
+            if c.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(ClientError::Cancelled);
+            }
+        }
 
         // Generate a DEK for this object
         let dek = self.encryption.key_manager.generate_dek();
@@ -7237,10 +7289,30 @@ impl EncryptedClient {
                 None
             };
 
+            // Issue #19: clone the cancel flag for this spawned task.
+            // Same two-check pattern as the resumable spawn loops in
+            // put_object_encrypted_resumable_with_cancel /
+            // resume_upload_with_cancel.
+            let cancel_for_task = cancel.clone();
+
             let handle = tokio::spawn(async move {
+                // Issue #19: check BEFORE acquiring the permit so
+                // cancelled chunks don't even hold a concurrency slot.
+                if let Some(ref c) = cancel_for_task {
+                    if c.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(ClientError::Cancelled);
+                    }
+                }
                 let _permit = sem.acquire().await.map_err(|e|
                     ClientError::Encryption(fula_crypto::CryptoError::Decryption(e.to_string()))
                 )?;
+                // Re-check after permit acquisition (long wait could
+                // span a cancel trigger).
+                if let Some(ref c) = cancel_for_task {
+                    if c.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(ClientError::Cancelled);
+                    }
+                }
                 let put_result = if let Some(ref pin) = pinning {
                     client.put_object_with_metadata_and_pinning(
                         &bucket, &chunk_key, chunk.ciphertext,

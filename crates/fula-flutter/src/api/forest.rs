@@ -447,6 +447,61 @@ pub async fn resume_flat_upload_from_path_cancellable(
     )
 }
 
+/// Discard a resumable upload's local state and best-effort delete its
+/// already-uploaded chunks on the storage backend (issue #20).
+///
+/// Use when the caller decides to give up on a cancelled or failed
+/// upload rather than resume. **Idempotent** — calling on a manifest
+/// that doesn't exist (e.g. already aborted, or SDK auto-deleted it on
+/// a prior clean completion) succeeds as a no-op. This matches Phase C
+/// "discard cancelled upload" UX semantics: pressing the button always
+/// leaves the system in a clean state, regardless of prior state.
+///
+/// **NOT a graceful stop.** This is POST-cancel cleanup. For mid-flight
+/// abort, see [`cancel_handle_trigger`] on a [`CancelHandle`] passed to
+/// the `_cancellable` variants (issue #18).
+///
+/// **Lock scope.** `client.inner.read().await` — same as the resumable
+/// bridge functions. The underlying `abort_upload` doesn't touch the
+/// encrypted forest (only the raw storage backend for chunk deletes
+/// plus the local manifest file), so B1's per-bucket write mutex is
+/// not needed here.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn abort_resumable_upload(
+    client: &EncryptedClientHandle,
+    manifest_path: String,
+) -> anyhow::Result<()> {
+    let manifest = std::path::PathBuf::from(&manifest_path);
+    // Idempotency short-circuit: missing manifest means cleanup already
+    // happened (prior abort, or SDK auto-delete on a successful clean
+    // upload). Surface as success — the caller's intent ("ensure this
+    // upload's local state is gone") is already satisfied. Other I/O
+    // errors during the abort itself (malformed manifest, permission
+    // denied, etc.) DO propagate so corruption + path bugs don't get
+    // silently swallowed.
+    if !manifest.exists() {
+        return Ok(());
+    }
+    let guard = client.inner.read().await;
+    guard
+        .abort_upload(&manifest)
+        .await
+        .with_context(|| {
+            format!("Failed to abort resumable upload for manifest {}", manifest_path)
+        })?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn abort_resumable_upload(
+    _client: &EncryptedClientHandle,
+    _manifest_path: String,
+) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "abort_resumable_upload is not supported on WASM (no filesystem manifest)"
+    )
+}
+
 /// Get the size of a file without reading it into memory
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn get_file_size(file_path: String) -> anyhow::Result<u64> {

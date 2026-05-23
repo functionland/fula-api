@@ -102,6 +102,10 @@ pub use forest::{
     cancel_handle_is_cancelled,
     put_flat_resumable_from_path_cancellable,
     resume_flat_upload_from_path_cancellable,
+    // Post-cancel cleanup (issue #20): discards a resumable upload's
+    // local manifest + best-effort deletes its already-uploaded chunks.
+    // Idempotent — missing manifest is a no-op.
+    abort_resumable_upload,
 };
 
 // Re-export sharing functions

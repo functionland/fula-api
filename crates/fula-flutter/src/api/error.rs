@@ -123,6 +123,15 @@ pub enum FulaError {
     /// Internal error
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// Upload cancelled cooperatively by the caller via a CancelHandle
+    /// trigger (issue #18). Display string is intentionally preserved
+    /// at `"upload cancelled by caller"` so any Dart code written
+    /// against the pre-#21 substring-match contract continues to work
+    /// after the variant promotion. New code should pattern-match the
+    /// typed variant directly.
+    #[error("upload cancelled by caller")]
+    Cancelled,
 }
 
 /// Result type alias for Fula operations
@@ -220,17 +229,14 @@ impl From<fula_client::ClientError> for FulaError {
                  of {}; increase multipart_chunk_size to at least {} bytes",
                 computed_parts, max, suggested_chunk_size
             )),
-            // Issue #18 — cooperative cancellation from the chunked
-            // resumable path. Mapped to UploadFailed for now to keep the
-            // FRB binding surface small; the message starts with
-            // "cancelled by caller" so Dart-side error handlers can
-            // pattern-match by substring without a new variant. If FxFiles
-            // later needs a typed match (e.g., to distinguish "user cancel"
-            // from "network upload failed" in UI flows), promote to a new
-            // FulaError::Cancelled variant.
-            ClientError::Cancelled => FulaError::UploadFailed(
-                "upload cancelled by caller".to_string(),
-            ),
+            // Issue #18 + #21 — cooperative cancellation from the chunked
+            // resumable path. The typed FulaError::Cancelled variant lets
+            // Dart callers pattern-match cleanly (user-cancel vs network-
+            // failure) without substring parsing. The variant's `#[error]`
+            // display string is intentionally preserved at "upload
+            // cancelled by caller" so any pre-#21 code that did substring
+            // matching continues to work during the transition.
+            ClientError::Cancelled => FulaError::Cancelled,
         }
     }
 }
@@ -316,6 +322,10 @@ impl FulaError {
             FulaError::SequenceRegression { .. } => "SEQUENCE_REGRESSION",
             FulaError::WireVersionUnsupported { .. } => "WIRE_VERSION_UNSUPPORTED",
             FulaError::Internal(_) => "INTERNAL",
+            // Issue #21 — typed cancellation. The category string is
+            // stable so any Dart code matching on category strings sees
+            // a clean "CANCELLED" instead of "UPLOAD_FAILED".
+            FulaError::Cancelled => "CANCELLED",
         }
     }
 
