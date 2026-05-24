@@ -7986,6 +7986,20 @@ impl EncryptedClient {
     /// registers the entry in the encrypted forest. Both
     /// `put_object_encrypted_resumable` and `resume_upload` go through
     /// here so the registration step lands in exactly one spot.
+    ///
+    /// **#23 fix**: flushes the forest to master AFTER registration
+    /// and BEFORE manifest deletion. Without the flush, the forest
+    /// upsert only lives in the in-memory cache + WAL — a fresh
+    /// client load (post app restart / storage clear / device swap)
+    /// pulls the pre-upload forest from master and the new file is
+    /// gone. This mirrors `put_object_flat`'s established
+    /// "register + flush" pattern (the non-resumable path always
+    /// flushed). The `_locked` variant is used because both callers
+    /// (`put_object_encrypted_resumable_with_cancel` and
+    /// `resume_upload_with_cancel`) already hold the per-bucket
+    /// `bucket_write_mutex` (issue #16); `flush_forest` itself
+    /// re-acquires that mutex and `tokio::sync::Mutex` is non-
+    /// reentrant — calling the public variant here would deadlock.
     #[cfg(not(target_arch = "wasm32"))]
     async fn finalize_and_register_resumed_upload(
         &self,
@@ -8002,10 +8016,15 @@ impl EncryptedClient {
             &manifest.index_metadata_json,
             private_meta,
         ).await?;
-        // Crash-safety (Reviewer B audit, #82): only delete the
-        // manifest after BOTH the index PUT and forest registration
-        // succeed. If `register_encrypted_chunked_upload_in_forest`
-        // errors above, this line is skipped and the manifest stays
+        // #23 fix: push the forest update to master. The registration
+        // step above only mutates in-memory cache + WAL; without this
+        // flush the master's bucket registry / IPNS chain never sees
+        // the new entry.
+        self.flush_forest_locked(&manifest.bucket).await?;
+        // Crash-safety (Reviewer B audit, #82; extended for #23):
+        // only delete the manifest after BOTH the index PUT, forest
+        // registration, AND the master flush succeed. If any step
+        // above errors, this line is skipped and the manifest stays
         // on disk so the caller can retry via `resume_upload`.
         let _ = std::fs::remove_file(manifest_path);
         Ok(result)

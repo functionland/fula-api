@@ -6,7 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.6.2] - 2026-05-23
-Fixed the race condition in rust tests multi gateway 
+
+### Fixed
+
+- **#23 — `uploadLargeFileResumable` now durably persists the forest to master.** Previously, the resumable chunked upload path (`put_object_encrypted_resumable_with_cancel` and `resume_upload_with_cancel`) registered the new entry only in the in-memory cache + on-disk WAL after chunks landed; the master-side flush sequence (`save_sharded_hamt_forest`/`save_monolithic_forest` → `Persisting bucket registry to IPFS` → `Bucket root CID enqueued for durable pin (W.9.6)` → IPNS update) never fired. A fresh client load — post app restart, post storage clear, fresh device — pulled the pre-upload forest and the file was missing despite the upload returning a valid etag. Symmetric with `put_object_flat`'s established "register + flush" pattern; the resumable path was added in v0.6.0 (issues #16/#17/#18) but the flush step was inadvertently omitted. Fix is one line inside `finalize_and_register_resumed_upload` (`crates/fula-client/src/encryption.rs`): call `self.flush_forest_locked(bucket)` after `register_encrypted_chunked_upload_in_forest`, before manifest deletion. Uses the `_locked` variant because both callers already hold `bucket_write_mutex` (issue #16); `flush_forest`'s public variant would deadlock on tokio's non-reentrant mutex. Manifest deletion moved after the flush so crash-safety extends to flush failure (manifest stays on disk for `resume_upload` retry).
+- Fixed a race condition in rust tests multi gateway.
+
+### Added
+
+- **Regression test `resumable_forest_persistence`** (`crates/fula-client/tests/resumable_forest_persistence.rs`) — integration test that uploads via the resumable path, drops the client entirely (including in-memory cache + on-disk WAL via separate tempdirs), creates a fresh client against the same master with no inherited state, and asserts the file appears in `list_files_from_forest` + downloads to the same bytes. Without the #23 fix this test fails at the fresh-client list assertion. Marked `#[ignore]`; opt-in via `FULA_JWT` + `FULA_S3` envvars (same convention as `offline_e2e`).
 
 ## [0.6.1] - 2026-05-09
 
