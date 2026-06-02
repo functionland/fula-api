@@ -183,10 +183,29 @@ impl ClusterClient {
             )));
         }
 
-        response
-            .json()
-            .await
-            .map_err(|e| BlockStoreError::ClusterApi(e.to_string()))
+        // ipfs-cluster streams `/peers` as newline-delimited JSON (one peer
+        // object per line), NOT a single JSON array — so `.json()` fails with
+        // "error decoding response body". Accept both shapes: try an array
+        // first, then parse line-by-line, tolerating the occasional
+        // unparseable peer so one bad entry can't kill peering/locate.
+        let text = response.text().await?;
+        if let Ok(arr) = serde_json::from_str::<Vec<ClusterPeerInfo>>(&text) {
+            return Ok(arr);
+        }
+        let mut peers = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<ClusterPeerInfo>(line) {
+                Ok(peer) => peers.push(peer),
+                Err(e) => {
+                    tracing::debug!(error = %e, "list_peers: skipping unparseable peer line")
+                }
+            }
+        }
+        Ok(peers)
     }
 
     /// Pin a CID in the cluster
@@ -466,5 +485,51 @@ mod tests {
     fn test_pin_status_default() {
         let status = PinStatus::default();
         assert_eq!(status, PinStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn list_peers_parses_ndjson_stream() {
+        use httpmock::prelude::*;
+        use serde_json::json;
+
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/id");
+                then.status(200).body("{}");
+            })
+            .await;
+
+        // ipfs-cluster `/peers` shape: one peer object per line (NDJSON), each
+        // carrying the kubo daemon under `ipfs`.
+        let line1 = json!({
+            "id": "clusterA", "addresses": [],
+            "ipfs": { "id": "kuboA", "addresses": ["/ip4/1.2.3.4/tcp/4001"] }
+        })
+        .to_string();
+        let line2 = json!({
+            "id": "clusterB", "addresses": [],
+            "ipfs": { "id": "kuboB", "addresses": ["/ip4/5.6.7.8/tcp/4001"] }
+        })
+        .to_string();
+        let ndjson = format!("{}\n{}\n", line1, line2);
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/peers");
+                then.status(200).body(ndjson.clone());
+            })
+            .await;
+
+        let client = ClusterClient::new(ClusterConfig::with_url(server.base_url()))
+            .await
+            .unwrap();
+        let peers = client.list_peers().await.unwrap();
+
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].ipfs.as_ref().unwrap().id.as_deref(), Some("kuboA"));
+        assert_eq!(
+            peers[1].ipfs.as_ref().unwrap().addresses.as_ref().unwrap()[0],
+            "/ip4/5.6.7.8/tcp/4001"
+        );
     }
 }
