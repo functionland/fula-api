@@ -4,10 +4,12 @@ use crate::config::GatewayConfig;
 use crate::multipart::MultipartManager;
 use blake3::Hasher;
 use fula_blockstore::{
-    FlexibleBlockStore, IpfsPinningBlockStore, IpfsPinningConfig, MemoryBlockStore,
+    ClusterClient, ClusterConfig, ClusterFallbackConfig, FlexibleBlockStore, IpfsBlockStore,
+    IpfsConfig, IpfsPinningBlockStore, IpfsPinningConfig, MemoryBlockStore,
 };
 use fula_core::BucketManager;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// Hash a user ID for privacy (Security audit fix A3)
@@ -85,6 +87,11 @@ impl AppState {
                 }
             }
         };
+
+        // Wrap with the cluster-aware read fallback (inside the LRU cache,
+        // around the IPFS store) when enabled. No-op for the memory store, when
+        // disabled, or when the cluster is unreachable at startup.
+        let inner = Self::maybe_wrap_cluster_fallback(inner, &config).await;
 
         // Optionally wrap in an LRU block cache
         let block_store = if config.block_cache_mb > 0 {
@@ -255,6 +262,60 @@ impl AppState {
 
         let store = IpfsPinningBlockStore::new(ipfs_config).await?;
         Ok(store)
+    }
+
+    /// Wrap the IPFS store with the cluster-aware read fallback when enabled.
+    /// Degrades to the unwrapped store (today's behavior) for the memory store,
+    /// when explicitly disabled, or when the cluster API is unreachable at
+    /// startup (the proactive-peering task may still run and recover reads).
+    async fn maybe_wrap_cluster_fallback(
+        inner: FlexibleBlockStore,
+        config: &GatewayConfig,
+    ) -> FlexibleBlockStore {
+        let enabled = config.cluster_fallback_enabled.unwrap_or_else(|| {
+            !config.use_memory_store && !config.cluster_url.trim().is_empty()
+        });
+        if !enabled || !matches!(inner, FlexibleBlockStore::IpfsPinning(_)) {
+            return inner;
+        }
+
+        // A dedicated bounded kubo handle for the fallback's offline/online/swarm
+        // calls (per-request timeouts override the client default).
+        let ipfs = match IpfsBlockStore::new_unverified(IpfsConfig::with_url(&config.ipfs_url)) {
+            Ok(handle) => handle,
+            Err(e) => {
+                warn!(error = %e, "cluster-fallback: kubo client build failed; fallback disabled");
+                return inner;
+            }
+        };
+
+        // Short-timeout cluster client; degrade if the cluster is down now.
+        let cluster_cfg = ClusterConfig {
+            timeout: Duration::from_secs(5),
+            ..ClusterConfig::with_url(&config.cluster_url)
+        };
+        let cluster = match ClusterClient::new(cluster_cfg).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    cluster_url = %config.cluster_url,
+                    "cluster-fallback: cluster unreachable at startup; fallback disabled (peering may still run)"
+                );
+                return inner;
+            }
+        };
+
+        let fb_cfg = ClusterFallbackConfig {
+            max_holders: config.cluster_fallback_max_holders.max(1),
+            ..ClusterFallbackConfig::default()
+        };
+        info!(
+            cluster_url = %config.cluster_url,
+            max_holders = config.cluster_fallback_max_holders,
+            "✓ Cluster-aware read fallback enabled"
+        );
+        inner.with_cluster_fallback(ipfs, cluster, fb_cfg)
     }
 }
 

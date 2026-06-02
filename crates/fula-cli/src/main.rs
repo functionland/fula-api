@@ -61,6 +61,14 @@ struct Args {
     /// LRU block cache size in MB (0 disables the cache)
     #[arg(long, default_value = "256", env = "FULA_BLOCK_CACHE_MB")]
     block_cache_mb: usize,
+
+    /// Disable the cluster-aware read fallback (kill-switch; exact prior behavior)
+    #[arg(long, env = "FULA_NO_CLUSTER_FALLBACK")]
+    no_cluster_fallback: bool,
+
+    /// Disable the proactive peering task (keeps the gateway kubo connected to the fleet)
+    #[arg(long, env = "FULA_NO_CLUSTER_PEERING")]
+    no_cluster_peering: bool,
 }
 
 #[tokio::main]
@@ -126,6 +134,8 @@ async fn main() -> anyhow::Result<()> {
         admin_jwt_secret: args.admin_jwt_secret,
         admin_api_enabled: args.admin_api,
         block_cache_mb: args.block_cache_mb,
+        cluster_fallback_enabled: if args.no_cluster_fallback { Some(false) } else { None },
+        cluster_peering_enabled: if args.no_cluster_peering { Some(false) } else { None },
         ..Default::default()
     };
 

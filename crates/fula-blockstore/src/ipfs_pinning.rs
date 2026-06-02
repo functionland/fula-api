@@ -8,6 +8,8 @@
 //! and any pinning service (Pinata, Web3.Storage, etc.) for persistence.
 
 use crate::{
+    cluster::ClusterClient,
+    cluster_fallback::{ClusterFallbackBlockStore, ClusterFallbackConfig},
     ipfs::{IpfsBlockStore, IpfsConfig},
     memory::{CachedBlockStore, MemoryBlockStore},
     pinning_service::{Pin, PinningServiceClient, PinningServiceConfig, PinningStatus},
@@ -503,6 +505,10 @@ pub enum FlexibleBlockStore {
     Memory(MemoryBlockStore),
     /// LRU-cached wrapper around any of the above (or further nesting)
     Cached(CachedBlockStore<Box<FlexibleBlockStore>>),
+    /// Cluster-aware read fallback wrapping the IPFS store (see
+    /// [`crate::cluster_fallback`]). Reads use the bounded/peered/locate path;
+    /// every other operation delegates to the wrapped store unchanged.
+    ClusterFallback(ClusterFallbackBlockStore),
 }
 
 impl FlexibleBlockStore {
@@ -525,6 +531,24 @@ impl FlexibleBlockStore {
         Self::Cached(CachedBlockStore::with_mb(Box::new(self), mb))
     }
 
+    /// Wrap this store with the cluster-aware read fallback. The wrapper holds
+    /// its own bounded kubo handle (`ipfs`) plus the cluster client used to
+    /// locate holders; reads take the bounded/peered/locate path while
+    /// writes/pins/deletes delegate unchanged.
+    pub fn with_cluster_fallback(
+        self,
+        ipfs: IpfsBlockStore,
+        cluster: ClusterClient,
+        cfg: ClusterFallbackConfig,
+    ) -> Self {
+        Self::ClusterFallback(ClusterFallbackBlockStore::new(
+            Box::new(self),
+            ipfs,
+            cluster,
+            cfg,
+        ))
+    }
+
     /// Check if using real IPFS or memory fallback (recursing through caches)
     pub fn is_persistent(&self) -> bool {
         match self {
@@ -537,6 +561,7 @@ impl FlexibleBlockStore {
                 // CachedBlockStore directly, so expose a helper below.
                 cached.inner_is_persistent()
             }
+            Self::ClusterFallback(store) => store.inner_is_persistent(),
         }
     }
 }
@@ -555,6 +580,7 @@ impl BlockStore for FlexibleBlockStore {
             Self::IpfsPinning(store) => store.put_block(data).await,
             Self::Memory(store) => store.put_block(data).await,
             Self::Cached(store) => store.put_block(data).await,
+            Self::ClusterFallback(store) => store.put_block(data).await,
         }
     }
 
@@ -563,6 +589,7 @@ impl BlockStore for FlexibleBlockStore {
             Self::IpfsPinning(store) => store.get_block(cid).await,
             Self::Memory(store) => store.get_block(cid).await,
             Self::Cached(store) => store.get_block(cid).await,
+            Self::ClusterFallback(store) => store.get_block(cid).await,
         }
     }
 
@@ -571,6 +598,7 @@ impl BlockStore for FlexibleBlockStore {
             Self::IpfsPinning(store) => store.has_block(cid).await,
             Self::Memory(store) => store.has_block(cid).await,
             Self::Cached(store) => store.has_block(cid).await,
+            Self::ClusterFallback(store) => store.has_block(cid).await,
         }
     }
 
@@ -579,6 +607,7 @@ impl BlockStore for FlexibleBlockStore {
             Self::IpfsPinning(store) => store.delete_block(cid).await,
             Self::Memory(store) => store.delete_block(cid).await,
             Self::Cached(store) => store.delete_block(cid).await,
+            Self::ClusterFallback(store) => store.delete_block(cid).await,
         }
     }
 
@@ -587,6 +616,7 @@ impl BlockStore for FlexibleBlockStore {
             Self::IpfsPinning(store) => store.block_size(cid).await,
             Self::Memory(store) => store.block_size(cid).await,
             Self::Cached(store) => store.block_size(cid).await,
+            Self::ClusterFallback(store) => store.block_size(cid).await,
         }
     }
 
@@ -595,6 +625,7 @@ impl BlockStore for FlexibleBlockStore {
             Self::IpfsPinning(store) => store.put_ipld(data).await,
             Self::Memory(store) => store.put_ipld(data).await,
             Self::Cached(store) => store.put_ipld(data).await,
+            Self::ClusterFallback(store) => store.put_ipld(data).await,
         }
     }
 
@@ -603,6 +634,7 @@ impl BlockStore for FlexibleBlockStore {
             Self::IpfsPinning(store) => store.get_ipld(cid).await,
             Self::Memory(store) => store.get_ipld(cid).await,
             Self::Cached(store) => store.get_ipld(cid).await,
+            Self::ClusterFallback(store) => store.get_ipld(cid).await,
         }
     }
 }
@@ -617,6 +649,7 @@ impl PinStore for FlexibleBlockStore {
                 Ok(())
             }
             Self::Cached(store) => store.inner_ref().pin(cid, name).await,
+            Self::ClusterFallback(store) => store.pin(cid, name).await,
         }
     }
 
@@ -628,6 +661,7 @@ impl PinStore for FlexibleBlockStore {
                 Ok(())
             }
             Self::Cached(store) => store.inner_ref().pin_with_token(cid, name, token).await,
+            Self::ClusterFallback(store) => store.pin_with_token(cid, name, token).await,
         }
     }
 
@@ -636,6 +670,7 @@ impl PinStore for FlexibleBlockStore {
             Self::IpfsPinning(store) => store.unpin(cid).await,
             Self::Memory(_) => Ok(()),
             Self::Cached(store) => store.inner_ref().unpin(cid).await,
+            Self::ClusterFallback(store) => store.unpin(cid).await,
         }
     }
 
@@ -644,6 +679,7 @@ impl PinStore for FlexibleBlockStore {
             Self::IpfsPinning(store) => store.is_pinned(cid).await,
             Self::Memory(_) => Ok(true), // Memory store "pins" everything
             Self::Cached(store) => store.inner_ref().is_pinned(cid).await,
+            Self::ClusterFallback(store) => store.is_pinned(cid).await,
         }
     }
 
@@ -652,6 +688,7 @@ impl PinStore for FlexibleBlockStore {
             Self::IpfsPinning(store) => store.list_pins().await,
             Self::Memory(_) => Ok(Vec::new()),
             Self::Cached(store) => store.inner_ref().list_pins().await,
+            Self::ClusterFallback(store) => store.list_pins().await,
         }
     }
 
@@ -660,6 +697,7 @@ impl PinStore for FlexibleBlockStore {
             Self::IpfsPinning(store) => store.pin_status(cid).await,
             Self::Memory(_) => Ok(crate::PinStatus::Pinned), // Memory store "pins" everything
             Self::Cached(store) => store.inner_ref().pin_status(cid).await,
+            Self::ClusterFallback(store) => store.pin_status(cid).await,
         }
     }
 }

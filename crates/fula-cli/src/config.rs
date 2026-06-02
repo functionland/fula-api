@@ -82,6 +82,30 @@ pub struct GatewayConfig {
     /// behavior. Backward-compatible default.
     #[serde(default)]
     pub entries_store_path: Option<String>,
+
+    /// Cluster-aware read fallback (see `fula_blockstore::cluster_fallback`).
+    /// `None` = auto: enabled when `cluster_url` is set and not using the
+    /// in-memory store. `Some(false)` is the kill-switch (exact prior behavior).
+    #[serde(default)]
+    pub cluster_fallback_enabled: Option<bool>,
+    /// Proactive peering task: keep the gateway kubo connected to the fleet so
+    /// bitswap stays fast. `None` = auto (same condition as the fallback).
+    #[serde(default)]
+    pub cluster_peering_enabled: Option<bool>,
+    /// How often the peering task refreshes the fleet peer list + reconnects.
+    #[serde(default = "default_cluster_peering_interval_secs")]
+    pub cluster_peering_interval_secs: u64,
+    /// Max holder peers to connect to per read miss in the fallback.
+    #[serde(default = "default_cluster_fallback_max_holders")]
+    pub cluster_fallback_max_holders: usize,
+}
+
+fn default_cluster_peering_interval_secs() -> u64 {
+    90
+}
+
+fn default_cluster_fallback_max_holders() -> usize {
+    5
 }
 
 fn default_block_cache_mb() -> usize {
@@ -122,6 +146,10 @@ impl Default for GatewayConfig {
             block_cache_mb: default_block_cache_mb(),
             pin_queue_path: Some("/var/lib/fula-gateway/pin_queue.redb".to_string()),
             entries_store_path: None,
+            cluster_fallback_enabled: None,
+            cluster_peering_enabled: None,
+            cluster_peering_interval_secs: default_cluster_peering_interval_secs(),
+            cluster_fallback_max_holders: default_cluster_fallback_max_holders(),
         }
     }
 }

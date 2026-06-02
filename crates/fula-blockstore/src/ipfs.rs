@@ -359,7 +359,7 @@ impl IpfsBlockStore {
     /// Remove a block
     pub async fn remove_block(&self, cid: &Cid) -> Result<()> {
         let url = format!("{}/api/v0/block/rm?arg={}", self.config.api_url, cid);
-        
+
         let response = self.client.post(&url).send().await?;
 
         if !response.status().is_success() {
@@ -371,6 +371,133 @@ impl IpfsBlockStore {
         }
 
         Ok(())
+    }
+
+    // ========================================================================
+    // Cluster-aware read fallback primitives
+    //
+    // These power `cluster_fallback::ClusterFallbackBlockStore`. They give the
+    // fallback layer (a) instant local-miss detection without paying the shared
+    // 30s bitswap timeout (`offline=true`), (b) per-request-bounded online
+    // fetches (explicit `.timeout(..)` overriding the client's 30s), and
+    // (c) the swarm primitives to connect/keep-connected the gateway kubo to
+    // the cluster nodes that actually hold a CID.
+    // ========================================================================
+
+    /// Construct without the startup `verify_connection` probe — for internal
+    /// reuse (e.g. the cluster-fallback layer) where the caller already holds a
+    /// verified handle to the same daemon.
+    pub fn new_unverified(config: IpfsConfig) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(config.timeout)
+            .build()
+            .map_err(|e| BlockStoreError::Connection(e.to_string()))?;
+        Ok(Self {
+            client,
+            config,
+            origins_cache: Arc::new(StdMutex::new(None)),
+        })
+    }
+
+    /// Shared bytes fetch with an explicit per-request `timeout`. When
+    /// `offline`, any non-success status OR transport failure maps to
+    /// `NotFound` — a local miss is the expected, non-exceptional outcome of an
+    /// `offline=true` probe, not an error to surface.
+    async fn fetch_bytes_bounded(
+        &self,
+        url: &str,
+        timeout: Duration,
+        cid: &Cid,
+        offline: bool,
+    ) -> Result<Bytes> {
+        let response = match self.client.post(url).timeout(timeout).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if offline {
+                    return Err(BlockStoreError::NotFound(*cid));
+                }
+                return Err(e.into());
+            }
+        };
+
+        if !response.status().is_success() {
+            if offline || response.status().as_u16() == 404 {
+                return Err(BlockStoreError::NotFound(*cid));
+            }
+            let error = response.text().await.unwrap_or_default();
+            return Err(BlockStoreError::IpfsApi(format!("Failed to get block: {}", error)));
+        }
+
+        response
+            .bytes()
+            .await
+            .map_err(|e| BlockStoreError::IpfsApi(e.to_string()))
+    }
+
+    /// Codec-aware fetch reading the LOCAL datastore only (`offline=true`):
+    /// instant hit, or instant `NotFound` on a miss — never bitswaps. Mirrors
+    /// `get_block_raw`'s codec branch (cat for dag-pb, block/get otherwise).
+    pub async fn get_block_offline(&self, cid: &Cid, timeout: Duration) -> Result<Bytes> {
+        const DAG_PB_CODEC: u64 = 0x70;
+        let url = if cid.codec() == DAG_PB_CODEC {
+            format!("{}/api/v0/cat?arg={}&offline=true", self.config.api_url, cid)
+        } else {
+            format!("{}/api/v0/block/get?arg={}&offline=true", self.config.api_url, cid)
+        };
+        self.fetch_bytes_bounded(&url, timeout, cid, true).await
+    }
+
+    /// Codec-aware online fetch (bitswap allowed) bounded by `timeout` instead
+    /// of the shared 30s client timeout.
+    pub async fn get_block_online_bounded(&self, cid: &Cid, timeout: Duration) -> Result<Bytes> {
+        const DAG_PB_CODEC: u64 = 0x70;
+        let url = if cid.codec() == DAG_PB_CODEC {
+            format!("{}/api/v0/cat?arg={}", self.config.api_url, cid)
+        } else {
+            format!("{}/api/v0/block/get?arg={}", self.config.api_url, cid)
+        };
+        self.fetch_bytes_bounded(&url, timeout, cid, false).await
+    }
+
+    /// Raw `block/get` of a single block, LOCAL only (`offline=true`), bounded.
+    /// IPLD nodes (dag-cbor) are always single blocks, so no cat traversal.
+    pub async fn get_raw_block_offline(&self, cid: &Cid, timeout: Duration) -> Result<Bytes> {
+        let url = format!("{}/api/v0/block/get?arg={}&offline=true", self.config.api_url, cid);
+        self.fetch_bytes_bounded(&url, timeout, cid, true).await
+    }
+
+    /// Raw `block/get` of a single block, online (bitswap), bounded.
+    pub async fn get_raw_block_online_bounded(&self, cid: &Cid, timeout: Duration) -> Result<Bytes> {
+        let url = format!("{}/api/v0/block/get?arg={}", self.config.api_url, cid);
+        self.fetch_bytes_bounded(&url, timeout, cid, false).await
+    }
+
+    /// Best-effort `swarm/connect` to a peer multiaddr. Never errors — returns
+    /// `true` on a 2xx, `false` on timeout / undialable / API error.
+    pub async fn swarm_connect(&self, multiaddr: &str, timeout: Duration) -> bool {
+        let url = format!(
+            "{}/api/v0/swarm/connect?arg={}",
+            self.config.api_url,
+            urlencoding::encode(multiaddr)
+        );
+        match self.client.post(&url).timeout(timeout).send().await {
+            Ok(r) => r.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
+    /// Best-effort `swarm/peering/add` — registers a peer so kubo *maintains*
+    /// and auto-reconnects the connection. Returns `true` on a 2xx.
+    pub async fn swarm_peering_add(&self, multiaddr: &str, timeout: Duration) -> bool {
+        let url = format!(
+            "{}/api/v0/swarm/peering/add?arg={}",
+            self.config.api_url,
+            urlencoding::encode(multiaddr)
+        );
+        match self.client.post(&url).timeout(timeout).send().await {
+            Ok(r) => r.status().is_success(),
+            Err(_) => false,
+        }
     }
 }
 

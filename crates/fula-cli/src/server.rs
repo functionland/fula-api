@@ -16,6 +16,10 @@ pub async fn run_server(config: GatewayConfig) -> anyhow::Result<()> {
     // lives for the lifetime of the process.
     locks::start_sweeper(state.lock_store.clone());
 
+    // Proactive peering: keep the gateway kubo connected to the fleet so
+    // bitswap serves reads fast. No-op when disabled / not configured.
+    crate::peering::spawn_if_enabled(&config);
+
     // Audit F-A5 / issue #13: spawn the multipart-upload reaper. Drops
     // abandoned in-memory upload sessions whose `last_activity_at` is
     // older than `multipart_expiry_secs`. Does NOT touch the blockstore
@@ -87,6 +91,10 @@ pub async fn run_server_with_shutdown(
     let state = Arc::new(AppState::new(config.clone()).await?);
 
     locks::start_sweeper(state.lock_store.clone());
+
+    // Proactive peering: keep the gateway kubo connected to the fleet so
+    // bitswap serves reads fast. No-op when disabled / not configured.
+    crate::peering::spawn_if_enabled(&config);
 
     // Phase 3.2 — spawn the users-index publisher loop iff the env
     // flag enabled the publisher at AppState construction time. When

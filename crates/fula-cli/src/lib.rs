@@ -39,6 +39,7 @@ pub mod error;
 pub mod handlers;
 pub mod middleware;
 pub mod multipart;
+pub mod peering;
 pub mod pin_drainer;
 pub mod pin_queue;
 pub mod pinning;
