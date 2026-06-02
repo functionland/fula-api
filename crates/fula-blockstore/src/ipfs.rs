@@ -58,12 +58,29 @@ pub struct IpfsBlockStore {
 }
 
 impl IpfsBlockStore {
+    /// Build the kubo HTTP client with idle connection pooling DISABLED.
+    ///
+    /// A pooled keep-alive connection to kubo can go stale (kubo closes it
+    /// server-side after an idle period); `reqwest`, not knowing the socket is
+    /// dead, reuses it for the next request, which then blocks waiting for a
+    /// response that never arrives — surfacing as `block/get` hanging to the
+    /// full per-request timeout. This was observed as 15s gateway read timeouts
+    /// on not-local blocks while the `ipfs` CLI and a one-shot `curl` (a fresh
+    /// connection per call) fetched the identical block from the *same* daemon
+    /// in <0.1s. Forcing a fresh connection per request
+    /// (`pool_max_idle_per_host(0)`) matches that behaviour; against a loopback
+    /// daemon the extra handshake costs microseconds.
+    fn build_client(config: &IpfsConfig) -> Result<Client> {
+        Client::builder()
+            .timeout(config.timeout)
+            .pool_max_idle_per_host(0)
+            .build()
+            .map_err(|e| BlockStoreError::Connection(e.to_string()))
+    }
+
     /// Create a new IPFS block store
     pub async fn new(config: IpfsConfig) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|e| BlockStoreError::Connection(e.to_string()))?;
+        let client = Self::build_client(&config)?;
 
         let store = Self {
             client,
@@ -388,10 +405,7 @@ impl IpfsBlockStore {
     /// reuse (e.g. the cluster-fallback layer) where the caller already holds a
     /// verified handle to the same daemon.
     pub fn new_unverified(config: IpfsConfig) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|e| BlockStoreError::Connection(e.to_string()))?;
+        let client = Self::build_client(&config)?;
         Ok(Self {
             client,
             config,
@@ -422,6 +436,12 @@ impl IpfsBlockStore {
 
         if !response.status().is_success() {
             if offline || response.status().as_u16() == 404 {
+                // Drain the error body before dropping the response so the
+                // connection is never abandoned mid-stream. Defensive now that
+                // pooling is disabled, but it keeps the miss path correct even
+                // if connection reuse is ever re-enabled (an undrained body
+                // makes a reused connection hang the next request).
+                let _ = response.bytes().await;
                 return Err(BlockStoreError::NotFound(*cid));
             }
             let error = response.text().await.unwrap_or_default();

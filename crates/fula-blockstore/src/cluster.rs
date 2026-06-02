@@ -110,7 +110,13 @@ pub struct ClusterClient {
 impl ClusterClient {
     /// Create a new cluster client
     pub async fn new(config: ClusterConfig) -> Result<Self> {
-        let builder = Client::builder().timeout(config.timeout);
+        // Disable idle connection pooling for the same reason as
+        // `IpfsBlockStore::build_client`: a stale pooled keep-alive connection
+        // to the cluster API blocks the next request until the timeout. A fresh
+        // connection per request avoids reusing a dead socket.
+        let builder = Client::builder()
+            .timeout(config.timeout)
+            .pool_max_idle_per_host(0);
 
         let client = builder
             .build()
