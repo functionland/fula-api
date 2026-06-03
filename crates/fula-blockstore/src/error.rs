@@ -13,6 +13,15 @@ pub enum BlockStoreError {
     #[error("block not found: {0}")]
     NotFound(Cid),
 
+    /// Block could not be retrieved after exhausting the bounded fetch path
+    /// while the local daemon was responsive — i.e. the data is genuinely
+    /// unavailable (lost / no reachable holder), NOT an infrastructure
+    /// failure. Distinct from `Timeout`/`Connection` so the gateway can map
+    /// it to HTTP 410 (a clean "I'm up, I just don't have this") instead of a
+    /// 5xx that would make the client SDK treat the whole master as down.
+    #[error("block unavailable (exhausted bounded fetch): {0}")]
+    Unavailable(Cid),
+
     /// Block already exists
     #[error("block already exists: {0}")]
     AlreadyExists(Cid),

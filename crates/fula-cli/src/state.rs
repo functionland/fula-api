@@ -59,6 +59,12 @@ pub struct AppState {
     /// `users[]` plaintext publisher path behave byte-identically
     /// to pre-Phase-2 deploys.
     pub entries_store: Option<Arc<crate::entries_store::EntriesStore>>,
+    /// Local-retain-until-replicated GC-safety context. `Some` when the feature
+    /// is enabled (`local_retain_path` + cluster configured, not memory store).
+    /// The PUT handler uses it to pin each block locally + enqueue; the verifier
+    /// task (spawned in `server::run_server`) drops local pins once the cluster
+    /// confirms replication. `None` = feature off (tests / dev / cluster down).
+    pub local_retain: Option<Arc<crate::local_retain::LocalRetainContext>>,
 }
 
 impl AppState {
@@ -236,6 +242,10 @@ impl AppState {
             }
         };
 
+        // Local-retain-until-replicated GC-safety. Degrades to `None` (feature
+        // off) on any setup failure so it never blocks startup.
+        let local_retain = Self::maybe_build_local_retain(&config).await;
+
         Ok(Self {
             config,
             block_store,
@@ -245,6 +255,7 @@ impl AppState {
             users_index_publisher,
             pin_queue,
             entries_store,
+            local_retain,
         })
     }
 
@@ -316,6 +327,70 @@ impl AppState {
             "✓ Cluster-aware read fallback enabled"
         );
         inner.with_cluster_fallback(ipfs, cluster, fb_cfg)
+    }
+
+    /// Build the local-retain-until-replicated context when enabled. Degrades
+    /// to `None` (feature off) on any setup failure so it never blocks startup.
+    async fn maybe_build_local_retain(
+        config: &GatewayConfig,
+    ) -> Option<Arc<crate::local_retain::LocalRetainContext>> {
+        let enabled = config.local_retain_enabled.unwrap_or_else(|| {
+            config.local_retain_path.is_some()
+                && !config.use_memory_store
+                && !config.cluster_url.trim().is_empty()
+        });
+        if !enabled {
+            return None;
+        }
+        let path = config.local_retain_path.as_ref()?;
+
+        let queue = match crate::local_retain_queue::LocalRetainQueue::open(path) {
+            Ok(q) => q,
+            Err(e) => {
+                warn!(error = %e, path = %path, "local-retain: failed to open backlog; feature disabled");
+                return None;
+            }
+        };
+        let kubo = match IpfsBlockStore::new_unverified(IpfsConfig::with_url(&config.ipfs_url)) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "local-retain: kubo client build failed; feature disabled");
+                return None;
+            }
+        };
+        let cluster_cfg = ClusterConfig {
+            timeout: Duration::from_secs(10),
+            ..ClusterConfig::with_url(&config.cluster_url)
+        };
+        // Capture the min-replication target before the config is consumed.
+        let min_repl = cluster_cfg.replication.min.max(1) as usize;
+        let cluster = match ClusterClient::new(cluster_cfg).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, cluster_url = %config.cluster_url, "local-retain: cluster unreachable at startup; feature disabled");
+                return None;
+            }
+        };
+        let master_peer_id = match cluster.peer_info().await {
+            Ok(info) => info.id,
+            Err(e) => {
+                warn!(error = %e, "local-retain: could not read master cluster peer id; feature disabled");
+                return None;
+            }
+        };
+        info!(
+            path = %path,
+            min_repl = min_repl,
+            master_peer_id = %master_peer_id,
+            "✓ Local-retain-until-replicated enabled (ipfs repo gc is now safe)"
+        );
+        Some(Arc::new(crate::local_retain::LocalRetainContext::new(
+            queue,
+            kubo,
+            cluster,
+            master_peer_id,
+            min_repl,
+        )))
     }
 }
 

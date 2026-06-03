@@ -266,6 +266,7 @@ mod tests {
             // tests (they don't trigger PUTs / pinning).
             pin_queue: None,
             entries_store: None,
+            local_retain: None,
         })
     }
 
@@ -476,6 +477,7 @@ mod tests {
             users_index_publisher: None,
             pin_queue: None,
             entries_store: None,
+            local_retain: None,
         });
 
         let _ = state_path; // silence unused; only here to mirror prod path layout
@@ -525,6 +527,7 @@ mod tests {
             users_index_publisher: None,
             pin_queue: None,
             entries_store: None,
+            local_retain: None,
         });
 
         let app = crate::routes::create_router(Arc::clone(&state));

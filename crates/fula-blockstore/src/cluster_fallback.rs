@@ -130,12 +130,17 @@ impl ClusterFallbackBlockStore {
 
     /// `get_block` with the bounded/peered/cluster-locate fallback.
     async fn get_block_fallback(&self, cid: &Cid) -> Result<Bytes> {
-        // 1. Instant local-only probe (small blocks and file roots alike).
-        match self.ipfs.get_block_offline(cid, self.cfg.offline_timeout).await {
+        // 1. Instant local-only probe (small blocks and file roots alike). A
+        //    clean HTTP miss (`NotFound`) means the daemon is up and the block
+        //    just isn't local; a transport error means the daemon may be down.
+        let responsive = match self.ipfs.get_block_offline(cid, self.cfg.offline_timeout).await {
             Ok(bytes) => return Ok(bytes),
-            Err(BlockStoreError::NotFound(_)) => {}
-            Err(e) => debug!(cid = %cid, error = %e, "cluster-fallback: offline probe errored; treating as miss"),
-        }
+            Err(BlockStoreError::NotFound(_)) => true,
+            Err(e) => {
+                debug!(cid = %cid, error = %e, "cluster-fallback: offline probe errored (daemon may be down)");
+                false
+            }
+        };
 
         // dag-pb roots are UnixFS FILES: `cat` buffers the whole object, so a
         // short timeout would cap the *download* (not probe connectivity). Give
@@ -146,7 +151,8 @@ impl ClusterFallbackBlockStore {
             return self
                 .ipfs
                 .get_block_online_bounded(cid, self.cfg.file_download_timeout)
-                .await;
+                .await
+                .map_err(|e| classify_exhaustion(cid, responsive, e));
         }
 
         // Small blocks (raw / dag-cbor index + object blocks): a peered holder
@@ -155,7 +161,10 @@ impl ClusterFallbackBlockStore {
             return Ok(bytes);
         }
         self.ensure_holders_connected(cid).await;
-        self.ipfs.get_block_online_bounded(cid, self.cfg.online_slow_timeout).await
+        self.ipfs
+            .get_block_online_bounded(cid, self.cfg.online_slow_timeout)
+            .await
+            .map_err(|e| classify_exhaustion(cid, responsive, e))
     }
 
     /// `get_ipld` with the same three-step fallback (raw single-block path).
@@ -166,16 +175,22 @@ impl ClusterFallbackBlockStore {
     }
 
     async fn get_ipld_bytes_fallback(&self, cid: &Cid) -> Result<Bytes> {
-        match self.ipfs.get_raw_block_offline(cid, self.cfg.offline_timeout).await {
+        let responsive = match self.ipfs.get_raw_block_offline(cid, self.cfg.offline_timeout).await {
             Ok(bytes) => return Ok(bytes),
-            Err(BlockStoreError::NotFound(_)) => {}
-            Err(e) => debug!(cid = %cid, error = %e, "cluster-fallback: ipld offline probe errored; treating as miss"),
-        }
+            Err(BlockStoreError::NotFound(_)) => true,
+            Err(e) => {
+                debug!(cid = %cid, error = %e, "cluster-fallback: ipld offline probe errored (daemon may be down)");
+                false
+            }
+        };
         if let Ok(bytes) = self.ipfs.get_raw_block_online_bounded(cid, self.cfg.online_fast_timeout).await {
             return Ok(bytes);
         }
         self.ensure_holders_connected(cid).await;
-        self.ipfs.get_raw_block_online_bounded(cid, self.cfg.online_slow_timeout).await
+        self.ipfs
+            .get_raw_block_online_bounded(cid, self.cfg.online_slow_timeout)
+            .await
+            .map_err(|e| classify_exhaustion(cid, responsive, e))
     }
 
     /// Best-effort: ask the cluster which peers hold `cid` and `swarm/connect`
@@ -271,6 +286,26 @@ impl ClusterFallbackBlockStore {
             }
             _ => self.peers_cache.lock().as_ref().map(|(_, p)| Arc::clone(p)),
         }
+    }
+}
+
+/// Map the final bounded-fetch error to `Unavailable` (→ HTTP 410) when the
+/// local daemon was responsive (the offline probe was a clean HTTP miss) and
+/// the failure is a *retrieval* failure (`Timeout`/`NotFound`) — i.e. the block
+/// is genuinely unavailable, not the daemon being down. Infrastructure errors
+/// (`Connection`/`IpfsApi`/…) and the not-responsive case pass through unchanged
+/// so they stay 5xx and the client SDK's health gate still trips on real
+/// master/kubo outages.
+fn classify_exhaustion(cid: &Cid, responsive: bool, e: BlockStoreError) -> BlockStoreError {
+    if responsive
+        && matches!(
+            e,
+            BlockStoreError::Timeout { .. } | BlockStoreError::NotFound(_)
+        )
+    {
+        BlockStoreError::Unavailable(*cid)
+    } else {
+        e
     }
 }
 
@@ -384,6 +419,37 @@ mod tests {
         assert!(!is_dialable("/ip4/127.0.0.1/tcp/4001"));
         assert!(!is_dialable("/ip6/::1/tcp/4001"));
         assert!(!is_dialable("/ip4/0.0.0.0/tcp/4001"));
+    }
+
+    #[test]
+    fn classify_exhaustion_maps_only_responsive_retrieval_failures() {
+        let cid: Cid = RAW_CID.parse().unwrap();
+        // Daemon responsive (clean offline miss) + a *retrieval* failure → the
+        // block is genuinely unavailable → Unavailable (gateway maps to 410).
+        assert!(matches!(
+            classify_exhaustion(&cid, true, BlockStoreError::Timeout { seconds: 12 }),
+            BlockStoreError::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_exhaustion(&cid, true, BlockStoreError::NotFound(cid)),
+            BlockStoreError::Unavailable(_)
+        ));
+        // Responsive but an *infrastructure* failure (kubo erroring / unreachable)
+        // → pass through unchanged → stays 5xx so the health gate still trips.
+        assert!(matches!(
+            classify_exhaustion(&cid, true, BlockStoreError::Connection("x".into())),
+            BlockStoreError::Connection(_)
+        ));
+        assert!(matches!(
+            classify_exhaustion(&cid, true, BlockStoreError::IpfsApi("x".into())),
+            BlockStoreError::IpfsApi(_)
+        ));
+        // Daemon NOT responsive (probe failed → maybe down) → pass through even a
+        // Timeout, so a real master outage is NOT masked as a per-file 410.
+        assert!(matches!(
+            classify_exhaustion(&cid, false, BlockStoreError::Timeout { seconds: 12 }),
+            BlockStoreError::Timeout { .. }
+        ));
     }
 
     #[test]

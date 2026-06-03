@@ -403,6 +403,16 @@ pub async fn put_object(
         }
     }
 
+    // Local-retain GC-safety: pin this object/chunk block locally on the master
+    // + record it in the backlog, so `ipfs repo gc` can't reclaim it until the
+    // cluster confirms replication. Synchronous so the block is gc-safe before
+    // we return 200; a local-pin failure is FATAL (propagates as 5xx) so we
+    // never 200 a block that isn't gc-safe — the client retries. No-op when the
+    // feature is disabled.
+    if let Some(lr) = state.local_retain.as_ref() {
+        lr.retain(&cid).await?;
+    }
+
     // W.9.6 — pin the BUCKET ROOT CID through the durable queue.
     // Cluster's recursive pin walks the bucket's Prolly Tree which
     // covers every object referenced from the bucket. With the
@@ -475,6 +485,13 @@ pub async fn put_object(
                 tracing::info!(cid = %bucket_root_cid, bucket = %pin_name_clone, "Bucket root CID pinned (recursive)");
             }
         });
+    }
+
+    // Local-retain GC-safety for the bucket root (Prolly-Tree root) too. Same
+    // fatal policy: a failed local pin of the forest root fails the PUT (5xx)
+    // rather than 200-ing an index whose root block isn't gc-safe.
+    if let Some(lr) = state.local_retain.as_ref() {
+        lr.retain(&bucket_root_cid).await?;
     }
 
     // Also pin THIS object's CID to the user's external pinning

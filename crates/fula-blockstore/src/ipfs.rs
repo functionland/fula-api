@@ -58,22 +58,12 @@ pub struct IpfsBlockStore {
 }
 
 impl IpfsBlockStore {
-    /// Build the kubo HTTP client with idle connection pooling DISABLED.
-    ///
-    /// A pooled keep-alive connection to kubo can go stale (kubo closes it
-    /// server-side after an idle period); `reqwest`, not knowing the socket is
-    /// dead, reuses it for the next request, which then blocks waiting for a
-    /// response that never arrives — surfacing as `block/get` hanging to the
-    /// full per-request timeout. This was observed as 15s gateway read timeouts
-    /// on not-local blocks while the `ipfs` CLI and a one-shot `curl` (a fresh
-    /// connection per call) fetched the identical block from the *same* daemon
-    /// in <0.1s. Forcing a fresh connection per request
-    /// (`pool_max_idle_per_host(0)`) matches that behaviour; against a loopback
-    /// daemon the extra handshake costs microseconds.
+    /// Build the kubo HTTP client (shared by `new` and `new_unverified`).
+    /// Keep-alive pooling is left at reqwest's default — the gateway talks to
+    /// kubo over loopback, so connection reuse is fine and cheap.
     fn build_client(config: &IpfsConfig) -> Result<Client> {
         Client::builder()
             .timeout(config.timeout)
-            .pool_max_idle_per_host(0)
             .build()
             .map_err(|e| BlockStoreError::Connection(e.to_string()))
     }
@@ -413,10 +403,17 @@ impl IpfsBlockStore {
         })
     }
 
-    /// Shared bytes fetch with an explicit per-request `timeout`. When
-    /// `offline`, any non-success status OR transport failure maps to
-    /// `NotFound` — a local miss is the expected, non-exceptional outcome of an
-    /// `offline=true` probe, not an error to surface.
+    /// Shared bytes fetch with an explicit per-request `timeout`.
+    ///
+    /// Failure semantics are deliberately split so callers can tell a *block*
+    /// miss from a *daemon* failure (the cluster-fallback layer uses this to
+    /// decide HTTP 410-vs-5xx):
+    /// - non-2xx **HTTP response** with `offline` (or any 404) → `NotFound`:
+    ///   kubo answered, the block just isn't local. This is the expected
+    ///   outcome of an `offline=true` probe and means "daemon is up".
+    /// - **transport error** (connection refused / request timeout) → the
+    ///   underlying `Connection`/`Timeout`, **even for the offline probe** —
+    ///   an unreachable daemon must NOT be masked as a clean miss.
     async fn fetch_bytes_bounded(
         &self,
         url: &str,
@@ -426,22 +423,16 @@ impl IpfsBlockStore {
     ) -> Result<Bytes> {
         let response = match self.client.post(url).timeout(timeout).send().await {
             Ok(r) => r,
-            Err(e) => {
-                if offline {
-                    return Err(BlockStoreError::NotFound(*cid));
-                }
-                return Err(e.into());
-            }
+            // Transport failure — surface it (Connection/Timeout). Do NOT map to
+            // NotFound even when offline: "kubo unreachable" must stay
+            // distinguishable from "block not local".
+            Err(e) => return Err(e.into()),
         };
 
         if !response.status().is_success() {
+            // kubo responded with a non-success status. For the offline probe
+            // (or any 404) that's a clean "not found locally" miss — daemon up.
             if offline || response.status().as_u16() == 404 {
-                // Drain the error body before dropping the response so the
-                // connection is never abandoned mid-stream. Defensive now that
-                // pooling is disabled, but it keeps the miss path correct even
-                // if connection reuse is ever re-enabled (an undrained body
-                // makes a reused connection hang the next request).
-                let _ = response.bytes().await;
                 return Err(BlockStoreError::NotFound(*cid));
             }
             let error = response.text().await.unwrap_or_default();
@@ -518,6 +509,89 @@ impl IpfsBlockStore {
             Ok(r) => r.status().is_success(),
             Err(_) => false,
         }
+    }
+
+    /// Pin a single block **directly** (`recursive=false`) in the master's OWN
+    /// local kubo datastore (`pin/add`), so `ipfs repo gc` cannot reclaim it.
+    /// Used by the local-retain-until-replicated path to hold an uploaded block
+    /// until the cluster confirms replication. Independent of the remote
+    /// pinning service — this is always a local pin.
+    pub async fn pin_local(&self, cid: &Cid, timeout: Duration) -> Result<()> {
+        let url = format!(
+            "{}/api/v0/pin/add?arg={}&recursive=false",
+            self.config.api_url, cid
+        );
+        let response = self.client.post(&url).timeout(timeout).send().await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(BlockStoreError::PinFailed(format!("local pin/add {}: {}", cid, body)))
+        }
+    }
+
+    /// Remove a local (direct) pin from the master's own kubo (`pin/rm`).
+    /// **Idempotent**: a "not pinned" response is treated as success, so a
+    /// retried verifier cycle that unpins twice is harmless.
+    pub async fn unpin_local(&self, cid: &Cid, timeout: Duration) -> Result<()> {
+        let url = format!(
+            "{}/api/v0/pin/rm?arg={}&recursive=false",
+            self.config.api_url, cid
+        );
+        let response = self.client.post(&url).timeout(timeout).send().await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let body = response.text().await.unwrap_or_default();
+        // kubo errors if the CID isn't pinned — that's the desired end state,
+        // so treat it as success (idempotent unpin).
+        if body.contains("not pinned") || body.contains("not found") {
+            return Ok(());
+        }
+        Err(BlockStoreError::UnpinFailed(format!("local pin/rm {}: {}", cid, body)))
+    }
+
+    /// List every block CID currently in the master's local datastore
+    /// (`refs local`). Used by the one-time local-retain **backfill** to
+    /// protect blocks that predate the feature. Heavy on large stores — give a
+    /// generous timeout. Lines carrying an `Err`, or with an unparseable CID,
+    /// are skipped.
+    pub async fn refs_local(&self, timeout: Duration) -> Result<Vec<Cid>> {
+        #[derive(serde::Deserialize)]
+        struct RefLine {
+            #[serde(rename = "Ref")]
+            r#ref: Option<String>,
+            #[serde(rename = "Err")]
+            err: Option<String>,
+        }
+        let url = format!("{}/api/v0/refs/local", self.config.api_url);
+        let response = self.client.post(&url).timeout(timeout).send().await?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| BlockStoreError::IpfsApi(e.to_string()))?;
+        if !status.is_success() {
+            return Err(BlockStoreError::IpfsApi(format!("refs/local: {}", text)));
+        }
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(r) = serde_json::from_str::<RefLine>(line) {
+                if !r.err.as_deref().unwrap_or("").is_empty() {
+                    continue;
+                }
+                if let Some(s) = r.r#ref {
+                    if let Ok(c) = s.parse::<Cid>() {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

@@ -1412,6 +1412,15 @@ impl FulaClient {
             _ => return Err(ClientError::Config(format!("Unknown method: {}", method))),
         };
 
+        // The master health gate answers "can I READ from the master?", so only
+        // read methods (GET/HEAD) may TRIP it. A failed WRITE (PUT/POST/DELETE)
+        // is a write-specific condition — e.g. the master accepted the request
+        // but couldn't durably pin the block (local-retain fatal-pin → 5xx) —
+        // and must NOT black out the whole app for reads that still work. A
+        // *successful* response of any method still proves reachability, so it
+        // clears the gate unconditionally (`record_success` below).
+        let read_method = matches!(method, "GET" | "HEAD");
+
         // Add query parameters
         if let Some(q) = query {
             req = req.query(q);
@@ -1438,11 +1447,14 @@ impl FulaClient {
         let response = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                // Connection-level error (refused, RST, DNS, timeout). Treat
-                // as a master-down signal for the gate's purposes. Returning
-                // the original error preserves caller diagnostics.
+                // Connection-level error (refused, RST, DNS, timeout). For a
+                // READ this is a master-down signal; for a WRITE we leave the
+                // gate untouched — a write timeout (e.g. a slow fatal pin) must
+                // not flip the app offline for reads that still work.
                 if let Some(gate) = &self.health_gate {
-                    gate.record_failure();
+                    if read_method {
+                        gate.record_failure();
+                    }
                 }
                 return Err(ClientError::Http(e));
             }
@@ -1452,14 +1464,17 @@ impl FulaClient {
         let status = response.status();
 
         // Phase 2.1: classify the response status for the health gate.
-        //   5xx → master-side failure → record_failure
+        //   5xx on a READ  → master-side read failure → record_failure
+        //   5xx on a WRITE → write-specific (e.g. durability/pin) → gate untouched
         //   4xx → request-level (auth, not-found, precondition, etc.); NOT
         //         a master-down signal — the server responded, the request
         //         was just bad. Don't touch the gate.
-        //   2xx/3xx → success → record_success (also clears any prior Down)
+        //   2xx/3xx (any method) → success → record_success (also clears any prior Down)
         if let Some(gate) = &self.health_gate {
             if status.is_server_error() {
-                gate.record_failure();
+                if read_method {
+                    gate.record_failure();
+                }
             } else if status.is_success() {
                 gate.record_success();
             }
@@ -2134,6 +2149,47 @@ mod phase_2_4_offline_tests {
         // semantics are exercised separately in health_gate.rs.
         config.health_gate_enabled = false;
         FulaClient::new(config).expect("client")
+    }
+
+    /// Local-retain fatal-pin guard (server-side `retain()` returns 5xx when a
+    /// block can't be durably pinned). A WRITE that 5xx's must NOT trip the
+    /// read-health gate and black out the whole app, whereas two READ 5xx's
+    /// still must. The gate answers "can I READ the master?" — a write failure
+    /// doesn't speak to that.
+    #[tokio::test]
+    async fn write_5xx_does_not_trip_health_gate_but_read_5xx_does() {
+        let master = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&master)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&master)
+            .await;
+
+        let mut config = Config::new(master.uri());
+        config.timeout = Duration::from_secs(2);
+        config.health_gate_enabled = true;
+        let client = FulaClient::new(config).expect("client");
+        let gate = client.health_gate.as_ref().expect("gate enabled");
+
+        // Two WRITE failures (PUT via create_bucket) must leave the gate Allow.
+        let _ = client.create_bucket("b1").await;
+        let _ = client.create_bucket("b2").await;
+        assert_eq!(
+            gate.decide(),
+            GateDecision::Allow,
+            "write 5xx must not trip the read-health gate"
+        );
+
+        // Two READ failures (GET via get_object) must trip it.
+        let _ = client.get_object("bucket", "key").await;
+        let _ = client.get_object("bucket", "key").await;
+        assert!(
+            matches!(gate.decide(), GateDecision::ShortCircuit { .. }),
+            "two read 5xx must trip the read-health gate"
+        );
     }
 
     #[tokio::test]

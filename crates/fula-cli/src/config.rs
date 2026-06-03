@@ -98,6 +98,35 @@ pub struct GatewayConfig {
     /// Max holder peers to connect to per read miss in the fallback.
     #[serde(default = "default_cluster_fallback_max_holders")]
     pub cluster_fallback_max_holders: usize,
+
+    /// Local-retain-until-replicated GC-safety. When enabled, every uploaded
+    /// block is pinned LOCALLY on the master's kubo (so `ipfs repo gc` cannot
+    /// reclaim it) and recorded in this redb backlog; a verifier drops the
+    /// local pin only once the cluster confirms replication to >= min-repl
+    /// non-master holders. Makes `ipfs repo gc` always safe.
+    #[serde(default = "default_local_retain_path")]
+    pub local_retain_path: Option<String>,
+    /// `None` = auto (enabled when `local_retain_path` + `cluster_url` are set
+    /// and not the in-memory store). `Some(false)` is the kill-switch.
+    #[serde(default)]
+    pub local_retain_enabled: Option<bool>,
+    /// How often the local-retain verifier polls cluster replication status.
+    #[serde(default = "default_local_retain_interval_secs")]
+    pub local_retain_interval_secs: u64,
+    /// One-time startup backfill: seed the backlog with the blocks already in
+    /// the master's local store so the verifier protects pre-existing
+    /// un-replicated data too. `None`/`Some(true)` = on, `Some(false)` = off.
+    /// Throttled + background; can be disabled on very large datastores.
+    #[serde(default)]
+    pub local_retain_backfill: Option<bool>,
+}
+
+fn default_local_retain_path() -> Option<String> {
+    Some("/var/lib/fula-gateway/local_retain.redb".to_string())
+}
+
+fn default_local_retain_interval_secs() -> u64 {
+    60
 }
 
 fn default_cluster_peering_interval_secs() -> u64 {
@@ -150,6 +179,10 @@ impl Default for GatewayConfig {
             cluster_peering_enabled: None,
             cluster_peering_interval_secs: default_cluster_peering_interval_secs(),
             cluster_fallback_max_holders: default_cluster_fallback_max_holders(),
+            local_retain_path: default_local_retain_path(),
+            local_retain_enabled: None,
+            local_retain_interval_secs: default_local_retain_interval_secs(),
+            local_retain_backfill: None,
         }
     }
 }

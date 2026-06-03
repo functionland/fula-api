@@ -37,6 +37,8 @@ pub mod config;
 pub mod entries_store;
 pub mod error;
 pub mod handlers;
+pub mod local_retain;
+pub mod local_retain_queue;
 pub mod middleware;
 pub mod multipart;
 pub mod peering;

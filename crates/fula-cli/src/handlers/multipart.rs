@@ -257,6 +257,28 @@ pub async fn complete_multipart_upload(
         tracing::warn!(error = %e, "Failed to persist bucket registry after complete_multipart_upload");
     }
 
+    // Local-retain GC-safety (mirrors put_object): pin every block this
+    // multipart object is made of locally on the master + enqueue it, so
+    // `ipfs repo gc` can't reclaim it until the cluster confirms replication.
+    // This covers ALL part blocks (the file data) and the bucket/forest root.
+    // It is load-bearing here BEYOND single-PUTs: parts 2..N are not reachable
+    // from the recursive bucket-root pin (the object's `metadata.cid` is only
+    // `first_part_cid`), so without this they have NO replication coverage and
+    // `ipfs repo gc` would delete them — losing most of every large file.
+    //
+    // BEST-EFFORT here, unlike put_object's FATAL policy: `complete_upload`
+    // above has already consumed (removed) the multipart session, so returning
+    // a 5xx now could not be retried without re-uploading the entire large
+    // file. `retain` enqueues every CID regardless of the pin outcome, so the
+    // verifier still re-asserts any pin that failed here within one cycle.
+    // No-op when the feature is disabled.
+    if let Some(lr) = state.local_retain.as_ref() {
+        for part_cid in &part_cids {
+            let _ = lr.retain(part_cid).await;
+        }
+        let _ = lr.retain(&bucket_root_cid).await;
+    }
+
     // W.9.6 — pin the BUCKET ROOT CID through the durable queue.
     // Mirrors the put_object handler's enqueue path so multipart
     // uploads get the same crash-safety + retry guarantees as

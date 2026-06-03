@@ -16,6 +16,11 @@ pub enum S3ErrorCode {
     BucketNotEmpty,
     EntityTooLarge,
     EntityTooSmall,
+    /// Block data is genuinely unavailable (lost / no reachable holder) while
+    /// the master itself is up → HTTP 410. The client SDK's health gate ignores
+    /// 4xx, so this degrades one file gracefully instead of flagging the whole
+    /// backend offline (which a 5xx would).
+    Gone,
     InternalError,
     InvalidAccessKeyId,
     InvalidArgument,
@@ -55,6 +60,7 @@ impl S3ErrorCode {
             Self::BucketNotEmpty => "BucketNotEmpty",
             Self::EntityTooLarge => "EntityTooLarge",
             Self::EntityTooSmall => "EntityTooSmall",
+            Self::Gone => "Gone",
             Self::InternalError => "InternalError",
             Self::InvalidAccessKeyId => "InvalidAccessKeyId",
             Self::InvalidArgument => "InvalidArgument",
@@ -91,6 +97,7 @@ impl S3ErrorCode {
             Self::BucketAlreadyExists | Self::BucketAlreadyOwnedByYou => StatusCode::CONFLICT,
             Self::BucketNotEmpty => StatusCode::CONFLICT,
             Self::EntityTooLarge | Self::EntityTooSmall => StatusCode::BAD_REQUEST,
+            Self::Gone => StatusCode::GONE,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidAccessKeyId | Self::InvalidToken | Self::SignatureDoesNotMatch => {
                 StatusCode::FORBIDDEN
@@ -188,8 +195,15 @@ impl ApiError {
                 // CoreError::PreconditionFailed for a different reason, route
                 // it through a distinct S3ErrorCode instead.
                 fula_core::CoreError::PreconditionFailed(_) => S3ErrorCode::BucketNotEmpty,
+                // Block genuinely unavailable (lost / no reachable holder) while
+                // the master is up → 410, so the SDK health gate (ignores 4xx)
+                // doesn't flip the whole app offline over a missing file.
+                fula_core::CoreError::BlockStore(fula_blockstore::BlockStoreError::Unavailable(_)) => {
+                    S3ErrorCode::Gone
+                }
                 _ => S3ErrorCode::InternalError,
             },
+            Self::BlockStore(fula_blockstore::BlockStoreError::Unavailable(_)) => S3ErrorCode::Gone,
             Self::BlockStore(_) | Self::Crypto(_) => S3ErrorCode::InternalError,
         }
     }

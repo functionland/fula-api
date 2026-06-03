@@ -69,6 +69,17 @@ struct Args {
     /// Disable the proactive peering task (keeps the gateway kubo connected to the fleet)
     #[arg(long, env = "FULA_NO_CLUSTER_PEERING")]
     no_cluster_peering: bool,
+
+    /// Disable local-retain-until-replicated GC-safety (kill-switch). When off,
+    /// uploaded blocks are NOT held locally until the cluster replicates them —
+    /// `ipfs repo gc` can again delete un-replicated blocks.
+    #[arg(long, env = "FULA_NO_LOCAL_RETAIN")]
+    no_local_retain: bool,
+
+    /// Disable the one-time startup backfill of pre-existing local blocks into
+    /// the local-retain backlog (the ongoing per-upload protection still runs).
+    #[arg(long, env = "FULA_NO_LOCAL_RETAIN_BACKFILL")]
+    no_local_retain_backfill: bool,
 }
 
 #[tokio::main]
@@ -136,6 +147,8 @@ async fn main() -> anyhow::Result<()> {
         block_cache_mb: args.block_cache_mb,
         cluster_fallback_enabled: if args.no_cluster_fallback { Some(false) } else { None },
         cluster_peering_enabled: if args.no_cluster_peering { Some(false) } else { None },
+        local_retain_enabled: if args.no_local_retain { Some(false) } else { None },
+        local_retain_backfill: if args.no_local_retain_backfill { Some(false) } else { None },
         ..Default::default()
     };
 

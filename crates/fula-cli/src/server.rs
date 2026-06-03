@@ -20,6 +20,22 @@ pub async fn run_server(config: GatewayConfig) -> anyhow::Result<()> {
     // bitswap serves reads fast. No-op when disabled / not configured.
     crate::peering::spawn_if_enabled(&config);
 
+    // Local-retain-until-replicated verifier: drop each block's local pin once
+    // the cluster confirms it's replicated to >= min-repl non-master holders,
+    // so `ipfs repo gc` on the master can never delete an un-replicated block.
+    // No-op when the feature is disabled (`state.local_retain` is `None`).
+    if let Some(lr) = state.local_retain.clone() {
+        crate::local_retain::spawn_verifier(
+            lr.clone(),
+            std::time::Duration::from_secs(state.config.local_retain_interval_secs.max(15)),
+        );
+        // One-time, throttled, background backfill of pre-existing local blocks
+        // (default on; `--no-local-retain-backfill` to skip on huge datastores).
+        if state.config.local_retain_backfill.unwrap_or(true) {
+            tokio::spawn(async move { lr.backfill().await });
+        }
+    }
+
     // Audit F-A5 / issue #13: spawn the multipart-upload reaper. Drops
     // abandoned in-memory upload sessions whose `last_activity_at` is
     // older than `multipart_expiry_secs`. Does NOT touch the blockstore
@@ -95,6 +111,22 @@ pub async fn run_server_with_shutdown(
     // Proactive peering: keep the gateway kubo connected to the fleet so
     // bitswap serves reads fast. No-op when disabled / not configured.
     crate::peering::spawn_if_enabled(&config);
+
+    // Local-retain-until-replicated verifier: drop each block's local pin once
+    // the cluster confirms it's replicated to >= min-repl non-master holders,
+    // so `ipfs repo gc` on the master can never delete an un-replicated block.
+    // No-op when the feature is disabled (`state.local_retain` is `None`).
+    if let Some(lr) = state.local_retain.clone() {
+        crate::local_retain::spawn_verifier(
+            lr.clone(),
+            std::time::Duration::from_secs(state.config.local_retain_interval_secs.max(15)),
+        );
+        // One-time, throttled, background backfill of pre-existing local blocks
+        // (default on; `--no-local-retain-backfill` to skip on huge datastores).
+        if state.config.local_retain_backfill.unwrap_or(true) {
+            tokio::spawn(async move { lr.backfill().await });
+        }
+    }
 
     // Phase 3.2 — spawn the users-index publisher loop iff the env
     // flag enabled the publisher at AppState construction time. When

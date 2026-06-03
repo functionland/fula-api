@@ -305,6 +305,30 @@ impl ClusterClient {
             .map_err(|e| BlockStoreError::ClusterApi(e.to_string()))
     }
 
+    /// Count cluster peers that report status **exactly `"pinned"`** for `cid`,
+    /// excluding `exclude_peer` (the master's own cluster peer id).
+    ///
+    /// Used by the local-retain verifier to decide a block is durably
+    /// replicated *elsewhere* so the master can drop its local copy. Counts
+    /// ONLY confirmed `"pinned"` — never `"pinning"`/`"queued"`/`"error"`, and
+    /// never the `allocations` fallback — so the unpin decision can't fire
+    /// before real replication. The safety invariant of the whole mechanism
+    /// rides on this method: it must under-count, never over-count.
+    pub async fn pinned_holder_count(&self, cid: &Cid, exclude_peer: &str) -> Result<usize> {
+        let info = self.get_pin_status(cid).await?;
+        Ok(info
+            .peer_map
+            .as_ref()
+            .map(|m| {
+                m.iter()
+                    .filter(|(id, st)| {
+                        id.as_str() != exclude_peer && st.status.eq_ignore_ascii_case("pinned")
+                    })
+                    .count()
+            })
+            .unwrap_or(0))
+    }
+
     /// List all pins
     pub async fn list_pins(&self) -> Result<Vec<PinInfo>> {
         let url = format!("{}/pins", self.config.api_url);
