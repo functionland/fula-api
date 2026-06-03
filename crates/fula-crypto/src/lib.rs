@@ -124,7 +124,7 @@ pub use private_forest::{
     DirectoryIndex, DirEntry, EncryptedDirectoryIndex,
     derive_dir_index_key, dir_index_aad,
 };
-pub use wnfs_hamt::{BlobBackend, V7NodeStore, V7_NODE_PREFIX};
+pub use wnfs_hamt::{BlobBackend, BlobPutResult, V7NodeStore, V7_NODE_PREFIX};
 pub use private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, PublicMetadata, KeyObfuscation, obfuscate_key};
 pub use rotation::{KeyRotationManager, FileSystemRotation, WrappedKeyInfo, RotationResult};
 pub use sharded_hamt_forest::{HamtEntry, ShardedHamtPrivateForest};

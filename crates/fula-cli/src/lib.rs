@@ -37,6 +37,8 @@ pub mod config;
 pub mod entries_store;
 pub mod error;
 pub mod handlers;
+pub mod index_pin_backfill;
+pub mod index_pin_set;
 pub mod local_retain;
 pub mod local_retain_queue;
 pub mod middleware;

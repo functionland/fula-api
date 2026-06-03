@@ -14,6 +14,21 @@ use tracing::{debug, instrument};
 /// Data larger than this MUST use UnixFS chunking via /api/v0/add
 const MAX_BLOCK_SIZE: usize = 1024 * 1024 - 256; // ~1MB minus safety margin
 
+/// Outcome of [`IpfsBlockStore::pin_local`] — lets the caller decide whether the
+/// block needs local-retain tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinOutcome {
+    /// A direct pin was created (or an existing direct pin re-confirmed) on the
+    /// master's own kubo. The caller is the retainer of this block and should
+    /// track it so it can be offloaded once replicated.
+    Pinned,
+    /// The block was ALREADY pinned — in practice "already pinned recursively",
+    /// i.e. a cluster recursive pin already covers it. It is gc-safe AND
+    /// cluster-managed (the cluster replicates + eventually drops it), so
+    /// local-retain need not track it.
+    AlreadyPinned,
+}
+
 /// Configuration for IPFS connection
 #[derive(Clone)]
 pub struct IpfsConfig {
@@ -516,26 +531,28 @@ impl IpfsBlockStore {
     /// Used by the local-retain-until-replicated path to hold an uploaded block
     /// until the cluster confirms replication. Independent of the remote
     /// pinning service — this is always a local pin.
-    pub async fn pin_local(&self, cid: &Cid, timeout: Duration) -> Result<()> {
+    pub async fn pin_local(&self, cid: &Cid, timeout: Duration) -> Result<PinOutcome> {
         let url = format!(
             "{}/api/v0/pin/add?arg={}&recursive=false",
             self.config.api_url, cid
         );
         let response = self.client.post(&url).timeout(timeout).send().await?;
         if response.status().is_success() {
-            return Ok(());
+            // 200 ⇒ a direct pin now exists by our hand. (kubo can only return
+            // success here when the CID is NOT already recursively pinned —
+            // otherwise it errors with "already pinned recursively" below.)
+            return Ok(PinOutcome::Pinned);
         }
         let body = response.text().await.unwrap_or_default();
         // kubo rejects `pin/add?recursive=false` when the CID is ALREADY pinned
-        // — most commonly "already pinned recursively", because a cluster
-        // recursive pin of the bucket root already covers this block. That IS
-        // the desired end state (the block is gc-safe — a recursive pin is
-        // stricter than our direct pin), so treat any "already pinned" response
-        // as success (idempotent), mirroring `unpin_local`'s "not pinned"
-        // handling. Without this, every block already covered by a recursive
-        // pin fails the fatal PUT path with a false error and breaks uploads.
+        // — in practice "already pinned recursively", because a cluster
+        // recursive pin of the bucket root already covers this block. That IS a
+        // gc-safe end state (a recursive pin is stricter than our direct pin),
+        // so it is NOT an error — but it's cluster-managed, so the caller can
+        // skip local-retain tracking. Without treating it as success the fatal
+        // PUT path would 5xx every already-recursively-pinned upload.
         if body.to_ascii_lowercase().contains("already pinned") {
-            return Ok(());
+            return Ok(PinOutcome::AlreadyPinned);
         }
         Err(BlockStoreError::PinFailed(format!("local pin/add {}: {}", cid, body)))
     }
@@ -836,6 +853,111 @@ mod tests {
         let _ = store.put_block(b"hello").await.expect("block put");
 
         block_put.assert_hits_async(1).await;
+    }
+
+    #[tokio::test]
+    async fn pin_local_treats_already_pinned_recursively_as_success() {
+        let server = MockServer::start_async().await;
+        let _id_mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/v0/id");
+                then.status(200).body("{}");
+            })
+            .await;
+        // kubo rejects a direct `pin/add?recursive=false` when the CID is
+        // already pinned recursively (a cluster recursive pin already covers
+        // it). This MUST be treated as success — the block is gc-safe — else
+        // the fatal PUT path breaks every upload of such a block.
+        let pin = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/v0/pin/add");
+                then.status(500).json_body(json!({
+                    "Message": "pin: bafkreigh2akiscaildc6v5q2xg34x5sqo5djznnha64x4jn3fjvu3j6jci already pinned recursively",
+                    "Code": 0,
+                    "Type": "error",
+                }));
+            })
+            .await;
+        let store = IpfsBlockStore::new(IpfsConfig::with_url(server.base_url()))
+            .await
+            .expect("ipfs store init");
+        let cid: Cid = "bafkreigh2akiscaildc6v5q2xg34x5sqo5djznnha64x4jn3fjvu3j6jci"
+            .parse()
+            .expect("cid");
+        let outcome = store
+            .pin_local(&cid, std::time::Duration::from_secs(5))
+            .await
+            .expect("already-pinned-recursively must be Ok");
+        assert_eq!(
+            outcome,
+            PinOutcome::AlreadyPinned,
+            "recursively-pinned block must report AlreadyPinned so the caller skips tracking it"
+        );
+        pin.assert_hits_async(1).await;
+    }
+
+    #[tokio::test]
+    async fn pin_local_returns_pinned_on_fresh_pin() {
+        let server = MockServer::start_async().await;
+        let _id_mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/v0/id");
+                then.status(200).body("{}");
+            })
+            .await;
+        let pin = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/v0/pin/add");
+                then.status(200).json_body(json!({
+                    "Pins": ["bafkreigh2akiscaildc6v5q2xg34x5sqo5djznnha64x4jn3fjvu3j6jci"],
+                }));
+            })
+            .await;
+        let store = IpfsBlockStore::new(IpfsConfig::with_url(server.base_url()))
+            .await
+            .expect("ipfs store init");
+        let cid: Cid = "bafkreigh2akiscaildc6v5q2xg34x5sqo5djznnha64x4jn3fjvu3j6jci"
+            .parse()
+            .expect("cid");
+        let outcome = store
+            .pin_local(&cid, std::time::Duration::from_secs(5))
+            .await
+            .expect("fresh pin must succeed");
+        assert_eq!(
+            outcome,
+            PinOutcome::Pinned,
+            "a fresh direct pin must report Pinned so the caller tracks it"
+        );
+        pin.assert_hits_async(1).await;
+    }
+
+    #[tokio::test]
+    async fn pin_local_propagates_a_genuine_pin_error() {
+        let server = MockServer::start_async().await;
+        let _id_mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/v0/id");
+                then.status(200).body("{}");
+            })
+            .await;
+        let _pin = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/v0/pin/add");
+                then.status(500).json_body(json!({
+                    "Message": "merkledag: not found",
+                    "Code": 0,
+                    "Type": "error",
+                }));
+            })
+            .await;
+        let store = IpfsBlockStore::new(IpfsConfig::with_url(server.base_url()))
+            .await
+            .expect("ipfs store init");
+        let cid: Cid = "bafkreigh2akiscaildc6v5q2xg34x5sqo5djznnha64x4jn3fjvu3j6jci"
+            .parse()
+            .expect("cid");
+        let r = store.pin_local(&cid, std::time::Duration::from_secs(5)).await;
+        assert!(r.is_err(), "a genuine pin error must still fail (fatal)");
     }
 
     #[tokio::test]

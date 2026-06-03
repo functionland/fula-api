@@ -439,8 +439,89 @@ where
         // Cache the CID and mark as clean
         self.root_cid = Some(cid);
         self.dirty = false;
-        
+
         Ok(cid)
+    }
+
+    /// Collect the CIDs of every node in the (flushed) index tree: the root
+    /// plus every internal and leaf node reachable from it.
+    ///
+    /// Used by the index-node pinning prevention fix. A `ProllyNode`'s child
+    /// CIDs are serialized as plain strings (not IPLD links), so `ipfs pin -r`
+    /// / cluster recursive pins cover ONLY the root block — every non-root node
+    /// is gc-exposed. Pinning each CID returned here makes the whole index
+    /// gc-safe. Requires a flushed tree (`flush` first).
+    ///
+    /// NOTE: this walks the tree via `get_ipld`, so for an already-degraded
+    /// tree it fetches missing nodes via the (cluster-fallback) store — that
+    /// re-localizes them as a side effect but cannot enumerate a node that is
+    /// gone fleet-wide (its subtree is then unreachable, and the fetch errors).
+    pub async fn collect_node_cids(&self) -> Result<Vec<Cid>> {
+        let root_cid = self.root_cid.ok_or_else(|| {
+            crate::CoreError::StorageError(
+                "collect_node_cids requires a flushed tree (call flush first)".to_string(),
+            )
+        })?;
+        let mut cids = vec![root_cid];
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(root_cid);
+        self.collect_descendant_cids(&self.root, &mut cids, &mut visited)
+            .await?;
+        Ok(cids)
+    }
+
+    /// Like [`collect_node_cids`](Self::collect_node_cids) but for an ARBITRARY
+    /// root CID loaded from the store (not the in-memory root). Used to compute
+    /// the SUPERSEDED node set on a flush: `old_root`'s nodes minus the new
+    /// root's nodes are the index blocks to unpin so `gc` can reclaim old index
+    /// versions (otherwise every flush accumulates an un-reclaimable tree).
+    ///
+    /// Errors if `root_cid`'s node (or any descendant) is unavailable — caller
+    /// should treat that as "can't diff, pin-current-only" rather than fatal.
+    pub async fn collect_node_cids_at(&self, root_cid: Cid) -> Result<Vec<Cid>> {
+        let mut cids = vec![root_cid];
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(root_cid);
+        let root_node: ProllyNode<K, V> = self.store.get_ipld(&root_cid).await?;
+        self.collect_descendant_cids(&root_node, &mut cids, &mut visited)
+            .await?;
+        Ok(cids)
+    }
+
+    /// Recursively append the CIDs of all child nodes (internal + leaf) below
+    /// `node`. Mirrors the `collect_prefix_bounded` traversal but records node
+    /// CIDs instead of entries.
+    ///
+    /// `visited` dedupes shared subtrees (and guards the cryptographically
+    /// impossible but cheap-to-rule-out CID cycle); `MAX_INDEX_NODES` caps a
+    /// pathological/corrupt stored tree so an admin probe can't recurse or fetch
+    /// unboundedly.
+    fn collect_descendant_cids<'a>(
+        &'a self,
+        node: &'a ProllyNode<K, V>,
+        cids: &'a mut Vec<Cid>,
+        visited: &'a mut std::collections::HashSet<Cid>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        const MAX_INDEX_NODES: usize = 10_000_000;
+        Box::pin(async move {
+            for pointer in &node.pointers {
+                if let Pointer::Link(cid) | Pointer::LinkWithBoundary { cid, .. } = pointer {
+                    // Skip already-seen nodes (shared subtree / cycle guard).
+                    if !visited.insert(*cid) {
+                        continue;
+                    }
+                    cids.push(*cid);
+                    if cids.len() > MAX_INDEX_NODES {
+                        return Err(crate::CoreError::StorageError(format!(
+                            "index node count exceeds {MAX_INDEX_NODES} — refusing to walk (corrupt tree?)"
+                        )));
+                    }
+                    let child: ProllyNode<K, V> = self.store.get_ipld(cid).await?;
+                    self.collect_descendant_cids(&child, cids, visited).await?;
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Collect all entries from a node as (key, value) pairs
@@ -684,6 +765,42 @@ mod tests {
             Some("value2".to_string())
         );
         assert_eq!(tree.get(&"key3".to_string()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn collect_node_cids_covers_root_and_all_children() {
+        let store = Arc::new(MemoryBlockStore::new());
+        let mut tree: ProllyTree<String, i32, _> = ProllyTree::new(Arc::clone(&store));
+        // Insert enough entries to force internal nodes (> max_leaf_entries = 64).
+        for i in 0..200 {
+            tree.set(format!("key{:04}", i), i).await.unwrap();
+        }
+        let root = tree.flush().await.unwrap();
+
+        let cids = tree.collect_node_cids().await.unwrap();
+
+        // Root is included and the tree has internal structure (multiple nodes).
+        assert!(cids.contains(&root), "root cid must be collected");
+        assert!(cids.len() > 1, "expected internal nodes; got {}", cids.len());
+        // All collected CIDs are unique.
+        let unique: std::collections::HashSet<_> = cids.iter().collect();
+        assert_eq!(unique.len(), cids.len(), "collected node cids must be unique");
+        // Every collected CID is a real, fetchable ProllyNode (confirms they are
+        // index nodes, not object/value CIDs).
+        for cid in &cids {
+            let _node: ProllyNode<String, i32> = store.get_ipld(cid).await.unwrap();
+        }
+
+        // Walking from the same root CID via the store yields the same set —
+        // this is exactly what the flush diff uses to enumerate the OLD root's
+        // nodes (to unpin superseded index blocks).
+        let cids_at = tree.collect_node_cids_at(root).await.unwrap();
+        let set_now: std::collections::HashSet<_> = cids.iter().copied().collect();
+        let set_at: std::collections::HashSet<_> = cids_at.iter().copied().collect();
+        assert_eq!(
+            set_now, set_at,
+            "collect_node_cids_at(root) must match collect_node_cids"
+        );
     }
 
     #[tokio::test]

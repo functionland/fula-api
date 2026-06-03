@@ -50,6 +50,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/admin/users/{user_id}", delete(handlers::delete_user))
         .route("/admin/pins/{cid}", delete(handlers::unpin_cid))
         .route("/admin/gc", post(handlers::trigger_gc))
+        // Recover (rebuild) a bucket's prolly index from a recovered key→cid
+        // set after the on-disk index lost nodes to gc. Server-side, keyless.
+        .route(
+            "/admin/recover-bucket-index",
+            post(handlers::recover_bucket_index)
+                // Recovery POSTs a whole bucket's key→cid+size set as one JSON
+                // body (buffered by the `Json` extractor). Cap it explicitly so an
+                // oversized bucket fails loud (413) instead of OOMing the gateway.
+                // ~512 MiB ≈ a few million entries; larger buckets need chunking.
+                .layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
         // PII sweep — rewrites bucket Prolly Tree leaves whose
         // ObjectMetadata.owner_id holds the raw JWT sub (plaintext email
         // for legacy users) instead of the canonical hashed_user_id. See

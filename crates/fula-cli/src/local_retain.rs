@@ -25,7 +25,7 @@
 use crate::error::ApiError;
 use crate::local_retain_queue::LocalRetainQueue;
 use cid::Cid;
-use fula_blockstore::{BlockStoreError, ClusterClient, IpfsBlockStore};
+use fula_blockstore::{BlockStoreError, ClusterClient, IpfsBlockStore, PinOutcome};
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +39,12 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const VERIFY_BATCH: usize = 256;
 /// Max concurrent status-checks per cycle (bounds load on the cluster API).
 const MAX_CONCURRENT_CHECKS: usize = 8;
+/// Backfill runs at LOW concurrency + a per-op throttle so the one-time sweep of
+/// a large datastore never saturates the kubo daemon and starves live
+/// reads/uploads. (Default-on backfill at high concurrency previously pushed
+/// ~300 pin ops/s and timed kubo out.) Slower, but safe to leave running.
+const BACKFILL_CONCURRENCY: usize = 2;
+const BACKFILL_THROTTLE: Duration = Duration::from_millis(50);
 /// Warn once the oldest backlog entry has been awaiting replication longer than
 /// this — a sign replication is stuck (cluster down / holders unhealthy) and a
 /// growing set of blocks is pinned locally and never being offloaded.
@@ -92,19 +98,68 @@ impl LocalRetainContext {
     /// already gc-safe, and a backlog-write failure only defers its *offload*
     /// until the next startup backfill (a storage leak, never data loss), so it
     /// must not fail the PUT.
+    ///
+    /// We only enqueue blocks we *freshly* direct-pinned. A block that is
+    /// already pinned recursively (by a cluster pin) is gc-safe AND
+    /// cluster-managed, so it needs no local-retain tracking — skipping it is
+    /// what keeps the backlog small instead of mirroring the whole datastore.
     pub async fn retain(&self, cid: &Cid) -> Result<(), ApiError> {
-        let pin_res = self.kubo.pin_local(cid, PIN_OP_TIMEOUT).await;
-        // Enqueue regardless of the pin outcome, so the verifier tracks (and, if
-        // the pin failed, re-asserts) this block independently of the client's
-        // retry. Best-effort — an enqueue failure does not fail the PUT.
-        if let Err(e) = self.queue.enqueue(cid) {
-            warn!(cid = %cid, error = %e, "local-retain: backlog enqueue failed; block stays pinned (gc-safe) but untracked until next backfill");
+        match self.kubo.pin_local(cid, PIN_OP_TIMEOUT).await {
+            // Fresh direct pin held by us → track it so the verifier can drop it
+            // once it is replicated to >= min_repl non-master holders.
+            Ok(PinOutcome::Pinned) => {
+                if let Err(e) = self.queue.enqueue(cid) {
+                    warn!(cid = %cid, error = %e, "local-retain: backlog enqueue failed; block stays pinned (gc-safe) but untracked until next backfill");
+                }
+                Ok(())
+            }
+            // Already covered by a cluster recursive pin → gc-safe and
+            // cluster-managed (it replicates + eventually drops it). Nothing for
+            // local-retain to do or track.
+            Ok(PinOutcome::AlreadyPinned) => Ok(()),
+            // Genuine pin failure → FATAL (never 200 a block that isn't gc-safe).
+            // Still enqueue so the verifier re-asserts the pin next cycle even if
+            // the client doesn't retry.
+            Err(e) => {
+                if let Err(e2) = self.queue.enqueue(cid) {
+                    warn!(cid = %cid, error = %e2, "local-retain: backlog enqueue failed after a failed pin");
+                }
+                warn!(cid = %cid, error = %e, "local-retain: PUT-time local pin failed (fatal) — failing the upload so the client retries");
+                Err(ApiError::from(e))
+            }
         }
-        if let Err(e) = pin_res {
-            warn!(cid = %cid, error = %e, "local-retain: PUT-time local pin failed (fatal) — failing the upload so the client retries");
-            return Err(ApiError::from(e));
+    }
+
+    /// Release a previously-retained block: stop tracking it in the backlog and
+    /// unpin it locally so `ipfs repo gc` can reclaim it. Used to drop a
+    /// SUPERSEDED index node (an old prolly-tree version no longer referenced by
+    /// the current root) on a flush, so pinning every index node for gc-safety
+    /// doesn't accumulate un-reclaimable index versions.
+    ///
+    /// Best-effort and **never fatal** — a failed release only defers reclaim (a
+    /// storage leak, never data loss). Durability of *live* nodes is governed by
+    /// the cluster pin, not this local pin.
+    pub async fn release(&self, cid: &Cid) {
+        if let Err(e) = self.queue.remove(cid) {
+            warn!(cid = %cid, error = %e, "local-retain: backlog remove failed during release");
         }
-        Ok(())
+        if let Err(e) = self.kubo.unpin_local(cid, PIN_OP_TIMEOUT).await {
+            warn!(cid = %cid, error = %e, "local-retain: unpin_local failed during release (block stays locally pinned until next gc-safe sweep)");
+        }
+    }
+
+    /// Pin `cid` locally on the master's kubo for gc-safety WITHOUT enqueuing it
+    /// to the replication backlog. Used by the one-time index-node backfill:
+    /// those nodes earn a durable cluster pin (and backlog tracking) on the
+    /// bucket's next PUT, so the backfill only needs to make them gc-safe now.
+    /// A direct pin also keeps the backlog from filling with cluster-invisible
+    /// index nodes that the verifier could never drain. `AlreadyPinned` ⇒ Ok.
+    pub async fn pin_local_only(&self, cid: &Cid) -> Result<(), ApiError> {
+        self.kubo
+            .pin_local(cid, PIN_OP_TIMEOUT)
+            .await
+            .map(|_| ())
+            .map_err(ApiError::from)
     }
 
     /// Pending backlog size (monitoring).
@@ -155,17 +210,27 @@ impl LocalRetainContext {
         if total == 0 {
             return;
         }
-        info!(total, "local-retain backfill: pinning + enqueueing pre-existing local blocks (one-time, throttled)");
+        info!(
+            total,
+            concurrency = BACKFILL_CONCURRENCY,
+            throttle_ms = BACKFILL_THROTTLE.as_millis() as u64,
+            "local-retain backfill: gently pinning pre-existing local blocks (one-time, rate-limited so it never saturates kubo — may take hours on a large store; skip with --no-local-retain-backfill)"
+        );
         let done = std::sync::atomic::AtomicUsize::new(0);
         futures::stream::iter(cids)
-            .for_each_concurrent(MAX_CONCURRENT_CHECKS, |cid| {
+            .for_each_concurrent(BACKFILL_CONCURRENCY, |cid| {
                 let done = &done;
                 async move {
                     // Best-effort during backfill: a pin failure on a
                     // pre-existing block is non-fatal here (these blocks were
                     // already at risk before the feature); the per-upload path
-                    // enforces the fatal contract for new writes.
+                    // enforces the fatal contract for new writes. With smart
+                    // retain, already-recursively-pinned blocks are a fast no-op
+                    // and are NOT enqueued, so the backlog stays small.
                     let _ = self.retain(&cid).await;
+                    // Gentle: pace the sweep so it doesn't compete with live
+                    // reads/uploads for the kubo daemon.
+                    tokio::time::sleep(BACKFILL_THROTTLE).await;
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if n % 5000 == 0 {
                         info!(done = n, total, "local-retain backfill: progress");

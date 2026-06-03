@@ -267,6 +267,7 @@ mod tests {
             pin_queue: None,
             entries_store: None,
             local_retain: None,
+            index_pin_set: None,
         })
     }
 
@@ -478,6 +479,7 @@ mod tests {
             pin_queue: None,
             entries_store: None,
             local_retain: None,
+            index_pin_set: None,
         });
 
         let _ = state_path; // silence unused; only here to mirror prod path layout
@@ -528,6 +530,7 @@ mod tests {
             pin_queue: None,
             entries_store: None,
             local_retain: None,
+            index_pin_set: None,
         });
 
         let app = crate::routes::create_router(Arc::clone(&state));

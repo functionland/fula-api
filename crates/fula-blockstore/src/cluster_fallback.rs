@@ -70,15 +70,17 @@ pub struct ClusterFallbackConfig {
 
 impl Default for ClusterFallbackConfig {
     fn default() -> Self {
-        // Small-block worst-case chain stays under the prior 30s:
-        // offline 2 + fast 3 + status 3 + list 3 + connect 3 + slow 12 = 26s.
-        // The common (peered) path is offline(instant miss) + fast(<1s).
-        // dag-pb FILES skip the short steps and get one generous `cat`
-        // (file_download_timeout, matching the gateway's prior 30s budget).
+        // Tuned for FAST failure on a genuinely-unavailable block: peering keeps
+        // live holders connected so a real fetch answers in <1s, so a lost small
+        // block now fails in roughly offline(instant miss) + fast 2 + status 3 +
+        // slow 4 ≈ 6–8s instead of ~18s. All three online timeouts are env-
+        // overridable at the gateway (`FULA_READ_{FAST,SLOW,FILE}_TIMEOUT_SECS`)
+        // so this can be tuned in prod without a rebuild. dag-pb FILES skip the
+        // short steps and get one generous `cat` (file_download_timeout).
         Self {
             offline_timeout: Duration::from_secs(2),
-            online_fast_timeout: Duration::from_secs(3),
-            online_slow_timeout: Duration::from_secs(12),
+            online_fast_timeout: Duration::from_secs(2),
+            online_slow_timeout: Duration::from_secs(4),
             file_download_timeout: Duration::from_secs(30),
             status_timeout: Duration::from_secs(3),
             connect_timeout: Duration::from_secs(3),

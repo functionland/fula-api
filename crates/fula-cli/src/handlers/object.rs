@@ -494,6 +494,89 @@ pub async fn put_object(
         lr.retain(&bucket_root_cid).await?;
     }
 
+    // P0 — pin the bucket's index NODES (interior + leaves) for gc-safety.
+    //
+    // A `ProllyNode`'s child CIDs are serialized as plain strings, not IPLD
+    // links, so the recursive `bucket:` cluster pin above covers ONLY the root
+    // block — every interior/leaf index node is gc-exposed and was being lost to
+    // `ipfs repo gc`. Pin each index node EXPLICITLY (cluster pin = durability;
+    // FATAL local-retain = gc-safe-before-200, like the body/root pins). To
+    // bound per-PUT work, pin only the DIFF vs the set we last CONFIRMED pinned
+    // for this bucket: an absent/empty prior set means "pin ALL" (rollout-safe —
+    // we never skip a still-unpinned shared node), and the prior set is updated
+    // ONLY after a successful fatal pin. NO unpin here — dropping a superseded
+    // node's pin by CID is unsafe across buckets that share an identical node
+    // CID; reclaiming superseded index versions is a separate refcounted pass.
+    if let (Some(queue), Some(ips), Some(lr)) = (
+        state.pin_queue.as_ref(),
+        state.index_pin_set.as_ref(),
+        state.local_retain.as_ref(),
+    ) {
+        // FATAL enumerate (codex review): if we can't list the index nodes we
+        // just committed, fail the PUT rather than leave a durable root whose
+        // nodes are gc-exposed. Succeeds on a healthy/cluster-recoverable index;
+        // only fails on a genuinely broken one (which already fails reads).
+        let new_nodes = bucket.index_node_cids().await.map_err(|e| {
+            tracing::error!(error = %e, bucket = %bucket_name, "index-node pin: enumerate failed after root committed — failing PUT so the index isn't left gc-exposed");
+            ApiError::s3(S3ErrorCode::InternalError, "Failed to protect storage index. Please retry.")
+        })?;
+        if !new_nodes.is_empty() {
+            let ips_key = format!("{}/{}", session.hashed_user_id, bucket_name);
+            let prev: std::collections::HashSet<_> =
+                ips.get(&ips_key).unwrap_or_default().into_iter().collect();
+            // Pin only nodes not already in the last CONFIRMED-pinned set
+            // (absent set ⇒ pin all ⇒ rollout-safe).
+            let to_pin: Vec<_> = new_nodes
+                .iter()
+                .copied()
+                .filter(|c| !prev.contains(c))
+                .collect();
+            // Nodes whose CLUSTER enqueue fails are pinned locally (gc-safe) but
+            // are NOT recorded as confirmed, so the next flush re-attempts their
+            // cluster pin (codex review: never strand a node on a single local
+            // pin the verifier will never drop).
+            let mut cluster_failed = std::collections::HashSet::new();
+            let index_pin_name = format!("index-node:{}", bucket_name);
+            for cid in &to_pin {
+                if let Err(e) = queue.enqueue(crate::pin_queue::PinRequest {
+                    cid: *cid,
+                    target: crate::pin_queue::PinTarget::MasterCluster,
+                    kind: crate::pin_queue::PinKind::Add,
+                    pin_name: Some(index_pin_name.clone()),
+                    bearer_token: Some(session.jwt_token.clone()),
+                    pinning_endpoint: None,
+                }) {
+                    tracing::warn!(cid = %cid, error = %e, "index-node cluster-pin enqueue failed; re-attempt next flush");
+                    cluster_failed.insert(*cid);
+                }
+                // FATAL local pin: never 200 a committed index whose nodes
+                // aren't gc-safe. Genuine pin failure fails the PUT (client
+                // retries); an already-pinned node is a fast no-op.
+                lr.retain(cid).await?;
+            }
+            // Record nodes confirmed BOTH locally pinned AND cluster-enqueued
+            // (all current nodes minus those whose cluster enqueue just failed),
+            // so the diff baseline only skips truly-protected nodes.
+            let confirmed: Vec<_> = new_nodes
+                .iter()
+                .copied()
+                .filter(|c| !cluster_failed.contains(c))
+                .collect();
+            if let Err(e) = ips.put(&ips_key, &confirmed) {
+                tracing::warn!(bucket = %bucket_name, error = %e, "index-pin-set: record failed (re-pins next flush)");
+            }
+            if !to_pin.is_empty() {
+                tracing::debug!(
+                    bucket = %bucket_name,
+                    newly_pinned = to_pin.len(),
+                    cluster_deferred = cluster_failed.len(),
+                    index_nodes = new_nodes.len(),
+                    "index-node pins applied (P0 gc-safety)"
+                );
+            }
+        }
+    }
+
     // Also pin THIS object's CID to the user's external pinning
     // service if credentials are configured. W.9.6: routes through
     // the same queue when `pin_queue_path` is set so user-external

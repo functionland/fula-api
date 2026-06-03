@@ -274,6 +274,32 @@ impl<S: BlockStore> Bucket<S> {
 
         Ok(root_cid)
     }
+
+    /// Collect the CIDs of every node in this bucket's index tree (root +
+    /// internal + leaf nodes). Requires the index to be flushed (call `flush`
+    /// first). Used to pin index nodes for gc-safety — a `ProllyNode`'s child
+    /// CIDs are serialized as plain strings, so recursive pins cover only the
+    /// root block and leave every other index node gc-exposed.
+    pub async fn index_node_cids(&self) -> Result<Vec<Cid>> {
+        self.index.collect_node_cids().await
+    }
+
+    /// Collect the index node CIDs of a PREVIOUS (or arbitrary) root, loaded
+    /// from the store. Pair with [`index_node_cids`](Self::index_node_cids) to
+    /// diff superseded index nodes on a flush: `index_node_cids_at(old_root)`
+    /// minus the new `index_node_cids()` are the index blocks to unpin so `gc`
+    /// can reclaim old index versions.
+    pub async fn index_node_cids_at(&self, root_cid: Cid) -> Result<Vec<Cid>> {
+        self.index.collect_node_cids_at(root_cid).await
+    }
+
+    /// The current root CID of this bucket's index (the last-flushed root, or
+    /// the empty-tree root before any objects were written). Used to capture
+    /// the OLD root before a new flush so the index-node diff can unpin
+    /// superseded nodes.
+    pub fn root_cid(&self) -> Cid {
+        self.metadata.root_cid
+    }
 }
 
 /// Result of listing objects
@@ -924,6 +950,162 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
         Ok(metadata)
     }
 
+    /// RECOVERY phase 1 of 2: build a FRESH index tree from a recovered
+    /// `(s3_key, ObjectMetadata)` set and write its blocks to the store, WITHOUT
+    /// touching the registry. Returns `(new_root, index_node_cids, entry_count,
+    /// total_size)`. The caller MUST pin `index_node_cids` (gc-safety) BEFORE
+    /// calling [`commit_rebuild_index`](Self::commit_rebuild_index), so a crash
+    /// or failure can never leave the committed root pointing at unpinned
+    /// (gc-reclaimable) index nodes (codex review). Building a fresh tree also
+    /// sidesteps the broken root's read-modify-write. Mutates no bucket state,
+    /// so it is safe to call before acquiring the write lock; the orphan blocks
+    /// it writes are gc-able and harmless if the commit never happens.
+    pub async fn prepare_rebuild_index(
+        &self,
+        entries: Vec<(String, ObjectMetadata)>,
+    ) -> Result<(Cid, Vec<Cid>, u64, u64)> {
+        // Dedupe by key (last write wins): `tree.set` overwrites a duplicate
+        // key, so object_count must be the UNIQUE key count and total_size the
+        // sum over unique keys — counting the raw vec would inflate both on a
+        // duplicate recovered row (codex review).
+        let mut deduped: std::collections::BTreeMap<String, ObjectMetadata> =
+            std::collections::BTreeMap::new();
+        for (key, meta) in entries {
+            deduped.insert(key, meta);
+        }
+        let entry_count = deduped.len() as u64;
+
+        let mut tree: ProllyTree<String, ObjectMetadata, S> =
+            ProllyTree::new(Arc::clone(&self.store));
+        let mut total_size: u64 = 0;
+        for (key, meta) in deduped {
+            total_size = total_size.saturating_add(meta.size);
+            tree.set(key, meta).await?;
+        }
+        let new_root = tree.flush().await?;
+        let node_cids = tree.collect_node_cids().await?;
+        Ok((new_root, node_cids, entry_count, total_size))
+    }
+
+    /// Probe whether a bucket's index is still walkable — the hard-loss decision
+    /// for recovery. MUST be called BEFORE
+    /// [`prepare_rebuild_index`](Self::prepare_rebuild_index) writes any blocks:
+    /// a faithful rebuild is deterministic (fixed-size chunking) and re-creates
+    /// `old_root`'s exact nodes in the same store, so probing AFTER prepare would
+    /// self-heal the walk and spuriously report "walkable" (codex review).
+    ///
+    /// - `Ok(true)`  — walkable fleet-wide (healthy or cluster-recoverable): do
+    ///   NOT rebuild; re-pinning (not clobbering) is the correct repair.
+    /// - `Ok(false)` — a GENUINE block-gone (NotFound / exhausted-Unavailable):
+    ///   the hard-loss case recovery exists for.
+    /// - `Err(_)`    — transient/ambiguous (connection/timeout/api/decode):
+    ///   inconclusive; the caller MUST NOT assume hard-loss.
+    pub async fn probe_bucket_walkability(&self, root_cid: Cid) -> Result<bool> {
+        let probe: ProllyTree<String, ObjectMetadata, S> =
+            ProllyTree::new(Arc::clone(&self.store));
+        match probe.collect_node_cids_at(root_cid).await {
+            Ok(_) => Ok(true),
+            Err(CoreError::BlockStore(
+                fula_blockstore::BlockStoreError::NotFound(_)
+                | fula_blockstore::BlockStoreError::Unavailable(_),
+            )) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// RECOVERY phase 2 of 2: swap a hard-loss bucket's root to the freshly
+    /// rebuilt index (from [`prepare_rebuild_index`](Self::prepare_rebuild_index),
+    /// after its nodes are pinned) and persist the registry. Returns the prior
+    /// `old_root` (the prior registry root-set is also backed up to
+    /// `registry.cid.bak`).
+    ///
+    /// Compare-and-swaps on `expected_root`: refuses if the bucket's root changed
+    /// since the caller captured it (a competing recovery), so it can't clobber a
+    /// newer state. The hard-loss WALKABILITY decision is the caller's, made via
+    /// [`probe_bucket_walkability`](Self::probe_bucket_walkability) BEFORE prepare
+    /// — re-probing here would be wrong (the rebuild re-creates `old_root`'s exact
+    /// nodes; codex review). Rolls back the in-memory registry on a persist
+    /// failure so a later persist can't commit a recovery the caller believes
+    /// failed. Holds the per-bucket write lock to serialize against PUTs.
+    pub async fn commit_rebuild_index(
+        &self,
+        user_id: &str,
+        bucket_name: &str,
+        expected_root: Cid,
+        new_root: Cid,
+        entry_count: u64,
+        total_size: u64,
+        token: &str,
+    ) -> Result<Cid> {
+        let internal_key = Self::scoped_bucket_key(user_id, bucket_name);
+        let lock = self.bucket_write_lock(user_id, bucket_name);
+        let _guard = lock.lock().await;
+
+        let saved = self
+            .buckets
+            .get(&internal_key)
+            .map(|r| r.clone())
+            .ok_or_else(|| CoreError::BucketNotFound(bucket_name.to_string()))?;
+        let old_root = saved.root_cid;
+
+        // Compare-and-swap: the caller captured `expected_root` BEFORE building
+        // the new tree. If the root changed since then — a concurrent recovery,
+        // or (only possible on a not-actually-hard-loss bucket) a PUT — abort
+        // rather than clobber the newer state (codex/advisor review). A hard-loss
+        // bucket can't take a successful PUT (its read-modify-write walks the
+        // gc'd root and errors), so for the intended use this only ever fires on
+        // a competing recovery.
+        if old_root != expected_root {
+            return Err(CoreError::PreconditionFailed(format!(
+                "bucket {bucket_name} root changed during recovery (expected {expected_root}, found {old_root}); re-export entries and retry"
+            )));
+        }
+
+        let mut metadata = saved.clone();
+        metadata.root_cid = new_root;
+        metadata.object_count = entry_count;
+        metadata.total_size = total_size;
+        self.buckets.insert(internal_key.clone(), metadata);
+        self.dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // An empty token must use the NO-token persist path: the Some("") path
+        // would call pin_with_token with an empty bearer and fail. The no-token
+        // path still writes registry.cid (heals the bucket root) and pins the
+        // registry via the default mechanism, so recovery works WITHOUT a pinning
+        // token (advisor review) — index-node gc-safety is already guaranteed by
+        // the caller's local pins; only multi-node replication is best-effort.
+        let persist = if token.is_empty() {
+            self.persist_registry().await
+        } else {
+            self.persist_registry_with_token(token).await
+        };
+        if let Err(e) = persist {
+            // Roll back the in-memory swap so a later persist can't commit a
+            // recovery the caller believes failed (codex review).
+            self.buckets.insert(internal_key, saved);
+            return Err(e);
+        }
+
+        tracing::info!(
+            bucket = %bucket_name,
+            old_root = %old_root,
+            new_root = %new_root,
+            entries = entry_count,
+            "index rebuild committed: swapped bucket root"
+        );
+        Ok(old_root)
+    }
+
+    /// The current registry root CID of a user-scoped bucket — a cheap in-memory
+    /// read (no tree walk). Recovery captures this BEFORE building the new tree
+    /// so [`commit_rebuild_index`](Self::commit_rebuild_index) can compare-and-
+    /// swap against it and refuse if the bucket changed underneath the recovery.
+    pub fn bucket_root_cid(&self, user_id: &str, bucket_name: &str) -> Option<Cid> {
+        let internal_key = Self::scoped_bucket_key(user_id, bucket_name);
+        self.buckets.get(&internal_key).map(|r| r.root_cid)
+    }
+
     /// Get (or lazily create) the per-bucket write lock for a user-scoped bucket.
     ///
     /// All index-mutating HTTP handlers (`put_object`, `delete_object`,
@@ -1008,6 +1190,18 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
             .iter()
             .filter(|r| r.key().starts_with(&prefix))
             .map(|r| r.value().clone())
+            .collect()
+    }
+
+    /// List every bucket with its internal `<user_id>:<bucket_name>` key. Used
+    /// by the index-node pin backfill to enumerate all (user, bucket) pairs so
+    /// it can re-open each bucket and pin its index nodes for gc-safety. The
+    /// key splits on the FIRST `:` (user ids are colon-free hex hashes; S3
+    /// bucket names cannot contain `:`).
+    pub fn list_buckets_with_keys(&self) -> Vec<(String, BucketMetadata)> {
+        self.buckets
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
             .collect()
     }
 

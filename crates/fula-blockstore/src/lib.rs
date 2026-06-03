@@ -50,7 +50,7 @@ pub use cid_utils::{create_cid, CidCodec};
 pub use cluster::{ClusterClient, ClusterConfig, PinStatus, ReplicationFactor};
 pub use cluster_fallback::{ClusterFallbackBlockStore, ClusterFallbackConfig};
 pub use error::{BlockStoreError, Result};
-pub use ipfs::{IpfsBlockStore, IpfsConfig};
+pub use ipfs::{IpfsBlockStore, IpfsConfig, PinOutcome};
 pub use ipfs_pinning::{FlexibleBlockStore, IpfsPinningBlockStore, IpfsPinningConfig};
 pub use memory::MemoryBlockStore;
 pub use pinning_service::{

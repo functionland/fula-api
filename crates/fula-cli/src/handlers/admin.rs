@@ -152,6 +152,260 @@ pub async fn list_user_buckets(
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
+/// One recovered index entry: an S3 object key and its content CID + size,
+/// reconstructed from the pin DB (the on-disk index lost it to gc).
+#[derive(Debug, Deserialize)]
+pub struct RecoverEntry {
+    pub key: String,
+    pub cid: String,
+    pub size: u64,
+}
+
+/// POST /admin/recover-bucket-index — rebuild a bucket's prolly index from a
+/// recovered key→cid+size set (server-side, keyless). `user_id` is the raw
+/// email (hashed here via `hash_user_id`, exactly as the bucket key is built).
+/// The pinning token for the registry persist + index-node cluster pins comes
+/// from the `X-Pinning-Token` header.
+#[derive(Debug, Deserialize)]
+pub struct RecoverBucketIndexRequest {
+    pub user_id: String,
+    pub bucket: String,
+    pub entries: Vec<RecoverEntry>,
+    /// Allow rebuilding even a still-walkable (healthy / cluster-recoverable)
+    /// bucket. Default false — recovery normally refuses non-hard-loss buckets,
+    /// because rebuilding from an incomplete entry set would drop entries.
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecoverBucketIndexResponse {
+    pub bucket: String,
+    pub old_root: String,
+    pub new_root: String,
+    pub entry_count: u64,
+    pub total_size: u64,
+    pub index_nodes_pinned: usize,
+    /// Count of supplied entries dropped because their cid was unparseable.
+    /// Default-skip-loud: recovery proceeds (so one bad row never denies a user
+    /// their whole bucket) but every dropped key is reported so the loss is
+    /// never silent (advisor review).
+    pub skipped_count: usize,
+    /// The dropped keys (capped; `skipped_count` is the true total).
+    pub skipped_keys: Vec<String>,
+}
+
+pub async fn recover_bucket_index(
+    State(state): State<Arc<AppState>>,
+    Extension(admin): Extension<AdminSession>,
+    headers: HeaderMap,
+    Json(req): Json<RecoverBucketIndexRequest>,
+) -> Result<Response, ApiError> {
+    let hashed_user_id = hash_user_id(&req.user_id);
+    let admin_id_hashed = hash_user_id(&admin.admin_id);
+    info!(
+        admin_id_hashed = %admin_id_hashed,
+        target_user_hashed = %hashed_user_id,
+        bucket = %req.bucket,
+        entries = req.entries.len(),
+        "Admin rebuilding bucket index from recovered entries"
+    );
+
+    // Pinning token for the registry persist + index-node cluster pins.
+    let token = headers
+        .get("X-Pinning-Token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // Parse {key, cid, size} → (key, ObjectMetadata). Default-skip-loud: an
+    // unparseable cid (these were gateway-written, so this should never happen)
+    // drops that one object but never denies the whole bucket — every dropped
+    // key is recorded and returned (advisor review).
+    const SKIPPED_KEYS_CAP: usize = 100;
+    let mut entries: Vec<(String, fula_core::ObjectMetadata)> =
+        Vec::with_capacity(req.entries.len());
+    let mut skipped_count = 0usize;
+    let mut skipped_keys: Vec<String> = Vec::new();
+    for e in &req.entries {
+        match Cid::from_str(&e.cid) {
+            Ok(cid) => {
+                let meta = fula_core::ObjectMetadata::new(cid, e.size, cid.to_string());
+                entries.push((e.key.clone(), meta));
+            }
+            Err(_) => {
+                skipped_count += 1;
+                if skipped_keys.len() < SKIPPED_KEYS_CAP {
+                    skipped_keys.push(e.key.clone());
+                }
+            }
+        }
+    }
+    if entries.is_empty() {
+        return Err(ApiError::s3(
+            S3ErrorCode::InternalError,
+            "no valid entries supplied to rebuild the index",
+        ));
+    }
+    if skipped_count > 0 {
+        warn!(
+            skipped = skipped_count,
+            bucket = %req.bucket,
+            keys = ?skipped_keys,
+            "index recovery: some pin-DB cids were unparseable and EXCLUDED — those objects will be absent from the rebuilt index"
+        );
+    }
+
+    // gc-safety requires local-retain: we FATALLY local-pin every rebuilt index
+    // node BEFORE committing the new root, so a crash/failure can never leave the
+    // committed root pointing at unpinned, gc-reclaimable nodes (codex review).
+    let lr = state.local_retain.as_ref().ok_or_else(|| {
+        ApiError::s3(
+            S3ErrorCode::InternalError,
+            "index recovery requires the local-retain gc-safety feature to be enabled",
+        )
+    })?;
+
+    // Capture the bucket's current root BEFORE building the new tree — the
+    // compare-and-swap at commit aborts if the bucket changes underneath us
+    // (a competing recovery; a PUT can't succeed on a hard-loss bucket).
+    let expected_root = state
+        .bucket_manager
+        .bucket_root_cid(&hashed_user_id, &req.bucket)
+        .ok_or_else(|| ApiError::s3(S3ErrorCode::NoSuchBucket, "bucket not found for recovery"))?;
+
+    // Decide hard-loss BEFORE writing any rebuild blocks. A faithful rebuild is
+    // deterministic and re-creates old_root's exact nodes in the SAME store, so
+    // probing AFTER prepare would self-heal the walk and spuriously refuse a real
+    // recovery (codex review). force=true is the operator's explicit override.
+    if !req.force {
+        match state
+            .bucket_manager
+            .probe_bucket_walkability(expected_root)
+            .await
+        {
+            // Walkable fleet-wide (healthy or cluster-recoverable): refuse — the
+            // correct repair is re-pinning, not clobbering from a recovered set.
+            Ok(true) => {
+                return Err(ApiError::s3(
+                    S3ErrorCode::PreconditionFailed,
+                    "bucket index is walkable (healthy/cluster-recoverable); pass force=true to rebuild anyway",
+                ));
+            }
+            // Genuine block-gone: the hard-loss case recovery exists for — proceed.
+            Ok(false) => {}
+            // Transient/ambiguous: do NOT assume hard-loss; have the operator retry.
+            Err(e) => {
+                error!(error = %e, bucket = %req.bucket, "walkability probe inconclusive — refusing (retry)");
+                return Err(ApiError::s3(
+                    S3ErrorCode::ServiceUnavailable,
+                    "walkability probe inconclusive (transient); retry, or pass force=true to rebuild anyway",
+                ));
+            }
+        }
+    }
+
+    // Phase 1 — build the fresh index (writes blocks; does NOT touch the registry).
+    let (new_root, node_cids, entry_count, total_size) = state
+        .bucket_manager
+        .prepare_rebuild_index(entries)
+        .await
+        .map_err(|e| {
+            error!(error = %e, bucket = %req.bucket, "index rebuild (prepare) failed");
+            ApiError::s3(S3ErrorCode::InternalError, "index rebuild failed")
+        })?;
+
+    // Phase 2 — pin every new index node BEFORE commit. Cluster pin = durability
+    // (best-effort); local pin = immediate gc-safety and FATAL — a failure aborts
+    // WITHOUT committing, leaving the bucket on its old root (the new blocks are
+    // unreferenced, gc-able orphans).
+    let index_pin_name = format!("index-node:{}:{}", hashed_user_id, req.bucket);
+    for cid in &node_cids {
+        if let Some(queue) = state.pin_queue.as_ref() {
+            let _ = queue.enqueue(crate::pin_queue::PinRequest {
+                cid: *cid,
+                target: crate::pin_queue::PinTarget::MasterCluster,
+                kind: crate::pin_queue::PinKind::Add,
+                pin_name: Some(index_pin_name.clone()),
+                bearer_token: if token.is_empty() {
+                    None
+                } else {
+                    Some(token.clone())
+                },
+                pinning_endpoint: None,
+            });
+        }
+        lr.pin_local_only(cid).await.map_err(|e| {
+            error!(error = %e, bucket = %req.bucket, cid = %cid, "failed to pin a rebuilt index node — aborting BEFORE commit");
+            ApiError::s3(
+                S3ErrorCode::InternalError,
+                "failed to pin rebuilt index nodes; bucket left unchanged",
+            )
+        })?;
+    }
+
+    // Phase 3 — commit: swap the root + persist (refuses a walkable bucket unless
+    // force; rolls back in-memory on persist failure).
+    let old_root = state
+        .bucket_manager
+        .commit_rebuild_index(
+            &hashed_user_id,
+            &req.bucket,
+            expected_root,
+            new_root,
+            entry_count,
+            total_size,
+            &token,
+        )
+        .await
+        .map_err(|e| {
+            error!(error = %e, bucket = %req.bucket, "index rebuild (commit) failed");
+            match e {
+                // CAS mismatch: the bucket changed under the recovery — a real
+                // precondition failure, not a 500 (codex review).
+                fula_core::CoreError::PreconditionFailed(_) => ApiError::s3(
+                    S3ErrorCode::PreconditionFailed,
+                    "index rebuild aborted: bucket root changed during recovery; re-export entries and retry",
+                ),
+                fula_core::CoreError::BucketNotFound(_) => {
+                    ApiError::s3(S3ErrorCode::NoSuchBucket, "bucket not found for recovery")
+                }
+                _ => ApiError::s3(
+                    S3ErrorCode::InternalError,
+                    "index rebuild commit failed (see gateway log)",
+                ),
+            }
+        })?;
+
+    // Record the confirmed-pinned set so the bucket's next PUT diffs correctly.
+    if let Some(ips) = state.index_pin_set.as_ref() {
+        let ips_key = format!("{}/{}", hashed_user_id, req.bucket);
+        let _ = ips.put(&ips_key, &node_cids);
+    }
+
+    let index_nodes_pinned = node_cids.len();
+    info!(
+        bucket = %req.bucket,
+        old_root = %old_root,
+        new_root = %new_root,
+        entry_count,
+        index_nodes_pinned,
+        skipped_count,
+        "✓ bucket index rebuilt + pinned + committed"
+    );
+    let response = RecoverBucketIndexResponse {
+        bucket: req.bucket.clone(),
+        old_root: old_root.to_string(),
+        new_root: new_root.to_string(),
+        entry_count,
+        total_size,
+        index_nodes_pinned,
+        skipped_count,
+        skipped_keys,
+    };
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
 /// DELETE /admin/users/{user_id}
 ///
 /// Delete all data for a user:

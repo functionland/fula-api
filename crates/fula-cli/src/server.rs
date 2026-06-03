@@ -36,6 +36,16 @@ pub async fn run_server(config: GatewayConfig) -> anyhow::Result<()> {
         }
     }
 
+    // P0 index-node gc-safety backfill: pin every existing bucket's index nodes
+    // (the per-PUT path only covers a bucket on its next write, so idle buckets
+    // would stay gc-exposed). Throttled, best-effort; run before re-enabling
+    // `ipfs repo gc`. No-op when the gc-safety feature is off.
+    if state.local_retain.is_some() && state.config.local_retain_backfill.unwrap_or(true) {
+        tokio::spawn(crate::index_pin_backfill::run_index_pin_backfill(Arc::clone(
+            &state,
+        )));
+    }
+
     // Audit F-A5 / issue #13: spawn the multipart-upload reaper. Drops
     // abandoned in-memory upload sessions whose `last_activity_at` is
     // older than `multipart_expiry_secs`. Does NOT touch the blockstore
@@ -126,6 +136,16 @@ pub async fn run_server_with_shutdown(
         if state.config.local_retain_backfill.unwrap_or(true) {
             tokio::spawn(async move { lr.backfill().await });
         }
+    }
+
+    // P0 index-node gc-safety backfill: pin every existing bucket's index nodes
+    // (the per-PUT path only covers a bucket on its next write, so idle buckets
+    // would stay gc-exposed). Throttled, best-effort; run before re-enabling
+    // `ipfs repo gc`. No-op when the gc-safety feature is off.
+    if state.local_retain.is_some() && state.config.local_retain_backfill.unwrap_or(true) {
+        tokio::spawn(crate::index_pin_backfill::run_index_pin_backfill(Arc::clone(
+            &state,
+        )));
     }
 
     // Phase 3.2 — spawn the users-index publisher loop iff the env

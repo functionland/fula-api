@@ -65,6 +65,11 @@ pub struct AppState {
     /// task (spawned in `server::run_server`) drops local pins once the cluster
     /// confirms replication. `None` = feature off (tests / dev / cluster down).
     pub local_retain: Option<Arc<crate::local_retain::LocalRetainContext>>,
+    /// Per-bucket "last confirmed-pinned index node set" store (P0 index
+    /// gc-safety). `Some` when `local_retain_path` is configured. The PUT
+    /// handler diffs against it to pin only newly-appeared index nodes (and pin
+    /// ALL when absent — rollout-safe). `None` = feature off.
+    pub index_pin_set: Option<Arc<crate::index_pin_set::IndexPinSet>>,
 }
 
 impl AppState {
@@ -245,6 +250,8 @@ impl AppState {
         // Local-retain-until-replicated GC-safety. Degrades to `None` (feature
         // off) on any setup failure so it never blocks startup.
         let local_retain = Self::maybe_build_local_retain(&config).await;
+        // Per-bucket pinned-index-node set (the gc-safety diff baseline).
+        let index_pin_set = Self::maybe_build_index_pin_set(&config);
 
         Ok(Self {
             config,
@@ -256,6 +263,7 @@ impl AppState {
             pin_queue,
             entries_store,
             local_retain,
+            index_pin_set,
         })
     }
 
@@ -317,9 +325,32 @@ impl AppState {
             }
         };
 
+        // Read budget is env-tunable so a too-slow / too-fast lost-block 410 can
+        // be adjusted in prod without a rebuild. Seconds; falls back to the
+        // (fast-failure) defaults when unset/unparseable.
+        let env_secs = |name: &str, default: std::time::Duration| -> std::time::Duration {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(default)
+        };
+        let fb_defaults = ClusterFallbackConfig::default();
         let fb_cfg = ClusterFallbackConfig {
             max_holders: config.cluster_fallback_max_holders.max(1),
-            ..ClusterFallbackConfig::default()
+            online_fast_timeout: env_secs(
+                "FULA_READ_FAST_TIMEOUT_SECS",
+                fb_defaults.online_fast_timeout,
+            ),
+            online_slow_timeout: env_secs(
+                "FULA_READ_SLOW_TIMEOUT_SECS",
+                fb_defaults.online_slow_timeout,
+            ),
+            file_download_timeout: env_secs(
+                "FULA_READ_FILE_TIMEOUT_SECS",
+                fb_defaults.file_download_timeout,
+            ),
+            ..fb_defaults
         };
         info!(
             cluster_url = %config.cluster_url,
@@ -391,6 +422,31 @@ impl AppState {
             master_peer_id,
             min_repl,
         )))
+    }
+
+    /// Open the per-bucket pinned-index-node-set store when the gc-safety
+    /// feature is configured. Derives its path next to the local-retain backlog
+    /// (`local_retain_path`'s directory). Degrades to `None` on any failure so
+    /// it never blocks startup; the index-node pinning in the PUT handler is
+    /// then a no-op.
+    fn maybe_build_index_pin_set(
+        config: &GatewayConfig,
+    ) -> Option<Arc<crate::index_pin_set::IndexPinSet>> {
+        let base = config.local_retain_path.as_ref()?;
+        let path = std::path::Path::new(base)
+            .parent()
+            .map(|p| p.join("index_pin_set.redb"))
+            .unwrap_or_else(|| std::path::PathBuf::from("index_pin_set.redb"));
+        match crate::index_pin_set::IndexPinSet::open(&path) {
+            Ok(s) => {
+                info!(path = %path.display(), "✓ Index-node pin-set store opened (P0 index gc-safety)");
+                Some(Arc::new(s))
+            }
+            Err(e) => {
+                warn!(error = %e, "index-pin-set: failed to open store; index-node pinning disabled");
+                None
+            }
+        }
     }
 }
 
