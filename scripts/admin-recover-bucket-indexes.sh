@@ -36,10 +36,12 @@
 #       404 here and are instead recovered app-side (the live app has the email
 #       in its JWT). Seed users do not need EMAIL_CSV.
 #
-#   Strategy per (user_id, bucket): POST with identity = pins.user_id first; on
-#   404, if EMAIL_CSV maps that user_id to an email, retry with the email. The
-#   per-bucket log shows which identity matched. RUN THE CANARY FIRST (below) to
-#   learn, empirically, which identity your fleet uses before the full sweep.
+#   Strategy per (user_id, bucket): POST identity = pins.user_id (NO email
+#   needed). This recovers ALL seed users + any OAuth bucket keyed by the hashed
+#   identity. An OAuth bucket keyed by hash_user_id(plaintext-email) — the common
+#   legacy case — 404s here and is recovered app-side (P4). If you happen to have
+#   an EMAIL_CSV, a 404 retries with the email. The per-bucket 200/404 tally
+#   shows the real server-side yield; RUN --dry-run-only + the CANARY FIRST.
 #
 # REQUIRED env ───────────────────────────────────────────────────────────────
 #   ADMIN_JWT_SECRET   The HS256 admin secret from /etc/fula/.env on master.
@@ -54,10 +56,12 @@
 #                      persist path, which still heals registry.cid and locally
 #                      pins the rebuilt index (gc-safe on master); only off-box
 #                      replication is then best-effort. Leave empty for recovery.
-#   EMAIL_CSV          Path to a `user_id,email` CSV (64-hex pins.user_id →
-#                      plaintext email) for OAuth users. Build it by decrypting
-#                      webui_users.encrypted_email with the pinning-service
-#                      ENCRYPTION_KEY, or export from your OAuth provider.
+#   EMAIL_CSV          OPTIONAL `user_id,email` CSV (64-hex pins.user_id →
+#                      plaintext email) for OAuth users. USUALLY UNAVAILABLE —
+#                      the email is one-way hashed on the server (sha256), so
+#                      unless you obtain plaintext emails out-of-band (e.g. your
+#                      OAuth provider) leave this unset; OAuth buckets that 404
+#                      are recovered app-side (P4), not here.
 #   STATUS_EXCLUDE     Pin statuses to EXCLUDE from the rebuilt index. Default
 #                      'deleted','failed' (failed = upload never completed → a
 #                      dangling index entry). Set to 'deleted' alone to be
@@ -72,32 +76,35 @@
 #   -h | --help      Show this header.
 #
 # CANARY-FIRST (strongly recommended) ─────────────────────────────────────────
-#   Validate the whole identity→hash→bucket-key→rebuild pipeline on ONE known
-#   bucket before the fleet sweep. This is the FIRST real end-to-end test of the
-#   whole chain (probe → pin-before-commit → root swap → client LIST) — expect to
-#   verify/debug here, NOT to rubber-stamp. Prereqs: the gateway is deployed with
-#   the recovery endpoint AND FULA_ADMIN_API=true (a 403 means it isn't enabled).
+#   Validate the whole pipeline on ONE known hard-loss bucket before the fleet
+#   sweep. This is the FIRST real end-to-end test of the chain (probe →
+#   pin-before-commit → root swap → client LIST) — expect to verify/debug here,
+#   NOT to rubber-stamp. Prereqs: the gateway is deployed with the recovery
+#   endpoint AND FULA_ADMIN_API=true (a 403 means it isn't enabled). No
+#   PINNING_TOKEN needed — recovery heals registry.cid via the same no-token
+#   persist path admin-pii-sweep.sh already uses in production.
 #
-#   For a SEED canary user (32-hex pins.user_id) — identity is automatic:
+#   Pick a SEED user (32-hex pins.user_id) for the cleanest no-email proof —
+#   identity is automatic and guaranteed to match:
 #     export ADMIN_JWT_SECRET="<from /etc/fula/.env>"
-#     ONLY_USER="<32-hex pins.user_id>" ONLY_BUCKET="images" \
+#     ONLY_USER="<32-hex pins.user_id>" ONLY_BUCKET="<bucket>" \
 #       ./scripts/admin-recover-bucket-indexes.sh --yes
+#   Expect REBUILT (200); then confirm that user's client can LIST the bucket.
 #
-#   For an OAUTH canary user (64-hex pins.user_id) you MUST supply the email, or
-#   it 404s (the bucket is keyed by hash_user_id(EMAIL), not hash_user_id(uid)):
-#     printf '%s,%s\n' "<64-hex pins.user_id>" "<plaintext-email>" > /tmp/canary.csv
-#     export ADMIN_JWT_SECRET="<from /etc/fula/.env>"
-#     EMAIL_CSV=/tmp/canary.csv ONLY_USER="<64-hex>" ONLY_BUCKET="images" \
+#   An OAUTH user (64-hex) 404s UNLESS its bucket is keyed by the hashed identity
+#   OR you have the plaintext email out-of-band (usually you don't — it's one-way
+#   hashed). A 404 here is EXPECTED for legacy OAuth buckets and means "route to
+#   P4", not "broken". Only if you DO have an email:
+#     printf '%s,%s\n' "<64-hex>" "<plaintext-email>" > /tmp/canary.csv
+#     EMAIL_CSV=/tmp/canary.csv ADMIN_JWT_SECRET="..." \
+#       ONLY_USER="<64-hex>" ONLY_BUCKET="<bucket>" \
 #       ./scripts/admin-recover-bucket-indexes.sh --yes
-#   The log shows `id=email` when the email path matched. A 200 + the user's
-#   client successfully LISTing the bucket = the pipeline works; THEN sweep.
-#   (No PINNING_TOKEN needed — recovery heals registry.cid via the same no-token
-#   persist path admin-pii-sweep.sh already uses in production.)
 #
 # FULL SWEEP ───────────────────────────────────────────────────────────────────
 #     export ADMIN_JWT_SECRET="<from /etc/fula/.env>"
-#     # optional: export EMAIL_CSV=/tmp/user_emails.csv   # for OAuth users
-#     ./scripts/admin-recover-bucket-indexes.sh --dry-run-only   # preview
+#     # EMAIL_CSV is usually unavailable (emails are one-way hashed) — omit it;
+#     # OAuth buckets that 404 route to app-side P4.
+#     ./scripts/admin-recover-bucket-indexes.sh --dry-run-only   # preview + tally
 #     ./scripts/admin-recover-bucket-indexes.sh                  # confirm + run
 #
 # Reads only the pin DB (SELECT) + POSTs to the admin endpoint. Writes only the
