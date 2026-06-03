@@ -124,6 +124,8 @@ ONLY_USER="${ONLY_USER:-}"
 ONLY_BUCKET="${ONLY_BUCKET:-}"
 LOG="${LOG:-/tmp/recover-$(date +%s).log}"
 REQ_TIMEOUT="${REQ_TIMEOUT:-600}"
+RESP="$(mktemp /tmp/recover-resp.XXXXXX)"
+trap 'rm -f "$RESP"' EXIT
 
 b64url() { openssl base64 -A | tr -d '=' | tr '+/' '-_'; }
 
@@ -153,6 +155,19 @@ psql_q() { docker exec -i "$PG_CONTAINER" sh -c 'psql -U "$POSTGRES_USER" -d "$P
 valid_uid()    { [[ "$1" =~ ^[0-9a-fA-F]{32,64}$ ]]; }
 valid_bucket() { [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{1,62}$ ]]; }
 
+# Validate operator-supplied SQL fragments BEFORE interpolation. (uid/bucket
+# coming from the DB are re-checked per-row in the loop; these env values are
+# otherwise unguarded and go straight into SQL — codex review.)
+if [[ -n "$ONLY_USER" ]] && ! valid_uid "$ONLY_USER"; then
+    echo "ERROR: ONLY_USER must be a 32/64-hex id" >&2; exit 1
+fi
+if [[ -n "$ONLY_BUCKET" ]] && ! valid_bucket "$ONLY_BUCKET"; then
+    echo "ERROR: ONLY_BUCKET must be a valid bucket name" >&2; exit 1
+fi
+if [[ ! "$STATUS_EXCLUDE" =~ ^\'[a-z]+\'(,\'[a-z]+\')*$ ]]; then
+    echo "ERROR: STATUS_EXCLUDE must look like \"'deleted','failed'\" (quoted, comma-separated)" >&2; exit 1
+fi
+
 # Load EMAIL_CSV (user_id,email) into an assoc array for the OAuth fallback.
 declare -A USER_EMAIL=()
 if [[ -n "$EMAIL_CSV" ]]; then
@@ -176,7 +191,13 @@ if [[ -n "$ONLY_USER" ]];   then ENUM_SQL="$ENUM_SQL AND user_id = '${ONLY_USER}
 if [[ -n "$ONLY_BUCKET" ]]; then ENUM_SQL="$ENUM_SQL AND split_part(substr(name,8),'/',1) = '${ONLY_BUCKET}'"; fi
 ENUM_SQL="$ENUM_SQL ORDER BY 1;"
 
-mapfile -t PAIRS < <(printf '%s' "$ENUM_SQL" | psql_q)
+# Capture explicitly: a process-substitution `< <(psql_q)` would swallow a
+# psql/docker failure under set -e and look like "0 candidates" — codex review.
+if ! ENUM_OUT=$(printf '%s' "$ENUM_SQL" | psql_q); then
+    echo "ERROR: enumeration query failed (psql/docker). Aborting — this is NOT 'nothing to do'." >&2
+    exit 1
+fi
+mapfile -t PAIRS < <(printf '%s\n' "$ENUM_OUT" | sed '/^$/d')
 echo "Found ${#PAIRS[@]} (user, bucket) candidate(s)." >&2
 if [[ "${#PAIRS[@]}" -eq 0 ]]; then echo "Nothing to do." >&2; exit 0; fi
 
@@ -186,27 +207,36 @@ if [[ "${#PAIRS[@]}" -eq 0 ]]; then echo "Nothing to do." >&2; exit 0; fi
 # one of that user's buckets — harmless extras the client never requests).
 entries_json() {
     local uid="$1" bucket="$2"
+    # starts_with() (not LIKE) so a `_` in a bucket name is a literal, not a
+    # wildcard. DISTINCT ON (k) ORDER BY updated_at DESC keeps the CURRENT pin
+    # per key (a re-uploaded object has multiple pins) so the rebuild is
+    # deterministic — codex review.
     printf "SELECT coalesce(json_agg(json_build_object('key',k,'cid',cid,'size',size)),'[]'::json) FROM (
-        SELECT substr(name, length('object:%s/')+1) AS k, cid, size
-          FROM pins WHERE user_id='%s' AND name LIKE 'object:%s/%%' AND status NOT IN (%s)
-        UNION
-        SELECT name AS k, cid, size
-          FROM pins WHERE user_id='%s' AND starts_with(name,'__fula_forest') AND status NOT IN (%s)
+        SELECT DISTINCT ON (k) k, cid, size FROM (
+            SELECT substr(name, length('object:%s/')+1) AS k, cid, size, updated_at
+              FROM pins WHERE user_id='%s' AND starts_with(name,'object:%s/') AND status NOT IN (%s)
+            UNION ALL
+            SELECT name AS k, cid, size, updated_at
+              FROM pins WHERE user_id='%s' AND starts_with(name,'__fula_forest_') AND status NOT IN (%s)
+        ) u ORDER BY k, updated_at DESC
     ) e;" "$bucket" "$uid" "$bucket" "$STATUS_EXCLUDE" "$uid" "$STATUS_EXCLUDE" | psql_q
 }
 
 # POST one recovery request; echoes the HTTP status code.
 post_recover() {
-    local identity="$1" bucket="$2" entries="$3" jwt resp
+    local identity="$1" bucket="$2" entries="$3" jwt payload code
     jwt=$(mint_jwt)
-    local payload
     payload=$(jq -nc --arg uid "$identity" --arg b "$bucket" --argjson e "$entries" \
         '{user_id:$uid, bucket:$b, force:false, entries:$e}')
     local hdrs=(-H "Authorization: Bearer $jwt" -H "Content-Type: application/json")
     [[ -n "$PINNING_TOKEN" ]] && hdrs+=(-H "X-Pinning-Token: $PINNING_TOKEN")
-    curl -sS -o /tmp/recover-resp.$$ -w '%{http_code}' --max-time "$REQ_TIMEOUT" \
+    : > "$RESP"
+    # Capture the status exactly once (a bare `curl … || echo 000` can emit
+    # `000000` on connect failure) — codex review.
+    code=$(curl -sS -o "$RESP" -w '%{http_code}' --max-time "$REQ_TIMEOUT" \
         -X POST "${hdrs[@]}" --data-binary @- \
-        "$BASE/admin/recover-bucket-index" <<<"$payload" || echo "000"
+        "$BASE/admin/recover-bucket-index" <<<"$payload") || code="000"
+    echo "$code"
 }
 
 echo "" >&2
@@ -232,7 +262,12 @@ for pair in "${PAIRS[@]}"; do
         TALLY[skip]=$((TALLY[skip]+1)); continue
     fi
 
-    entries=$(entries_json "$uid" "$bucket")
+    # One bucket's transient psql failure must not abort the whole sweep
+    # (set -e would exit on the bare command substitution) — codex review.
+    if ! entries=$(entries_json "$uid" "$bucket"); then
+        echo "[$i/${#PAIRS[@]}] $bucket  ENTRIES-QUERY-FAILED  skip" | tee -a "$LOG" >&2
+        TALLY[other]=$((TALLY[other]+1)); continue
+    fi
     n=$(jq 'length' <<<"$entries" 2>/dev/null || echo 0)
 
     if [[ "$DRY_RUN_ONLY" == "1" ]]; then
@@ -259,7 +294,7 @@ for pair in "${PAIRS[@]}"; do
         used="email"
     fi
 
-    summary=$(jq -rc '{new_root,entry_count,index_nodes_pinned,skipped_count}' /tmp/recover-resp.$$ 2>/dev/null || cat /tmp/recover-resp.$$ 2>/dev/null)
+    summary=$(jq -rc '{new_root,entry_count,index_nodes_pinned,skipped_count}' "$RESP" 2>/dev/null || cat "$RESP" 2>/dev/null)
     case "$code" in
         200) TALLY[200]=$((TALLY[200]+1)); tag="REBUILT" ;;
         412) TALLY[412]=$((TALLY[412]+1)); tag="skip-healthy" ;;
@@ -269,7 +304,6 @@ for pair in "${PAIRS[@]}"; do
     esac
     printf '[%d/%d] %s/%s  n=%s  id=%s  %s  %s\n' \
         "$i" "${#PAIRS[@]}" "${uid:0:12}…" "$bucket" "$n" "$used" "$tag" "$summary" | tee -a "$LOG"
-    rm -f /tmp/recover-resp.$$
 done
 
 echo "" >&2
