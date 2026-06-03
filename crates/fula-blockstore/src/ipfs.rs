@@ -523,11 +523,21 @@ impl IpfsBlockStore {
         );
         let response = self.client.post(&url).timeout(timeout).send().await?;
         if response.status().is_success() {
-            Ok(())
-        } else {
-            let body = response.text().await.unwrap_or_default();
-            Err(BlockStoreError::PinFailed(format!("local pin/add {}: {}", cid, body)))
+            return Ok(());
         }
+        let body = response.text().await.unwrap_or_default();
+        // kubo rejects `pin/add?recursive=false` when the CID is ALREADY pinned
+        // — most commonly "already pinned recursively", because a cluster
+        // recursive pin of the bucket root already covers this block. That IS
+        // the desired end state (the block is gc-safe — a recursive pin is
+        // stricter than our direct pin), so treat any "already pinned" response
+        // as success (idempotent), mirroring `unpin_local`'s "not pinned"
+        // handling. Without this, every block already covered by a recursive
+        // pin fails the fatal PUT path with a false error and breaks uploads.
+        if body.to_ascii_lowercase().contains("already pinned") {
+            return Ok(());
+        }
+        Err(BlockStoreError::PinFailed(format!("local pin/add {}: {}", cid, body)))
     }
 
     /// Remove a local (direct) pin from the master's own kubo (`pin/rm`).
@@ -543,9 +553,21 @@ impl IpfsBlockStore {
             return Ok(());
         }
         let body = response.text().await.unwrap_or_default();
-        // kubo errors if the CID isn't pinned — that's the desired end state,
-        // so treat it as success (idempotent unpin).
-        if body.contains("not pinned") || body.contains("not found") {
+        // All of these mean "there is no DIRECT local pin of ours to remove",
+        // which is the desired end state, so treat them as success (idempotent):
+        //  - "not pinned" / "not found": the block is already not directly pinned.
+        //  - "pinned recursively" / "indirectly pinned": the block is held by a
+        //    cluster RECURSIVE pin, not our direct pin — we cannot (and must
+        //    not) drop that here; the cluster owns it. Returning Ok lets the
+        //    verifier stop tracking it instead of retrying the same failure
+        //    every cycle.
+        let b = body.to_ascii_lowercase();
+        if b.contains("not pinned")
+            || b.contains("not found")
+            || b.contains("pinned recursively")
+            || b.contains("indirectly pinned")
+            || b.contains("pinned indirectly")
+        {
             return Ok(());
         }
         Err(BlockStoreError::UnpinFailed(format!("local pin/rm {}: {}", cid, body)))
