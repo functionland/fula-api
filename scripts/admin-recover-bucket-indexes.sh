@@ -73,11 +73,26 @@
 #
 # CANARY-FIRST (strongly recommended) ─────────────────────────────────────────
 #   Validate the whole identity→hash→bucket-key→rebuild pipeline on ONE known
-#   bucket before the fleet sweep:
+#   bucket before the fleet sweep. This is the FIRST real end-to-end test of the
+#   whole chain (probe → pin-before-commit → root swap → client LIST) — expect to
+#   verify/debug here, NOT to rubber-stamp. Prereqs: the gateway is deployed with
+#   the recovery endpoint AND FULA_ADMIN_API=true (a 403 means it isn't enabled).
+#
+#   For a SEED canary user (32-hex pins.user_id) — identity is automatic:
 #     export ADMIN_JWT_SECRET="<from /etc/fula/.env>"
-#     ONLY_USER="<that user's pins.user_id>" ONLY_BUCKET="images" \
+#     ONLY_USER="<32-hex pins.user_id>" ONLY_BUCKET="images" \
 #       ./scripts/admin-recover-bucket-indexes.sh --yes
-#   Confirm a 200 and that the user's client can LIST the bucket, THEN sweep.
+#
+#   For an OAUTH canary user (64-hex pins.user_id) you MUST supply the email, or
+#   it 404s (the bucket is keyed by hash_user_id(EMAIL), not hash_user_id(uid)):
+#     printf '%s,%s\n' "<64-hex pins.user_id>" "<plaintext-email>" > /tmp/canary.csv
+#     export ADMIN_JWT_SECRET="<from /etc/fula/.env>"
+#     EMAIL_CSV=/tmp/canary.csv ONLY_USER="<64-hex>" ONLY_BUCKET="images" \
+#       ./scripts/admin-recover-bucket-indexes.sh --yes
+#   The log shows `id=email` when the email path matched. A 200 + the user's
+#   client successfully LISTing the bucket = the pipeline works; THEN sweep.
+#   (No PINNING_TOKEN needed — recovery heals registry.cid via the same no-token
+#   persist path admin-pii-sweep.sh already uses in production.)
 #
 # FULL SWEEP ───────────────────────────────────────────────────────────────────
 #     export ADMIN_JWT_SECRET="<from /etc/fula/.env>"
