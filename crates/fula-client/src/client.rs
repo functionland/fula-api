@@ -1013,6 +1013,62 @@ impl FulaClient {
         key: &str,
         cid_hint: &cid::Cid,
     ) -> Result<OfflineGetResult> {
+        // Generic cid-hint entry point. A 404/NoSuchKey from a reachable
+        // master propagates UNCHANGED (a missing object is a real miss,
+        // not an offline condition); only master-unreachable consults the
+        // hint. This strict invariant is covered by
+        // `test_cid_hint_master_4xx_propagates_without_fallback` — do not
+        // weaken it. Forest infrastructure that must recover a gc-orphaned
+        // node on a 404 uses `get_forest_object_known_cid` instead.
+        self.get_object_with_offline_fallback_known_cid_inner(bucket, key, cid_hint, false)
+            .await
+    }
+
+    /// Forest-infrastructure variant of
+    /// [`get_object_with_offline_fallback_known_cid`] (issue #24).
+    ///
+    /// Identical to the generic method EXCEPT it ALSO engages the verified
+    /// gateway race when a reachable master returns a 404/NoSuchKey —
+    /// recovering a forest node or manifest page whose gateway
+    /// storage-key → CID index entry was destroyed by a server-side
+    /// `ipfs repo gc` while the block itself still exists in IPFS by CID.
+    ///
+    /// Scoped to forest infrastructure (HAMT nodes + manifest pages) on
+    /// purpose: those callers hold an authoritative, freshly-decrypted CID
+    /// from the parent `LinkV2` / `page_ref`, so a 404 there means "index
+    /// entry gc'd", not "object deleted". The fetched bytes are
+    /// content-verified against the supplied CID inside the gateway race
+    /// (`fetch_verified` → `verify_cid_against_bytes`), so recovery can
+    /// only ever return the exact block the manifest points at — the CID
+    /// is the capability. The generic method keeps the strict
+    /// propagate-404 invariant so no future non-forest caller can silently
+    /// inherit hide-404 behavior.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[instrument(skip(self, cid_hint))]
+    pub async fn get_forest_object_known_cid(
+        &self,
+        bucket: &str,
+        key: &str,
+        cid_hint: &cid::Cid,
+    ) -> Result<OfflineGetResult> {
+        self.get_object_with_offline_fallback_known_cid_inner(bucket, key, cid_hint, true)
+            .await
+    }
+
+    /// Shared implementation of the two cid-hint entry points above.
+    /// `recover_on_not_found` gates the issue-#24 behavior: `true` routes
+    /// a 404/NoSuchKey from a reachable master into the verified gateway
+    /// race (forest nodes/pages); `false` propagates the 404 unchanged
+    /// (generic objects). The master-up success path and the
+    /// master-unreachable branch are identical for both.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn get_object_with_offline_fallback_known_cid_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        cid_hint: &cid::Cid,
+        recover_on_not_found: bool,
+    ) -> Result<OfflineGetResult> {
         // Fast path mirror of get_object_with_offline_fallback — flags
         // off means no hint consumption, identical latency.
         if self.block_cache.is_none() && self.gateway_pool.is_none() {
@@ -1057,7 +1113,37 @@ impl FulaClient {
                     freshness: ReadFreshness::Live,
                 })
             }
-            Err(e) if is_master_unreachable_error(&e) => {
+            // Issue #24: forest infrastructure (`recover_on_not_found`) ALSO
+            // recovers on a NoSuchKey/404 from a REACHABLE master — the
+            // node/page's gateway storage-key→CID index entry was gc-orphaned
+            // while the block still exists by CID. We match the shared
+            // `is_not_found()` (which also covers NoSuchBucket) rather than a
+            // narrower object-only predicate on purpose: the two forest
+            // callers (`S3BlobBackend::get_with_cid_hint`, `load_manifest_pages`)
+            // are reached only AFTER the bucket's manifest decrypted, so a
+            // NoSuchBucket cannot occur here, and the gateway race is
+            // content-verified against the manifest-supplied CID regardless of
+            // which not-found shape triggered it (caller scope verified at
+            // source during review).
+            Err(e)
+                if is_master_unreachable_error(&e)
+                    || (recover_on_not_found && e.is_not_found()) =>
+            {
+                // Surface gc-orphan recovery: a silent recover would hide
+                // ongoing gateway-index rot. Fires only on the reachable-
+                // master not-found path, not the normal master-unreachable
+                // case (which is the expected offline-mode flow).
+                if recover_on_not_found && !is_master_unreachable_error(&e) {
+                    warn!(
+                        bucket = %bucket,
+                        key = %key,
+                        cid = %cid_hint,
+                        "forest node/page not-found from reachable master — \
+                         gateway index entry likely gc-orphaned; recovering via \
+                         verified gateway race by CID (issue #24). Repeated \
+                         occurrences mean the gateway index needs re-pin."
+                    );
+                }
                 self.try_offline_fallback_with_cid_hint(bucket, key, cid_hint, e)
                     .await
             }

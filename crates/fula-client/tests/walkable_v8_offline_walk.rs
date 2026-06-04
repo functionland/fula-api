@@ -195,3 +195,65 @@ async fn s3_backend_get_with_cid_hint_rejects_gateway_tamper() {
          walkable-v8 inherits from gateway_fetch."
     );
 }
+
+/// Online orphaned-node recovery (issue #24). Master is UP but returns
+/// `404 NoSuchKey` for a forest node whose storage-key -> CID index entry
+/// was destroyed by a server-side `ipfs repo gc`, while the node's block
+/// still exists in IPFS by CID. The forest cid-hint fetch MUST recover it
+/// via the verified gateway race (the same mechanism the master-down path
+/// already uses), not abort the walk.
+///
+/// Pre-fix this FAILS: `get_with_cid_hint` routes through
+/// `get_object_with_offline_fallback_known_cid`, which only engages the
+/// race on `is_master_unreachable_error`; a 404 is not master-down, so it
+/// propagates and the `.expect()` below panics. Post-fix the forest-scoped
+/// wrapper also recovers on a `NotFound`, so the node resolves by CID.
+#[tokio::test]
+async fn s3_backend_get_with_cid_hint_recovers_orphaned_node_on_master_404() {
+    let master = MockServer::start().await;
+    let gateway = MockServer::start().await;
+
+    let body = b"opaque-v8-hamt-node-ciphertext-orphaned-by-gc".to_vec();
+    let body_cid = blake3_raw_cid(&body);
+
+    // Master is UP but the storage-key -> CID index entry is gone:
+    // returns 404 NoSuchKey (NOT a master-down 5xx).
+    Mock::given(method("GET"))
+        .and(wm_path("/images/__fula_forest_v7_nodes/orphaned"))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_string(
+                r#"<Error><Code>NoSuchKey</Code><Message>not here</Message></Error>"#,
+            ),
+        )
+        .mount(&master)
+        .await;
+
+    // The node's block still exists in IPFS, addressable by CID.
+    let gateway_path = format!("/ipfs/{}", body_cid);
+    Mock::given(method("GET"))
+        .and(wm_path(gateway_path.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&gateway)
+        .await;
+
+    let gateway_template = format!("{}/ipfs/{{cid}}", gateway.uri());
+    let config = mk_config_with_gateway(&master.uri(), &gateway_template);
+    let client = FulaClient::new(config).expect("build FulaClient");
+    let backend = S3BlobBackend::new(client, "images".to_string());
+
+    let result = backend
+        .get_with_cid_hint("__fula_forest_v7_nodes/orphaned", Some(&body_cid))
+        .await
+        .expect(
+            "issue #24: a forest node that 404s by storage-key but exists by \
+             CID must be recovered via the verified gateway race even with \
+             master UP. Pre-fix this propagates the 404 and aborts the walk.",
+        );
+
+    assert_eq!(
+        result, body,
+        "recovered bytes must content-address to the manifest-supplied CID; \
+         a successful Ok confirms the gateway race executed and passed \
+         verify_cid_against_bytes",
+    );
+}
