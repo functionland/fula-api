@@ -221,8 +221,11 @@ for row in "${ROWS[@]}"; do
     fi
 
     # POST with the pre-hashed owner_id (no email, no hash_user_id on the server).
-    payload=$(jq -nc --arg o "$owner" --arg b "$bucket" --argjson e "$entries" \
-        '{owner_id:$o, bucket:$b, force:false, entries:$e}')
+    # Pipe entries through jq's STDIN (as `.`) — passing a big array via
+    # --argjson overflows the argv limit ("Argument list too long") on buckets
+    # with thousands of entries.
+    payload=$(printf '%s' "$entries" | jq -c --arg o "$owner" --arg b "$bucket" \
+        '{owner_id:$o, bucket:$b, force:false, entries:.}')
     hdrs=(-H "Authorization: Bearer $(mint_jwt)" -H "Content-Type: application/json")
     [[ -n "$PINNING_TOKEN" ]] && hdrs+=(-H "X-Pinning-Token: $PINNING_TOKEN")
     : > "$RESP"
