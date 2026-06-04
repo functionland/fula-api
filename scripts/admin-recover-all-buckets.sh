@@ -243,8 +243,15 @@ for row in "${ROWS[@]}"; do
     # Pipe entries through jq's STDIN (as `.`) — passing a big array via
     # --argjson overflows the argv limit ("Argument list too long") on buckets
     # with thousands of entries.
-    payload=$(printf '%s' "$entries" | jq -c --arg o "$owner" --arg b "$bucket" \
-        '{owner_id:$o, bucket:$b, force:false, entries:.}')
+    # FORCE=1 sets force:true → the endpoint SKIPS the walkability probe and
+    # rebuilds even a bucket that "lists" healthy. Needed when the prolly INDEX
+    # is missing individual DATA objects (404 NoSuchKey on download) while its
+    # root still probes walkable — with force=false such a bucket 412-skips and
+    # the missing object->CID entries are never restored. Always scope with
+    # ONLY_OWNER/ONLY_BUCKET when forcing. Rebuild stays CAS-guarded + safe.
+    force_json=false; [[ "${FORCE:-0}" == "1" ]] && force_json=true
+    payload=$(printf '%s' "$entries" | jq -c --arg o "$owner" --arg b "$bucket" --argjson f "$force_json" \
+        '{owner_id:$o, bucket:$b, force:$f, entries:.}')
     hdrs=(-H "Authorization: Bearer $(mint_jwt)" -H "Content-Type: application/json")
     [[ -n "$PINNING_TOKEN" ]] && hdrs+=(-H "X-Pinning-Token: $PINNING_TOKEN")
     : > "$RESP"
