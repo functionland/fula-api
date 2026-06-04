@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.2] - 2026-05-23
 
 ### Fixed
+- **#24 — Fixed 404 breaks.**
+
+## [0.6.2] - 2026-05-23
+
+### Fixed
 
 - **#23 — `uploadLargeFileResumable` now durably persists the forest to master.** Previously, the resumable chunked upload path (`put_object_encrypted_resumable_with_cancel` and `resume_upload_with_cancel`) registered the new entry only in the in-memory cache + on-disk WAL after chunks landed; the master-side flush sequence (`save_sharded_hamt_forest`/`save_monolithic_forest` → `Persisting bucket registry to IPFS` → `Bucket root CID enqueued for durable pin (W.9.6)` → IPNS update) never fired. A fresh client load — post app restart, post storage clear, fresh device — pulled the pre-upload forest and the file was missing despite the upload returning a valid etag. Symmetric with `put_object_flat`'s established "register + flush" pattern; the resumable path was added in v0.6.0 (issues #16/#17/#18) but the flush step was inadvertently omitted. Fix is one line inside `finalize_and_register_resumed_upload` (`crates/fula-client/src/encryption.rs`): call `self.flush_forest_locked(bucket)` after `register_encrypted_chunked_upload_in_forest`, before manifest deletion. Uses the `_locked` variant because both callers already hold `bucket_write_mutex` (issue #16); `flush_forest`'s public variant would deadlock on tokio's non-reentrant mutex. Manifest deletion moved after the flush so crash-safety extends to flush failure (manifest stays on disk for `resume_upload` retry).
 - Fixed a race condition in rust tests multi gateway.

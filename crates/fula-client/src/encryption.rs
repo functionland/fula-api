@@ -517,7 +517,7 @@ impl BlobBackend for S3BlobBackend {
             attempt += 1;
             match self
                 .inner
-                .get_object_with_offline_fallback_known_cid(&self.bucket, path, cid)
+                .get_forest_object_known_cid(&self.bucket, path, cid)
                 .await
             {
                 Ok(result) => return Ok(result.inner.data.to_vec()),
@@ -5279,7 +5279,7 @@ impl EncryptedClient {
             let (blob, observed_etag) = match cid_hint {
                 Some(cid) => self
                     .inner
-                    .get_object_with_offline_fallback_known_cid(bucket, &page_key, &cid)
+                    .get_forest_object_known_cid(bucket, &page_key, &cid)
                     .await,
                 None => {
                     self.inner
