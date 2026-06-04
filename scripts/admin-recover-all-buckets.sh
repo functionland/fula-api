@@ -107,6 +107,7 @@ psql_q() { docker exec -i "$PG_CONTAINER" sh -c 'psql -U "$POSTGRES_USER" -d "$P
 valid_hex32() { [[ "$1" =~ ^[0-9a-fA-F]{32}$ ]]; }
 valid_bucket() { [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{1,62}$ ]]; }
 valid_cid()    { [[ "$1" =~ ^[a-zA-Z0-9]{20,120}$ ]]; }
+valid_uid()    { [[ "$1" =~ ^([0-9a-f]{32}|[0-9a-f]{64})$ ]]; }  # 32-hex seed OR 64-hex sha256
 
 # ── 1. Pull the gateway bucket dump (owner_id, bucket, root_cid, manifest) ────
 echo "===== fetching gateway bucket dump =====" >&2
@@ -129,7 +130,7 @@ if [[ "$DRY_RUN_ONLY" != "1" && "$ASSUME_YES" != "1" ]]; then
 fi
 
 : > "$LOG"
-declare -A TALLY=([200]=0 [404]=0 [412]=0 [503]=0 [nobridge]=0 [noentries]=0 [skip]=0 [other]=0)
+declare -A TALLY=([200]=0 [404]=0 [412]=0 [503]=0 [nobridge]=0 [ambiguous]=0 [noentries]=0 [skip]=0 [other]=0)
 
 # Stream the dump as TSV: owner_id<TAB>bucket<TAB>root_cid<TAB>forest_manifest_cid
 mapfile -t ROWS < <(echo "$DUMP" | jq -r '.buckets[] | [.owner_id, .bucket, .root_cid, (.forest_manifest_cid // "")] | @tsv')
@@ -146,19 +147,37 @@ for row in "${ROWS[@]}"; do
         echo "[$i/$TOTAL] SKIP malformed row: owner=$owner bucket=$bucket" | tee -a "$LOG" >&2
         TALLY[skip]=$((TALLY[skip]+1)); continue
     fi
-    # Bridge CIDs: root + (optional) forest manifest, both gateway-known + pinned.
-    bridge_in="'$root'"
-    if [[ -n "$manifest" ]] && valid_cid "$manifest"; then bridge_in="$bridge_in,'$manifest'"; fi
-
-    # Bridge: the pins.user_id that pins the root or manifest = this bucket's
-    # pinning user. Pick the one pinning the most of them (tie-safe).
-    if ! uid=$(printf "SELECT user_id FROM pins WHERE cid IN (%s) AND user_id <> '' GROUP BY user_id ORDER BY count(*) DESC LIMIT 1;" "$bridge_in" | psql_q); then
+    # Bridge: find THE pinning user for this bucket via content CIDs present on
+    # both sides. The root_cid is matched ONLY against THIS bucket's own
+    # `bucket:<bucket>` pin — an empty/shared prolly root (every empty bucket has
+    # the SAME content-addressed root, computed before the owner is attached)
+    # would otherwise collide across users. The forest_manifest_cid is
+    # content-unique per bucket (encrypted, salted) so it's matched unscoped.
+    # REFUSE if >1 distinct user resolves: the true owner's pin row always
+    # survives gc (gc drops blocks, not pin rows), so exactly-1 = the owner and
+    # >1 means a collision that must NEVER silently pick a user and rebuild a
+    # bucket from someone else's objects (advisor review — blocking).
+    bridge_where="(cid='$root' AND name='bucket:$bucket')"
+    if [[ -n "$manifest" ]] && valid_cid "$manifest"; then
+        bridge_where="$bridge_where OR cid='$manifest'"
+    fi
+    if ! bridge_out=$(printf "SELECT DISTINCT user_id FROM pins WHERE user_id <> '' AND (%s);" "$bridge_where" | psql_q); then
         echo "[$i/$TOTAL] $bucket  BRIDGE-QUERY-FAILED  skip" | tee -a "$LOG" >&2
         TALLY[other]=$((TALLY[other]+1)); continue
     fi
-    if [[ -z "$uid" ]]; then
+    mapfile -t uids < <(printf '%s\n' "$bridge_out" | sed '/^$/d')
+    if [[ "${#uids[@]}" -eq 0 ]]; then
         echo "[$i/$TOTAL] ${owner:0:10}…/$bucket  NO-BRIDGE (root/manifest not in pin DB)  skip" | tee -a "$LOG"
         TALLY[nobridge]=$((TALLY[nobridge]+1)); continue
+    fi
+    if [[ "${#uids[@]}" -gt 1 ]]; then
+        echo "[$i/$TOTAL] ${owner:0:10}…/$bucket  AMBIGUOUS-BRIDGE (${#uids[@]} users — refusing, no silent wrong-pick)  skip" | tee -a "$LOG"
+        TALLY[ambiguous]=$((TALLY[ambiguous]+1)); continue
+    fi
+    uid="${uids[0]}"
+    if ! valid_uid "$uid"; then
+        echo "[$i/$TOTAL] $bucket  BAD-UID($uid)  skip" | tee -a "$LOG" >&2
+        TALLY[other]=$((TALLY[other]+1)); continue
     fi
 
     # Entries for (uid, bucket): current pin per key (DISTINCT ON) — object pins
@@ -214,6 +233,7 @@ printf '  skip-healthy(412)   : %s\n' "${TALLY[412]}"      | tee -a "$LOG"
 printf '  owner/bucket-miss   : %s\n' "${TALLY[404]}"      | tee -a "$LOG"
 printf '  inconclusive(503)   : %s\n' "${TALLY[503]}"      | tee -a "$LOG"
 printf '  no-bridge           : %s\n' "${TALLY[nobridge]}" | tee -a "$LOG"
+printf '  ambiguous-refused   : %s\n' "${TALLY[ambiguous]}"| tee -a "$LOG"
 printf '  no-entries          : %s\n' "${TALLY[noentries]}"| tee -a "$LOG"
 printf '  malformed-skip      : %s\n' "${TALLY[skip]}"     | tee -a "$LOG"
 printf '  other               : %s\n' "${TALLY[other]}"    | tee -a "$LOG"
