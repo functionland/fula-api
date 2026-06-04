@@ -202,11 +202,15 @@ for row in "${ROWS[@]}"; do
     # that only matches `object:<bucket>/` selects a STALE forest snapshot whose
     # root/pages commit to shard sequences the live nodes no longer satisfy → the
     # client aborts the walk with "stale manifest page". Fix: union BOTH name
-    # shapes per key and take newest across all. The bare branch is scoped via
-    # EXISTS to keys this bucket actually owns (a bare name carries no bucket), so
-    # it can't pull another bucket's object in. (Confirmed on a live bucket: the
-    # prefixed-only query pinned a May-19 manifest while the real latest was a
-    # bare June-1 flush; unioning both made the forest walk past the manifest.)
+    # shapes per key and take newest across all. The bare branch takes ALL of the
+    # user's bare keys (forest manifest root + pages, re-pinned bare each flush).
+    # An earlier EXISTS-scope to a matching object:<bucket>/ twin was WRONG — it
+    # dropped bare-ONLY pages (a live videos page pinned bare with no twin → 404
+    # mid-walk). Forest objects are content-addressed (unique keys) and the client
+    # only fetches keys its own manifest references, so over-inclusion is safe.
+    # LIMITATION: a node the gc ORPHANED (no pin row at all) can't be mapped from
+    # the DB by ANY query — its CID lives only in the encrypted manifest
+    # (walkable-v8), so the client must fetch it by CID hint, not via the index.
     if ! entries=$(printf "SELECT coalesce(json_agg(json_build_object('key',k,'cid',cid,'size',size)),'[]'::json) FROM (
         SELECT DISTINCT ON (k) k, cid, size FROM (
             SELECT substr(name, length('object:%s/')+1) AS k, cid, size, updated_at
@@ -215,11 +219,10 @@ for row in "${ROWS[@]}"; do
             SELECT name AS k, cid, size, updated_at
               FROM pins WHERE user_id='%s' AND starts_with(name,'__fula_forest_') AND status NOT IN (%s)
             UNION ALL
-            SELECT p.name AS k, p.cid, p.size, p.updated_at
-              FROM pins p WHERE p.user_id='%s' AND position('/' in p.name)=0 AND p.status NOT IN (%s)
-                AND EXISTS (SELECT 1 FROM pins q WHERE q.user_id='%s' AND q.name='object:%s/'||p.name)
+            SELECT name AS k, cid, size, updated_at
+              FROM pins WHERE user_id='%s' AND position('/' in name)=0 AND status NOT IN (%s)
         ) u ORDER BY k, updated_at DESC) e;" \
-        "$bucket" "$uid" "$bucket" "$STATUS_EXCLUDE" "$uid" "$STATUS_EXCLUDE" "$uid" "$STATUS_EXCLUDE" "$uid" "$bucket" | psql_q); then
+        "$bucket" "$uid" "$bucket" "$STATUS_EXCLUDE" "$uid" "$STATUS_EXCLUDE" "$uid" "$STATUS_EXCLUDE" | psql_q); then
         echo "[$i/$TOTAL] $bucket  ENTRIES-QUERY-FAILED  skip" | tee -a "$LOG" >&2
         TALLY[other]=$((TALLY[other]+1)); continue
     fi
