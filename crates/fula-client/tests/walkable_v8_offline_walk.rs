@@ -257,3 +257,70 @@ async fn s3_backend_get_with_cid_hint_recovers_orphaned_node_on_master_404() {
          verify_cid_against_bytes",
     );
 }
+
+/// Download-path recovery: a gc-orphaned DATA CHUNK (404 NoSuchKey from a
+/// REACHABLE master, block still present on a gateway by CID) is recovered via
+/// the verified gateway race — the same mechanism the forest walk uses, now
+/// extended to the encrypted-download path (file index object + data chunks).
+///
+/// This exercises `get_object_with_recovery_known_cid` with a `.chunks/`-style
+/// key — the method the windowed/range chunk-download callers
+/// (`download_chunks_windowed_to_writer`, `get_range`) and the single-block
+/// file-object fetch now route through. Pre-fix those callers used the
+/// propagate-404 method, so a single gc-orphaned chunk 404'd and aborted the
+/// whole download (offline mode already recovered it; online did not). The real
+/// download path is covered end-to-end by the uncommitted E2E; this locks the
+/// method contract the routing depends on.
+#[tokio::test]
+async fn recovery_known_cid_recovers_orphaned_chunk_on_master_404() {
+    let master = MockServer::start().await;
+    let gateway = MockServer::start().await;
+
+    let body = b"opaque-encrypted-chunk-ciphertext-orphaned-by-gc".to_vec();
+    let body_cid = blake3_raw_cid(&body);
+
+    // A data-chunk key (mirrors `ChunkedFileMetadata::chunk_key`:
+    // `<storage_key>.chunks/<idx>`). Master is UP but 404s it (gc-orphaned),
+    // exactly like `.../.chunks/00000006` in the production logs.
+    let chunk_key = "Qm6efdexamplestoragekey.chunks/00000006";
+    Mock::given(method("GET"))
+        .and(wm_path(format!("/videos/{}", chunk_key)))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_string(
+                r#"<Error><Code>NoSuchKey</Code><Message>not here</Message></Error>"#,
+            ),
+        )
+        .mount(&master)
+        .await;
+
+    // The chunk's block still exists in IPFS, addressable by CID.
+    let gateway_path = format!("/ipfs/{}", body_cid);
+    Mock::given(method("GET"))
+        .and(wm_path(gateway_path.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&gateway)
+        .await;
+
+    let gateway_template = format!("{}/ipfs/{{cid}}", gateway.uri());
+    let config = mk_config_with_gateway(&master.uri(), &gateway_template);
+    let client = FulaClient::new(config).expect("build FulaClient");
+
+    let result = client
+        .get_object_with_recovery_known_cid("videos", chunk_key, &body_cid)
+        .await
+        .expect(
+            "a gc-orphaned data chunk that 404s by storage-key but exists by \
+             CID must be recovered via the verified gateway race (download-path \
+             recovery). Pre-fix the download caller used the propagate-404 \
+             method and the 404 aborted the download.",
+        );
+
+    assert_eq!(
+        result.inner.data.as_ref(),
+        body.as_slice(),
+        "recovered chunk bytes must content-address to the index-supplied CID; \
+         a successful Ok confirms the gateway race ran + passed \
+         verify_cid_against_bytes (the chunk is additionally Bao-verified \
+         downstream during real-download assembly)",
+    );
+}

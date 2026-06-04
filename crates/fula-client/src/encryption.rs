@@ -517,7 +517,7 @@ impl BlobBackend for S3BlobBackend {
             attempt += 1;
             match self
                 .inner
-                .get_forest_object_known_cid(&self.bucket, path, cid)
+                .get_object_with_recovery_known_cid(&self.bucket, path, cid)
                 .await
             {
                 Ok(result) => return Ok(result.inner.data.to_vec()),
@@ -1598,7 +1598,12 @@ impl EncryptedClient {
             match cid_hint {
                 Some(cid) => self
                     .inner
-                    .get_object_with_offline_fallback_known_cid(bucket, storage_key, cid)
+                    // Recover a gc-orphaned single-block file object on a
+                    // reachable-master 404 (issue #24 extended to download):
+                    // the object is referenced by the live forest entry, so a
+                    // 404 = index gc'd, not deletion. Race the gateway by the
+                    // entry's storage_cid; a truly-gone block still 404s.
+                    .get_object_with_recovery_known_cid(bucket, storage_key, cid)
                     .await?
                     .inner,
                 None => self
@@ -1926,9 +1931,14 @@ impl EncryptedClient {
                     #[cfg(not(target_arch = "wasm32"))]
                     let data = fetch_chunk_with_timeout(
                         async {
+                            // Recover gc-orphaned chunks on a reachable-master
+                            // 404, matching the offline path: a chunk referenced
+                            // by the live file index is never a deletion, so race
+                            // the gateway for its CID. A truly-gone block still
+                            // surfaces the original 404 (Bao then catches any hole).
                             match chunk_cid_hint {
                                 Some(cid) => client
-                                    .get_object_with_offline_fallback_known_cid(
+                                    .get_object_with_recovery_known_cid(
                                         &bucket, &chunk_key, &cid,
                                     )
                                     .await
@@ -5279,7 +5289,7 @@ impl EncryptedClient {
             let (blob, observed_etag) = match cid_hint {
                 Some(cid) => self
                     .inner
-                    .get_forest_object_known_cid(bucket, &page_key, &cid)
+                    .get_object_with_recovery_known_cid(bucket, &page_key, &cid)
                     .await,
                 None => {
                     self.inner
@@ -5465,6 +5475,14 @@ impl EncryptedClient {
             };
             (r.inner.data, etag)
         };
+        // DELIBERATE: the dir-index stays on the propagate-404 method
+        // (`get_object_with_offline_fallback_known_cid`), NOT the recovery
+        // variant. A 404 here is a valid SENTINEL — "no dir-index object
+        // exists yet" → `Ok(None)` below — not a gc-orphan. Routing this
+        // through `get_object_with_recovery_known_cid` would race the gateway
+        // pool on a legitimately-absent object (added latency + a chance of
+        // serving a stale dir-index) and could mask the "not found" signal.
+        // Do NOT consolidate this onto the recovery path.
         #[cfg(not(target_arch = "wasm32"))]
         let (blob, observed_etag) = match cid_hint {
             Some(cid) => match self
@@ -10402,7 +10420,10 @@ impl EncryptedClient {
                 match chunk_cid_hint {
                     Some(cid) => self
                         .inner
-                        .get_object_with_offline_fallback_known_cid(bucket, &chunk_key, &cid)
+                        // Same gc-orphan chunk recovery as the windowed path:
+                        // recover a reachable-master 404 via the gateway race by
+                        // the chunk's CID (range/seek reads of live files).
+                        .get_object_with_recovery_known_cid(bucket, &chunk_key, &cid)
                         .await
                         .map(|r| r.inner.data)?,
                     None => self
