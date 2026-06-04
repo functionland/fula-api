@@ -52,6 +52,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/admin/gc", post(handlers::trigger_gc))
         // Recover (rebuild) a bucket's prolly index from a recovered key→cid
         // set after the on-disk index lost nodes to gc. Server-side, keyless.
+        // Dump all buckets (owner_id, name, root_cid, forest_manifest_cid) so the
+        // recovery runbook can bridge each to the pinning DB with no email.
+        .route("/admin/buckets", get(handlers::list_all_buckets))
         .route(
             "/admin/recover-bucket-index",
             post(handlers::recover_bucket_index)

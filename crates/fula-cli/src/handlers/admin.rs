@@ -168,7 +168,17 @@ pub struct RecoverEntry {
 /// from the `X-Pinning-Token` header.
 #[derive(Debug, Deserialize)]
 pub struct RecoverBucketIndexRequest {
+    /// Raw identity (e.g. email) — hashed here via `hash_user_id` to the bucket
+    /// key prefix. Use this OR `owner_id`. Optional when `owner_id` is supplied.
+    #[serde(default)]
     pub user_id: String,
+    /// PRE-HASHED bucket-key prefix (32-hex `hash_user_id` output = the registry
+    /// `owner_id`). Used directly, bypassing `hash_user_id`. This is how the
+    /// users-index → root_cid → pin-DB bridge recovers OAuth users WITHOUT the
+    /// plaintext email (which is not stored on the server). Takes precedence
+    /// over `user_id` when non-empty.
+    #[serde(default)]
+    pub owner_id: Option<String>,
     pub bucket: String,
     pub entries: Vec<RecoverEntry>,
     /// Allow rebuilding even a still-walkable (healthy / cluster-recoverable)
@@ -195,13 +205,85 @@ pub struct RecoverBucketIndexResponse {
     pub skipped_keys: Vec<String>,
 }
 
+/// One row of the bucket dump: the gateway registry's view of a bucket, enough
+/// to (a) bridge it to the pinning DB via `root_cid`/`forest_manifest_cid` and
+/// (b) address it for recovery via the pre-hashed `owner_id`.
+#[derive(Debug, Serialize)]
+pub struct BucketDumpRow {
+    /// Pre-hashed bucket-key prefix (32-hex). Pass straight back as the recovery
+    /// request's `owner_id` — no `hash_user_id`, no email.
+    pub owner_id: String,
+    pub bucket: String,
+    pub root_cid: String,
+    pub forest_manifest_cid: Option<String>,
+    pub object_count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BucketsDumpResponse {
+    pub count: usize,
+    pub buckets: Vec<BucketDumpRow>,
+}
+
+/// GET /admin/buckets — dump every bucket the gateway registry knows, with the
+/// pre-hashed `owner_id`, name, current `root_cid`, and `forest_manifest_cid`.
+/// The recovery runbook joins `root_cid`/`forest_manifest_cid` against the
+/// pinning DB to find each bucket's `pins.user_id` (= sha256(email)) and rebuild
+/// its entries — recovering OAuth buckets with NO plaintext email (the email is
+/// not stored server-side). This is the gateway-side half of the email-free
+/// "users-index owner_id → root_cid → pin DB" bridge.
+pub async fn list_all_buckets(
+    State(state): State<Arc<AppState>>,
+    Extension(admin): Extension<AdminSession>,
+) -> Result<Response, ApiError> {
+    info!(
+        admin_id_hashed = %hash_user_id(&admin.admin_id),
+        "Admin dumping all buckets for recovery bridge"
+    );
+    let mut buckets = Vec::new();
+    for (internal_key, md) in state.bucket_manager.list_buckets_with_keys() {
+        // internal_key = "<owner_id>:<bucket>" (owner_id is colon-free hex; S3
+        // bucket names cannot contain ':').
+        let Some((owner_id, bucket)) = internal_key.split_once(':') else {
+            continue;
+        };
+        buckets.push(BucketDumpRow {
+            owner_id: owner_id.to_string(),
+            bucket: bucket.to_string(),
+            root_cid: md.root_cid.to_string(),
+            forest_manifest_cid: md.forest_manifest_cid.clone(),
+            object_count: md.object_count,
+        });
+    }
+    let response = BucketsDumpResponse {
+        count: buckets.len(),
+        buckets,
+    };
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
 pub async fn recover_bucket_index(
     State(state): State<Arc<AppState>>,
     Extension(admin): Extension<AdminSession>,
     headers: HeaderMap,
     Json(req): Json<RecoverBucketIndexRequest>,
 ) -> Result<Response, ApiError> {
-    let hashed_user_id = hash_user_id(&req.user_id);
+    // owner_id (pre-hashed) takes precedence: it IS the bucket-key prefix, used
+    // directly. Otherwise hash the raw user_id. This is what lets the bridge
+    // recovery (users-index owner_id → root_cid → pin DB) heal OAuth buckets
+    // with no plaintext email.
+    let hashed_user_id = match req.owner_id.as_deref() {
+        Some(o) if !o.is_empty() => o.to_string(),
+        _ => {
+            if req.user_id.is_empty() {
+                return Err(ApiError::s3(
+                    S3ErrorCode::InvalidArgument,
+                    "recover-bucket-index requires either owner_id (pre-hashed) or user_id (raw)",
+                ));
+            }
+            hash_user_id(&req.user_id)
+        }
+    };
     let admin_id_hashed = hash_user_id(&admin.admin_id);
     info!(
         admin_id_hashed = %admin_id_hashed,
