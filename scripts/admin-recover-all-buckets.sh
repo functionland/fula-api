@@ -130,54 +130,67 @@ if [[ "$DRY_RUN_ONLY" != "1" && "$ASSUME_YES" != "1" ]]; then
 fi
 
 : > "$LOG"
-declare -A TALLY=([200]=0 [404]=0 [412]=0 [503]=0 [nobridge]=0 [ambiguous]=0 [noentries]=0 [skip]=0 [other]=0)
+declare -A TALLY=([200]=0 [404]=0 [412]=0 [503]=0 [nobridge]=0 [ambiguous]=0 [noentries]=0 [recoverable]=0 [skip]=0 [other]=0)
 
 # Stream the dump as TSV: owner_id<TAB>bucket<TAB>root_cid<TAB>forest_manifest_cid
 mapfile -t ROWS < <(echo "$DUMP" | jq -r '.buckets[] | [.owner_id, .bucket, .root_cid, (.forest_manifest_cid // "")] | @tsv')
 
-i=0
+# ── PASS 1: learn the owner_id → pins.user_id map ────────────────────────────
+# owner_id (hash_user_id(email)) ↔ pins.user_id (sha256(email)) is ONE mapping
+# per user. We learn it from ANY of an owner's buckets whose root_cid /
+# forest_manifest_cid is in the pin DB, then (pass 2) apply it to ALL that
+# owner's buckets — including ones whose own CID didn't match (legacy/empty
+# buckets with no manifest and an unpinned root). The per-bucket bridge keeps
+# the blocking safety guards: root matched only against THIS bucket's own
+# `bucket:<bucket>` pin (empty buckets share a content-addressed root), manifest
+# matched unscoped (content-unique), and >1 distinct user = refuse.
+echo "===== pass 1: learning owner→uid map via content CIDs =====" >&2
+declare -A OWNER_UID=()
+declare -A OWNER_BAD=()
 for row in "${ROWS[@]}"; do
-    i=$((i+1))
     IFS=$'\t' read -r owner bucket root manifest <<<"$row"
-
-    [[ -n "$ONLY_OWNER"  && "$owner"  != "$ONLY_OWNER"  ]] && continue
-    [[ -n "$ONLY_BUCKET" && "$bucket" != "$ONLY_BUCKET" ]] && continue
-
-    if ! valid_hex32 "$owner" || ! valid_bucket "$bucket" || ! valid_cid "$root"; then
-        echo "[$i/$TOTAL] SKIP malformed row: owner=$owner bucket=$bucket" | tee -a "$LOG" >&2
-        TALLY[skip]=$((TALLY[skip]+1)); continue
-    fi
-    # Bridge: find THE pinning user for this bucket via content CIDs present on
-    # both sides. The root_cid is matched ONLY against THIS bucket's own
-    # `bucket:<bucket>` pin — an empty/shared prolly root (every empty bucket has
-    # the SAME content-addressed root, computed before the owner is attached)
-    # would otherwise collide across users. The forest_manifest_cid is
-    # content-unique per bucket (encrypted, salted) so it's matched unscoped.
-    # REFUSE if >1 distinct user resolves: the true owner's pin row always
-    # survives gc (gc drops blocks, not pin rows), so exactly-1 = the owner and
-    # >1 means a collision that must NEVER silently pick a user and rebuild a
-    # bucket from someone else's objects (advisor review — blocking).
+    [[ -n "$ONLY_OWNER" && "$owner" != "$ONLY_OWNER" ]] && continue
+    valid_hex32 "$owner" && valid_bucket "$bucket" && valid_cid "$root" || continue
+    [[ -n "${OWNER_BAD[$owner]:-}" ]] && continue
     bridge_where="(cid='$root' AND name='bucket:$bucket')"
     if [[ -n "$manifest" ]] && valid_cid "$manifest"; then
         bridge_where="$bridge_where OR cid='$manifest'"
     fi
-    if ! bridge_out=$(printf "SELECT DISTINCT user_id FROM pins WHERE user_id <> '' AND (%s);" "$bridge_where" | psql_q); then
-        echo "[$i/$TOTAL] $bucket  BRIDGE-QUERY-FAILED  skip" | tee -a "$LOG" >&2
-        TALLY[other]=$((TALLY[other]+1)); continue
-    fi
+    bridge_out=$(printf "SELECT DISTINCT user_id FROM pins WHERE user_id <> '' AND (%s);" "$bridge_where" | psql_q) || continue
     mapfile -t uids < <(printf '%s\n' "$bridge_out" | sed '/^$/d')
-    if [[ "${#uids[@]}" -eq 0 ]]; then
-        echo "[$i/$TOTAL] ${owner:0:10}…/$bucket  NO-BRIDGE (root/manifest not in pin DB)  skip" | tee -a "$LOG"
-        TALLY[nobridge]=$((TALLY[nobridge]+1)); continue
+    [[ "${#uids[@]}" -ne 1 ]] && continue          # 0 = this bucket didn't bridge; >1 = collision → ignore this bucket
+    valid_uid "${uids[0]}" || continue
+    if [[ -n "${OWNER_UID[$owner]:-}" ]]; then
+        # An owner must map to exactly ONE pins.user_id. A conflict means a CID
+        # collision mis-resolved — refuse the whole owner rather than risk a
+        # cross-user rebuild.
+        [[ "${OWNER_UID[$owner]}" != "${uids[0]}" ]] && { OWNER_BAD["$owner"]=1; unset 'OWNER_UID[$owner]'; }
+    else
+        OWNER_UID["$owner"]="${uids[0]}"
     fi
-    if [[ "${#uids[@]}" -gt 1 ]]; then
-        echo "[$i/$TOTAL] ${owner:0:10}…/$bucket  AMBIGUOUS-BRIDGE (${#uids[@]} users — refusing, no silent wrong-pick)  skip" | tee -a "$LOG"
+done
+echo "Resolved ${#OWNER_UID[@]} owner→uid mapping(s); ${#OWNER_BAD[@]} conflicting owner(s) refused." >&2
+
+# ── PASS 2: recover every bucket using the learned owner→uid map ─────────────
+i=0
+for row in "${ROWS[@]}"; do
+    i=$((i+1))
+    IFS=$'\t' read -r owner bucket root manifest <<<"$row"
+    [[ -n "$ONLY_OWNER"  && "$owner"  != "$ONLY_OWNER"  ]] && continue
+    [[ -n "$ONLY_BUCKET" && "$bucket" != "$ONLY_BUCKET" ]] && continue
+
+    if ! valid_hex32 "$owner" || ! valid_bucket "$bucket"; then
+        echo "[$i/$TOTAL] SKIP malformed row: owner=$owner bucket=$bucket" | tee -a "$LOG" >&2
+        TALLY[skip]=$((TALLY[skip]+1)); continue
+    fi
+    if [[ -n "${OWNER_BAD[$owner]:-}" ]]; then
+        echo "[$i/$TOTAL] ${owner:0:10}…/$bucket  AMBIGUOUS-OWNER (bridges to >1 user — refusing)  skip" | tee -a "$LOG"
         TALLY[ambiguous]=$((TALLY[ambiguous]+1)); continue
     fi
-    uid="${uids[0]}"
-    if ! valid_uid "$uid"; then
-        echo "[$i/$TOTAL] $bucket  BAD-UID($uid)  skip" | tee -a "$LOG" >&2
-        TALLY[other]=$((TALLY[other]+1)); continue
+    uid="${OWNER_UID[$owner]:-}"
+    if [[ -z "$uid" ]]; then
+        echo "[$i/$TOTAL] ${owner:0:10}…/$bucket  NO-BRIDGE (owner never resolved — no pinned root/manifest in ANY of its buckets)  skip" | tee -a "$LOG"
+        TALLY[nobridge]=$((TALLY[nobridge]+1)); continue
     fi
 
     # Entries for (uid, bucket): current pin per key (DISTINCT ON) — object pins
@@ -197,12 +210,13 @@ for row in "${ROWS[@]}"; do
     n=$(jq 'length' <<<"$entries" 2>/dev/null || echo 0)
 
     if [[ "$DRY_RUN_ONLY" == "1" ]]; then
+        if [[ "$n" -gt 0 ]]; then TALLY[recoverable]=$((TALLY[recoverable]+1)); else TALLY[noentries]=$((TALLY[noentries]+1)); fi
         printf '[%d/%d] %s/%s  owner=%s  uid=%s  entries=%s\n' \
             "$i" "$TOTAL" "${owner:0:10}…" "$bucket" "${owner:0:10}…" "${uid:0:10}…" "$n" | tee -a "$LOG"
         continue
     fi
     if [[ "$n" -eq 0 ]]; then
-        echo "[$i/$TOTAL] $bucket  NO-ENTRIES  skip" | tee -a "$LOG" >&2
+        echo "[$i/$TOTAL] ${owner:0:10}…/$bucket  NO-ENTRIES (empty bucket)  skip" | tee -a "$LOG" >&2
         TALLY[noentries]=$((TALLY[noentries]+1)); continue
     fi
 
@@ -228,6 +242,7 @@ done
 
 echo "" >&2
 echo "===== summary =====" | tee -a "$LOG" >&2
+printf '  recoverable(dry)    : %s\n' "${TALLY[recoverable]}" | tee -a "$LOG"
 printf '  rebuilt(200)        : %s\n' "${TALLY[200]}"      | tee -a "$LOG"
 printf '  skip-healthy(412)   : %s\n' "${TALLY[412]}"      | tee -a "$LOG"
 printf '  owner/bucket-miss   : %s\n' "${TALLY[404]}"      | tee -a "$LOG"
