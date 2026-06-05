@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod batch;
+pub mod block_by_cid;
 pub mod bucket;
 pub mod encrypted_user_index;
 pub mod internal;
@@ -9,6 +10,7 @@ pub mod list_buckets_for_owner;
 pub mod locks;
 pub mod multipart;
 pub mod object;
+pub mod resolve_keys;
 pub mod service;
 pub mod tagging;
 pub mod user_entry_submit;

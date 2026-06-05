@@ -91,6 +91,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/buckets/list",
             get(handlers::list_buckets_for_owner::list_buckets_for_owner),
         )
+        // GC recovery (read-only): resolve storage_key→pinned-CID, and fetch a
+        // pinned block by CID — lets a client walk a gc-damaged bucket's forest
+        // by CID with no server-side prolly-index rebuild. Both 503 when
+        // FULA_PINS_DATABASE_URL is unset (state.pins_db = None).
+        .route(
+            "/api/v1/buckets/{bucket}/resolve-keys",
+            post(handlers::resolve_keys::resolve_bucket_keys),
+        )
+        .route(
+            "/api/v1/blocks/{cid}",
+            get(handlers::block_by_cid::get_block_by_cid),
+        )
         .route(
             "/api/v1/users-index/per-user",
             put(handlers::encrypted_user_index::put_encrypted_bucketsindex),

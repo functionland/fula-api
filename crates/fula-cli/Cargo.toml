@@ -83,6 +83,11 @@ postcard = { workspace = true }
 # HTTP client (for balance check API)
 reqwest = { workspace = true }
 
+# Read-only Postgres pool for the GC-recovery endpoints (resolve-keys /
+# block-by-cid). Same workspace sqlx the project already pins; used ONLY when
+# FULA_PINS_DATABASE_URL is configured.
+sqlx = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 test-log = { workspace = true }

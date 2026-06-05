@@ -70,6 +70,12 @@ pub struct AppState {
     /// handler diffs against it to pin only newly-appeared index nodes (and pin
     /// ALL when absent — rollout-safe). `None` = feature off.
     pub index_pin_set: Option<Arc<crate::index_pin_set::IndexPinSet>>,
+    /// Read-only Postgres pool to the pinning DB, used ONLY by the GC-recovery
+    /// endpoints (`/api/v1/buckets/{b}/resolve-keys`, `/api/v1/blocks/{cid}`) to
+    /// resolve storage_key→CID and gate block fetches. `Some` when
+    /// `FULA_PINS_DATABASE_URL` is set; `None` (default) → those endpoints 503.
+    /// No other code path touches it; lazily connected.
+    pub pins_db: Option<sqlx::PgPool>,
 }
 
 impl AppState {
@@ -253,6 +259,36 @@ impl AppState {
         // Per-bucket pinned-index-node set (the gc-safety diff baseline).
         let index_pin_set = Self::maybe_build_index_pin_set(&config);
 
+        // Read-only pins-DB pool for the GC-recovery endpoints (resolve-keys /
+        // block-by-cid). Lazily connected; `None` when FULA_PINS_DATABASE_URL is
+        // unset (default) → those two endpoints return 503 and every existing
+        // route behaves byte-identically. Strictly additive.
+        let pins_db = match std::env::var("FULA_PINS_DATABASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(url) => match sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .acquire_timeout(Duration::from_secs(10))
+                .connect_lazy(&url)
+            {
+                Ok(pool) => {
+                    info!("✓ Pins-DB pool ready (recovery resolve-keys/block endpoints enabled)");
+                    Some(pool)
+                }
+                Err(e) => {
+                    warn!(error = %e, "pins-DB pool init failed; recovery endpoints will 503 this run");
+                    None
+                }
+            },
+            None => {
+                info!(
+                    "FULA_PINS_DATABASE_URL unset; recovery resolve-keys/block endpoints disabled (503)"
+                );
+                None
+            }
+        };
+
         Ok(Self {
             config,
             block_store,
@@ -264,6 +300,7 @@ impl AppState {
             entries_store,
             local_retain,
             index_pin_set,
+            pins_db,
         })
     }
 

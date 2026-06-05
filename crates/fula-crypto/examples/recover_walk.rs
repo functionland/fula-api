@@ -31,6 +31,67 @@ use fula_crypto::{
     ShardedHamtPrivateForest,
 };
 use fula_crypto::{BlobBackend, BlobPutResult};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static SSH_FETCHES: AtomicUsize = AtomicUsize::new(0);
+
+/// On-demand, read-only fetch of one block from the master by CID
+/// (`ipfs block get`). Lets the walk pull exactly the forest-structure blocks it
+/// references (~dozens) without pre-exporting the user's entire bare-pin set
+/// (which is scattered across 120k+ rows under a non-bucket-scoped user_id).
+fn ssh_block_get(cid: &str) -> Option<Vec<u8>> {
+    let out = std::process::Command::new("ssh")
+        .args([
+            "-i",
+            "c:/users/ehsan/documents/functionland.pem",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "BatchMode=yes",
+            "root@cloud.fx.land",
+            &format!("docker exec ipfs_host ipfs block get {cid}"),
+        ])
+        .output()
+        .ok()?;
+    if out.status.success() && !out.stdout.is_empty() {
+        let n = SSH_FETCHES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 25 == 0 {
+            eprintln!("   … {n} blocks fetched on-demand");
+        }
+        Some(out.stdout)
+    } else {
+        None
+    }
+}
+
+/// Read-only: ask the master's pin DB for the latest CID of a storage key whose
+/// path isn't in the (incomplete) pin map. Only hit as a fallback for legacy
+/// pointers with no CID hint.
+fn ssh_resolve_cid(path: &str) -> Option<String> {
+    let path = path.replace('\'', "''"); // defensive SQL-escape
+    let remote = format!(
+        "U=$(docker exec postgres-pinning printenv POSTGRES_USER); D=$(docker exec postgres-pinning printenv POSTGRES_DB); docker exec -i postgres-pinning psql -U \"$U\" -d \"$D\" -t -A -c \"SELECT cid FROM pins WHERE name='{path}' ORDER BY updated_at DESC LIMIT 1\""
+    );
+    let out = std::process::Command::new("ssh")
+        .args([
+            "-i",
+            "c:/users/ehsan/documents/functionland.pem",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "BatchMode=yes",
+            "root@cloud.fx.land",
+            &remote,
+        ])
+        .output()
+        .ok()?;
+    let cid = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if cid.is_empty() {
+        None
+    } else {
+        Some(cid)
+    }
+}
 
 /// Read-only blob backend: object path -> candidate CIDs (pin map) -> local
 /// block file bytes. Implements only `get`; `put` is rejected.
@@ -45,32 +106,46 @@ impl PinMapBackend {
     /// Used for walkable-v8 CID hints, which are authoritative even when the
     /// master's mutable object pins are stale.
     fn read_cid(&self, cid: &str) -> fula_crypto::Result<Vec<u8>> {
-        std::fs::read(self.blocks_dir.join(cid)).map_err(|e| {
-            CryptoError::Hamt(format!(
-                "block file {cid} not present in {}: {e}",
-                self.blocks_dir.display()
-            ))
-        })
+        let p = self.blocks_dir.join(cid);
+        if let Ok(bytes) = std::fs::read(&p) {
+            return Ok(bytes);
+        }
+        // Not in the local export: fetch on-demand from the master (read-only),
+        // cache it locally, and return. This is what makes the walk independent
+        // of which pins happened to be in the (incomplete) pre-export.
+        if let Some(bytes) = ssh_block_get(cid) {
+            let _ = std::fs::write(&p, &bytes);
+            return Ok(bytes);
+        }
+        Err(CryptoError::Hamt(format!(
+            "block {cid} not present in {} and on-demand fetch failed (genuinely unavailable?)",
+            self.blocks_dir.display()
+        )))
     }
 }
 
 #[async_trait::async_trait]
 impl BlobBackend for PinMapBackend {
     async fn get(&self, path: &str) -> fula_crypto::Result<Vec<u8>> {
-        let cids = self
-            .map
-            .get(path)
-            .ok_or_else(|| CryptoError::Hamt(format!("pin map has no entry for path: {path}")))?;
-        for cid in cids {
-            let p = self.blocks_dir.join(cid);
-            if let Ok(bytes) = std::fs::read(&p) {
+        // Pin-map candidates first (route through read_cid so each can be
+        // fetched on-demand if missing locally).
+        if let Some(cids) = self.map.get(path) {
+            for cid in cids {
+                if let Ok(bytes) = self.read_cid(cid) {
+                    return Ok(bytes);
+                }
+            }
+        }
+        // Path absent from the pin map (e.g. a forest object pinned under a
+        // user_id the export wasn't scoped to): resolve its latest CID from the
+        // master's pin DB, then fetch on-demand.
+        if let Some(cid) = ssh_resolve_cid(path) {
+            if let Ok(bytes) = self.read_cid(&cid) {
                 return Ok(bytes);
             }
         }
         Err(CryptoError::Hamt(format!(
-            "no local block file for path {path} ({} candidate cid(s): none present in {})",
-            cids.len(),
-            self.blocks_dir.display()
+            "pin map has no entry for path {path} and DB resolve/fetch failed"
         )))
     }
 
