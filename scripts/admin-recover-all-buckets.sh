@@ -203,7 +203,13 @@ for row in "${ROWS[@]}"; do
     # root/pages commit to shard sequences the live nodes no longer satisfy → the
     # client aborts the walk with "stale manifest page". Fix: union BOTH name
     # shapes per key and take newest across all. The bare branch takes ALL of the
-    # user's bare keys (forest manifest root + pages, re-pinned bare each flush).
+    # user's bare keys: forest manifest root + pages (no slash) AND bare-pinned
+    # DATA CHUNKS (`<key>.chunks/N`, which DO contain a slash). An earlier
+    # `position('/' in name)=0` test silently DROPPED those chunks → a chunked
+    # file with a bare-only chunk 404s mid-download (e.g. the Hailuo video had
+    # only the bare `Qm6efd….chunks/00000006` pin, no object: twin → chunk 6 404).
+    # Excluding the prefixed shapes (object:/__fula_forest_/bucket:/v8-node:)
+    # catches bare keys AND bare chunks.
     # An earlier EXISTS-scope to a matching object:<bucket>/ twin was WRONG — it
     # dropped bare-ONLY pages (a live videos page pinned bare with no twin → 404
     # mid-walk). Forest objects are content-addressed (unique keys) and the client
@@ -220,7 +226,10 @@ for row in "${ROWS[@]}"; do
               FROM pins WHERE user_id='%s' AND starts_with(name,'__fula_forest_') AND status NOT IN (%s)
             UNION ALL
             SELECT name AS k, cid, size, updated_at
-              FROM pins WHERE user_id='%s' AND position('/' in name)=0 AND status NOT IN (%s)
+              FROM pins WHERE user_id='%s'
+                AND NOT starts_with(name,'object:') AND NOT starts_with(name,'__fula_forest_')
+                AND NOT starts_with(name,'bucket:') AND NOT starts_with(name,'v8-node:')
+                AND status NOT IN (%s)
         ) u ORDER BY k, updated_at DESC) e;" \
         "$bucket" "$uid" "$bucket" "$STATUS_EXCLUDE" "$uid" "$STATUS_EXCLUDE" "$uid" "$STATUS_EXCLUDE" | psql_q); then
         echo "[$i/$TOTAL] $bucket  ENTRIES-QUERY-FAILED  skip" | tee -a "$LOG" >&2
