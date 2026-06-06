@@ -260,31 +260,52 @@ impl AppState {
         let index_pin_set = Self::maybe_build_index_pin_set(&config);
 
         // Read-only pins-DB pool for the GC-recovery endpoints (resolve-keys /
-        // block-by-cid). Lazily connected; `None` when FULA_PINS_DATABASE_URL is
-        // unset (default) → those two endpoints return 503 and every existing
-        // route behaves byte-identically. Strictly additive.
-        let pins_db = match std::env::var("FULA_PINS_DATABASE_URL")
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
-            Some(url) => match sqlx::postgres::PgPoolOptions::new()
-                .max_connections(5)
-                .acquire_timeout(Duration::from_secs(10))
-                .connect_lazy(&url)
-            {
-                Ok(pool) => {
-                    info!("✓ Pins-DB pool ready (recovery resolve-keys/block endpoints enabled)");
-                    Some(pool)
+        // block-by-cid). Prefer the individual POSTGRES_* vars (no URL-encoding
+        // pitfalls); fall back to a full FULA_PINS_DATABASE_URL. Neither set →
+        // those two endpoints 503 and every existing route is byte-identical.
+        // Strictly additive; lazily connected.
+        let pins_db: Option<sqlx::PgPool> = {
+            use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+            let env_nonempty = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+            if let (Some(host), Some(db), Some(user)) = (
+                env_nonempty("POSTGRES_HOST"),
+                env_nonempty("POSTGRES_DB"),
+                env_nonempty("POSTGRES_USER"),
+            ) {
+                let port = env_nonempty("POSTGRES_PORT")
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(5432);
+                let pass = std::env::var("POSTGRES_PASSWORD").unwrap_or_default();
+                let opts = PgConnectOptions::new()
+                    .host(&host)
+                    .port(port)
+                    .database(&db)
+                    .username(&user)
+                    .password(&pass);
+                info!(host = %host, port, db = %db, "✓ Pins-DB pool ready (POSTGRES_* env; recovery endpoints enabled)");
+                Some(
+                    PgPoolOptions::new()
+                        .max_connections(5)
+                        .acquire_timeout(Duration::from_secs(10))
+                        .connect_lazy_with(opts),
+                )
+            } else if let Some(url) = env_nonempty("FULA_PINS_DATABASE_URL") {
+                match PgPoolOptions::new()
+                    .max_connections(5)
+                    .acquire_timeout(Duration::from_secs(10))
+                    .connect_lazy(&url)
+                {
+                    Ok(pool) => {
+                        info!("✓ Pins-DB pool ready (FULA_PINS_DATABASE_URL; recovery endpoints enabled)");
+                        Some(pool)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "pins-DB URL invalid; recovery endpoints will 503 this run");
+                        None
+                    }
                 }
-                Err(e) => {
-                    warn!(error = %e, "pins-DB pool init failed; recovery endpoints will 503 this run");
-                    None
-                }
-            },
-            None => {
-                info!(
-                    "FULA_PINS_DATABASE_URL unset; recovery resolve-keys/block endpoints disabled (503)"
-                );
+            } else {
+                info!("pins-DB not configured (set POSTGRES_HOST/DB/USER, or FULA_PINS_DATABASE_URL); recovery resolve-keys/block endpoints disabled (503)");
                 None
             }
         };
