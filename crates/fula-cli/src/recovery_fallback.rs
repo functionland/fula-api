@@ -177,19 +177,16 @@ async fn ensure_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
 /// a cluster API failure or an empty/zero-named response — never wipes a good
 /// mirror because of a transient cluster hiccup.
 async fn reconcile_once(pool: &PgPool, cluster_url: &str) -> anyhow::Result<u64> {
-    // NOTE: `list_pins()` buffers the cluster's full pin list transiently
-    // (~a few hundred MB for a very large fleet). Acceptable for the current
-    // scale + the reconcile interval; a streaming variant is a future
-    // optimization if memory pressure shows up.
-    //
-    // The full pinset (100k+ entries) is slow to stream — the default 60s
-    // cluster timeout is too short and the first reconcile times out. Give the
-    // one-shot mirror fetch a generous budget (still well under the reconcile
-    // interval).
+    // Use `/allocations` (pin SPECS: cid + name), NOT `/pins` (per-peer STATUS
+    // aggregation, which is far too slow — it timed out at 300s on a 345k-pin
+    // cluster, while `/allocations` returns the same set in ~23s). Still buffers
+    // the response transiently (~a few hundred MB at very large scale);
+    // streaming is a future optimization if memory pressure shows up. The
+    // generous timeout guards a slow cluster without risking the 60s default.
     let mut cfg = ClusterConfig::with_url(cluster_url.to_string());
     cfg.timeout = Duration::from_secs(300);
     let cluster = ClusterClient::new(cfg).await?;
-    let pins = cluster.list_pins().await?;
+    let pins = cluster.list_allocations().await?;
 
     // Dedup by name (last CID wins) so a single UNNEST upsert can't hit the
     // same conflict row twice, and so versioned duplicates collapse.

@@ -363,6 +363,44 @@ impl ClusterClient {
         Ok(pins)
     }
 
+    /// List all pin ALLOCATIONS (the pinset definitions: cid + name + holder
+    /// peers). Much faster than [`Self::list_pins`] for large pinsets —
+    /// `GET /pins` aggregates per-peer status across the whole cluster (slow at
+    /// 100k+ pins), whereas `GET /allocations` returns just the pin specs.
+    pub async fn list_allocations(&self) -> Result<Vec<PinAllocation>> {
+        let url = format!("{}/allocations", self.config.api_url);
+        let mut req = self.client.get(&url);
+
+        if let Some((user, pass)) = &self.config.basic_auth {
+            req = req.basic_auth(user, Some(pass));
+        }
+
+        let response = req.send().await?;
+
+        if !response.status().is_success() {
+            let error = response.text().await.unwrap_or_default();
+            return Err(BlockStoreError::ClusterApi(format!(
+                "Failed to list allocations: {}",
+                error
+            )));
+        }
+
+        // Newline-delimited JSON, one pin spec per line. Unknown fields
+        // (replication factors, allocations, timestamps, …) are ignored by
+        // serde so each line parses cheaply into just cid + name.
+        let text = response.text().await?;
+        let mut out = Vec::new();
+        for line in text.lines() {
+            if !line.is_empty() {
+                let p: PinAllocation = serde_json::from_str(line)
+                    .map_err(|e| BlockStoreError::ClusterApi(e.to_string()))?;
+                out.push(p);
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Add and pin data in one operation
     #[instrument(skip(self, data), fields(size = data.len()))]
     pub async fn add_and_pin(&self, data: &[u8], name: Option<&str>) -> Result<AddPinResponse> {
@@ -463,6 +501,18 @@ pub struct PinInfo {
     pub created: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub peer_map: Option<std::collections::HashMap<String, PeerPinStatus>>,
+}
+
+/// A single pin allocation spec from `GET /allocations` (the pinset
+/// definition). Only the fields the recovery mirror needs are kept; serde
+/// ignores the rest (replication factors, holder peers, timestamps, …).
+#[derive(Clone, Debug, Deserialize)]
+pub struct PinAllocation {
+    /// Content CID (base32 string).
+    pub cid: String,
+    /// Pin name — the storage_key / `object:<bucket>/<key>` set at upload.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// Per-peer pin status
