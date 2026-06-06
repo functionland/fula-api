@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use fula_blockstore::{BlockStore, PinStore};
+use fula_blockstore::{BlockStore, BlockStoreError, PinStore};
 use fula_core::metadata::ObjectMetadata;
 use fula_crypto::hashing::md5_hash;
 use serde::Deserialize;
@@ -691,12 +691,27 @@ pub async fn get_object(
     // User-scoped bucket access
     let bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
 
-    let metadata = bucket.get_object(&key).await?
-        .ok_or_else(|| ApiError::s3_with_resource(
-            S3ErrorCode::NoSuchKey,
-            "Object not found",
-            format!("{}/{}", bucket_name, key),
-        ))?;
+    let metadata = match bucket.get_object(&key).await? {
+        Some(m) => m,
+        None => {
+            // GC-recovery read-fallback: the prolly index lost this key's
+            // mapping to `ipfs repo gc`. Before returning 404, try to resolve
+            // the key→CID from the cluster pinset mirror and serve the block.
+            // No-op (returns None) when the feature is disabled or the key has
+            // no surviving cluster pin. (Miss-path only — healthy GETs returned
+            // `Some(m)` and never reach this branch.)
+            if let Some(rec) =
+                crate::recovery_fallback::try_recover_block(&state, &bucket_name, &key).await
+            {
+                return Ok(recovery_block_response(rec.data, rec.cid, &headers));
+            }
+            return Err(ApiError::s3_with_resource(
+                S3ErrorCode::NoSuchKey,
+                "Object not found",
+                format!("{}/{}", bucket_name, key),
+            ));
+        }
+    };
 
     // Check delete marker
     if metadata.is_delete_marker {
@@ -707,7 +722,7 @@ pub async fn get_object(
         ));
     }
 
-    let etag = format!("\"{}\"", metadata.etag);
+    let mut etag = format!("\"{}\"", metadata.etag);
     let last_modified = metadata.last_modified;
     let last_modified_str = last_modified.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
 
@@ -749,8 +764,25 @@ pub async fn get_object(
         }
     }
 
-    // Retrieve data from block store
-    let data = state.block_store.get_block(&metadata.cid).await?;
+    // Retrieve data from block store. If the index points at a gc'd CID, the
+    // block store returns the NARROW miss errors `NotFound`/`Unavailable` (NOT
+    // infra errors like Timeout/Connection) — only those trigger the GC-recovery
+    // read-fallback, which re-resolves the CURRENT CID from the cluster mirror
+    // and serves it. On recovery, the served ETag becomes that CID (never the
+    // stale index ETag). Any other error is propagated unchanged.
+    let data = match state.block_store.get_block(&metadata.cid).await {
+        Ok(d) => d,
+        Err(e @ (BlockStoreError::NotFound(_) | BlockStoreError::Unavailable(_))) => {
+            match crate::recovery_fallback::try_recover_block(&state, &bucket_name, &key).await {
+                Some(rec) => {
+                    etag = format!("\"{}\"", rec.cid);
+                    rec.data
+                }
+                None => return Err(e.into()),
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
     let total_size = data.len();
 
     // Handle Range request
@@ -812,6 +844,41 @@ pub async fn get_object(
     }
 
     Ok(response.body(Body::from(body_data)).unwrap())
+}
+
+/// Build the response for a block recovered via the GC read-fallback when the
+/// index had NO metadata for the key (the index-miss case). The `ETag` is the
+/// served CID (never a stale index ETag); a `Range` request is honored against
+/// the recovered bytes; no `Content-Type`/user-metadata is claimed since the
+/// index entry that carried them is gone.
+fn recovery_block_response(
+    data: Bytes,
+    cid: impl std::fmt::Display,
+    req_headers: &HeaderMap,
+) -> Response {
+    let etag = format!("\"{}\"", cid);
+    let total = data.len();
+    let (status, body, content_range) = match req_headers
+        .get("Range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|r| parse_range_header(r, total).ok())
+    {
+        Some((start, end)) => (
+            StatusCode::PARTIAL_CONTENT,
+            data.slice(start..=end),
+            Some(format!("bytes {}-{}/{}", start, end, total)),
+        ),
+        None => (StatusCode::OK, data, None),
+    };
+    let mut resp = Response::builder()
+        .status(status)
+        .header("ETag", &etag)
+        .header("Content-Length", body.len().to_string())
+        .header("Accept-Ranges", "bytes");
+    if let Some(cr) = content_range {
+        resp = resp.header("Content-Range", cr);
+    }
+    resp.body(Body::from(body)).unwrap()
 }
 
 /// Attempt to decode HTTP chunked transfer encoding from a request body.

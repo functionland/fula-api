@@ -119,6 +119,23 @@ pub struct GatewayConfig {
     /// Throttled + background; can be disabled on very large datastores.
     #[serde(default)]
     pub local_retain_backfill: Option<bool>,
+
+    /// GC-recovery READ-FALLBACK: on an object-GET index miss (404/410), resolve
+    /// the storage_key→CID from the cluster pinset mirror and serve the block
+    /// straight from the cluster. Miss-path only (healthy reads untouched). A
+    /// background job mirrors the cluster pinset into the `recovery_key_cid`
+    /// table. `None` = auto (on when the pins DB + `cluster_url` are configured,
+    /// not the in-memory store). `Some(false)` is the kill switch (exact prior
+    /// behavior — a gc-orphaned key just returns 404/410 as before).
+    #[serde(default)]
+    pub recovery_read_fallback_enabled: Option<bool>,
+    /// How often the recovery reconcile job refreshes the cluster→CID mirror.
+    #[serde(default = "default_recovery_reconcile_interval_secs")]
+    pub recovery_reconcile_interval_secs: u64,
+}
+
+fn default_recovery_reconcile_interval_secs() -> u64 {
+    600 // 10 minutes
 }
 
 fn default_local_retain_path() -> Option<String> {
@@ -183,6 +200,8 @@ impl Default for GatewayConfig {
             local_retain_enabled: None,
             local_retain_interval_secs: default_local_retain_interval_secs(),
             local_retain_backfill: None,
+            recovery_read_fallback_enabled: None,
+            recovery_reconcile_interval_secs: default_recovery_reconcile_interval_secs(),
         }
     }
 }

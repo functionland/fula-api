@@ -93,6 +93,13 @@ pub async fn run_server(config: GatewayConfig) -> anyhow::Result<()> {
         info!("✓ Pin drainer (W.9.6) started");
     }
 
+    // GC-recovery read-fallback: a background job mirrors the cluster pinset
+    // (storage_key→CID) into `recovery_key_cid` so an object-GET index miss can
+    // resolve the key from the cluster and serve the block (turning a gc-orphan
+    // 404/410 into a 200). No-op when disabled (kill switch / no pins DB / no
+    // cluster URL / memory store). Healthy reads are never affected.
+    crate::recovery_fallback::spawn_reconcile_if_enabled(&state);
+
     // Create router
     let app = routes::create_router(state);
 
@@ -184,6 +191,13 @@ pub async fn run_server_with_shutdown(
         std::mem::forget(cancel);
         info!("✓ Pin drainer (W.9.6) started");
     }
+
+    // GC-recovery read-fallback: a background job mirrors the cluster pinset
+    // (storage_key→CID) into `recovery_key_cid` so an object-GET index miss can
+    // resolve the key from the cluster and serve the block (turning a gc-orphan
+    // 404/410 into a 200). No-op when disabled (kill switch / no pins DB / no
+    // cluster URL / memory store). Healthy reads are never affected.
+    crate::recovery_fallback::spawn_reconcile_if_enabled(&state);
 
     let app = routes::create_router(state);
 
