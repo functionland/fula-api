@@ -181,7 +181,14 @@ async fn reconcile_once(pool: &PgPool, cluster_url: &str) -> anyhow::Result<u64>
     // (~a few hundred MB for a very large fleet). Acceptable for the current
     // scale + the reconcile interval; a streaming variant is a future
     // optimization if memory pressure shows up.
-    let cluster = ClusterClient::new(ClusterConfig::with_url(cluster_url.to_string())).await?;
+    //
+    // The full pinset (100k+ entries) is slow to stream — the default 60s
+    // cluster timeout is too short and the first reconcile times out. Give the
+    // one-shot mirror fetch a generous budget (still well under the reconcile
+    // interval).
+    let mut cfg = ClusterConfig::with_url(cluster_url.to_string());
+    cfg.timeout = Duration::from_secs(300);
+    let cluster = ClusterClient::new(cfg).await?;
     let pins = cluster.list_pins().await?;
 
     // Dedup by name (last CID wins) so a single UNNEST upsert can't hit the
