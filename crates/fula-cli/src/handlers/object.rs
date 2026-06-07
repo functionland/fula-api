@@ -710,23 +710,29 @@ pub async fn get_object(
                         BlockStoreError::NotFound(_) | BlockStoreError::Unavailable(_)
                     ))
             );
-            if is_index_miss {
-                if let Some(rec) =
-                    crate::recovery_fallback::try_recover_block(&state, &bucket_name, &key).await
-                {
-                    return Ok(recovery_block_response(rec.data, rec.cid, &headers));
-                }
+            if !is_index_miss {
+                // Auth / infra / other — propagate unchanged, no recovery.
+                return Err(other.unwrap_err().into());
             }
-            // Recovery didn't apply or didn't help — surface the original miss.
-            return match other {
-                Ok(None) => Err(ApiError::s3_with_resource(
-                    S3ErrorCode::NoSuchKey,
-                    "Object not found",
-                    format!("{}/{}", bucket_name, key),
-                )),
-                Err(e) => Err(e.into()),
-                Ok(Some(_)) => unreachable!(),
-            };
+            // Server-side cluster-mirror fallback first.
+            if let Some(rec) =
+                crate::recovery_fallback::try_recover_block(&state, &bucket_name, &key).await
+            {
+                return Ok(recovery_block_response(rec.data, rec.cid, &headers));
+            }
+            // The gateway can't serve it (not in the cluster mirror) — but the
+            // block may still be reachable BY CID via the CLIENT's forest hints
+            // (Walkable-v8 `chunk_cids` / `storage_cid`). Return 404 NoSuchKey
+            // (NOT 410 Gone) so the client's by-CID recovery
+            // (`get_object_with_recovery_known_cid`) engages — it fires on a
+            // reachable-master 404 and NEVER on 410, racing public IPFS for the
+            // hinted CID. A genuinely-lost block then fails that race and
+            // surfaces a hard error; a still-reachable one is recovered.
+            return Err(ApiError::s3_with_resource(
+                S3ErrorCode::NoSuchKey,
+                "Object not found (gc-orphaned index; client recovers by CID)",
+                format!("{}/{}", bucket_name, key),
+            ));
         }
     };
 
@@ -789,13 +795,22 @@ pub async fn get_object(
     // stale index ETag). Any other error is propagated unchanged.
     let data = match state.block_store.get_block(&metadata.cid).await {
         Ok(d) => d,
-        Err(e @ (BlockStoreError::NotFound(_) | BlockStoreError::Unavailable(_))) => {
+        Err(BlockStoreError::NotFound(_) | BlockStoreError::Unavailable(_)) => {
             match crate::recovery_fallback::try_recover_block(&state, &bucket_name, &key).await {
                 Some(rec) => {
                     etag = format!("\"{}\"", rec.cid);
                     rec.data
                 }
-                None => return Err(e.into()),
+                // Mirror can't serve it — hand off to the client's by-CID
+                // recovery with a 404 (not 410), same as the index-miss path
+                // above: the block may still be reachable by its hinted CID.
+                None => {
+                    return Err(ApiError::s3_with_resource(
+                        S3ErrorCode::NoSuchKey,
+                        "Object not found (gc-orphaned block; client recovers by CID)",
+                        format!("{}/{}", bucket_name, key),
+                    ))
+                }
             }
         }
         Err(e) => return Err(e.into()),
