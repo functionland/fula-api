@@ -19,7 +19,7 @@ services:
       # re-walks every index, hits hard-loss nodes at ~6s each, and burns
       # gateway/kubo capacity on every restart for no gain (per-PUT pinning still
       # protects active buckets). Reversible: remove this line to re-enable.
-      - FULA_NO_LOCAL_RETAIN_BACKFILL=1
+      - FULA_NO_LOCAL_RETAIN_BACKFILL=true
       # Tighten the bounded-read budget so a gc-orphaned block fails over to the
       # cluster-mirror fallback in ~3s instead of ~6s (offline-miss + fast 1s +
       # slow 2s). Modest + reversible; peering keeps live holders sub-second so
