@@ -691,25 +691,42 @@ pub async fn get_object(
     // User-scoped bucket access
     let bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
 
-    let metadata = match bucket.get_object(&key).await? {
-        Some(m) => m,
-        None => {
-            // GC-recovery read-fallback: the prolly index lost this key's
-            // mapping to `ipfs repo gc`. Before returning 404, try to resolve
-            // the key→CID from the cluster pinset mirror and serve the block.
-            // No-op (returns None) when the feature is disabled or the key has
-            // no surviving cluster pin. (Miss-path only — healthy GETs returned
-            // `Some(m)` and never reach this branch.)
-            if let Some(rec) =
-                crate::recovery_fallback::try_recover_block(&state, &bucket_name, &key).await
-            {
-                return Ok(recovery_block_response(rec.data, rec.cid, &headers));
+    let metadata = match bucket.get_object(&key).await {
+        Ok(Some(m)) => m,
+        // GC-recovery read-fallback. A GET can miss the gc-damaged index TWO
+        // ways: (a) the index has no entry for the key (`Ok(None)`), or (b) the
+        // prolly index itself lost an interior node to `ipfs repo gc`, so it
+        // can't even read the entry and returns `Err(BlockStore(NotFound|
+        // Unavailable))`. BOTH are recovery candidates — resolve the key→CID
+        // from the cluster pinset mirror and serve the block. Healthy reads
+        // return `Ok(Some(m))` above and never reach here; any non-miss error
+        // (auth / infra / etc.) is propagated unchanged (codex: don't recover
+        // on errors that aren't a genuine block-miss).
+        other => {
+            let is_index_miss = matches!(
+                &other,
+                Ok(None)
+                    | Err(fula_core::CoreError::BlockStore(
+                        BlockStoreError::NotFound(_) | BlockStoreError::Unavailable(_)
+                    ))
+            );
+            if is_index_miss {
+                if let Some(rec) =
+                    crate::recovery_fallback::try_recover_block(&state, &bucket_name, &key).await
+                {
+                    return Ok(recovery_block_response(rec.data, rec.cid, &headers));
+                }
             }
-            return Err(ApiError::s3_with_resource(
-                S3ErrorCode::NoSuchKey,
-                "Object not found",
-                format!("{}/{}", bucket_name, key),
-            ));
+            // Recovery didn't apply or didn't help — surface the original miss.
+            return match other {
+                Ok(None) => Err(ApiError::s3_with_resource(
+                    S3ErrorCode::NoSuchKey,
+                    "Object not found",
+                    format!("{}/{}", bucket_name, key),
+                )),
+                Err(e) => Err(e.into()),
+                Ok(Some(_)) => unreachable!(),
+            };
         }
     };
 
