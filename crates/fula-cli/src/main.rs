@@ -62,6 +62,18 @@ struct Args {
     #[arg(long, default_value = "256", env = "FULA_BLOCK_CACHE_MB")]
     block_cache_mb: usize,
 
+    /// Per-user sustained rate limit (requests/second; token refill rate).
+    #[arg(long, default_value = "1000", env = "FULA_RATE_LIMIT_RPS")]
+    rate_limit_rps: u32,
+
+    /// Per-user rate-limit burst capacity (token-bucket size). A client "list"
+    /// of a bucket is a client-side forest walk = hundreds of structural
+    /// `__fula_forest_v7_nodes/<h>` GETs in a sub-second burst, so this must
+    /// comfortably exceed a bucket's node count or listings 429 mid-walk and
+    /// time out. Tune up (no rebuild) for very large buckets.
+    #[arg(long, default_value = "10000", env = "FULA_RATE_LIMIT_BURST")]
+    rate_limit_burst: u32,
+
     /// Disable the cluster-aware read fallback (kill-switch; exact prior behavior)
     #[arg(long, env = "FULA_NO_CLUSTER_FALLBACK")]
     no_cluster_fallback: bool,
@@ -142,6 +154,8 @@ async fn main() -> anyhow::Result<()> {
         use_memory_store: args.memory_store,
         jwt_secret: args.jwt_secret,
         auth_enabled: !args.no_auth,
+        rate_limit_rps: args.rate_limit_rps,
+        rate_limit_burst: args.rate_limit_burst,
         admin_jwt_secret: args.admin_jwt_secret,
         admin_api_enabled: args.admin_api,
         block_cache_mb: args.block_cache_mb,

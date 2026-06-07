@@ -26,9 +26,19 @@ use std::sync::Arc;
 /// Rate limiter type
 pub type KeyedRateLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, governor::clock::DefaultClock>;
 
-/// Create a rate limiter
-pub fn create_rate_limiter(requests_per_second: u32) -> Arc<KeyedRateLimiter> {
-    let quota = Quota::per_second(NonZeroU32::new(requests_per_second).unwrap());
+/// Create a rate limiter.
+///
+/// `requests_per_second` is the sustained token-refill rate; `burst` is the
+/// token-bucket capacity. A client "list" of a bucket is a client-side forest
+/// walk — hundreds of structural `__fula_forest_v7_nodes/<h>` GETs fired in a
+/// sub-second burst — so the bucket capacity must comfortably exceed a bucket's
+/// node count or the walk 429s partway through and the listing times out.
+/// `burst` is floored at `requests_per_second` (a smaller burst would be
+/// nonsensical) and both are floored at 1.
+pub fn create_rate_limiter(requests_per_second: u32, burst: u32) -> Arc<KeyedRateLimiter> {
+    let rps = NonZeroU32::new(requests_per_second.max(1)).unwrap();
+    let burst = NonZeroU32::new(burst.max(requests_per_second).max(1)).unwrap();
+    let quota = Quota::per_second(rps).allow_burst(burst);
     Arc::new(RateLimiter::keyed(quota))
 }
 
@@ -252,9 +262,29 @@ mod tests {
 
     #[test]
     fn test_create_rate_limiter() {
-        let limiter = create_rate_limiter(100);
-        
+        let limiter = create_rate_limiter(100, 5000);
+
         // First request should pass
         assert!(limiter.check_key(&"user1".to_string()).is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter_absorbs_forest_walk_burst() {
+        // A bucket "list" fires hundreds of structural GETs at once; the burst
+        // capacity must let a full walk through in one shot (regression guard
+        // for the 100-rps cap that 429'd large-bucket listings mid-walk).
+        let limiter = create_rate_limiter(1000, 5000);
+        for _ in 0..5000 {
+            assert!(limiter.check_key(&"walker".to_string()).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_floored_at_rps() {
+        // A nonsensical burst < rps is floored to rps, never below it.
+        let limiter = create_rate_limiter(1000, 10);
+        for _ in 0..1000 {
+            assert!(limiter.check_key(&"u".to_string()).is_ok());
+        }
     }
 }

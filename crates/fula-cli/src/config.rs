@@ -22,8 +22,15 @@ pub struct GatewayConfig {
     pub jwt_secret: Option<String>,
     /// Enable authentication
     pub auth_enabled: bool,
-    /// Rate limit (requests per second per user)
+    /// Rate limit — sustained requests per second per user (token refill rate).
     pub rate_limit_rps: u32,
+    /// Rate limit — burst capacity (token-bucket size) per user. A client
+    /// "list" of a bucket is a client-side forest walk = hundreds of structural
+    /// `__fula_forest_v7_nodes/<h>` GETs fired in a sub-second burst, so the
+    /// burst must comfortably exceed a bucket's node count or the listing 429s
+    /// mid-walk and times out. Refills at `rate_limit_rps`.
+    #[serde(default = "default_rate_limit_burst")]
+    pub rate_limit_burst: u32,
     /// Maximum request body size (bytes)
     pub max_body_size: usize,
     /// Maximum multipart upload size (bytes)
@@ -158,6 +165,10 @@ fn default_block_cache_mb() -> usize {
     256
 }
 
+fn default_rate_limit_burst() -> u32 {
+    10000
+}
+
 fn default_multipart_per_user_cap() -> Option<usize> {
     Some(8)
 }
@@ -177,7 +188,8 @@ impl Default for GatewayConfig {
             use_memory_store: false,
             jwt_secret: None,
             auth_enabled: true,
-            rate_limit_rps: 100,
+            rate_limit_rps: 1000,
+            rate_limit_burst: default_rate_limit_burst(),
             max_body_size: 5 * 1024 * 1024 * 1024, // 5 GB
             max_upload_size: 5 * 1024 * 1024 * 1024 * 1024, // 5 TB
             multipart_expiry_secs: 24 * 60 * 60, // 24 hours

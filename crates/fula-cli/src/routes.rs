@@ -17,7 +17,8 @@ use axum::http::{Method, header, HeaderValue};
 /// Create the main router
 pub fn create_router(state: Arc<AppState>) -> Router {
     // Create rate limiter
-    let rate_limiter = middleware::create_rate_limiter(state.config.rate_limit_rps);
+    let rate_limiter =
+        middleware::create_rate_limiter(state.config.rate_limit_rps, state.config.rate_limit_burst);
 
     // Security audit fix #7: Configurable CORS
     let cors = create_cors_layer(&state.config.cors_origins);
