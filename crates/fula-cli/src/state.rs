@@ -216,7 +216,8 @@ impl AppState {
             Arc::clone(&bucket_manager),
             Arc::clone(&block_store),
             entries_store.clone(),
-        );
+        )
+        .await;
 
         // W.9.6 durable pin queue — opens the redb file at the
         // configured path. The drainer is spawned in
@@ -605,7 +606,7 @@ impl UserSession {
 /// | `FULA_USERS_INDEX_IPNS_TTL_SECS`            | 900 (15m)                                                  |
 /// | `FULA_USERS_INDEX_IPNS_DISABLED`            | unset → IPNS enabled                                       |
 /// | `FULA_USERS_INDEX_FIRST_PUBLISH_PINS_PER_S` | 100                                                        |
-fn build_users_index_publisher(
+async fn build_users_index_publisher(
     config: &GatewayConfig,
     bucket_manager: Arc<BucketManager<FlexibleBlockStore>>,
     block_store: Arc<FlexibleBlockStore>,
@@ -614,6 +615,7 @@ fn build_users_index_publisher(
     use crate::handlers::users_index_publisher::{
         IpnsPublisher, PublisherConfig, UsersIndexPublisher,
     };
+    use fula_blockstore::{ClusterClient, ClusterConfig};
     use std::time::Duration;
 
     let enabled = std::env::var("FULA_USERS_INDEX_PUBLISHER_ENABLED")
@@ -674,6 +676,30 @@ fn build_users_index_publisher(
         Some(IpnsPublisher::new(config.ipfs_url.clone()))
     };
 
+    // Direct cluster client so the publisher REPLICATES its objects (global
+    // root + per-user bucketsIndex) to holders — the block store's own pin()
+    // only pins them to the master's local kubo here, leaving zero redundancy.
+    // Best-effort: if the cluster is unreachable at startup, publish LOCAL-only
+    // (no holder replication) rather than disabling the publisher; the next
+    // restart re-attempts and the first tick re-pins every user.
+    let cluster = {
+        let cfg = ClusterConfig {
+            timeout: Duration::from_secs(10),
+            ..ClusterConfig::with_url(&config.cluster_url)
+        };
+        match ClusterClient::new(cfg).await {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    cluster_url = %config.cluster_url,
+                    "users-index publisher: cluster client build failed; publishing LOCAL-only (no holder replication) until restart"
+                );
+                None
+            }
+        }
+    };
+
     match UsersIndexPublisher::open_with_ipns_and_entries(
         pub_config,
         bucket_manager,
@@ -686,9 +712,10 @@ fn build_users_index_publisher(
                 flush_interval_secs = flush_interval.as_secs(),
                 ipns_key_name = %ipns_key_name,
                 internal_token_set = internal_token.is_some(),
+                cluster_replication = cluster.is_some(),
                 "users-index publisher: enabled"
             );
-            Some(Arc::new(p))
+            Some(Arc::new(p.with_cluster(cluster)))
         }
         Err(e) => {
             warn!(

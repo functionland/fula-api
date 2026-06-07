@@ -37,7 +37,7 @@
 
 use anyhow::Result as AnyResult;
 use cid::Cid;
-use fula_blockstore::{BlockStore, PinStore};
+use fula_blockstore::{BlockStore, ClusterClient, PinStore};
 use fula_core::{metadata::BucketMetadata, BucketManager};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
+
+/// Cluster replication factor for the resilience-critical users-index objects
+/// (the global root + every per-user bucketsIndex). Deliberately WIDER than the
+/// cluster's default data-block factor (min 2 / max 6): these objects are tiny
+/// but are the entry point the SDK needs to read ANY bucket when the master is
+/// down, so they warrant many holders. Applied only to these pins, via
+/// `ClusterClient::pin_cid_with_replication`; all other pins keep the default.
+const USERS_INDEX_REPL_MIN: i32 = 5;
+const USERS_INDEX_REPL_MAX: i32 = 20;
 
 /// State that persists across master restarts. Single source of truth
 /// for "what did we last successfully publish?". Written **after** a
@@ -528,6 +537,32 @@ pub fn build_global_users_index_v2(
 /// Buckets are sorted by `name` first (BLAKE3 is itself
 /// order-sensitive). Domain separator at the start defends against
 /// cross-namespace collisions.
+/// Pure reconcile set-ops for [`UsersIndexPublisher::reconcile_cluster`],
+/// extracted so the COLLISION-SAFETY invariant is unit-testable without a
+/// cluster client.
+///
+/// - `pinned`: CIDs we believe are currently cluster-pinned.
+/// - `pending`: CIDs queued by the PREVIOUS reconcile to unpin (one-tick defer).
+/// - `live`: CIDs referenced by SOME user this tick (+ the global root).
+///
+/// Returns `(to_unpin, new_pending)`:
+/// - `to_unpin`: previously-queued CIDs STILL not referenced → release now
+///   (their replacement had a full tick to (re)pin first).
+/// - `new_pending`: CIDs that were pinned but are no longer referenced by ANY
+///   user → defer to next tick. A CID shared by multiple users stays OUT of
+///   this set while any user still references it — so it is never unpinned out
+///   from under a co-referencing user (the bug a per-user "previous CID" unpin
+///   would have: 104 users currently map to only 70 distinct CIDs).
+fn reconcile_set_ops(
+    pinned: &std::collections::HashSet<Cid>,
+    pending: &std::collections::HashSet<Cid>,
+    live: &std::collections::HashSet<Cid>,
+) -> (Vec<Cid>, std::collections::HashSet<Cid>) {
+    let to_unpin: Vec<Cid> = pending.iter().filter(|c| !live.contains(c)).copied().collect();
+    let new_pending: std::collections::HashSet<Cid> = pinned.difference(live).copied().collect();
+    (to_unpin, new_pending)
+}
+
 pub(crate) fn compute_user_content_hash(buckets: &[BucketMetadata]) -> [u8; 32] {
     let mut sorted: Vec<&BucketMetadata> = buckets.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
@@ -779,6 +814,26 @@ pub struct UsersIndexPublisher<S: BlockStore + PinStore + 'static> {
     /// current snapshot of the store. The store itself is owned by
     /// `AppState`; the publisher just reads.
     entries_store: Option<Arc<crate::entries_store::EntriesStore>>,
+    /// Direct ipfs-cluster client for REPLICATING the published objects
+    /// (global root + per-user bucketsIndex) to holders. The block store's
+    /// own `pin()` only pins to the master's LOCAL kubo here (its
+    /// `pinning_client` is `None` for this background task), so without this
+    /// the resilience objects have zero redundancy and a master-down read is
+    /// impossible. `None` in tests / when no cluster is configured (then only
+    /// the local pin happens, exactly as before). Best-effort: a cluster-pin
+    /// failure is logged but never fails the tick or drops a user.
+    cluster: Option<Arc<ClusterClient>>,
+    /// In-memory set of CIDs we currently believe are cluster-pinned for
+    /// resilience (the live per-user bucketsIndex CIDs + the global root).
+    /// `reconcile_cluster` diffs against it to decide which pins to release.
+    /// Lost on restart (→ a one-time re-pin of all live CIDs + a small orphan
+    /// residual until the next reconcile, accepted).
+    cluster_pinned: Mutex<std::collections::HashSet<Cid>>,
+    /// CIDs that went stale on the PREVIOUS reconcile, queued to unpin on the
+    /// NEXT one — a one-tick deferral so a changed user's replacement CID is
+    /// always (re)pinned before its predecessor is released (avoids a
+    /// replicated→local-only gap if a pin transiently failed).
+    cluster_unpin_pending: Mutex<std::collections::HashSet<Cid>>,
 }
 
 /// Outcome of a single `run_tick` call. Useful for tests and for
@@ -889,7 +944,117 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
             latest: RwLock::new(latest),
             tick_lock: tokio::sync::Mutex::new(()),
             entries_store,
+            cluster: None,
+            cluster_pinned: Mutex::new(std::collections::HashSet::new()),
+            cluster_unpin_pending: Mutex::new(std::collections::HashSet::new()),
         })
+    }
+
+    /// Attach a direct ipfs-cluster client so the published objects (global
+    /// root + per-user bucketsIndex) are REPLICATED to holders, not just pinned
+    /// on the master's local kubo. Without this the resilience objects have no
+    /// redundancy and a master-down read is impossible. Builder-style so the
+    /// existing constructors (and their many test callers) stay unchanged;
+    /// production wires it in `state::build_users_index_publisher`.
+    pub fn with_cluster(mut self, cluster: Option<Arc<ClusterClient>>) -> Self {
+        self.cluster = cluster;
+        self
+    }
+
+    /// Collision-safe cluster reconcile for the resilience objects. Called once
+    /// per change-tick AFTER the live set is known. ALL best-effort — a cluster
+    /// hiccup never aborts the tick or drops a user from the published index.
+    ///
+    /// 1. Pin the DISTINCT live set (per-user bucketsIndex CIDs + the global
+    ///    root) at the wide users-index replication factor. Re-pinning the whole
+    ///    set every tick is also how a previously-FAILED pin is retried (cluster
+    ///    pin is idempotent), so a transient failure self-heals next tick.
+    /// 2. Unpin CIDs that were queued stale on the PREVIOUS reconcile and are
+    ///    STILL not live — a one-tick deferral so a changed user's replacement
+    ///    CID is always (re)pinned before its predecessor is released.
+    /// 3. Queue CIDs that are pinned-but-no-longer-live as next tick's stale.
+    ///
+    /// Why live-set membership and not a per-user "previous CID": per-user CIDs
+    /// are SHARED across users (identical/empty bucket sets ⇒ identical CBOR ⇒
+    /// identical CID — verified live: 104 users, 70 distinct CIDs). Unpinning a
+    /// user's "previous" CID would clobber it out from under another user that
+    /// still references it. A CID is only released once NO user references it.
+    async fn reconcile_cluster(&self, global_cid: Cid, live_user_cids: &[Cid]) {
+        use futures::stream::{self, StreamExt};
+        use std::collections::HashSet;
+
+        let Some(cluster) = self.cluster.clone() else {
+            return; // local-only mode (tests / no cluster configured)
+        };
+
+        // Distinct live set: dedups shared per-user CIDs and folds in the global.
+        let live: HashSet<Cid> = live_user_cids
+            .iter()
+            .copied()
+            .chain(std::iter::once(global_cid))
+            .collect();
+
+        // 1. Pin all live (idempotent; also the retry path for past failures).
+        let max_concurrent = self.config.first_publish_max_pins_per_sec.max(1) as usize;
+        let pin_failures: usize = stream::iter(live.iter().copied().map(|cid| {
+            let cluster = cluster.clone();
+            async move {
+                match cluster
+                    .pin_cid_with_replication(
+                        &cid,
+                        Some("fula-users-index-resilient"),
+                        USERS_INDEX_REPL_MIN,
+                        USERS_INDEX_REPL_MAX,
+                    )
+                    .await
+                {
+                    Ok(_) => 0usize,
+                    Err(e) => {
+                        warn!(cid = %cid, error = %e, "users-index publisher: resilience cluster-pin failed (best-effort; retries next tick)");
+                        1
+                    }
+                }
+            }
+        }))
+        .buffer_unordered(max_concurrent)
+        .collect::<Vec<usize>>()
+        .await
+        .into_iter()
+        .sum();
+
+        // Compute deferred unpins + next-tick stale (pure set ops — the
+        // collision-safety invariant lives in `reconcile_set_ops`, tested there).
+        let (to_unpin, new_stale) = {
+            let pinned = self.cluster_pinned.lock();
+            let pending = self.cluster_unpin_pending.lock();
+            reconcile_set_ops(&pinned, &pending, &live)
+        };
+
+        // 2 + 3. Release stale CIDs ONLY on a tick where EVERY live pin
+        // succeeded — otherwise we could drop an old replica while its
+        // replacement is still unreplicated (a transient pin failure repeated
+        // across consecutive change ticks; codex #3). On a failure tick: unpin
+        // nothing (keep every old replica as a fallback) and carry the unpin
+        // queue forward (still-stale deferred + newly-stale) to retry once the
+        // pins recover. Commit serialized with all reconciles by `tick_lock`.
+        if pin_failures == 0 {
+            for cid in &to_unpin {
+                if let Err(e) = cluster.unpin_cid(cid).await {
+                    tracing::debug!(cid = %cid, error = %e, "users-index publisher: cluster-unpin stale resilience CID failed (best-effort)");
+                }
+            }
+            *self.cluster_pinned.lock() = live;
+            *self.cluster_unpin_pending.lock() = new_stale;
+        } else {
+            let mut deferred = new_stale;
+            deferred.extend(to_unpin.iter().copied());
+            *self.cluster_pinned.lock() = live;
+            *self.cluster_unpin_pending.lock() = deferred;
+            warn!(
+                failures = pin_failures,
+                "users-index publisher: resilience cluster-pins failed this tick — deferred ALL unpins (old replicas kept) until a clean tick"
+            );
+        }
     }
 
     /// Snapshot of the last successful publish. Cheap-clone via the
@@ -1015,6 +1180,13 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
                         Ok((hash, cid))
                     }
                     .await;
+                    // Cluster replication of per-user objects is handled AFTER
+                    // the tick builds the full live set (see `reconcile_cluster`),
+                    // not here — because per-user CIDs can be SHARED across users
+                    // (two users with identical/empty bucket sets produce the same
+                    // CBOR ⇒ same CID), so a per-user unpin would clobber another
+                    // user's current object. The reconcile pins/unpins by live-set
+                    // membership, which is collision-safe.
                     (owner_id, inner)
                 }
             }))
@@ -1136,6 +1308,13 @@ impl<S: BlockStore + PinStore + 'static> UsersIndexPublisher<S> {
         self.block_store
             .pin(&global_cid, Some("fula-users-index-global"))
             .await?;
+
+        // Cluster-replicate the live set (per-user CIDs + this global root) and
+        // release CIDs no user references anymore. Done as one collision-safe
+        // reconcile because per-user CIDs can be shared across users; see
+        // `reconcile_cluster`. Best-effort: never aborts the tick.
+        let live_user_cids: Vec<Cid> = user_to_cid.values().copied().collect();
+        self.reconcile_cluster(global_cid, &live_user_cids).await;
 
         // 7. Best-effort unpin previous global. Failure is fine —
         //    cluster GC will eventually reap it.
@@ -1306,6 +1485,42 @@ mod tests {
         bytes[0] = seed;
         let mh = Multihash::<64>::wrap(0x1e /* blake3 */, &bytes).unwrap();
         Cid::new_v1(0x71 /* dag-cbor */, mh)
+    }
+
+    #[test]
+    fn test_reconcile_set_ops_collision_safe_and_deferred() {
+        use std::collections::HashSet;
+        let a = fixture_cid(1);
+        let b = fixture_cid(2);
+        let shared = fixture_cid(3); // referenced by TWO users (the 70-of-104 case)
+        let global = fixture_cid(9);
+
+        // Collision safety: user A changed (a -> b) but ANOTHER user still
+        // references `shared`. Even though `shared` is in `pinned`, it must NOT
+        // be queued stale, because it is still in the live set.
+        let pinned: HashSet<Cid> = [a, shared, global].into_iter().collect();
+        let pending: HashSet<Cid> = HashSet::new();
+        let live: HashSet<Cid> = [b, shared, global].into_iter().collect();
+        let (to_unpin, new_pending) = reconcile_set_ops(&pinned, &pending, &live);
+        assert!(to_unpin.is_empty(), "nothing queued yet → nothing to unpin");
+        assert!(new_pending.contains(&a), "a no longer referenced → queued stale");
+        assert!(
+            !new_pending.contains(&shared),
+            "shared still referenced → must NOT be queued (collision-safety)"
+        );
+        assert!(!new_pending.contains(&b) && !new_pending.contains(&global));
+
+        // One-tick deferral guard: a queued CID still not live is unpinned now;
+        // a queued CID that came BACK into the live set is NOT unpinned.
+        let pinned2: HashSet<Cid> = [b, shared, global].into_iter().collect();
+        let pending2: HashSet<Cid> = [a, shared].into_iter().collect();
+        let live2: HashSet<Cid> = [b, shared, global].into_iter().collect();
+        let (to_unpin2, _new) = reconcile_set_ops(&pinned2, &pending2, &live2);
+        assert!(to_unpin2.contains(&a), "a queued + still not live → unpin now");
+        assert!(
+            !to_unpin2.contains(&shared),
+            "shared came back live → must NOT be unpinned (deferral guard)"
+        );
     }
 
     /// Build a synthetic `BucketMetadata` for the **pure** (no-IPFS)

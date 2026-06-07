@@ -214,15 +214,35 @@ impl ClusterClient {
         Ok(peers)
     }
 
-    /// Pin a CID in the cluster
+    /// Pin a CID in the cluster with the configured replication factor.
     #[instrument(skip(self))]
     pub async fn pin_cid(&self, cid: &Cid, name: Option<&str>) -> Result<PinInfo> {
+        self.pin_cid_with_replication(
+            cid,
+            name,
+            self.config.replication.min,
+            self.config.replication.max,
+        )
+        .await
+    }
+
+    /// Pin a CID in the cluster with an EXPLICIT replication factor, overriding
+    /// the configured default for this one pin. Used for the small but
+    /// resilience-critical users-index objects (global root + per-user
+    /// bucketsIndex), which warrant wider replication than ordinary data blocks
+    /// so they survive the master going down. Other pins keep the configured
+    /// factor (they call `pin_cid`).
+    #[instrument(skip(self))]
+    pub async fn pin_cid_with_replication(
+        &self,
+        cid: &Cid,
+        name: Option<&str>,
+        replication_min: i32,
+        replication_max: i32,
+    ) -> Result<PinInfo> {
         let mut url = format!(
             "{}/pins/{}?replication-min={}&replication-max={}",
-            self.config.api_url,
-            cid,
-            self.config.replication.min,
-            self.config.replication.max
+            self.config.api_url, cid, replication_min, replication_max
         );
 
         if let Some(n) = name {
@@ -230,13 +250,13 @@ impl ClusterClient {
         }
 
         let mut req = self.client.post(&url);
-        
+
         if let Some((user, pass)) = &self.config.basic_auth {
             req = req.basic_auth(user, Some(pass));
         }
 
         let response = req.send().await?;
-        
+
         if !response.status().is_success() {
             let error = response.text().await.unwrap_or_default();
             return Err(BlockStoreError::PinFailed(format!(
