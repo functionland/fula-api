@@ -20,12 +20,18 @@ services:
       # gateway/kubo capacity on every restart for no gain (per-PUT pinning still
       # protects active buckets). Reversible: remove this line to re-enable.
       - FULA_NO_LOCAL_RETAIN_BACKFILL=true
-      # Tighten the bounded-read budget so a gc-orphaned block fails over to the
-      # cluster-mirror fallback in ~3s instead of ~6s (offline-miss + fast 1s +
-      # slow 2s). Modest + reversible; peering keeps live holders sub-second so
-      # healthy remote reads are unaffected. Raise if legit slow holders 410.
+      # Bounded-read budget. The local-retain verifier has offloaded ~nothing
+      # (backlog ~956k pending, oldest ~4.5 days) so essentially EVERY block is
+      # still local — there are almost no remote reads to protect, and the
+      # online tail is pure dead-weight on gc-orphaned reads (stale/gc'd CID
+      # that's gone). So: keep a 1s shot at any peered holder (fast=1) and kill
+      # the slow tail (slow=0) → gc-orphaned reads fast-fail to the cluster-mirror
+      # fallback (or 404) in ~1s instead of ~3-6s, for BOTH mirror-hits and
+      # mirror-misses. Healthy local reads are the offline-hit fast path,
+      # unaffected. If the backlog ever drains (real remote reads appear) and
+      # legit slow holders start 410'ing, raise slow back to 2-4.
       - FULA_READ_FAST_TIMEOUT_SECS=1
-      - FULA_READ_SLOW_TIMEOUT_SECS=2
+      - FULA_READ_SLOW_TIMEOUT_SECS=0
     volumes:
       - /var/lib/fula-gateway:/var/lib/fula-gateway
     network_mode: host
