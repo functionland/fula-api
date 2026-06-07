@@ -13,6 +13,19 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
+    environment:
+      # --- Load-relief for gc-damaged buckets (2026-06-07) ---
+      # Stop the one-time fleet-wide index-node backfill: on damaged buckets it
+      # re-walks every index, hits hard-loss nodes at ~6s each, and burns
+      # gateway/kubo capacity on every restart for no gain (per-PUT pinning still
+      # protects active buckets). Reversible: remove this line to re-enable.
+      - FULA_NO_LOCAL_RETAIN_BACKFILL=1
+      # Tighten the bounded-read budget so a gc-orphaned block fails over to the
+      # cluster-mirror fallback in ~3s instead of ~6s (offline-miss + fast 1s +
+      # slow 2s). Modest + reversible; peering keeps live holders sub-second so
+      # healthy remote reads are unaffected. Raise if legit slow holders 410.
+      - FULA_READ_FAST_TIMEOUT_SECS=1
+      - FULA_READ_SLOW_TIMEOUT_SECS=2
     volumes:
       - /var/lib/fula-gateway:/var/lib/fula-gateway
     network_mode: host
