@@ -25,6 +25,7 @@
 use crate::error::ApiError;
 use crate::local_retain_queue::LocalRetainQueue;
 use cid::Cid;
+use fula_blockstore::cluster::PinInfo;
 use fula_blockstore::{BlockStoreError, ClusterClient, IpfsBlockStore, PinOutcome};
 use futures::StreamExt;
 use std::sync::Arc;
@@ -49,6 +50,125 @@ const BACKFILL_THROTTLE: Duration = Duration::from_millis(50);
 /// this — a sign replication is stuck (cluster down / holders unhealthy) and a
 /// growing set of blocks is pinned locally and never being offloaded.
 const STUCK_AGE_WARN_SECS: u64 = 3600;
+/// Pin name used when the verifier RE-DRIVES a cluster pin for an
+/// under-replicated backlog block (distinguishable in `pin ls` for triage).
+const REDRIVE_PIN_NAME: &str = "local-retain-redrive";
+/// Stop issuing cluster pin re-drives once this many cluster API calls have
+/// failed in a row — a crude circuit breaker so a struggling/slow cluster
+/// doesn't get flooded with redundant pin requests (status-timeout death
+/// spiral). Resets to 0 on the first successful status call. Local pins are
+/// still re-asserted while the breaker is open, so blocks stay gc-safe.
+const STATUS_FAIL_BREAKER: u32 = 20;
+/// New-data drop guard: a block must be observed at `>= min_repl` non-master
+/// holders for AT LEAST this long before the master drops its local copy. This
+/// absorbs eventually-consistent cluster status (a holder can report "pinned"
+/// before it has fully materialised every leaf) so an unsupervised drop never
+/// fires on a single transient/stale snapshot. Tunable via
+/// `FULA_LOCAL_RETAIN_SETTLE_SECS` (0 = drop as soon as confirmed — only set
+/// for an already-audited legacy drain).
+const SETTLE_DEFAULT_SECS: u64 = 300;
+
+/// Read a boolean knob from the environment. Unset or unrecognised → `default`.
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name)
+        .ok()
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => default,
+    }
+}
+
+/// Count DISTINCT non-master peers reporting status exactly `"pinned"` for a
+/// pin. Mirrors [`ClusterClient::pinned_holder_count`] but reads an already
+/// fetched [`PinInfo`] so the verifier needs only ONE status call per block
+/// (it also wants the in-progress signal below). Under-counts by design —
+/// only confirmed `"pinned"` ever counts toward dropping the master copy.
+fn count_non_master_pinned(info: &PinInfo, master: &str) -> usize {
+    info.peer_map
+        .as_ref()
+        .map(|m| {
+            m.iter()
+                .filter(|(id, st)| {
+                    id.as_str() != master && st.status.eq_ignore_ascii_case("pinned")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// True if any non-master peer already has the block pinned OR is actively
+/// pinning/queued — i.e. replication is already underway, so re-driving the
+/// cluster pin would be redundant. Used to avoid hammering the cluster
+/// consensus with repeat pin requests every cycle.
+fn has_active_non_master_holder(info: &PinInfo, master: &str) -> bool {
+    info.peer_map
+        .as_ref()
+        .map(|m| {
+            m.iter().any(|(id, st)| {
+                id.as_str() != master
+                    && matches!(
+                        st.status.to_ascii_lowercase().as_str(),
+                        "pinned" | "pinning" | "pin_queued" | "queued"
+                    )
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The verifier's decision for one backlog block, given its cluster replication
+/// state. Pure + total so the policy is unit-tested directly (the HTTP wiring
+/// in `process_one` stays a thin executor of these actions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainAction {
+    /// Replicated on `>= min_repl` non-master holders → drop the master's local
+    /// copy (and the root's leaves too, when `drop_leaves`).
+    Drop { drop_leaves: bool },
+    /// Under-replicated → keep gc-safe locally AND re-drive the cluster pin so
+    /// replication actually starts/resumes.
+    KeepAndRedrive,
+    /// Under-replicated but replication is already underway, or re-drive is
+    /// disabled / the cluster-API breaker is open → keep gc-safe locally only.
+    KeepOnly,
+}
+
+/// Decide what to do with one backlog block.
+///
+/// * **Drop** only when ALL of: confirmed on `>= min_repl` non-master holders;
+///   `auto_drop` on (a replicate-only supervised migration never unpins);
+///   the cluster-API breaker is CLOSED (don't delete the only complete copy
+///   while the cluster's own health signal is flaky); AND replication has been
+///   **stable for the settle window** (`settled`). The settle guards against a
+///   transient / lagging / phantom "pinned" status — an eventually-consistent
+///   cluster can report a holder pinned before it has materialised every leaf,
+///   and dropping on a single snapshot would bet the master's only complete
+///   copy on that. No drop is unsupervised AND instantaneous.
+/// * **Re-drive** only when under-replicated, re-drive enabled, nothing already
+///   in progress, and the breaker is closed (don't pile onto a sick cluster).
+/// * Otherwise keep the block gc-safe locally and do nothing else.
+fn decide(
+    holders: usize,
+    min_repl: usize,
+    auto_drop: bool,
+    has_leaves: bool,
+    redrive: bool,
+    in_progress: bool,
+    breaker_open: bool,
+    settled: bool,
+) -> RetainAction {
+    if holders >= min_repl && auto_drop && !breaker_open && settled {
+        return RetainAction::Drop {
+            drop_leaves: has_leaves,
+        };
+    }
+    if holders < min_repl && redrive && !in_progress && !breaker_open {
+        return RetainAction::KeepAndRedrive;
+    }
+    RetainAction::KeepOnly
+}
 
 /// Shared local-retain state: the durable backlog plus the handles needed to
 /// hold/drop local pins and read cluster replication status.
@@ -62,6 +182,35 @@ pub struct LocalRetainContext {
     /// Drop the local copy only once this many DISTINCT non-master holders
     /// report `"pinned"` (the cluster's configured min replication factor).
     min_repl: usize,
+    /// Sweep cursor (redb key of the last visited backlog entry) so the
+    /// verifier rotates through the WHOLE backlog across cycles instead of
+    /// re-processing the lowest-key head forever (head-of-line starvation).
+    /// In-memory: a restart simply resumes the sweep from the start, which
+    /// still makes full progress — nothing is lost.
+    cursor: std::sync::Mutex<Option<Vec<u8>>>,
+    /// Re-drive a cluster pin for under-replicated backlog blocks (default on,
+    /// `FULA_LOCAL_RETAIN_REDRIVE`). This is what actually replicates blocks
+    /// whose original cluster pin never succeeded — without it the backlog can
+    /// never drain. Idempotent at the cluster.
+    redrive: bool,
+    /// Auto-drop the local copy once a block is confirmed replicated to
+    /// `>= min_repl` non-master holders (default on, `FULA_LOCAL_RETAIN_AUTO_DROP`).
+    /// `false` = REPLICATE-ONLY: the verifier re-drives + keeps blocks gc-safe
+    /// but NEVER unpins — used for the supervised one-time migration of the
+    /// legacy backlog, where the operator audits real holders before
+    /// authorising the irreversible drop of ~105 GB.
+    auto_drop: bool,
+    /// Consecutive cluster status/pin failures (circuit breaker, see
+    /// [`STATUS_FAIL_BREAKER`]). `Relaxed` is fine — it's a fuzzy health gauge,
+    /// not a correctness lock.
+    status_failures: std::sync::atomic::AtomicU32,
+    /// Drop-settle tracker: CID → first time it was seen at `>= min_repl`
+    /// non-master holders. A drop requires that to persist for [`Self::settle_dur`];
+    /// under-replicated / dropped CIDs are evicted. In-memory (a restart just
+    /// re-starts the settle clock — safe, never drops earlier).
+    settle: dashmap::DashMap<Cid, std::time::Instant>,
+    /// How long replication must be stable before a drop (see [`SETTLE_DEFAULT_SECS`]).
+    settle_dur: Duration,
 }
 
 impl LocalRetainContext {
@@ -72,6 +221,19 @@ impl LocalRetainContext {
         master_peer_id: String,
         min_repl: usize,
     ) -> Self {
+        let redrive = env_bool("FULA_LOCAL_RETAIN_REDRIVE", true);
+        let auto_drop = env_bool("FULA_LOCAL_RETAIN_AUTO_DROP", true);
+        let settle_secs = std::env::var("FULA_LOCAL_RETAIN_SETTLE_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(SETTLE_DEFAULT_SECS);
+        info!(
+            redrive,
+            auto_drop,
+            settle_secs,
+            min_repl = min_repl.max(1),
+            "local-retain: verifier configured (redrive re-pins under-replicated backlog blocks; auto_drop=false = replicate-only for the supervised migration; settle_secs = how long replication must hold before a drop)"
+        );
         Self {
             queue,
             kubo,
@@ -80,6 +242,12 @@ impl LocalRetainContext {
             // A zero/negative configured min would unpin immediately on 0
             // holders — clamp to at least 1 so we never drop the only copy.
             min_repl: min_repl.max(1),
+            cursor: std::sync::Mutex::new(None),
+            redrive,
+            auto_drop,
+            status_failures: std::sync::atomic::AtomicU32::new(0),
+            settle: dashmap::DashMap::new(),
+            settle_dur: Duration::from_secs(settle_secs),
         }
     }
 
@@ -125,6 +293,72 @@ impl LocalRetainContext {
                     warn!(cid = %cid, error = %e2, "local-retain: backlog enqueue failed after a failed pin");
                 }
                 warn!(cid = %cid, error = %e, "local-retain: PUT-time local pin failed (fatal) — failing the upload so the client retries");
+                Err(ApiError::from(e))
+            }
+        }
+    }
+
+    /// Like [`Self::retain`] but for a large-object **root** (a UnixFS dag-pb
+    /// root produced by chunking): direct-pin the root AND each of its raw
+    /// leaves, then enqueue ONLY the root, flagged `has_leaves`. The verifier
+    /// tracks the root — which IS individually cluster-pinned, so its status
+    /// reflects real replication — and drops the leaves with it.
+    ///
+    /// Why this shape:
+    ///   * closes the gc gap for large-object leaves WITHOUT a blanket
+    ///     `refs local` backfill, so ONLY Fula data is ever pinned (never
+    ///     transient IPFS-network cache);
+    ///   * keeps the backlog small (roots, not leaves) and the cluster lean
+    ///     (no per-leaf cluster pins — the root's recursive cluster pin
+    ///     replicates the leaves);
+    ///   * all pins are DIRECT, so dropping them never tears out a cluster
+    ///     recursive pin (collision-safe).
+    ///
+    /// Root pin failure is FATAL (same contract as [`Self::retain`]); leaf pin
+    /// failures are best-effort (logged) — the root's cluster pin is the
+    /// replication backstop and the verifier re-drives it.
+    pub async fn retain_with_leaves(&self, root: &Cid) -> Result<(), ApiError> {
+        match self.kubo.pin_local(root, PIN_OP_TIMEOUT).await {
+            // Fresh root → also pin its leaves (gc-safe) and track the root.
+            Ok(PinOutcome::Pinned) => {
+                // Leaves were just stored by the UnixFS add → present locally,
+                // so enumerate OFFLINE (never hangs on the network). A DIRECT
+                // pin of the dag-pb root does NOT protect its descendants, so if
+                // we can't enumerate + pin every leaf the leaves are gc-exposed
+                // until replication — FATAL, fail the upload (the client retries;
+                // re-pinning is idempotent). The root stays pinned + enqueued so
+                // the verifier retries too.
+                let leaves = match self.kubo.refs_recursive_offline(root, PIN_OP_TIMEOUT).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let _ = self.queue.enqueue_with_leaves(root);
+                        warn!(cid = %root, error = %e, "local-retain: leaf enumeration failed for large-object root (fatal) — failing the upload so the client retries");
+                        return Err(ApiError::from(e));
+                    }
+                };
+                if !leaves.is_empty() {
+                    let failed = self.kubo.pin_local_many(&leaves, PIN_OP_TIMEOUT).await;
+                    if failed > 0 {
+                        let _ = self.queue.enqueue_with_leaves(root);
+                        warn!(root = %root, failed, total = leaves.len(), "local-retain: large-object leaves failed to pin (fatal) — failing the upload so the client retries");
+                        return Err(ApiError::from(BlockStoreError::PinFailed(format!(
+                            "{} of {} large-object leaves not gc-safe",
+                            failed,
+                            leaves.len()
+                        ))));
+                    }
+                }
+                if let Err(e) = self.queue.enqueue_with_leaves(root) {
+                    warn!(cid = %root, error = %e, "local-retain: backlog enqueue (with-leaves) failed; root stays pinned but untracked until next backfill");
+                }
+                Ok(())
+            }
+            // Already covered by a cluster recursive pin → the cluster holds the
+            // root AND its leaves; nothing for us to pin or track.
+            Ok(PinOutcome::AlreadyPinned) => Ok(()),
+            Err(e) => {
+                let _ = self.queue.enqueue_with_leaves(root);
+                warn!(cid = %root, error = %e, "local-retain: PUT-time local pin of large-object root failed (fatal) — failing the upload so the client retries");
                 Err(ApiError::from(e))
             }
         }
@@ -241,76 +475,170 @@ impl LocalRetainContext {
         info!(total, "local-retain backfill: complete");
     }
 
-    /// One verifier pass over a batch of the backlog.
+    /// One verifier pass over a batch of the backlog, advancing a persistent
+    /// in-memory cursor so successive cycles sweep the ENTIRE backlog rather
+    /// than re-checking the same lowest-key head every cycle. (Head-of-line
+    /// bug: under-replicated blocks are never removed, so a plain
+    /// `list(VERIFY_BATCH)` returns the same blocked head forever and one
+    /// permanently-stuck block stalls all the rest.)
     async fn verify_once(&self) {
-        let batch = match self.queue.list(VERIFY_BATCH) {
-            Ok(b) => b,
+        let after = self.cursor.lock().unwrap().clone();
+        let (batch, next) = match self.queue.list_from(after.as_deref(), VERIFY_BATCH) {
+            Ok(x) => x,
             Err(e) => {
                 warn!(error = %e, "local-retain: backlog list failed this cycle");
                 return;
             }
         };
         if batch.is_empty() {
+            // Reached the end of the keyspace → wrap to the start next cycle.
+            *self.cursor.lock().unwrap() = None;
             return;
         }
+        *self.cursor.lock().unwrap() = next;
         futures::stream::iter(batch)
-            .for_each_concurrent(MAX_CONCURRENT_CHECKS, |cid| self.process_one(cid))
+            .for_each_concurrent(MAX_CONCURRENT_CHECKS, |(cid, has_leaves)| {
+                self.process_one(cid, has_leaves)
+            })
             .await;
     }
 
-    /// Process one backlog CID: drop-if-replicated, else re-assert the pin.
-    async fn process_one(&self, cid: Cid) {
-        let count = match tokio::time::timeout(
-            STATUS_TIMEOUT,
-            self.cluster.pinned_holder_count(&cid, &self.master_peer_id),
-        )
-        .await
+    /// Process one backlog CID:
+    ///   * confirmed replicated (`>= min_repl` non-master holders) AND
+    ///     `auto_drop` → drop the master's local copy;
+    ///   * otherwise → keep it gc-safe locally (re-assert the pin) AND
+    ///     RE-DRIVE its cluster pin if replication isn't already underway, so a
+    ///     block whose original cluster pin never succeeded actually replicates
+    ///     (the fix for the never-draining backlog).
+    ///
+    /// A single `get_pin_status` call serves both the holder count and the
+    /// "already pinning?" check, so we don't re-issue a pin needlessly.
+    ///
+    /// NOTE on scope: the verifier acts ONLY on CIDs already in the backlog,
+    /// which (with the blanket `refs local` backfill disabled) are exclusively
+    /// blocks the PUT path stored on a user's behalf — never transient
+    /// IPFS-network cache. So re-drive replicates Fula data only; it never
+    /// scans or pins arbitrary local blocks.
+    async fn process_one(&self, cid: Cid, has_leaves: bool) {
+        use std::sync::atomic::Ordering;
+        let info = match tokio::time::timeout(STATUS_TIMEOUT, self.cluster.get_pin_status(&cid))
+            .await
         {
-            Ok(Ok(n)) => n,
-            // Not tracked as a cluster pin yet (or no peer has it) → treat as
-            // 0 replicas; keep it locally retained.
-            Ok(Err(BlockStoreError::NotFound(_))) => 0,
+            Ok(Ok(info)) => {
+                self.status_failures.store(0, Ordering::Relaxed);
+                Some(info)
+            }
+            // Not tracked in the cluster pinset at all → 0 holders; a prime
+            // candidate for re-drive (its original pin never landed).
+            Ok(Err(BlockStoreError::NotFound(_))) => {
+                self.status_failures.store(0, Ordering::Relaxed);
+                None
+            }
             Ok(Err(e)) => {
+                self.status_failures.fetch_add(1, Ordering::Relaxed);
                 debug!(cid = %cid, error = %e, "local-retain: pin status failed; retry next cycle");
                 return;
             }
             Err(_) => {
+                self.status_failures.fetch_add(1, Ordering::Relaxed);
                 debug!(cid = %cid, "local-retain: pin status timed out; retry next cycle");
                 return;
             }
         };
 
-        if count >= self.min_repl {
-            // Durably replicated elsewhere → safe to drop the master's copy.
-            match self.kubo.unpin_local(&cid, PIN_OP_TIMEOUT).await {
-                Ok(()) => match self.queue.remove(&cid) {
-                    Ok(()) => debug!(cid = %cid, holders = count, "local-retain: replicated; dropped local pin"),
-                    Err(e) => warn!(cid = %cid, error = %e, "local-retain: unpinned but backlog-remove failed (idempotent; retries)"),
-                },
-                Err(e) => warn!(cid = %cid, error = %e, "local-retain: local unpin failed; retry next cycle"),
-            }
+        let holders = info
+            .as_ref()
+            .map(|i| count_non_master_pinned(i, &self.master_peer_id))
+            .unwrap_or(0);
+        let in_progress = info
+            .as_ref()
+            .map(|i| has_active_non_master_holder(i, &self.master_peer_id))
+            .unwrap_or(false);
+        let breaker_open =
+            self.status_failures.load(Ordering::Relaxed) >= STATUS_FAIL_BREAKER;
+
+        // Drop-settle: require replication observed at >= min_repl to PERSIST
+        // for `settle_dur` before unpinning — guards a transient / lagging /
+        // phantom "pinned" from deleting the master's only complete copy. Track
+        // the first-confirmed time per CID; evict when it falls back under
+        // threshold. settle_dur == 0 → settled immediately.
+        let settled = if holders >= self.min_repl {
+            let first = *self.settle.entry(cid).or_insert_with(std::time::Instant::now);
+            first.elapsed() >= self.settle_dur
         } else {
-            // Not yet replicated → make sure it stays gc-safe (idempotent;
-            // covers a PUT-time pin that failed).
-            if let Err(e) = self.kubo.pin_local(&cid, PIN_OP_TIMEOUT).await {
-                // Re-assert failed. If the block is ALSO gone from the master's
-                // local store, an under-replicated block has lost its only
-                // master copy → possible in-flight data loss. Probe local
-                // presence (offline, local-only) to escalate at the right
-                // severity instead of burying it at debug.
-                if matches!(
-                    self.kubo.get_raw_block_offline(&cid, STATUS_TIMEOUT).await,
-                    Err(BlockStoreError::NotFound(_))
-                ) {
-                    error!(
-                        cid = %cid,
-                        holders = count,
-                        min_repl = self.min_repl,
-                        error = %e,
-                        "local-retain: POSSIBLE DATA LOSS — under-replicated block is missing from the master local store and re-pin failed"
-                    );
-                } else {
-                    debug!(cid = %cid, error = %e, "local-retain: re-assert local pin failed; retry next cycle");
+            self.settle.remove(&cid);
+            false
+        };
+
+        match decide(
+            holders,
+            self.min_repl,
+            self.auto_drop,
+            has_leaves,
+            self.redrive,
+            in_progress,
+            breaker_open,
+            settled,
+        ) {
+            RetainAction::Drop { drop_leaves } => {
+                // Confirmed + stable → stop tracking the settle for this CID.
+                self.settle.remove(&cid);
+                // Durably replicated elsewhere → drop the master's copy. For a
+                // large-object root, first drop the leaves we direct-pinned
+                // alongside it — enumerated OFFLINE (a damaged root yields a
+                // partial set; un-enumerable leaves just stay pinned, the safe
+                // direction) and BEFORE unpinning the root, so its DAG is still
+                // intact to walk.
+                if drop_leaves {
+                    match self.kubo.refs_recursive_offline(&cid, STATUS_TIMEOUT).await {
+                        Ok(leaves) if !leaves.is_empty() => {
+                            self.kubo.unpin_local_many(&leaves, PIN_OP_TIMEOUT).await;
+                            debug!(cid = %cid, leaves = leaves.len(), "local-retain: dropped large-object root's leaves");
+                        }
+                        Ok(_) => {}
+                        Err(e) => debug!(cid = %cid, error = %e, "local-retain: leaf enumerate failed on drop; leaves stay pinned (safe)"),
+                    }
+                }
+                match self.kubo.unpin_local(&cid, PIN_OP_TIMEOUT).await {
+                    Ok(()) => match self.queue.remove(&cid) {
+                        Ok(()) => debug!(cid = %cid, holders, "local-retain: replicated; dropped local pin"),
+                        Err(e) => warn!(cid = %cid, error = %e, "local-retain: unpinned but backlog-remove failed (idempotent; retries)"),
+                    },
+                    Err(e) => warn!(cid = %cid, error = %e, "local-retain: local unpin failed; retry next cycle"),
+                }
+            }
+            action @ (RetainAction::KeepAndRedrive | RetainAction::KeepOnly) => {
+                // Under-replicated (or auto_drop disabled) → keep it gc-safe
+                // locally (idempotent; covers a PUT-time pin that failed).
+                if let Err(e) = self.kubo.pin_local(&cid, PIN_OP_TIMEOUT).await {
+                    // Re-assert failed. If the block is ALSO gone from the
+                    // master's local store, an under-replicated block has lost
+                    // its only master copy → possible in-flight data loss.
+                    if matches!(
+                        self.kubo.get_raw_block_offline(&cid, STATUS_TIMEOUT).await,
+                        Err(BlockStoreError::NotFound(_))
+                    ) {
+                        error!(
+                            cid = %cid,
+                            holders,
+                            min_repl = self.min_repl,
+                            error = %e,
+                            "local-retain: POSSIBLE DATA LOSS — under-replicated block is missing from the master local store and re-pin failed"
+                        );
+                    } else {
+                        debug!(cid = %cid, error = %e, "local-retain: re-assert local pin failed; retry next cycle");
+                    }
+                }
+                // RE-DRIVE the cluster pin so replication actually starts/resumes
+                // (decide() already gated on !in_progress && !breaker_open).
+                if action == RetainAction::KeepAndRedrive {
+                    match self.cluster.pin_cid(&cid, Some(REDRIVE_PIN_NAME)).await {
+                        Ok(_) => debug!(cid = %cid, "local-retain: re-drove cluster pin (under-replicated)"),
+                        Err(e) => {
+                            self.status_failures.fetch_add(1, Ordering::Relaxed);
+                            debug!(cid = %cid, error = %e, "local-retain: re-drive pin failed; retry next cycle");
+                        }
+                    }
                 }
             }
         }
@@ -337,4 +665,268 @@ pub fn spawn_verifier(ctx: Arc<LocalRetainContext>, interval: Duration) {
             ctx.log_backlog_stats();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fula_blockstore::cluster::PeerPinStatus;
+    use std::collections::HashMap;
+
+    fn peer(status: &str) -> PeerPinStatus {
+        PeerPinStatus {
+            peername: None,
+            status: status.to_string(),
+            timestamp: None,
+            error: None,
+        }
+    }
+
+    /// PinInfo whose peer_map has the master at `master_status` + one entry per
+    /// `others` status.
+    fn info_with(master_status: &str, others: &[&str]) -> PinInfo {
+        let mut m = HashMap::new();
+        m.insert("MASTER".to_string(), peer(master_status));
+        for (i, s) in others.iter().enumerate() {
+            m.insert(format!("peer{i}"), peer(s));
+        }
+        PinInfo {
+            cid: "bafytest".to_string(),
+            name: None,
+            allocations: None,
+            origins: None,
+            created: None,
+            metadata: None,
+            peer_map: Some(m),
+        }
+    }
+
+    #[test]
+    fn count_excludes_master_and_only_counts_pinned() {
+        // master pinned + 2 non-master pinned + 1 pinning → 2.
+        let info = info_with("pinned", &["pinned", "pinned", "pinning"]);
+        assert_eq!(count_non_master_pinned(&info, "MASTER"), 2);
+    }
+
+    #[test]
+    fn count_is_zero_when_only_the_master_holds_it() {
+        // The safety invariant: a block only the master has must read as 0
+        // replicas so it is NEVER dropped.
+        let info = info_with("pinned", &["unpinned", "pin_error"]);
+        assert_eq!(count_non_master_pinned(&info, "MASTER"), 0);
+    }
+
+    #[test]
+    fn active_holder_detects_in_progress_so_redrive_is_skipped() {
+        // A non-master peer mid-pin → replication underway → skip re-drive.
+        assert!(has_active_non_master_holder(
+            &info_with("pinned", &["pinning"]),
+            "MASTER"
+        ));
+        // Only master + failed/unpinned others → nothing underway → re-drive.
+        assert!(!has_active_non_master_holder(
+            &info_with("pinned", &["unpinned", "pin_error"]),
+            "MASTER"
+        ));
+    }
+
+    #[test]
+    fn env_bool_parses_truthy_falsy_and_defaults() {
+        assert!(env_bool("FULA_TEST_NONEXISTENT_KNOB_Q1", true));
+        assert!(!env_bool("FULA_TEST_NONEXISTENT_KNOB_Q1", false));
+        std::env::set_var("FULA_TEST_KNOB_Q2", "false");
+        assert!(!env_bool("FULA_TEST_KNOB_Q2", true));
+        std::env::set_var("FULA_TEST_KNOB_Q2", "ON");
+        assert!(env_bool("FULA_TEST_KNOB_Q2", false));
+        std::env::remove_var("FULA_TEST_KNOB_Q2");
+    }
+
+    // decide args: (holders, min_repl, auto_drop, has_leaves, redrive,
+    //               in_progress, breaker_open, settled)
+    #[test]
+    fn decide_drops_only_when_replicated_settled_and_auto_drop_on() {
+        // >= min_repl + auto_drop + breaker closed + SETTLED → Drop.
+        assert_eq!(
+            decide(2, 2, true, false, true, false, false, true),
+            RetainAction::Drop { drop_leaves: false }
+        );
+        // has_leaves propagates to drop_leaves.
+        assert_eq!(
+            decide(3, 2, true, true, true, false, false, true),
+            RetainAction::Drop { drop_leaves: true }
+        );
+        // auto_drop OFF (supervised migration) → NEVER drop, however replicated.
+        assert_eq!(
+            decide(5, 2, false, false, true, false, false, true),
+            RetainAction::KeepOnly
+        );
+    }
+
+    #[test]
+    fn decide_does_not_drop_until_settled_or_with_breaker_open() {
+        // Replicated but NOT yet settled → hold (guards a transient "pinned").
+        assert_eq!(
+            decide(2, 2, true, false, true, false, false, false),
+            RetainAction::KeepOnly
+        );
+        // Replicated + settled but cluster breaker OPEN → don't delete the only
+        // complete copy while the cluster's health signal is flaky.
+        assert_eq!(
+            decide(3, 2, true, false, true, false, true, true),
+            RetainAction::KeepOnly
+        );
+    }
+
+    #[test]
+    fn decide_redrives_under_replicated_when_idle() {
+        // 0 holders, redrive on, nothing in progress, breaker closed → re-drive.
+        assert_eq!(
+            decide(0, 2, true, false, true, false, false, false),
+            RetainAction::KeepAndRedrive
+        );
+        // 1 < min_repl → still re-drive.
+        assert_eq!(
+            decide(1, 2, true, false, true, false, false, false),
+            RetainAction::KeepAndRedrive
+        );
+    }
+
+    #[test]
+    fn decide_holds_off_when_in_progress_or_breaker_or_disabled() {
+        // Replication already underway → don't re-issue the pin.
+        assert_eq!(
+            decide(0, 2, true, false, true, true, false, false),
+            RetainAction::KeepOnly
+        );
+        // Breaker open (cluster unhealthy) → hold off re-drive.
+        assert_eq!(
+            decide(0, 2, true, false, true, false, true, false),
+            RetainAction::KeepOnly
+        );
+        // Re-drive disabled entirely.
+        assert_eq!(
+            decide(0, 2, true, false, false, false, false, false),
+            RetainAction::KeepOnly
+        );
+    }
+
+    // ---- HTTP-wiring integration tests (wiremock kubo + cluster) ----
+    // These exercise process_one's ACTUAL HTTP calls — what the unit `decide`
+    // tests can't: an under-replicated block triggers a cluster pin (re-drive),
+    // and a replicated+settled block triggers a local unpin (drop).
+    use fula_blockstore::{ClusterConfig, IpfsConfig};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_cid() -> Cid {
+        "bafkreigh2akiscaildc6v5q2xg34x5sqo5djznnha64x4jn3fjvu3j6jci"
+            .parse()
+            .unwrap()
+    }
+
+    async fn build_ctx(
+        kubo_uri: String,
+        cluster_uri: String,
+    ) -> (LocalRetainContext, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = LocalRetainQueue::open(dir.path().join("retain.redb")).unwrap();
+        let kubo = IpfsBlockStore::new(IpfsConfig::with_url(kubo_uri))
+            .await
+            .expect("kubo init");
+        let cluster = ClusterClient::new(ClusterConfig::with_url(cluster_uri))
+            .await
+            .expect("cluster init");
+        let ctx = LocalRetainContext::new(queue, kubo, cluster, "MASTER".to_string(), 2);
+        (ctx, dir)
+    }
+
+    #[tokio::test]
+    async fn verifier_redrives_an_unpinned_block() {
+        let cid = test_cid();
+        let kubo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&kubo)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/add")) // the re-assert local pin
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"Pins":[cid.to_string()]})),
+            )
+            .mount(&kubo)
+            .await;
+
+        let cluster = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&cluster)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/pins/{cid}"))) // status: untracked → 0 holders
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&cluster)
+            .await;
+        // THE ASSERTION: the re-drive POST /pins/{cid} fires exactly once.
+        Mock::given(method("POST"))
+            .and(path(format!("/pins/{cid}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"cid": cid.to_string()})),
+            )
+            .expect(1)
+            .mount(&cluster)
+            .await;
+
+        let (ctx, _dir) = build_ctx(kubo.uri(), cluster.uri()).await;
+        ctx.queue.enqueue(&cid).unwrap();
+        ctx.verify_once().await;
+        // `cluster` MockServer drop verifies expect(1) — the re-drive fired.
+    }
+
+    #[tokio::test]
+    async fn verifier_drops_a_replicated_settled_block() {
+        let cid = test_cid();
+        let kubo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&kubo)
+            .await;
+        // THE ASSERTION: the drop POST /api/v0/pin/rm fires exactly once.
+        Mock::given(method("POST"))
+            .and(path("/api/v0/pin/rm"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&kubo)
+            .await;
+
+        let cluster = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&cluster)
+            .await;
+        // Two non-master holders report "pinned" → replicated.
+        Mock::given(method("GET"))
+            .and(path(format!("/pins/{cid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "cid": cid.to_string(),
+                "peer_map": {
+                    "peer1": {"status": "pinned"},
+                    "peer2": {"status": "pinned"},
+                    "MASTER": {"status": "pinned"}
+                }
+            })))
+            .mount(&cluster)
+            .await;
+
+        let (mut ctx, _dir) = build_ctx(kubo.uri(), cluster.uri()).await;
+        ctx.settle_dur = std::time::Duration::ZERO; // skip the settle window for the test
+        ctx.queue.enqueue(&cid).unwrap();
+        ctx.verify_once().await;
+        // `kubo` MockServer drop verifies expect(1) — the drop fired.
+    }
 }

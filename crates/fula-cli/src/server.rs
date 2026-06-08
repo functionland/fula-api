@@ -29,9 +29,14 @@ pub async fn run_server(config: GatewayConfig) -> anyhow::Result<()> {
             lr.clone(),
             std::time::Duration::from_secs(state.config.local_retain_interval_secs.max(15)),
         );
-        // One-time, throttled, background backfill of pre-existing local blocks
-        // (default on; `--no-local-retain-backfill` to skip on huge datastores).
-        if state.config.local_retain_backfill.unwrap_or(true) {
+        // One-time background backfill of pre-existing local blocks.
+        // DEFAULT OFF: `refs local` pins EVERY local block — including transient
+        // IPFS-network cache the node fetched/relayed — which would wrongly
+        // replicate non-Fula data. The PUT path (incl. `retain_with_leaves` for
+        // large-object leaves) now protects all NEW Fula data without it; any
+        // pre-existing un-replicated data is migrated explicitly. Opt in
+        // (`local_retain_backfill = true`) only for a one-off legacy sweep.
+        if state.config.local_retain_backfill.unwrap_or(false) {
             tokio::spawn(async move { lr.backfill().await });
         }
     }
@@ -138,9 +143,14 @@ pub async fn run_server_with_shutdown(
             lr.clone(),
             std::time::Duration::from_secs(state.config.local_retain_interval_secs.max(15)),
         );
-        // One-time, throttled, background backfill of pre-existing local blocks
-        // (default on; `--no-local-retain-backfill` to skip on huge datastores).
-        if state.config.local_retain_backfill.unwrap_or(true) {
+        // One-time background backfill of pre-existing local blocks.
+        // DEFAULT OFF: `refs local` pins EVERY local block — including transient
+        // IPFS-network cache the node fetched/relayed — which would wrongly
+        // replicate non-Fula data. The PUT path (incl. `retain_with_leaves` for
+        // large-object leaves) now protects all NEW Fula data without it; any
+        // pre-existing un-replicated data is migrated explicitly. Opt in
+        // (`local_retain_backfill = true`) only for a one-off legacy sweep.
+        if state.config.local_retain_backfill.unwrap_or(false) {
             tokio::spawn(async move { lr.backfill().await });
         }
     }
