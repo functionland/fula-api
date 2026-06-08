@@ -410,7 +410,17 @@ pub async fn put_object(
     // never 200 a block that isn't gc-safe — the client retries. No-op when the
     // feature is disabled.
     if let Some(lr) = state.local_retain.as_ref() {
-        lr.retain(&cid).await?;
+        // A large object stored via UnixFS chunking has a dag-pb root whose raw
+        // leaves also need gc-protecting; a small object is a single raw block.
+        // `retain_with_leaves` pins + tracks the root AND pins its leaves, so the
+        // leaves are gc-safe WITHOUT a blanket `refs local` backfill (only Fula
+        // data is ever pinned, never transient IPFS-network cache).
+        const DAG_PB: u64 = 0x70;
+        if cid.codec() == DAG_PB {
+            lr.retain_with_leaves(&cid).await?;
+        } else {
+            lr.retain(&cid).await?;
+        }
     }
 
     // W.9.6 — pin the BUCKET ROOT CID through the durable queue.

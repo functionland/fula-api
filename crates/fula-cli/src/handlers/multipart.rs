@@ -273,9 +273,18 @@ pub async fn complete_multipart_upload(
     // verifier still re-asserts any pin that failed here within one cycle.
     // No-op when the feature is disabled.
     if let Some(lr) = state.local_retain.as_ref() {
+        // A large part stored via UnixFS chunking is a dag-pb root whose raw
+        // leaves also need gc-protecting (same as put_object's body path).
+        const DAG_PB: u64 = 0x70;
         for part_cid in &part_cids {
-            let _ = lr.retain(part_cid).await;
+            if part_cid.codec() == DAG_PB {
+                let _ = lr.retain_with_leaves(part_cid).await;
+            } else {
+                let _ = lr.retain(part_cid).await;
+            }
         }
+        // The bucket root is a prolly-tree (dag-cbor) node, not a UnixFS root —
+        // plain retain (its index nodes are tracked separately).
         let _ = lr.retain(&bucket_root_cid).await;
     }
 

@@ -632,6 +632,121 @@ impl IpfsBlockStore {
         }
         Ok(out)
     }
+
+    /// Recursively enumerate the LOCAL descendants of `root`
+    /// (`refs -r --offline`), returning the descendant CIDs (NOT the root
+    /// itself). **Offline** so it never hangs fetching blocks that were gc'd —
+    /// a damaged/partial DAG yields the reachable subset and stops, which is
+    /// the safe direction for callers (un-enumerable leaves simply stay locally
+    /// pinned). Used to pin a large object's leaves at PUT and to drop them
+    /// once the root is replicated.
+    pub async fn refs_recursive_offline(
+        &self,
+        root: &Cid,
+        timeout: Duration,
+    ) -> Result<Vec<Cid>> {
+        #[derive(serde::Deserialize)]
+        struct RefLine {
+            #[serde(rename = "Ref")]
+            r#ref: Option<String>,
+            #[serde(rename = "Err")]
+            err: Option<String>,
+        }
+        let url = format!(
+            "{}/api/v0/refs?arg={}&recursive=true&unique=true&offline=true",
+            self.config.api_url, root
+        );
+        let response = self.client.post(&url).timeout(timeout).send().await?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| BlockStoreError::IpfsApi(e.to_string()))?;
+        if !status.is_success() {
+            return Err(BlockStoreError::IpfsApi(format!("refs {}: {}", root, text)));
+        }
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(r) = serde_json::from_str::<RefLine>(line) {
+                // A per-ref Err (e.g. a child missing offline) ends that branch;
+                // skip it and keep the refs we did get (safe partial result).
+                if !r.err.as_deref().unwrap_or("").is_empty() {
+                    continue;
+                }
+                if let Some(s) = r.r#ref {
+                    if let Ok(c) = s.parse::<Cid>() {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batched **DIRECT** local pin of many CIDs
+    /// (`pin/add?arg=…&arg=…&recursive=false`), chunked to stay under URL
+    /// limits, with a per-CID fallback if a chunk errors (e.g. one CID already
+    /// pinned). DIRECT keeps these pins SEPARATE from any cluster recursive
+    /// pin, so dropping them later never tears out a cluster pin. Returns the
+    /// count that still failed to pin (0 = all gc-safe). Best-effort: callers
+    /// anchor gc-safety on the recursively-tracked root, not every leaf.
+    pub async fn pin_local_many(&self, cids: &[Cid], timeout: Duration) -> usize {
+        const CHUNK: usize = 64; // ~64*60B < 4KB URL, safely under server limits
+        let mut failed = 0usize;
+        for chunk in cids.chunks(CHUNK) {
+            let mut url = format!("{}/api/v0/pin/add?recursive=false", self.config.api_url);
+            for c in chunk {
+                url.push_str("&arg=");
+                url.push_str(&c.to_string());
+            }
+            let ok = matches!(
+                self.client.post(&url).timeout(timeout).send().await,
+                Ok(r) if r.status().is_success()
+            );
+            if !ok {
+                // Batch failed (maybe one already-pinned / transient); pin
+                // per-CID so partial success still lands.
+                for c in chunk {
+                    if self.pin_local(c, timeout).await.is_err() {
+                        failed += 1;
+                    }
+                }
+            }
+        }
+        failed
+    }
+
+    /// Batched **DIRECT** local unpin (`pin/rm?arg=…&recursive=false`), chunked,
+    /// with a per-CID idempotent fallback. Used to drop a replicated root's
+    /// leaves. Never removes a recursive (cluster) pin — `unpin_local`'s
+    /// idempotent handling treats "pinned recursively"/"not pinned" as success.
+    pub async fn unpin_local_many(&self, cids: &[Cid], timeout: Duration) {
+        const CHUNK: usize = 64;
+        for chunk in cids.chunks(CHUNK) {
+            let mut url = format!("{}/api/v0/pin/rm?recursive=false", self.config.api_url);
+            for c in chunk {
+                url.push_str("&arg=");
+                url.push_str(&c.to_string());
+            }
+            let ok = matches!(
+                self.client.post(&url).timeout(timeout).send().await,
+                Ok(r) if r.status().is_success()
+            );
+            if !ok {
+                // A chunk containing an already-unpinned / recursively-pinned
+                // CID errors as a batch; fall back to per-CID so the rest still
+                // drop and cluster pins are left intact (unpin_local is
+                // idempotent + recursive-pin-safe).
+                for c in chunk {
+                    let _ = self.unpin_local(c, timeout).await;
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]

@@ -21,6 +21,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const LOCAL_RETAIN: TableDefinition<&[u8], u64> = TableDefinition::new("local_retain_v1");
 
+/// High bit of the stored timestamp value, set to mark a CID as a large-object
+/// ROOT whose raw leaves were direct-pinned alongside it. On dropping the root
+/// after replication, the verifier re-enumerates (`refs --offline`) and drops
+/// those leaves too. Unix-ms timestamps use ~41 bits, so bit 63 is free for
+/// ~292 million years; old entries (bit clear) are plain leaf/block entries.
+const HAS_LEAVES_BIT: u64 = 1 << 63;
+
 /// Errors from the local-retain backlog store.
 #[derive(Debug, thiserror::Error)]
 pub enum LocalRetainError {
@@ -110,6 +117,22 @@ impl LocalRetainQueue {
         Ok(())
     }
 
+    /// Like [`Self::enqueue`] but marks the CID as a large-object ROOT whose
+    /// raw leaves were direct-pinned alongside it (see [`HAS_LEAVES_BIT`]). The
+    /// verifier, on dropping the root after replication, re-enumerates and
+    /// drops those leaves too. Idempotent like `enqueue`.
+    pub fn enqueue_with_leaves(&self, cid: &Cid) -> Result<(), LocalRetainError> {
+        let key = cid.to_bytes();
+        let now = now_unix_ms() | HAS_LEAVES_BIT;
+        let txn = self.db.begin_write()?;
+        {
+            let mut tbl = txn.open_table(LOCAL_RETAIN)?;
+            tbl.insert(&key[..], now)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Up to `max` pending CIDs (the verifier processes them in batches).
     pub fn list(&self, max: usize) -> Result<Vec<Cid>, LocalRetainError> {
         let txn = self.db.begin_read()?;
@@ -129,6 +152,53 @@ impl LocalRetainQueue {
             }
         }
         Ok(out)
+    }
+
+    /// Like [`Self::list`] but starts strictly AFTER the `after` redb key (a
+    /// cursor), so the verifier can sweep the ENTIRE backlog across cycles
+    /// instead of re-processing the same lowest-key batch every cycle
+    /// (head-of-line starvation: under-replicated blocks are never removed, so
+    /// a plain `list(max)` returns the same blocked head forever and never
+    /// reaches the rest — and one permanently-stuck block stalls everything).
+    ///
+    /// Returns the batch plus the redb key of the last entry visited; pass it
+    /// back as `after` next cycle. An empty batch means the keyspace after the
+    /// cursor is exhausted — the caller wraps to the start by passing
+    /// `after: None`. Keys are CID bytes; iteration is in redb key order, which
+    /// is stable, so the sweep is complete and deterministic.
+    pub fn list_from(
+        &self,
+        after: Option<&[u8]>,
+        max: usize,
+    ) -> Result<(Vec<(Cid, bool)>, Option<Vec<u8>>), LocalRetainError> {
+        use std::ops::Bound;
+        let txn = self.db.begin_read()?;
+        let tbl = txn.open_table(LOCAL_RETAIN)?;
+        // Each item is (cid, has_leaves) — has_leaves from the value's marker bit.
+        let mut out: Vec<(Cid, bool)> = Vec::new();
+        let mut cursor: Option<Vec<u8>> = None;
+        let lower: Bound<&[u8]> = match after {
+            Some(a) => Bound::Excluded(a),
+            None => Bound::Unbounded,
+        };
+        for item in tbl.range::<&[u8]>((lower, Bound::Unbounded))? {
+            if out.len() >= max {
+                break;
+            }
+            let (k, v) = item?;
+            // Advance the cursor for EVERY visited key (including unparseable
+            // ones) so a bad key can't wedge the sweep at a fixed position.
+            cursor = Some(k.value().to_vec());
+            let has_leaves = (v.value() & HAS_LEAVES_BIT) != 0;
+            match Cid::try_from(k.value()) {
+                Ok(cid) => out.push((cid, has_leaves)),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "local_retain: skipping unparseable cid key (will not retry)"
+                ),
+            }
+        }
+        Ok((out, cursor))
     }
 
     /// Remove a CID once its block is confirmed replicated (and the local pin
@@ -163,9 +233,10 @@ impl LocalRetainQueue {
         let mut oldest_age_ms: Option<u64> = None;
         for item in tbl.iter()? {
             let (_k, v) = item?;
-            // `saturating_sub` guards against a clock that moved backwards
-            // between enqueue and now (→ age 0 rather than a huge wrap).
-            let age = now.saturating_sub(v.value());
+            // Mask the HAS_LEAVES marker bit before treating the value as a
+            // timestamp. `saturating_sub` guards against a clock that moved
+            // backwards between enqueue and now (→ age 0 rather than a huge wrap).
+            let age = now.saturating_sub(v.value() & !HAS_LEAVES_BIT);
             oldest_age_ms = Some(oldest_age_ms.map_or(age, |o| o.max(age)));
         }
         Ok((count, oldest_age_ms))
@@ -239,5 +310,69 @@ mod tests {
         let q2 = LocalRetainQueue::open(&path).unwrap();
         assert_eq!(q2.pending_count().unwrap(), 1);
         assert_eq!(q2.list(10).unwrap(), vec![a]);
+    }
+
+    #[test]
+    fn list_from_cursor_sweeps_whole_backlog() {
+        let (q, _d) = fresh();
+        // More entries than a single batch.
+        for i in 0..10u8 {
+            q.enqueue(&make_cid(i)).unwrap();
+        }
+        assert_eq!(q.pending_count().unwrap(), 10);
+
+        // Sweep in batches of 3, advancing the cursor. Must visit ALL 10
+        // distinct CIDs — a plain `list(3)` would return the same head 3
+        // forever (the head-of-line bug this method fixes).
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor: Option<Vec<u8>> = None;
+        for _ in 0..20 {
+            let (batch, c) = q.list_from(cursor.as_deref(), 3).unwrap();
+            if batch.is_empty() {
+                break; // exhausted → caller wraps with None
+            }
+            assert!(batch.len() <= 3);
+            for (cid, _has_leaves) in &batch {
+                seen.insert(*cid);
+            }
+            cursor = c;
+        }
+        assert_eq!(
+            seen.len(),
+            10,
+            "cursor sweep must visit every backlog entry, not just the lowest-key head"
+        );
+    }
+
+    #[test]
+    fn list_from_none_starts_from_beginning_and_signals_end() {
+        let (q, _d) = fresh();
+        q.enqueue(&make_cid(5)).unwrap();
+        let (batch, cursor) = q.list_from(None, 10).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert!(cursor.is_some());
+        // Ranging strictly after the only key returns empty → end of sweep.
+        let (batch2, _) = q.list_from(cursor.as_deref(), 10).unwrap();
+        assert!(
+            batch2.is_empty(),
+            "after the last key there is nothing → caller wraps to start"
+        );
+    }
+
+    #[test]
+    fn enqueue_with_leaves_sets_the_flag() {
+        let (q, _d) = fresh();
+        let root = make_cid(3);
+        let leaf = make_cid(4);
+        q.enqueue_with_leaves(&root).unwrap();
+        q.enqueue(&leaf).unwrap();
+        let (batch, _) = q.list_from(None, 10).unwrap();
+        let map: std::collections::HashMap<Cid, bool> = batch.into_iter().collect();
+        assert_eq!(map.get(&root), Some(&true), "root must be marked has_leaves");
+        assert_eq!(map.get(&leaf), Some(&false), "plain block must not be marked");
+        // The flag bit must not corrupt the age (stats stay sane).
+        let (count, age) = q.backlog_stats().unwrap();
+        assert_eq!(count, 2);
+        assert!(age.unwrap() < 60_000, "age must mask the flag bit");
     }
 }
