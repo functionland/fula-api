@@ -567,7 +567,7 @@ mod tests {
             buffered_download_max_bytes: 64 * 1024 * 1024,
             ..FulaConfig::default()
         };
-        let handle = create_client(cfg).expect("create_client should succeed");
+        let handle = futures::executor::block_on(create_client(cfg)).expect("create_client should succeed");
         let inner_cfg = handle.inner.config();
         assert_eq!(
             inner_cfg.per_chunk_download_timeout,
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn fula_config_default_plumbs_audit_defaults() {
         let cfg = FulaConfig::default();
-        let handle = create_client(cfg).expect("create_client should succeed");
+        let handle = futures::executor::block_on(create_client(cfg)).expect("create_client should succeed");
         let inner_cfg = handle.inner.config();
         assert_eq!(
             inner_cfg.per_chunk_download_timeout,
@@ -609,7 +609,7 @@ mod tests {
             health_gate_ttl_seconds: 45,
             ..FulaConfig::default()
         };
-        let handle = create_client(cfg).expect("create_client");
+        let handle = futures::executor::block_on(create_client(cfg)).expect("create_client");
         let inner = handle.inner.config();
         assert!(inner.health_gate_enabled, "health_gate_enabled must plumb");
         assert_eq!(inner.health_gate_ttl, Duration::from_secs(45));
@@ -628,7 +628,7 @@ mod tests {
             block_cache_max_bytes: 64 * 1024 * 1024,
             ..FulaConfig::default()
         };
-        let handle = create_client(cfg).expect("create_client");
+        let handle = futures::executor::block_on(create_client(cfg)).expect("create_client");
         let inner = handle.inner.config();
         assert!(inner.block_cache_enabled);
         assert_eq!(inner.block_cache_path, Some(cache_path));
@@ -646,7 +646,7 @@ mod tests {
             block_cache_path: String::new(),
             ..FulaConfig::default()
         };
-        let handle = create_client(cfg).expect("create_client");
+        let handle = futures::executor::block_on(create_client(cfg)).expect("create_client");
         let inner = handle.inner.config();
         assert_eq!(inner.block_cache_path, None,
             "empty block_cache_path string must translate to None so the SDK uses the platform default");
@@ -663,7 +663,7 @@ mod tests {
             gateway_race_concurrency: 5,
             ..FulaConfig::default()
         };
-        let handle = create_client(cfg).expect("create_client");
+        let handle = futures::executor::block_on(create_client(cfg)).expect("create_client");
         let inner = handle.inner.config();
         assert!(inner.gateway_fallback_enabled);
         assert_eq!(inner.gateway_fallback_urls.len(), 2);
@@ -677,7 +677,7 @@ mod tests {
         // produces a default-constructed Rust config. Apps that don't
         // touch the new fields see byte-identical pre-Phase-2.x behavior.
         let cfg = FulaConfig::default();
-        let handle = create_client(cfg).expect("create_client");
+        let handle = futures::executor::block_on(create_client(cfg)).expect("create_client");
         let inner = handle.inner.config();
         assert!(!inner.health_gate_enabled);
         assert!(!inner.block_cache_enabled);
@@ -706,7 +706,7 @@ mod tests {
             walkable_v8_writer_enabled: true,
             ..Default::default()
         };
-        let handle = create_client(cfg).expect("create_client");
+        let handle = futures::executor::block_on(create_client(cfg)).expect("create_client");
         let inner = handle.inner.config();
         assert!(
             inner.walkable_v8_writer_enabled,

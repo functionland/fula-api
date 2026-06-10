@@ -1,4 +1,4 @@
-//! Integration tests for fula-flutter bridge
+﻿//! Integration tests for fula-flutter bridge
 //!
 //! These tests verify that the Flutter bridge wrapper types and functions
 //! work correctly for both native and WASM builds.
@@ -404,8 +404,8 @@ fn test_rotation_report_helpers() {
         failed: 0,
         failures: vec![],
     };
-    assert!(report.is_success());
-    assert_eq!(report.success_rate(), 100.0);
+    assert!(futures::executor::block_on(report.is_success()));
+    assert_eq!(futures::executor::block_on(report.success_rate()), 100.0);
 }
 
 #[test]
@@ -422,8 +422,8 @@ fn test_rotation_report_with_failures() {
             },
         ],
     };
-    assert!(!report.is_success());
-    assert_eq!(report.success_rate(), 90.0);
+    assert!(!futures::executor::block_on(report.is_success()));
+    assert_eq!(futures::executor::block_on(report.success_rate()), 90.0);
 }
 
 #[test]
@@ -572,16 +572,17 @@ fn test_chunked_constants() {
 #[test]
 fn test_should_use_chunked() {
     use fula_flutter::api::chunked::{should_use_chunked, CHUNKED_THRESHOLD};
+    use futures::executor::block_on;
 
     // Small files should not use chunked
-    assert!(!should_use_chunked(1024));
-    assert!(!should_use_chunked(CHUNKED_THRESHOLD - 1));
+    assert!(!block_on(should_use_chunked(1024)));
+    assert!(!block_on(should_use_chunked(CHUNKED_THRESHOLD - 1)));
     // At exactly the threshold, don't use chunked (implementation is >)
-    assert!(!should_use_chunked(CHUNKED_THRESHOLD));
+    assert!(!block_on(should_use_chunked(CHUNKED_THRESHOLD)));
 
     // Files larger than threshold should use chunked
-    assert!(should_use_chunked(CHUNKED_THRESHOLD + 1));
-    assert!(should_use_chunked(100_000_000));
+    assert!(block_on(should_use_chunked(CHUNKED_THRESHOLD + 1)));
+    assert!(block_on(should_use_chunked(100_000_000)));
 }
 
 // ============================================================================
