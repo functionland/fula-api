@@ -1193,6 +1193,49 @@ pub struct DirIndexShardRef {
     pub cid: Option<Cid>,
 }
 
+/// Which on-the-wire format a bucket's directory index uses (Option A —
+/// "format follows the bucket").
+///
+/// **Sticky by construction:** decided exactly once — at bucket birth for new
+/// buckets, or inferred once on first load for legacy buckets that predate this
+/// field — and never changed afterwards. This is what makes the guarantee
+/// hold: the load-time rebuild path calls
+/// [`ShardedHamtPrivateForest::clear_dir_index_etag`] on a missing/corrupt/
+/// seq-mismatched index, which erases the single-blob signal
+/// (`dir_index_etag`). Inferring the format from live manifest state at flush
+/// time would then misread an old single-blob bucket as "brand-new" and
+/// silently shard it. Pinning the decision here survives that mutation.
+///
+/// Serialized via `serde_json` (the manifest's wire format), so a
+/// `#[serde(default)]` absent field on every pre-existing bucket deserializes
+/// as [`DirIndexFormat::Unspecified`] and is resolved on first load — the same
+/// no-migration property `dir_index_shards` relies on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DirIndexFormat {
+    /// Legacy manifest written before this field existed. The loader infers the
+    /// real format once (from the mutually-exclusive `dir_index_etag` /
+    /// `dir_index_shards` signals) and rewrites it as `SingleBlob` or `Sharded`
+    /// so subsequent flushes are deterministic.
+    #[default]
+    Unspecified,
+    /// v7 single-blob directory index — one AEAD blob at the stable
+    /// [`derive_dir_index_key`] location. Old read-only buckets keep this.
+    SingleBlob,
+    /// v8 sharded directory index — keyed AEAD shards (fixes the ~1 MiB
+    /// single-blob cliff). Every new bucket is born with this.
+    Sharded,
+}
+
+impl DirIndexFormat {
+    /// `skip_serializing_if` predicate: keep `Unspecified` (and only that) off
+    /// the wire so legacy v7 manifests stay byte-identical until they're
+    /// deliberately re-flushed with a resolved format.
+    pub fn is_unspecified(&self) -> bool {
+        matches!(self, DirIndexFormat::Unspecified)
+    }
+}
+
 /// Root of the two-level manifest.
 ///
 /// This is what [`EncryptedShardManifestV7`] wraps. Pages carry the bulk of
@@ -1266,6 +1309,23 @@ pub struct ManifestRoot {
     /// keeps v7 manifests byte-identical on the wire.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dir_index_shards: BTreeMap<u8, DirIndexShardRef>,
+    /// Sticky directory-index format marker (Option A — "format follows the
+    /// bucket"). Resolved exactly once — at load in
+    /// [`ShardedHamtPrivateForest::from_manifest`], or born `Sharded` for new
+    /// buckets — and honored verbatim by every flush. This is what guarantees
+    /// an old single-blob bucket can never silently flip to sharded: the
+    /// rebuild path's [`ShardedHamtPrivateForest::clear_dir_index_etag`] erases
+    /// `dir_index_etag` (so an unconditional overwrite can self-heal a corrupt
+    /// index) but leaves THIS untouched, so the flush still routes to the
+    /// single-blob branch.
+    ///
+    /// `#[serde(default)]` → [`DirIndexFormat::Unspecified`] on every legacy
+    /// manifest written before this field existed; `skip_serializing_if` keeps
+    /// those byte-identical on the wire until a deliberate re-flush stamps the
+    /// resolved value. The `dir_index_etag` / `dir_index_shards` signals above
+    /// remain the inference source for that one-time resolution.
+    #[serde(default, skip_serializing_if = "DirIndexFormat::is_unspecified")]
+    pub dir_index_format: DirIndexFormat,
 }
 
 impl ManifestRoot {
@@ -1290,6 +1350,11 @@ impl ManifestRoot {
             dir_index_seq: None,
             dir_index_cid: None,
             dir_index_shards: BTreeMap::new(),
+            // Neutral at construction — `from_manifest` resolves the sticky
+            // format (brand-new buckets, which also flow through `from_manifest`
+            // with a fresh root, are born `Sharded`). Migration overrides this
+            // to `SingleBlob` on its snapshot before committing.
+            dir_index_format: DirIndexFormat::Unspecified,
         }
     }
 

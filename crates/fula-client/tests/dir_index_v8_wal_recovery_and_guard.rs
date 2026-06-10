@@ -4,14 +4,18 @@
 //! mock master that HONORS conditional PUTs (If-None-Match:* / If-Match) and
 //! persists objects across client instances:
 //!
-//!   1. **Write-path guard** (`guard_rejects_v8_write_over_v7_single_blob`):
-//!      a bucket that still carries a legacy single-blob dir-index
-//!      (`dir_index_etag` set, no shards) must HARD-ERROR if the new code tries
-//!      to write a v8 sharded index over it (old buckets are read-only). The
-//!      current SDK never writes single-blob, so the test does "manifest
-//!      surgery" (decrypt the committed root, flip it to single-blob, re-encrypt
-//!      at seq+1, PUT it back) to manufacture the precondition, then asserts the
-//!      SPECIFIC guard error — not a generic failure (which could be a load bug).
+//!   1. **Format follows the bucket** (Option A — two tests):
+//!      * `format_follows_bucket_single_blob_stays_single_blob`: a bucket whose
+//!        sticky format is single-blob must FLUSH AS SINGLE-BLOB — never flip to
+//!        sharded, never hard-error. It asserts a single-blob blob lands at the
+//!        stable dir-index key and decrypts to the live index.
+//!      * `backstop_rejects_dual_format_sharded_with_etag`: the impossible dual
+//!        state (sticky `Sharded` + a live single-blob `dir_index_etag`, which
+//!        only an OLD pre-v8 client could create) must HARD-ERROR with the
+//!        SPECIFIC backstop message — not a generic failure (which could mask a
+//!        deleted backstop). Both use a test-only helper to manufacture the
+//!        precondition on a cleanly-loaded forest (page_index stays consistent
+//!        with storage, isolating the format dispatch).
 //!
 //!   2. **Coarse WAL recovery** (`wal_recovers_crash_before_root_commit`):
 //!      client A crashes AFTER pages + dir-index shards are PUT but BEFORE the
@@ -29,10 +33,10 @@
 //!      shard's pre-PUT WAL promise but before its PUT (torn write). Both must
 //!      recover to a fully-consistent, readable bucket.
 //!
-//! Tests 2/3 require `--features test-fault-injection` (the crash hooks compile
-//! out of production). Test 1 needs no feature. The crash flags + `FULA_STATE_DIR`
-//! are process-global, so the fault tests serialize on a static mutex and clear
-//! the flags via a panic-safe RAII guard.
+//! The crash hooks AND the format-force helpers compile out of production, so
+//! the whole file is gated on `--features test-fault-injection`. The crash flags
+//! + `FULA_STATE_DIR` are process-global, so the tests serialize on a static
+//! mutex and clear the flags via a panic-safe RAII guard.
 //!
 //! ## Running (PowerShell)
 //! ```powershell
@@ -52,7 +56,7 @@ use cid::multihash::Multihash;
 use cid::Cid;
 use fula_client::{Config, EncryptedClient, EncryptionConfig};
 use fula_crypto::keys::{KeyManager, SecretKey};
-use fula_crypto::private_forest::derive_index_key;
+use fula_crypto::private_forest::{derive_index_key, derive_dir_index_key, EncryptedDirectoryIndex};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
@@ -245,25 +249,28 @@ fn forest_dek(secret: &SecretKey, bucket: &str) -> fula_crypto::keys::DekKey {
     KeyManager::from_secret_key(secret.clone()).derive_path_key(&format!("forest:{bucket}"))
 }
 
-// ───────────────────────────── Test 1: guard ────────────────────────────────
+// ──────────────── Test 1: format-follows-bucket (Option A) ───────────────────
 
-/// The write-path guard must hard-error when asked to write a v8 sharded
-/// dir-index over a bucket that still carries a legacy single-blob dir-index.
+/// Option A: an OLD single-blob bucket must FLUSH AS SINGLE-BLOB — never flip
+/// to sharded, never hard-error. Forcing the loaded forest to single-blob, then
+/// writing + flushing, must (a) succeed and (b) persist a single-blob dir-index
+/// blob (not shard objects) that decrypts to the live index. A regression that
+/// re-inferred the format from live manifest state — or kept the old "always
+/// shard" behaviour — would either shard over it or trip the former guard.
 #[tokio::test]
-async fn guard_rejects_v8_write_over_v7_single_blob() {
+async fn format_follows_bucket_single_blob_stays_single_blob() {
     let _serial = SerialGuard::acquire();
     let state = TempDir::new().expect("state dir");
     std::env::set_var("FULA_STATE_DIR", state.path());
 
-    let (server, _stash) = start_mock().await;
+    let (server, stash) = start_mock().await;
     let secret = SecretKey::generate();
-    let bucket = "guard-v7-single-blob";
+    let bucket = "single-blob-stays-single-blob";
 
     let cache = TempDir::new().unwrap();
     let client = build_client(&server.uri(), &cache.path().join("b.redb"), secret.clone());
 
-    // 1) Write a normal v8 (sharded) bucket + flush. Proves the forest is fully
-    //    functional and loaded into the client's cache.
+    // Born sharded; flush so the forest is fully loaded + functional.
     for (k, body) in recovery_files() {
         client
             .put_object_flat_deferred(bucket, &k, Bytes::from(body), None)
@@ -272,32 +279,108 @@ async fn guard_rejects_v8_write_over_v7_single_blob() {
     }
     client.flush_forest(bucket).await.expect("initial sharded flush");
 
-    // 2) Force the LOADED forest into the legacy v7 single-blob shape in-memory
-    //    (dir_index_etag set, dir_index_shards cleared) — exactly the read-only
-    //    OLD bucket the guard protects. Because the forest stays loaded, its
-    //    page_index remains consistent with storage (unlike forging a manifest
-    //    out-of-band), so the ONLY thing the next flush can object to is the
-    //    dir-index format — isolating the guard cleanly.
+    // Force the loaded forest to the legacy single-blob shape (sticky format =
+    // SingleBlob). The forest stays loaded so its page_index remains consistent
+    // with storage — the only thing under test is the format dispatch.
     client
         .test_force_single_blob_dir_index(bucket)
         .await
         .expect("force single-blob dir-index state");
 
-    // 3) A write dirties a dir-index shard → flush hits Phase 1.6 → the
-    //    read-only-old guard must hard-error with its specific message (not a
-    //    generic failure, which could mask a silently-deleted guard).
+    // A write dirties the dir-index → flush hits Phase 1.6. Under Option A this
+    // takes the SINGLE-BLOB branch and must SUCCEED (not error, not shard).
+    // First flush: etag is None (post-rebuild state) → unconditional CREATE.
     client
         .put_object_flat_deferred(bucket, "/d00/after_force.txt", Bytes::from_static(b"x"), None)
+        .await
+        .expect("deferred upsert (no flush yet) must succeed");
+    client
+        .flush_forest(bucket)
+        .await
+        .expect("single-blob flush (create) must succeed (format follows the bucket — no guard, no shard)");
+
+    // Second flush: a real etag now pins the blob → exercises the `If-Match`
+    // conditional-UPDATE path of the single-blob branch (and seq monotonicity).
+    client
+        .put_object_flat_deferred(bucket, "/d01/after_force_2.txt", Bytes::from_static(b"y"), None)
+        .await
+        .expect("second deferred upsert must succeed");
+    client
+        .flush_forest(bucket)
+        .await
+        .expect("single-blob flush (conditional update) must succeed");
+
+    // Prove it stayed single-blob: a blob exists at the STABLE single-blob
+    // dir-index key and decrypts to a DirectoryIndex carrying the live dirs.
+    // (The force helper only set an in-memory etag with no blob; this object can
+    // only exist because the single-blob WRITE branch actually ran.)
+    let dek = forest_dek(&secret, bucket);
+    let dir_key_path = format!("/{bucket}/{}", derive_dir_index_key(&dek, bucket));
+    let blob = stash
+        .lock()
+        .unwrap()
+        .get(&dir_key_path)
+        .cloned()
+        .expect("a single-blob dir-index object must exist after a single-blob flush");
+    let (index, _seq) = EncryptedDirectoryIndex::from_bytes(&blob)
+        .expect("single-blob dir-index envelope must parse")
+        .decrypt(&dek, bucket)
+        .expect("single-blob dir-index must decrypt under the forest DEK");
+    assert!(
+        index.entries.contains_key("/d00"),
+        "single-blob index must contain the live directory tree; entries = {:?}",
+        index.entries.keys().collect::<Vec<_>>()
+    );
+}
+
+/// The Sharded-branch BACKSTOP must hard-error on the impossible dual-format
+/// state (sticky `Sharded` + a live single-blob `dir_index_etag`) — the
+/// corruption an OLD pre-v8 client creates by writing a v7 index over a v8
+/// bucket. Replaces the former read-only-old guard, which is now unreachable
+/// from our own writers (the single-blob branch owns single-blob buckets).
+#[tokio::test]
+async fn backstop_rejects_dual_format_sharded_with_etag() {
+    let _serial = SerialGuard::acquire();
+    let state = TempDir::new().expect("state dir");
+    std::env::set_var("FULA_STATE_DIR", state.path());
+
+    let (server, _stash) = start_mock().await;
+    let secret = SecretKey::generate();
+    let bucket = "dual-format-backstop";
+
+    let cache = TempDir::new().unwrap();
+    let client = build_client(&server.uri(), &cache.path().join("b.redb"), secret.clone());
+
+    for (k, body) in recovery_files() {
+        client
+            .put_object_flat_deferred(bucket, &k, Bytes::from(body), None)
+            .await
+            .unwrap_or_else(|e| panic!("put {k}: {e:?}"));
+    }
+    client.flush_forest(bucket).await.expect("initial sharded flush");
+
+    // Force the impossible dual state: format stays Sharded (shards populated)
+    // but a single-blob dir_index_etag is also set.
+    client
+        .test_force_dual_format_sharded_with_etag(bucket)
+        .await
+        .expect("force dual-format state");
+
+    // A write dirties a shard → flush hits the Sharded branch → the backstop
+    // must hard-error with its SPECIFIC message (not a generic failure, which
+    // could mask a silently-deleted backstop).
+    client
+        .put_object_flat_deferred(bucket, "/d00/dual.txt", Bytes::from_static(b"x"), None)
         .await
         .expect("deferred upsert (no flush yet) must succeed");
     let err = client
         .flush_forest(bucket)
         .await
-        .expect_err("flush over a single-blob bucket must hit the read-only-old guard");
+        .expect_err("a Sharded bucket with a live single-blob etag must trip the backstop");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("refusing to write a v8 sharded dir-index"),
-        "expected the read-only-old guard error, got a DIFFERENT error (would mask a deleted guard): {msg}"
+        msg.contains("dual-format corruption"),
+        "expected the dual-format backstop error, got a DIFFERENT error: {msg}"
     );
 }
 

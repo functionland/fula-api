@@ -519,10 +519,31 @@ impl ShardedHamtPrivateForest {
     /// mutation. All shards start as `NotLoaded` and are materialized on
     /// first access.
     pub fn from_manifest(
-        manifest: ShardManifestV7,
+        mut manifest: ShardManifestV7,
         bucket: impl Into<String>,
         forest_dek: DekKey,
     ) -> Self {
+        // Option A (sticky dir-index format): resolve the format ONCE, here,
+        // from the manifest exactly as loaded — BEFORE any caller-side rebuild
+        // can call `clear_dir_index_etag` and erase the single-blob signal.
+        // Legacy manifests (written before `dir_index_format` existed) arrive
+        // as `Unspecified`; infer from the mutually-exclusive etag/shards
+        // signals and lock it in so every subsequent flush is deterministic.
+        // A manifest that already carries a resolved format is left untouched
+        // (the sticky guarantee). Brand-new buckets flow through here with a
+        // fresh both-empty root and are born `Sharded` so they never hit the
+        // ~1 MiB single-blob cliff.
+        if manifest.root.dir_index_format
+            == crate::private_forest::DirIndexFormat::Unspecified
+        {
+            manifest.root.dir_index_format = if !manifest.root.dir_index_shards.is_empty() {
+                crate::private_forest::DirIndexFormat::Sharded
+            } else if manifest.root.dir_index_etag.is_some() {
+                crate::private_forest::DirIndexFormat::SingleBlob
+            } else {
+                crate::private_forest::DirIndexFormat::Sharded
+            };
+        }
         let num = manifest.num_shards();
         let bucket: String = bucket.into();
         let dir_index_route_key =
@@ -654,6 +675,13 @@ impl ShardedHamtPrivateForest {
     /// True when the dir-index has unflushed mutations.
     pub fn dir_index_dirty(&self) -> bool {
         self.dir_index_dirty
+    }
+
+    /// The sticky directory-index format resolved at load (Option A). The flush
+    /// reads this to choose the sharded vs single-blob write branch instead of
+    /// re-inferring from live manifest state (which the rebuild path mutates).
+    pub fn dir_index_format(&self) -> crate::private_forest::DirIndexFormat {
+        self.manifest.root.dir_index_format
     }
 
     /// plan-D5 (v8) — read-only view of the shards changed since the last
@@ -843,20 +871,36 @@ impl ShardedHamtPrivateForest {
     }
 
     /// Test-only: force the manifest into the legacy v7 single-blob dir-index
-    /// shape (`dir_index_etag` set, `dir_index_shards` empty) so a test can
-    /// exercise the client's read-only-old write-path guard without the fragile
-    /// alternative of re-encrypting a committed manifest out-of-band (which
-    /// desyncs `page_index` from the pages on storage). Clears the dir-index
-    /// dirty set so this helper alone is inert — the test dirties a shard
-    /// afterward via a real write to trip the guard. Compiled out of production.
+    /// shape (sticky format `SingleBlob`, `dir_index_shards` empty) so a test
+    /// can exercise the client's single-blob flush branch (Option A) without the
+    /// fragile alternative of re-encrypting a committed manifest out-of-band
+    /// (which desyncs `page_index` from the pages on storage). Leaves
+    /// `dir_index_etag = None` — i.e. the realistic post-rebuild single-blob
+    /// state, where the first flush does an unconditional create; a second flush
+    /// then exercises the `If-Match` conditional-update path. Clears the
+    /// dir-index dirty set so this helper alone is inert — the test dirties a
+    /// shard afterward via a real write. Compiled out of production.
     #[cfg(any(test, feature = "test-fault-injection"))]
     pub fn test_force_single_blob_dir_index(&mut self) {
-        self.manifest.root.dir_index_etag = Some("test-forced-single-blob-etag".to_string());
-        if self.manifest.root.dir_index_seq.is_none() {
-            self.manifest.root.dir_index_seq = Some(1);
-        }
+        self.manifest.root.dir_index_etag = None;
         self.manifest.root.dir_index_shards.clear();
+        self.manifest.root.dir_index_format =
+            crate::private_forest::DirIndexFormat::SingleBlob;
         self.dir_index_dirty_shards.clear();
+    }
+
+    /// Test-only: force the IMPOSSIBLE dual-format state — sticky format
+    /// `Sharded` while a live single-blob `dir_index_etag` is still set. This
+    /// is the corruption an OLD pre-v8 client could create by writing a v7
+    /// single-blob index over a v8 bucket; the flush's Sharded-branch backstop
+    /// must refuse it loudly rather than produce an ambiguous manifest.
+    /// Compiled out of production.
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    pub fn test_force_dual_format_sharded_with_etag(&mut self) {
+        self.manifest.root.dir_index_etag = Some("test-forced-dual-format-etag".to_string());
+        self.manifest.root.dir_index_seq = Some(1);
+        self.manifest.root.dir_index_format =
+            crate::private_forest::DirIndexFormat::Sharded;
     }
 
     /// plan-D5 (v8) — reconcile a single dir-index SHARD's root-side

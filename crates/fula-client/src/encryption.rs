@@ -26,6 +26,7 @@ use fula_crypto::{
         EncryptedDirectoryIndexShard, DirIndexShardRef,
         derive_dir_index_route_key, derive_dir_index_shard_key,
         split_directory_index_into_shards,
+        DirIndexFormat,
     },
     sharing::{ShareToken, AcceptedShare, ShareRecipient},
     rotation::{KeyRotationManager, WrappedKeyInfo},
@@ -4449,7 +4450,13 @@ impl EncryptedClient {
         // is bound to the post-flush sequence we'll commit in phase 2.
         // Phase 1 also marks pages dirty automatically via `shard_mut`.
         let backend = Arc::new(S3BlobBackend::new(self.inner.clone(), bucket.to_string()));
-        let (mut manifest_snapshot, dir_index_snapshot, dir_index_dirty_shards) = {
+        let (
+            mut manifest_snapshot,
+            dir_index_snapshot,
+            dir_index_dirty_shards,
+            dir_index_dirty,
+            dir_index_seq_base,
+        ) = {
             let mut guard = forest_arc.write().await;
             guard.flush_dirty(&backend).await
                 .map_err(ClientError::Encryption)?;
@@ -4457,8 +4464,17 @@ impl EncryptedClient {
                 guard.manifest().clone(),
                 guard.directory_index().clone(),
                 // plan-D5 (v8): the SHARDS that changed since the last flush —
-                // the write loop re-PUTs only these (no amplification).
+                // the sharded write loop re-PUTs only these (no amplification).
                 guard.dir_index_dirty_shards().clone(),
+                // Option A: the overall dir-index-dirty flag gates the
+                // SINGLE-BLOB branch — it stays true even for an all-empty index
+                // (every entry removed), where the per-shard set is empty but a
+                // re-PUT is still owed.
+                guard.dir_index_dirty(),
+                // Option A: the authoritative single-blob seq baseline. A
+                // rebuild resets this to 0 (the root pin stays stale), so the
+                // flush must bump from HERE — not from `root.dir_index_seq`.
+                guard.dir_index_seq(),
             )
         };
 
@@ -4647,20 +4663,33 @@ impl EncryptedClient {
         // WAL::DirIndexShardWrote is appended+fsynced BEFORE each PUT so a crash
         // between the fsync and the PUT replays idempotently at the same
         // index-addressed key under the same seq.
-        let dir_index_shards_flushed = if !dir_index_dirty_shards.is_empty() {
-            // Read-only-old guard (mutual exclusivity, advisor F#3): a bucket
-            // still carrying a v7 single-blob dir-index (legacy `dir_index_etag`
-            // set, no shards) must never be written in v8 — old buckets are
-            // read-only, new buckets are born v8. Refuse loudly rather than
-            // create an ambiguous dual-format manifest.
-            if manifest_snapshot.root.dir_index_etag.is_some()
-                && manifest_snapshot.root.dir_index_shards.is_empty()
-            {
+        // Phase 1.6 dispatch on the STICKY format (Option A — "format follows
+        // the bucket"). Reading the resolved `dir_index_format` instead of
+        // re-inferring from live manifest state is what stops an old single-blob
+        // bucket from silently flipping to sharded after a rebuild cleared its
+        // `dir_index_etag`. `dir_index_flushed` drives the post-commit reconcile
+        // (clears the dirty set) for whichever branch ran; the single-blob
+        // branch additionally records its committed seq so the reconcile can
+        // advance the forest's seq baseline (rollback protection).
+        let mut single_blob_flushed_seq: Option<u64> = None;
+        let dir_index_flushed = if matches!(
+            manifest_snapshot.root.dir_index_format,
+            DirIndexFormat::Sharded
+        ) && !dir_index_dirty_shards.is_empty()
+        {
+            // Backstop assertion (replaces the old read-only-old guard): a
+            // Sharded-format bucket must never carry a live single-blob
+            // `dir_index_etag`. That impossible dual state is the corruption an
+            // OLD pre-v8 client creates by writing a v7 single-blob index over a
+            // v8 bucket. Refuse loudly rather than emit an ambiguous manifest.
+            // Under Option A this is unreachable from our own writers — the
+            // single-blob branch below owns single-blob buckets.
+            if manifest_snapshot.root.dir_index_etag.is_some() {
                 return Err(ClientError::Encryption(fula_crypto::CryptoError::Encryption(
                     format!(
-                        "refusing to write a v8 sharded dir-index over bucket '{}' that already \
-                         has a v7 single-blob dir-index (old buckets are read-only; new uploads \
-                         go to new buckets)",
+                        "refusing to write a v8 sharded dir-index over bucket '{}' that also \
+                         carries a v7 single-blob dir-index etag (dual-format corruption — an old \
+                         client wrote v7 over a v8 bucket; resolve before writing)",
                         bucket
                     ),
                 )));
@@ -4801,7 +4830,142 @@ impl EncryptedClient {
             manifest_snapshot.root.dir_index_seq = None;
             manifest_snapshot.root.dir_index_cid = None;
             true
+        } else if matches!(
+            manifest_snapshot.root.dir_index_format,
+            DirIndexFormat::SingleBlob
+        ) && dir_index_dirty
+        {
+            // ── v7 single-blob buckets (old, read-only) ─────────────────────
+            // Re-introduced single-blob flush branch (Option A). Writes the
+            // WHOLE directory index as ONE AEAD blob at the stable
+            // `derive_dir_index_key` location — mirroring the v1→v7 migration's
+            // dir-index PUT, but with the same offline + pinning hardening every
+            // other Phase 1.5/1.6 PUT carries:
+            //   * Constraint #1 (offline walkability): stamps `dir_index_cid`
+            //     so the offline reader's gateway race can fetch the index by
+            //     CID when master is down; the conditional-PUT helper also warms
+            //     the block cache with the ciphertext.
+            //   * Constraint #2 (pinning): attaches the `fula-bucket-lookup-h`
+            //     header so master forwards this blob's CID to GC-retain /
+            //     bucket-lookup population (and onward to the pinning service)
+            //     exactly like a page or a shard. The v1→v7 migration's
+            //     dir-index PUT historically omitted this header — that is the
+            //     class of "CID not sent to pinning" gap this branch closes.
+            let prior_dir_index_etag = manifest_snapshot.root.dir_index_etag.clone();
+            // Bump from the forest's seq baseline (`dir_index_seq_base`), NOT
+            // the root pin: a rebuild reset the baseline to 0 while the root pin
+            // stayed stale, so this yields the rebuild's intended seq=1 instead
+            // of erroneously continuing from the rejected blob's pinned seq.
+            let next_dir_index_seq = dir_index_seq_base.saturating_add(1);
+            single_blob_flushed_seq = Some(next_dir_index_seq);
+            // WAL pre-PUT promise (idempotent replay at the same stable key +
+            // seq). Recovery folds the highest-seq DirIndexWrote and applies it
+            // via `reconcile_dir_index_etag` on the next load.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Err(e) = wal::append(
+                bucket,
+                &wal_mac,
+                WalEntry::DirIndexWrote {
+                    old_etag: prior_dir_index_etag.clone(),
+                    new_etag: None,
+                    seq: next_dir_index_seq,
+                },
+            ) {
+                tracing::warn!(%bucket, error = %e, "WAL append DirIndexWrote (single-blob pre) failed");
+            }
+            let envelope = EncryptedDirectoryIndex::encrypt(
+                &dir_index_snapshot,
+                &forest_dek,
+                bucket,
+                next_dir_index_seq,
+            ).map_err(ClientError::Encryption)?;
+            let blob = envelope.to_bytes().map_err(ClientError::Encryption)?;
+            // Walkable-v8: pre-compute BLAKE3(blob) for the post-PUT self-verify,
+            // before `Bytes::from` consumes the body. Only when the writer flag
+            // is on (soft-fail: a mismatch just stamps no hint).
+            let expected_dir_index_cid = if walkable_v8 {
+                Some(crate::walkable_v8::local_blake3_raw_cid(&blob))
+            } else {
+                None
+            };
+            let dir_index_key = derive_dir_index_key(&forest_dek, bucket);
+            let metadata = ObjectMetadata::new()
+                .with_content_type("application/octet-stream")
+                .with_metadata("fula-bucket-lookup-h", &lookup_h_hex);
+            // Stable key → NEVER `If-None-Match: *` (it would 412 against the
+            // pre-existing blob). `If-Match` the known etag for a conditional
+            // update; after a rebuild cleared it (`None`) the PUT is an
+            // unconditional overwrite — the Phase 2 root `If-Match` still
+            // arbitrates concurrent committers (documented at the rebuild site).
+            let put = match self.inner.put_object_with_metadata_conditional(
+                bucket,
+                &dir_index_key,
+                Bytes::from(blob),
+                Some(metadata),
+                prior_dir_index_etag.as_deref(),
+                None,
+            ).await {
+                Ok(r) => r,
+                Err(e) if e.is_concurrent_modification() => {
+                    // A concurrent writer advanced the dir-index. Evict so the
+                    // retry reloads the winner's etag before re-attempting.
+                    self.forest_cache.remove(bucket);
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
+            let new_dir_index_etag = if put.etag.is_empty() { None } else { Some(put.etag) };
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Err(e) = wal::append(
+                bucket,
+                &wal_mac,
+                WalEntry::DirIndexWrote {
+                    old_etag: prior_dir_index_etag.clone(),
+                    new_etag: new_dir_index_etag.clone(),
+                    seq: next_dir_index_seq,
+                },
+            ) {
+                tracing::warn!(%bucket, error = %e, "WAL append DirIndexWrote (single-blob post) failed");
+            }
+            // Constraint #1 (offline): stamp the CID hint via self-verify, same
+            // pattern as the page / shard PUTs above.
+            let dir_index_cid = match (
+                walkable_v8,
+                expected_dir_index_cid,
+                new_dir_index_etag.as_deref(),
+            ) {
+                (true, Some(expected), Some(et)) => {
+                    crate::walkable_v8::verify_etag_against_expected_cid(
+                        et, expected, bucket, &dir_index_key,
+                    )
+                }
+                _ => None,
+            };
+            // Single-blob bucket: set the legacy fields, leave `dir_index_shards`
+            // empty, and KEEP `dir_index_format = SingleBlob` (sticky) so the
+            // next flush takes this same branch.
+            manifest_snapshot.root.dir_index_etag = new_dir_index_etag;
+            manifest_snapshot.root.dir_index_seq = Some(next_dir_index_seq);
+            manifest_snapshot.root.dir_index_cid = dir_index_cid;
+            true
+        } else if matches!(
+            manifest_snapshot.root.dir_index_format,
+            DirIndexFormat::Unspecified
+        ) {
+            // `from_manifest` / `new` always resolve the format; an Unspecified
+            // here means a forest reached flush without going through them.
+            // Refuse rather than guess (guessing is exactly the bug Option A
+            // closes).
+            return Err(ClientError::Encryption(fula_crypto::CryptoError::Encryption(
+                format!(
+                    "internal: dir_index_format unresolved at flush for bucket '{}' \
+                     (forest not constructed via from_manifest/new)",
+                    bucket
+                ),
+            )));
         } else {
+            // Sharded with no dirty shards, or SingleBlob with nothing dirty —
+            // nothing to flush this round.
             false
         };
 
@@ -4935,10 +5099,21 @@ impl EncryptedClient {
         {
             let mut guard = forest_arc.write().await;
             guard.reconcile_flush(manifest_snapshot.root.clone(), &dirty_pages);
-            if dir_index_shards_flushed {
-                // Clear only the shards we actually flushed (the snapshot set),
-                // not the whole live set — defensive against any future window.
+            if dir_index_flushed {
+                // Clear the dir-index dirty state for whichever branch ran. For
+                // the sharded branch this drops the flushed shards (the snapshot
+                // set, not the whole live set — defensive against any future
+                // window). For the single-blob branch the same call clears the
+                // dirty flag once the snapshot's shards are removed (the whole
+                // index was rewritten in one blob).
                 guard.reconcile_dir_index_shards_flush(&dir_index_dirty_shards);
+                // Single-blob branch: advance the forest's seq baseline to the
+                // seq we just committed (+ clear the dirty flag), so the next
+                // flush bumps monotonically — rollback protection. The committed
+                // root pin is already carried by reconcile_flush above.
+                if let Some(seq) = single_blob_flushed_seq {
+                    guard.reconcile_dir_index_flush(seq);
+                }
             }
         }
 
@@ -6163,7 +6338,12 @@ impl EncryptedClient {
                 bucket,
                 &page_key,
                 Bytes::from(blob),
-                Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
+                // Constraint #2 (pinning): attach bucket-lookup-h so master
+                // forwards each migrated meta-HAMT page's CID to GC-retain / the
+                // pinning service, matching the flush path's Phase 1.5.
+                Some(ObjectMetadata::new()
+                    .with_content_type("application/octet-stream")
+                    .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket))),
                 None,
                 Some("*"),
             ).await {
@@ -6267,7 +6447,14 @@ impl EncryptedClient {
             bucket,
             &dir_index_key,
             Bytes::from(dir_index_blob),
-            Some(ObjectMetadata::new().with_content_type("application/octet-stream")),
+            // Constraint #2 (pinning): attach the bucket-lookup-h header so
+            // master forwards this migrated single-blob dir-index's CID to
+            // GC-retain / the pinning service — the flush path's Phase 1.6 does
+            // the same. Without it, a v1→v7-migrated bucket that then goes
+            // read-only would leave its dir-index CID unpinned.
+            Some(ObjectMetadata::new()
+                .with_content_type("application/octet-stream")
+                .with_metadata("fula-bucket-lookup-h", &self.compute_bucket_lookup_h_hex(bucket))),
         ).await {
             Ok(r) => r,
             Err(e) => {
@@ -6308,6 +6495,14 @@ impl EncryptedClient {
         manifest_snapshot.root.dir_index_etag = new_dir_index_etag;
         manifest_snapshot.root.dir_index_seq = Some(dir_index_seq);
         manifest_snapshot.root.dir_index_cid = dir_index_cid_mig;
+        // Option A (sticky format): a v1→v7 migration produces an OLD-style
+        // single-blob bucket. Stamp the sticky marker so every subsequent flush
+        // routes through the single-blob branch and never shards over it —
+        // matching the rollout model ("old buckets are single-blob, read-only").
+        // Set BEFORE the manifest-root encrypt+PUT below and before the
+        // post-commit `reconcile_flush`, so both the persisted manifest and the
+        // cached forest agree on the format.
+        manifest_snapshot.root.dir_index_format = DirIndexFormat::SingleBlob;
 
         let manifest_seq: u64 = 1;
         let manifest_data = match EncryptedShardManifestV7::encrypt_v7(
@@ -8705,6 +8900,32 @@ impl EncryptedClient {
         };
         let mut guard = forest_arc.write().await;
         guard.test_force_single_blob_dir_index();
+        Ok(())
+    }
+
+    /// Test-only: force the loaded forest for `bucket` into the IMPOSSIBLE
+    /// dual-format state (sticky `Sharded` format + a live single-blob
+    /// `dir_index_etag`) so a test can assert the flush's Sharded-branch
+    /// backstop refuses it. Compiled out of production.
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    pub async fn test_force_dual_format_sharded_with_etag(&self, bucket: &str) -> Result<()> {
+        let forest_arc = {
+            let entry = self.forest_cache.get(bucket).ok_or_else(|| {
+                ClientError::Encryption(fula_crypto::CryptoError::Encryption(
+                    "test_force_dual_format_sharded_with_etag: no forest in cache (load it first)".into(),
+                ))
+            })?;
+            match entry.value() {
+                ForestCacheEntry::ShardedHamt { forest, .. } => forest.clone(),
+                _ => {
+                    return Err(ClientError::Encryption(fula_crypto::CryptoError::Encryption(
+                        "test_force_dual_format_sharded_with_etag: forest is not v7 sharded-HAMT".into(),
+                    )))
+                }
+            }
+        };
+        let mut guard = forest_arc.write().await;
+        guard.test_force_dual_format_sharded_with_etag();
         Ok(())
     }
 
