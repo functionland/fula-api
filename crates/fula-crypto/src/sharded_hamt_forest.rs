@@ -502,6 +502,16 @@ pub struct ShardedHamtPrivateForest {
     /// True when `dir_index` has diverged from the on-disk blob. Flush path
     /// tests this, PUTs a new blob if set, and clears it on success.
     dir_index_dirty: bool,
+    /// plan-D5 (v8) — keyed routing key for the sharded dir-index, derived
+    /// once from `(forest_dek, bucket)`. Routes a mutated dir path to its
+    /// shard for per-shard dirty tracking; kept here so mutation sites don't
+    /// re-derive it per call.
+    dir_index_route_key: [u8; 32],
+    /// plan-D5 (v8) — set of dir-index shards changed since the last flush.
+    /// The client write path re-PUTs ONLY these shards (no write
+    /// amplification). Superset-safe: a shard is marked whenever any of its
+    /// entries is created / modified / removed.
+    dir_index_dirty_shards: std::collections::BTreeSet<u8>,
 }
 
 impl ShardedHamtPrivateForest {
@@ -514,6 +524,9 @@ impl ShardedHamtPrivateForest {
         forest_dek: DekKey,
     ) -> Self {
         let num = manifest.num_shards();
+        let bucket: String = bucket.into();
+        let dir_index_route_key =
+            crate::private_forest::derive_dir_index_route_key(&forest_dek, &bucket);
         Self {
             manifest,
             loaded_shards: (0..num)
@@ -521,10 +534,13 @@ impl ShardedHamtPrivateForest {
                 .collect(),
             dirty_shards: vec![false; num],
             forest_dek,
-            bucket: bucket.into(),
+            bucket,
             dir_index: crate::private_forest::DirectoryIndex::new(),
             dir_index_seq: 0,
+            // Loaded from storage → not dirty; no shards pending.
             dir_index_dirty: false,
+            dir_index_route_key,
+            dir_index_dirty_shards: std::collections::BTreeSet::new(),
         }
     }
 
@@ -538,6 +554,19 @@ impl ShardedHamtPrivateForest {
     ) -> Self {
         let manifest = ShardManifestV7::new(num_shards);
         let actual_num = manifest.num_shards();
+        let bucket: String = bucket.into();
+        let dir_index_route_key =
+            crate::private_forest::derive_dir_index_route_key(&forest_dek, &bucket);
+        // Fresh forest: start with a root-only index so mkdir on `/foo`
+        // doesn't require a rebuild on first use. The root entry must be
+        // flushed, so mark its owning shard dirty.
+        let dir_index = crate::private_forest::DirectoryIndex::new();
+        let mut dir_index_dirty_shards = std::collections::BTreeSet::new();
+        for path in dir_index.entries.keys() {
+            dir_index_dirty_shards.insert(
+                crate::private_forest::shard_index_for_path(path, &dir_index_route_key),
+            );
+        }
         Self {
             manifest,
             // Brand-new shards are known-empty — no need to go through a
@@ -548,13 +577,14 @@ impl ShardedHamtPrivateForest {
                 .collect(),
             dirty_shards: vec![false; actual_num],
             forest_dek,
-            bucket: bucket.into(),
-            // Fresh forest: start with a root-only index so mkdir on `/foo`
-            // doesn't require a rebuild on first use. `dir_index_seq` stays 0
-            // until the first successful flush (prior_seq is bound into AAD).
-            dir_index: crate::private_forest::DirectoryIndex::new(),
+            bucket,
+            // `dir_index_seq` stays 0 until the first successful flush
+            // (prior_seq is bound into AAD).
+            dir_index,
             dir_index_seq: 0,
             dir_index_dirty: true,
+            dir_index_route_key,
+            dir_index_dirty_shards,
         }
     }
 
@@ -618,11 +648,53 @@ impl ShardedHamtPrivateForest {
         self.dir_index = index;
         self.dir_index_seq = seq;
         self.dir_index_dirty = false;
+        self.dir_index_dirty_shards.clear();
     }
 
     /// True when the dir-index has unflushed mutations.
     pub fn dir_index_dirty(&self) -> bool {
         self.dir_index_dirty
+    }
+
+    /// plan-D5 (v8) — read-only view of the shards changed since the last
+    /// flush. The client's flush snapshot clones this; the write path re-PUTs
+    /// only these shards.
+    pub fn dir_index_dirty_shards(&self) -> &std::collections::BTreeSet<u8> {
+        &self.dir_index_dirty_shards
+    }
+
+    /// plan-D5 (v8) — clear the FLUSHED shards from the dirty set after a
+    /// successful sharded dir-index flush, and clear the overall dirty flag
+    /// only if nothing remains. The new per-shard `DirIndexShardRef`s are
+    /// carried into the live manifest by `reconcile_flush(root.clone(), ..)`.
+    ///
+    /// Clearing only the flushed shards (rather than the whole set) is
+    /// defensive: it stays correct even if a future change ever allowed a
+    /// mutation to mark a new shard dirty between the flush snapshot and this
+    /// reconcile (today the per-bucket write mutex excludes that). A shard
+    /// dirtied after the snapshot is preserved and flushed next time.
+    pub fn reconcile_dir_index_shards_flush(&mut self, flushed: &std::collections::BTreeSet<u8>) {
+        for idx in flushed {
+            self.dir_index_dirty_shards.remove(idx);
+        }
+        if self.dir_index_dirty_shards.is_empty() {
+            self.dir_index_dirty = false;
+        }
+    }
+
+    /// plan-D5 (v8) — mark the shards owning `keys` dirty (and set the overall
+    /// dir-index-dirty flag). Called from the dir-index mutation sites with the
+    /// exact keys the `DirectoryIndex` method changed, so only the affected
+    /// shards are re-PUT on flush.
+    fn mark_dir_index_keys_dirty(&mut self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        self.dir_index_dirty = true;
+        for k in keys {
+            let idx = crate::private_forest::shard_index_for_path(k, &self.dir_index_route_key);
+            self.dir_index_dirty_shards.insert(idx);
+        }
     }
 
     /// Last successfully flushed dir-index sequence. Bumped by
@@ -645,6 +717,19 @@ impl ShardedHamtPrivateForest {
     /// correct, but storage doesn't know about it yet.
     pub fn mark_dir_index_dirty(&mut self) {
         self.dir_index_dirty = true;
+        // plan-D5 (v8): a rebuild reconstructs the WHOLE index, so every shard
+        // holding any entry is (re-)dirtied. Collect the routes first to avoid
+        // borrowing `self.dir_index` and `self.dir_index_dirty_shards` at once.
+        let rk = self.dir_index_route_key;
+        let idxs: Vec<u8> = self
+            .dir_index
+            .entries
+            .keys()
+            .map(|p| crate::private_forest::shard_index_for_path(p, &rk))
+            .collect();
+        for idx in idxs {
+            self.dir_index_dirty_shards.insert(idx);
+        }
     }
 
     /// Clear the in-memory root's `dir_index_etag` so the next flush's
@@ -755,6 +840,53 @@ impl ShardedHamtPrivateForest {
         self.manifest.root.dir_index_etag = etag;
         self.manifest.root.dir_index_seq = Some(seq);
         self.manifest.root.dir_index_cid = cid;
+    }
+
+    /// Test-only: force the manifest into the legacy v7 single-blob dir-index
+    /// shape (`dir_index_etag` set, `dir_index_shards` empty) so a test can
+    /// exercise the client's read-only-old write-path guard without the fragile
+    /// alternative of re-encrypting a committed manifest out-of-band (which
+    /// desyncs `page_index` from the pages on storage). Clears the dir-index
+    /// dirty set so this helper alone is inert — the test dirties a shard
+    /// afterward via a real write to trip the guard. Compiled out of production.
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    pub fn test_force_single_blob_dir_index(&mut self) {
+        self.manifest.root.dir_index_etag = Some("test-forced-single-blob-etag".to_string());
+        if self.manifest.root.dir_index_seq.is_none() {
+            self.manifest.root.dir_index_seq = Some(1);
+        }
+        self.manifest.root.dir_index_shards.clear();
+        self.dir_index_dirty_shards.clear();
+    }
+
+    /// plan-D5 (v8) — reconcile a single dir-index SHARD's root-side
+    /// `DirIndexShardRef` from a post-PUT WAL record. Counterpart to
+    /// [`reconcile_page_etag`] for the sharded dir-index layer: after a
+    /// Phase-1.6-shard-landed-but-Phase-2-crashed write, the reloaded root's
+    /// `dir_index_shards[shard_idx]` still carries the pre-crash etag/seq. This
+    /// patches it so the next flush's conditional PUT matches S3.
+    ///
+    /// **Seq guard** (same rationale as `reconcile_page_etag`): reject WAL
+    /// entries that aren't strictly newer than the loaded shard's `seq` — they
+    /// reflect state already superseded by a later root commit.
+    pub fn reconcile_dir_index_shard_etag(
+        &mut self,
+        shard_idx: u8,
+        seq: u64,
+        etag: Option<String>,
+    ) {
+        if let Some(existing) = self.manifest.root.dir_index_shards.get(&shard_idx) {
+            if seq <= existing.seq {
+                return;
+            }
+        }
+        // Recover the CID from master's etag string (= `cid.to_string()` for v8
+        // shard PUTs) when possible; legacy/malformed etags fall through to None.
+        let cid: Option<cid::Cid> = etag.as_deref().and_then(|s| s.parse().ok());
+        self.manifest.root.dir_index_shards.insert(
+            shard_idx,
+            crate::private_forest::DirIndexShardRef { etag, seq, cid },
+        );
     }
 
     /// O(1) list of immediate subdirectories beneath `dir_path`, answered
@@ -1149,10 +1281,11 @@ impl ShardedHamtPrivateForest {
         self.ensure_ancestor_chain(&parent, backend).await?;
 
         // Keep the in-memory DirectoryIndex consistent with the forest. Only
-        // count new inserts (overwrites don't change file_count).
+        // count new inserts (overwrites don't change file_count). The keys the
+        // insert actually changed drive per-shard dirty tracking (v8).
         if !had_file {
-            self.dir_index.insert_file(&file_path);
-            self.dir_index_dirty = true;
+            let changed = self.dir_index.insert_file(&file_path);
+            self.mark_dir_index_keys_dirty(&changed);
         }
 
         Ok(())
@@ -1240,9 +1373,10 @@ impl ShardedHamtPrivateForest {
         self.ensure_ancestor_chain(&dir_path, backend).await?;
 
         // Mirror the dir's existence in the DirectoryIndex so `list_subdirs`
-        // resolves it without touching the HAMT.
-        self.dir_index.ensure_dir(&dir_path);
-        self.dir_index_dirty = true;
+        // resolves it without touching the HAMT. The keys ensure_dir actually
+        // changed drive per-shard dirty tracking (v8).
+        let changed = self.dir_index.ensure_dir(&dir_path);
+        self.mark_dir_index_keys_dirty(&changed);
 
         Ok(())
     }
@@ -1339,9 +1473,9 @@ impl ShardedHamtPrivateForest {
 
             // Mirror the deletion in the directory index so subsequent
             // `file_count`/`list_subdirs` queries are coherent without
-            // a forest walk.
-            self.dir_index.remove_file(path);
-            self.dir_index_dirty = true;
+            // a forest walk. The changed key drives per-shard dirty tracking.
+            let changed = self.dir_index.remove_file(path);
+            self.mark_dir_index_keys_dirty(&changed);
         }
 
         Ok(removed_file)
@@ -1669,9 +1803,16 @@ impl ShardedHamtPrivateForest {
         let all = self.collect_all_entries(backend).await?;
         let mut index = crate::private_forest::DirectoryIndex::new();
         for entry in all {
+            // Discard the changed-keys return — this builds a standalone index;
+            // the forest re-dirties all shards via `mark_dir_index_dirty` after
+            // installing it.
             match entry {
-                HamtEntry::File(f) => index.insert_file(&f.path),
-                HamtEntry::Dir(d) => index.ensure_dir(&d.path),
+                HamtEntry::File(f) => {
+                    index.insert_file(&f.path);
+                }
+                HamtEntry::Dir(d) => {
+                    index.ensure_dir(&d.path);
+                }
             }
         }
         Ok(index)
@@ -2232,6 +2373,117 @@ mod tests {
             .unwrap();
         assert!(files.is_empty());
         assert!(dirs.is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // plan-D5 (v8) — per-shard dir-index dirty tracking (no write amplification)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// A fresh forest marks the root entry's shard dirty so the first flush
+    /// persists the root-only index.
+    #[tokio::test]
+    async fn dir_index_v8_fresh_forest_marks_root_shard_dirty() {
+        let forest = ShardedHamtPrivateForest::new("bucket-fresh", test_dek(), 16);
+        let rk = crate::private_forest::derive_dir_index_route_key(&test_dek(), "bucket-fresh");
+        let root_shard = crate::private_forest::shard_index_for_path("/", &rk);
+        assert_eq!(
+            forest.dir_index_dirty_shards(),
+            &std::collections::BTreeSet::from([root_shard]),
+            "fresh forest must mark exactly the root entry's shard dirty"
+        );
+    }
+
+    /// Inserting a file into an EXISTING directory marks exactly that
+    /// directory's shard dirty — the load-bearing no-amplification property.
+    #[tokio::test]
+    async fn dir_index_v8_file_into_existing_dir_marks_one_shard() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let bucket = "bucket-one";
+        let mut forest = ShardedHamtPrivateForest::new(bucket, test_dek(), 16);
+        let rk = crate::private_forest::derive_dir_index_route_key(&test_dek(), bucket);
+
+        // Create /dir via the first file, then clear the dirty set.
+        forest.upsert_file(file_entry("/dir/a.txt", 1), &backend).await.unwrap();
+        let flushed = forest.dir_index_dirty_shards().clone();
+        forest.reconcile_dir_index_shards_flush(&flushed);
+        assert!(forest.dir_index_dirty_shards().is_empty(), "reconcile must clear");
+
+        // A second file into the EXISTING /dir only changes /dir's file_count
+        // → exactly /dir's shard is dirty (no amplification to other shards).
+        forest.upsert_file(file_entry("/dir/b.txt", 1), &backend).await.unwrap();
+        let expected = std::collections::BTreeSet::from([
+            crate::private_forest::shard_index_for_path("/dir", &rk),
+        ]);
+        assert_eq!(
+            forest.dir_index_dirty_shards(),
+            &expected,
+            "a file into an existing dir must dirty exactly that dir's shard"
+        );
+    }
+
+    /// Removing a file dirties its parent directory's shard.
+    #[tokio::test]
+    async fn dir_index_v8_remove_marks_parent_shard() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let bucket = "bucket-rm";
+        let mut forest = ShardedHamtPrivateForest::new(bucket, test_dek(), 16);
+        let rk = crate::private_forest::derive_dir_index_route_key(&test_dek(), bucket);
+        forest.upsert_file(file_entry("/d/x.txt", 1), &backend).await.unwrap();
+        let flushed = forest.dir_index_dirty_shards().clone();
+        forest.reconcile_dir_index_shards_flush(&flushed);
+
+        forest.remove_file("/d/x.txt", &backend).await.unwrap();
+        let expected = std::collections::BTreeSet::from([
+            crate::private_forest::shard_index_for_path("/d", &rk),
+        ]);
+        assert_eq!(forest.dir_index_dirty_shards(), &expected);
+    }
+
+    /// `mark_dir_index_dirty` (rebuild path) dirties every shard that holds an
+    /// entry, so a post-rebuild flush re-PUTs the whole sharded index.
+    #[tokio::test]
+    async fn dir_index_v8_rebuild_marks_all_populated_shards() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let bucket = "bucket-rebuild";
+        let mut forest = ShardedHamtPrivateForest::new(bucket, test_dek(), 16);
+        let rk = crate::private_forest::derive_dir_index_route_key(&test_dek(), bucket);
+        for p in &["/a/1.txt", "/b/2.txt", "/c/d/3.txt"] {
+            forest.upsert_file(file_entry(p, 1), &backend).await.unwrap();
+        }
+        let flushed = forest.dir_index_dirty_shards().clone();
+        forest.reconcile_dir_index_shards_flush(&flushed);
+        assert!(forest.dir_index_dirty_shards().is_empty());
+
+        forest.mark_dir_index_dirty();
+        let mut expected = std::collections::BTreeSet::new();
+        for key in forest.directory_index().entries.keys() {
+            expected.insert(crate::private_forest::shard_index_for_path(key, &rk));
+        }
+        assert_eq!(forest.dir_index_dirty_shards(), &expected);
+        assert!(!expected.is_empty());
+    }
+
+    /// `reconcile_dir_index_shard_etag` (WAL-replay) applies a strictly-newer
+    /// post-PUT etag and rejects a stale (≤ recorded) seq — the seq guard that
+    /// mirrors `reconcile_page_etag`.
+    #[test]
+    fn dir_index_v8_reconcile_shard_etag_seq_guard() {
+        let mut forest = ShardedHamtPrivateForest::new("bucket-seq", test_dek(), 16);
+        forest.reconcile_dir_index_shard_etag(3, 5, Some("etag-5".to_string()));
+        assert_eq!(forest.manifest().root.dir_index_shards.get(&3).unwrap().seq, 5);
+        // Stale (equal/older) seqs are rejected.
+        forest.reconcile_dir_index_shard_etag(3, 5, Some("etag-stale".to_string()));
+        forest.reconcile_dir_index_shard_etag(3, 4, Some("etag-older".to_string()));
+        assert_eq!(
+            forest.manifest().root.dir_index_shards.get(&3).unwrap().etag.as_deref(),
+            Some("etag-5"),
+            "stale/equal seq must not overwrite the recorded etag"
+        );
+        // A strictly-newer seq applies.
+        forest.reconcile_dir_index_shard_etag(3, 6, Some("etag-6".to_string()));
+        let r = forest.manifest().root.dir_index_shards.get(&3).unwrap();
+        assert_eq!(r.seq, 6);
+        assert_eq!(r.etag.as_deref(), Some("etag-6"));
     }
 
     #[tokio::test]

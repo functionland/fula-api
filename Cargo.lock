@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "fula-api"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "fula-blockstore"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "fula-cli"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "fula-client"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1898,7 +1898,7 @@ dependencies = [
 
 [[package]]
 name = "fula-core"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "fula-crypto"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1978,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "fula-flutter"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "async-lock",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "fula-js"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "base64 0.22.1",
  "bytes",

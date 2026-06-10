@@ -135,6 +135,14 @@ fn build_client(
     cfg.gateway_fallback_urls = Vec::new(); // SDK-shipped 6-gateway default
     cfg.gateway_race_concurrency = 3;
 
+    // Match FxFiles production (fula_api_service.dart:256). The writer's
+    // per-block CID self-verify is soft-fail — on an etag/CID mismatch it
+    // simply stamps no hint and behaves like the flag being off — so enabling
+    // it is strictly more faithful and never hard-fails a write. Walkable-v8
+    // cid-stamps are also what let the cold-start gateway walk fetch blocks by
+    // CID (the offline-from-gateway path).
+    cfg.walkable_v8_writer_enabled = true;
+
     let enc = EncryptionConfig::from_secret_key(secret);
     EncryptedClient::new(cfg, enc).expect("EncryptedClient construction must succeed")
 }
@@ -1697,6 +1705,12 @@ fn build_client_with_cold_start(
     cfg.users_index_ipns_name = ipns_name;
     cfg.users_index_user_key = Some(user_key);
     cfg.users_index_ipns_gateway_urls = ipns_gateway_urls;
+
+    // Match FxFiles production (fula_api_service.dart:256). Required for the
+    // cold-start gateway walk to resolve blocks by CID — the very offline path
+    // this builder exists to test. Soft-fail self-verify means enabling it is
+    // strictly more faithful and never hard-fails a write.
+    cfg.walkable_v8_writer_enabled = true;
 
     let enc = EncryptionConfig::from_secret_key(secret);
     EncryptedClient::new(cfg, enc).expect("EncryptedClient construction must succeed")

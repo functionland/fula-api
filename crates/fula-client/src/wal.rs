@@ -133,6 +133,18 @@ pub(crate) enum WalEntry {
         new_etag: Option<String>,
         seq: u64,
     },
+    /// plan-D5 (v8) — one SHARD of the sharded directory index was PUT, but the
+    /// manifest-root update tying `new_etag` into `root.dir_index_shards[idx]`
+    /// may still race. Replay re-issues the shard PUT (idempotent at its
+    /// index-addressed key) and retries the root PUT. Mirrors `PageWrote` for
+    /// the dir-index shard layer.
+    #[serde(rename = "dir_index_shard_wrote")]
+    DirIndexShardWrote {
+        shard_idx: u8,
+        old_etag: Option<String>,
+        new_etag: Option<String>,
+        seq: u64,
+    },
 }
 
 /// Group metadata tag for transactional multi-entry appends written via

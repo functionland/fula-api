@@ -319,6 +319,47 @@ async fn main() {
         return;
     }
 
+    // Diagnostic: find file(s) whose path contains FULA_FIND and dump their
+    // storage_key + shape, so we can check the cluster mirror for the key + its
+    // chunks (gone vs recoverable-but-slow).
+    if let Ok(needle) = std::env::var("FULA_FIND") {
+        let nl = needle.to_lowercase();
+        let mut hits = 0;
+        for f in &files {
+            if f.path.to_lowercase().contains(&nl) {
+                hits += 1;
+                let chunked = f
+                    .user_metadata
+                    .get("x-fula-chunked")
+                    .map(|s| s == "true")
+                    .unwrap_or(false);
+                let has_meta = f.user_metadata.contains_key("x-fula-encryption");
+                println!(
+                    "FOUND sk={} size={} encrypted={} chunked={} forest_meta={} path='{}'",
+                    f.storage_key, f.size, f.encrypted, chunked, has_meta, f.path
+                );
+                if let Some(enc_str) = f.user_metadata.get("x-fula-encryption") {
+                    if let Ok(enc) = serde_json::from_str::<serde_json::Value>(enc_str) {
+                        let ch = &enc["chunked"];
+                        let num = ch["num_chunks"].as_u64().unwrap_or(0);
+                        let cc = &ch["chunk_cids"];
+                        let present: usize = cc
+                            .as_array()
+                            .map(|a| a.iter().filter(|v| !v.is_null()).count())
+                            .unwrap_or(0);
+                        let c3 = cc.get(3).map(|v| v.to_string()).unwrap_or_else(|| "MISSING".into());
+                        println!(
+                            "    num_chunks={} chunk_cids_present={} chunk3_cid={}",
+                            num, present, c3
+                        );
+                    }
+                }
+            }
+        }
+        println!("(matched {hits})");
+        return;
+    }
+
     // ===== STEP 3 — REAL download: fetch + DECRYPT to plaintext, exactly like
     // FxFiles (DEK unwrap → AEAD single-block, or per-chunk decrypt + Bao). We
     // download one single-block file and one chunked file and verify each

@@ -1169,6 +1169,30 @@ pub struct PageRef {
     pub cid: Option<Cid>,
 }
 
+/// plan-D5 — pointer to one sharded directory-index object from the manifest
+/// root. The dir-index analogue of [`PageRef`]: binds the `etag` (for
+/// `If-Match` on re-PUT and master-divergence detection), the expected
+/// monotonic `seq` (readers reject a shard whose plaintext `seq` is below
+/// this — rollback / staleness), and the walkable-v8 `cid` hint (offline
+/// gateway-race fetch). Present in `ManifestRoot.dir_index_shards` only for
+/// NON-EMPTY shards.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirIndexShardRef {
+    /// ETag returned by S3 on the last successful PUT of this shard object;
+    /// `None` before its first flush.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    /// Expected monotonic shard sequence. Readers reject a shard whose
+    /// plaintext `seq` is below this.
+    pub seq: u64,
+    /// Walkable-v8 CID hint for this shard's encrypted blob (from master's
+    /// PUT-response ETag, self-verified against `BLAKE3(ciphertext)`). `None`
+    /// when the walkable-v8 writer is off; readers then fall back to the
+    /// storage-key fetch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<Cid>,
+}
+
 /// Root of the two-level manifest.
 ///
 /// This is what [`EncryptedShardManifestV7`] wraps. Pages carry the bulk of
@@ -1230,6 +1254,18 @@ pub struct ManifestRoot {
     /// struct — the no-migration property for production data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir_index_cid: Option<Cid>,
+    /// plan-D5 — per-shard pointers for the SHARDED directory index (v8).
+    /// `shard_idx → DirIndexShardRef` for each NON-EMPTY shard. A non-empty
+    /// map means this bucket uses the sharded dir-index and the reader MUST
+    /// route through the v8 path; an empty map (the default, and every legacy
+    /// v7 bucket) means the single-blob `dir_index_etag`/`dir_index_seq`/
+    /// `dir_index_cid` fields above are authoritative. The two are mutually
+    /// exclusive by construction — a v8 write leaves the legacy fields `None`.
+    /// `#[serde(default, skip_serializing_if)]` keeps every existing v7
+    /// manifest blob deserializing cleanly (field absent → empty map) and
+    /// keeps v7 manifests byte-identical on the wire.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dir_index_shards: BTreeMap<u8, DirIndexShardRef>,
 }
 
 impl ManifestRoot {
@@ -1253,6 +1289,7 @@ impl ManifestRoot {
             dir_index_etag: None,
             dir_index_seq: None,
             dir_index_cid: None,
+            dir_index_shards: BTreeMap::new(),
         }
     }
 
@@ -1848,17 +1885,29 @@ impl DirectoryIndex {
     /// Ensure every ancestor of `norm_dir` exists, threading child-pointers
     /// from each parent down to its immediate child. Idempotent: repeated
     /// calls for the same path never duplicate children (BTreeSet insert).
-    pub fn ensure_dir(&mut self, dir_path: &str) {
+    ///
+    /// Returns the entry keys this call ACTUALLY changed (a created child, or
+    /// a parent whose `subdirs` gained a segment) — used by the v8 sharded
+    /// dir-index for precise per-shard dirty tracking. An idempotent call that
+    /// changes nothing returns an empty Vec. Keys may repeat; callers dedupe.
+    pub fn ensure_dir(&mut self, dir_path: &str) -> Vec<String> {
         let norm = Self::normalize_dir_path(dir_path);
+        let mut changed = Vec::new();
         if norm == "/" {
-            self.entries.entry("/".to_string()).or_default();
-            return;
+            if !self.entries.contains_key("/") {
+                self.entries.insert("/".to_string(), DirEntry::default());
+                changed.push("/".to_string());
+            }
+            return changed;
         }
         // Walk from root down, creating missing parents and linking each
         // new child in via its parent's `subdirs`.
         let mut cursor = String::from("/");
         // Ensure root exists.
-        self.entries.entry("/".to_string()).or_default();
+        if !self.entries.contains_key("/") {
+            self.entries.insert("/".to_string(), DirEntry::default());
+            changed.push("/".to_string());
+        }
         for segment in norm.trim_start_matches('/').split('/') {
             let parent = cursor.clone();
             let child = if parent == "/" {
@@ -1866,32 +1915,50 @@ impl DirectoryIndex {
             } else {
                 format!("{}/{}", parent, segment)
             };
-            self.entries.entry(child.clone()).or_default();
+            if !self.entries.contains_key(&child) {
+                self.entries.insert(child.clone(), DirEntry::default());
+                changed.push(child.clone());
+            }
             if let Some(parent_entry) = self.entries.get_mut(&parent) {
-                parent_entry.subdirs.insert(segment.to_string());
+                // `BTreeSet::insert` returns true iff the segment was new, i.e.
+                // the parent's `subdirs` actually changed.
+                if parent_entry.subdirs.insert(segment.to_string()) {
+                    changed.push(parent.clone());
+                }
             }
             cursor = child;
         }
+        changed
     }
 
     /// Record that one file has been added under `file_path`'s parent
     /// directory. Ensures the parent directory (and its ancestors) exist.
-    pub fn insert_file(&mut self, file_path: &str) {
+    ///
+    /// Returns the entry keys this call changed (the parent's `file_count`
+    /// always changes, plus any ancestors `ensure_dir` created).
+    pub fn insert_file(&mut self, file_path: &str) -> Vec<String> {
         let parent = parent_dir_of_file(file_path);
-        self.ensure_dir(&parent);
+        let mut changed = self.ensure_dir(&parent);
         if let Some(de) = self.entries.get_mut(&parent) {
             de.file_count = de.file_count.saturating_add(1);
+            changed.push(parent);
         }
+        changed
     }
 
     /// Record that one file has been removed from `file_path`'s parent
     /// directory. Saturating: an over-remove (replay double-count) is
     /// harmless rather than wrapping.
-    pub fn remove_file(&mut self, file_path: &str) {
+    ///
+    /// Returns the affected entry key (the parent whose `file_count` changed),
+    /// or empty if the parent isn't tracked.
+    pub fn remove_file(&mut self, file_path: &str) -> Vec<String> {
         let parent = parent_dir_of_file(file_path);
         if let Some(de) = self.entries.get_mut(&parent) {
             de.file_count = de.file_count.saturating_sub(1);
+            return vec![parent];
         }
+        Vec::new()
     }
 
     /// Remove a directory node and unlink it from its parent's `subdirs`.
@@ -2037,274 +2104,275 @@ impl EncryptedDirectoryIndex {
     }
 }
 
-/// plan-D5 — directory-index sharded envelope (version 8).
+/// plan-D5 — directory-index sharding (version-8 per-shard envelopes).
 ///
-/// Splits a [`DirectoryIndex`] into N=16 hash-prefix shards, each
-/// encrypted as its own AEAD ciphertext with `(bucket, shard_idx,
-/// sequence)` bound into AAD. Lifts the 1 MiB single-blob cliff
-/// (`MAX_MANIFEST_BLOCK_SIZE`) for buckets with ≥ ~30k directories
-/// without breaking pre-D5 buckets — the v7 envelope continues to be
-/// readable, and pre-D5 buckets still write v7 until the auto-shard
-/// threshold (~80% of the cap) triggers.
+/// Splits a [`DirectoryIndex`] into [`DIR_INDEX_V8_NUM_SHARDS`] hash-prefix
+/// shards, each stored as its OWN AEAD object at [`derive_dir_index_shard_key`]
+/// and bound to `(bucket, shard_idx, seq)` via AAD. This lifts the 1 MiB
+/// single-blob cliff (`MAX_MANIFEST_BLOCK_SIZE`) that the v7
+/// [`EncryptedDirectoryIndex`] hits at ~30k directories: 16 shards raise the
+/// effective ceiling to ~16× that.
 ///
-/// **Sharding rule** (operator-confirmed, plan-D5 question #2): a
-/// constant domain-separator prefix is mixed with `dir_path` so the
-/// routing is deterministic across buckets and the DEK is NOT used —
-/// routing is not a confidentiality boundary (the path is decrypted
-/// before routing), so adding the DEK adds no security and complicates
-/// debugging. See [`shard_index_for_path`].
+/// **Storage model.** Each shard is an independent object (NOT one blob
+/// holding all 16), index-addressed at a deterministic key and overwritten in
+/// place. The manifest root records, per non-empty shard, a
+/// [`DirIndexShardRef`] `{etag, seq, cid}` in `dir_index_shards` — mirroring
+/// the manifest-page model (`page_index` / [`PageRef`]). The client writes
+/// only the shards that changed since the last flush (per-shard dirty
+/// tracking), so the common case re-PUTs one small shard, not the whole index.
 ///
-/// **Sequence model** (operator-confirmed, plan-D5 question #1): one
-/// `sequence` per envelope, bound into every shard's AAD. All 16
-/// shards re-PUT on every flush even if only one shard changed. Write
-/// amplification can be optimized later via per-shard diff caching;
-/// the simpler model is the safer default for the initial v8 wire.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EncryptedDirectoryIndexV8 {
-    /// Envelope version (= 8).
-    pub version: u8,
-    /// Number of hash-prefix shards. Locked at 16 for the initial
-    /// design. Future tuning would require a coordinated reader+writer
-    /// rollout because the shard a path lands in changes with
-    /// `num_shards`.
-    pub num_shards: u8,
-    /// Monotonic sequence shared across all shards. Bound into every
-    /// shard's AAD so a stale shard ciphertext cannot replay against a
-    /// newer envelope-level claim.
-    pub sequence: u64,
-    /// One ciphertext per shard, ordered by `shard_idx` (0..num_shards).
-    pub shards: Vec<EncryptedDirectoryIndexV8Shard>,
-}
+/// **Routing is KEYED** (audit fix): the shard a directory lands in is
+/// `BLAKE3_keyed(route_key, dir_path)` where
+/// `route_key = derive_dir_index_route_key(forest_dek, bucket)`. Keying the
+/// routing — rather than the unkeyed constant-prefix hash of the original D5
+/// draft — denies an external observer the "known-path confirmation oracle"
+/// (guess a path, compute its shard locally, watch whether that shard object
+/// grew on a write). The path is plaintext in memory at routing time, so
+/// keying costs nothing.
+///
+/// **Per-shard sequence** is monotonic and bound into the shard AAD. The
+/// reader rejects a shard whose plaintext `seq` is below the root's pinned
+/// `DirIndexShardRef.seq` (rollback / staleness — mirrors the page seq check
+/// in `load_manifest_pages`).
 
-/// One shard of a sharded directory index. Holds the AEAD ciphertext
-/// over the JSON-serialized sub-index containing only entries that
-/// hash to this shard's `shard_idx`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EncryptedDirectoryIndexV8Shard {
-    /// 0-indexed shard position, < num_shards.
-    pub shard_idx: u8,
-    /// AEAD ciphertext over the per-shard sub-DirectoryIndex JSON.
-    #[serde(with = "base64_serde")]
-    pub ciphertext: Vec<u8>,
-    /// Nonce used for encryption.
-    #[serde(with = "base64_serde")]
-    pub nonce: Vec<u8>,
-}
-
-impl EncryptedDirectoryIndexV8Shard {
-    pub fn shard_idx(&self) -> u8 {
-        self.shard_idx
-    }
-
-    /// Serialize this shard's envelope for storage. Each shard's bytes
-    /// MUST fit a single IPFS block (`MAX_MANIFEST_BLOCK_SIZE`).
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(self)
-            .map_err(|e| CryptoError::Serialization(e.to_string()))
-    }
-}
-
-/// plan-D5 — fixed shard count for the v8 envelope. Documented as
-/// "16 hash-prefix shards" in the issue and locked here so a future
-/// drift between envelope and routing can never silently change which
-/// shard a path lands in.
+/// plan-D5 — fixed shard count. Locked at 16; changing it is a coordinated
+/// reader+writer migration because the shard a path routes to depends on it.
 pub const DIR_INDEX_V8_NUM_SHARDS: u8 = 16;
 
-/// plan-D5 — domain separator prefix for the directory-index shard
-/// routing function. Mixed with `dir_path` to derive a uniform
-/// hash-prefix across the 0..16 range. The literal value is part of
-/// the wire format — changing it would change which shard every path
-/// lands in, breaking lazy migration. Locked at v1.
-const DIR_INDEX_V8_ROUTE_PREFIX: &[u8] = b"fula:dir-index-shard-route:v1";
-
-/// plan-D5 — AAD domain separator prefix for v8 shard ciphertexts.
-/// Distinct from the v7 `dir_index_aad` prefix so a v7 reader cannot
-/// be tricked into accepting a v8 ciphertext. Each shard's full AAD
-/// is `DIR_INDEX_V8_AAD_PREFIX || bucket || shard_idx || sequence`.
+/// plan-D5 — AAD domain separator for v8 shard ciphertexts. Distinct from the
+/// v7 `dir_index_aad` prefix so a v7 reader cannot accept a v8 ciphertext (and
+/// vice-versa). Full AAD:
+/// `DIR_INDEX_V8_AAD_PREFIX || bucket || ':' || shard_idx || ':' || seq_le`.
 const DIR_INDEX_V8_AAD_PREFIX: &[u8] = b"fula:dir-index:v8:";
 
-/// plan-D5 — compute the 0..16 shard index for `dir_path`. Uses a
-/// constant domain-separator prefix (NOT the DEK) so the routing is
-/// deterministic across buckets and easy to debug.
-pub fn shard_index_for_path(dir_path: &str) -> u8 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(DIR_INDEX_V8_ROUTE_PREFIX);
-    hasher.update(dir_path.as_bytes());
-    let h = hasher.finalize();
+/// KDF context for the keyed shard-routing key (per bucket).
+const DIR_INDEX_ROUTE_KEY_DOMAIN: &str = "fula/private-forest/dir-index-route/v1";
+
+/// KDF domain for the per-shard storage key. Distinct from the v7 dir-index,
+/// shard, page, and node domains so the derived keys never alias.
+const DIR_INDEX_SHARD_KEY_DOMAIN: &str = "fula/private-forest/dir-index-shard/v1";
+
+/// Maximum plaintext size of a single shard's serialized sub-index.
+///
+/// The hard cap is the 1 MiB IPFS block limit on the *serialized envelope*
+/// ([`EncryptedDirectoryIndexShard::to_bytes`]), which base64-encodes the
+/// ciphertext (+16 B AEAD tag) and nonce — ~1.34× the plaintext plus a little
+/// JSON overhead. 700 KiB of plaintext therefore yields a <1 MiB envelope with
+/// comfortable margin. [`EncryptedDirectoryIndexShard::encrypt`] fails LOUDLY
+/// at this bound rather than producing an object the blockstore would reject
+/// downstream. At 16 shards this corresponds to an ~11 MiB total dir-index
+/// (≈ several hundred thousand directories), far beyond any expected bucket; a
+/// bucket that trips it needs plan-D5b (more shards, or an internally-sharded
+/// `DirEntry.subdirs`).
+const DIR_INDEX_SHARD_MAX_PLAINTEXT: usize = 700 * 1024;
+
+/// plan-D5 — derive the per-bucket keyed-routing key. Deterministic from
+/// `(forest_dek, bucket)` under [`DIR_INDEX_ROUTE_KEY_DOMAIN`], so every reader
+/// and writer of the same bucket routes identically, while an external
+/// observer (who lacks `forest_dek`) cannot predict which shard a known path
+/// lands in.
+pub fn derive_dir_index_route_key(forest_dek: &DekKey, bucket: &str) -> [u8; 32] {
+    let mut material = Vec::with_capacity(forest_dek.as_bytes().len() + bucket.len());
+    material.extend_from_slice(forest_dek.as_bytes());
+    material.extend_from_slice(bucket.as_bytes());
+    blake3::derive_key(DIR_INDEX_ROUTE_KEY_DOMAIN, &material)
+}
+
+/// plan-D5 — keyed shard index in `0..DIR_INDEX_V8_NUM_SHARDS` for `dir_path`
+/// under the bucket's `route_key`. Keyed (audit fix) so the mapping is
+/// unguessable without `forest_dek`.
+pub fn shard_index_for_path(dir_path: &str, route_key: &[u8; 32]) -> u8 {
+    let h = blake3::keyed_hash(route_key, dir_path.as_bytes());
     h.as_bytes()[0] & 0x0F
 }
 
-/// plan-D5 — AAD for one v8 shard ciphertext. Binds bucket name,
-/// shard index, and the envelope-level sequence so a shard ciphertext
-/// cannot be cross-shard-swapped, cross-bucket-replayed, or replayed
-/// against a newer sequence claim.
+/// plan-D5 — deterministic storage key for one dir-index shard object,
+/// `(forest_dek, bucket, shard_idx)` under [`DIR_INDEX_SHARD_KEY_DOMAIN`].
+/// Index-addressed (overwritten in place); distinct KDF domain so it can never
+/// collide with the v7 dir-index key, a shard key, a page key, or a node key.
+pub fn derive_dir_index_shard_key(forest_dek: &DekKey, bucket: &str, shard_idx: u8) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key(DIR_INDEX_SHARD_KEY_DOMAIN);
+    hasher.update(forest_dek.as_bytes());
+    hasher.update(bucket.as_bytes());
+    hasher.update(&[shard_idx]);
+    let hash = hasher.finalize();
+    format!("Qm{}", hex::encode(&hash.as_bytes()[..22]))
+}
+
+/// plan-D5 — route every entry of `index` into its shard's sub-index under
+/// `route_key`. Returns only NON-EMPTY shards (a shard with no entries has no
+/// object and no `DirIndexShardRef`). One O(D) in-memory pass; the caller then
+/// encrypts + PUTs only the shards it needs (its dirty set).
+pub fn split_directory_index_into_shards(
+    index: &DirectoryIndex,
+    route_key: &[u8; 32],
+) -> BTreeMap<u8, DirectoryIndex> {
+    let mut shards: BTreeMap<u8, DirectoryIndex> = BTreeMap::new();
+    for (path, entry) in &index.entries {
+        let idx = shard_index_for_path(path, route_key);
+        shards
+            .entry(idx)
+            .or_insert_with(|| DirectoryIndex {
+                version: index.version,
+                entries: HashMap::new(),
+            })
+            .entries
+            .insert(path.clone(), entry.clone());
+    }
+    shards
+}
+
+/// plan-D5 — AAD for one v8 shard ciphertext. Binds bucket, shard index,
+/// and the shard's sequence so a ciphertext cannot be cross-shard-swapped,
+/// cross-bucket-replayed, or replayed against a different sequence.
+///
+/// The variable-length `bucket` is LENGTH-PREFIXED (advisor fix) so the AAD is
+/// injective regardless of bucket charset: distinct `(bucket, shard_idx, seq)`
+/// triples can never produce the same AAD bytes. (The older v4/v7 AADs use
+/// `:`-delimited string formatting and rely on the S3 bucket charset excluding
+/// `:`; v8 is a fresh wire format with no deployed data, so it adopts the
+/// stronger, charset-independent encoding.)
 fn dir_index_v8_aad(bucket: &str, shard_idx: u8, sequence: u64) -> Vec<u8> {
-    // capacity = prefix + bucket + ':' + shard_idx + ':' + sequence_le (8 bytes)
-    let mut aad = Vec::with_capacity(
-        DIR_INDEX_V8_AAD_PREFIX.len() + bucket.len() + 1 + 1 + 1 + 8,
-    );
+    // prefix || bucket_len_le(4) || bucket || shard_idx(1) || sequence_le(8)
+    let blen = bucket.len() as u32;
+    let mut aad =
+        Vec::with_capacity(DIR_INDEX_V8_AAD_PREFIX.len() + 4 + bucket.len() + 1 + 8);
     aad.extend_from_slice(DIR_INDEX_V8_AAD_PREFIX);
+    aad.extend_from_slice(&blen.to_le_bytes());
     aad.extend_from_slice(bucket.as_bytes());
-    aad.push(b':');
     aad.push(shard_idx);
-    aad.push(b':');
     aad.extend_from_slice(&sequence.to_le_bytes());
     aad
 }
 
-impl EncryptedDirectoryIndexV8 {
-    pub fn num_shards(&self) -> u8 {
-        self.num_shards
+/// plan-D5 — one encrypted directory-index shard (version 8).
+///
+/// Stored as its own object at [`derive_dir_index_shard_key`]. The
+/// `(shard_idx, seq)` it carries are also bound into the AEAD AAD, so the
+/// envelope is self-describing AND tamper-evident on those fields. The reader
+/// additionally pins `seq` against the manifest root's [`DirIndexShardRef`] to
+/// reject rollback.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EncryptedDirectoryIndexShard {
+    /// Envelope version (= 8).
+    pub version: u8,
+    /// 0-indexed shard position (< [`DIR_INDEX_V8_NUM_SHARDS`]).
+    pub shard_idx: u8,
+    /// Monotonic per-shard sequence, bound into the AAD.
+    pub seq: u64,
+    /// Nonce used for encryption.
+    #[serde(with = "base64_serde")]
+    pub nonce: Vec<u8>,
+    /// AEAD ciphertext over the per-shard sub-`DirectoryIndex` JSON.
+    #[serde(with = "base64_serde")]
+    pub ciphertext: Vec<u8>,
+}
+
+impl EncryptedDirectoryIndexShard {
+    pub fn shard_idx(&self) -> u8 {
+        self.shard_idx
     }
 
-    pub fn shards(&self) -> &[EncryptedDirectoryIndexV8Shard] {
-        &self.shards
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 
-    pub fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    /// Encrypt a [`DirectoryIndex`] as a 16-shard sharded envelope.
+    /// Encrypt one shard's sub-index. `sub_index` MUST contain only entries
+    /// that route to `shard_idx` (use [`split_directory_index_into_shards`]).
     ///
-    /// 1. Each entry routes to [`shard_index_for_path`].
-    /// 2. Each shard's sub-`DirectoryIndex` (only the entries routing
-    ///    to that shard) is JSON-serialized.
-    /// 3. Each shard's plaintext is AEAD-encrypted with
-    ///    [`dir_index_v8_aad`]`(bucket, shard_idx, sequence)`.
-    /// 4. The 16 ciphertexts (plus envelope-level sequence) form the
-    ///    returned [`EncryptedDirectoryIndexV8`].
-    ///
-    /// Per-shard plaintext size is ~`total_plaintext / 16` (uniform
-    /// hash distribution), so a 1.9 MB single-blob input becomes 16
-    /// blobs each ~120 KB. Test 2 (`dir_index_v8_30k_entries_handled_via_sharding_d5`)
-    /// asserts each shard's serialized envelope is < 256 KiB — well
-    /// under the 1 MiB IPFS block cap.
-    pub fn encrypt_sharded(
-        index: &DirectoryIndex,
+    /// Fails LOUDLY with [`CryptoError::Serialization`] if the serialized
+    /// sub-index exceeds [`DIR_INDEX_SHARD_MAX_PLAINTEXT`] — a clear error
+    /// here beats an over-1-MiB object the blockstore rejects later.
+    pub fn encrypt(
+        sub_index: &DirectoryIndex,
         dek: &DekKey,
         bucket: &str,
-        sequence: u64,
+        shard_idx: u8,
+        seq: u64,
     ) -> Result<Self> {
-        // Route every entry into one of N=16 sub-indices. Each sub-index
-        // carries the same `version` field so the merged DirectoryIndex
-        // round-trips byte-identically. Entries below 16 are normal;
-        // empty shards are still emitted (with an empty `entries` map)
-        // so the envelope shape is constant.
-        let mut sub_indices: Vec<DirectoryIndex> = (0..DIR_INDEX_V8_NUM_SHARDS)
-            .map(|_| DirectoryIndex {
-                version: index.version,
-                entries: HashMap::new(),
-            })
-            .collect();
-        for (path, dir_entry) in &index.entries {
-            let idx = shard_index_for_path(path) as usize;
-            sub_indices[idx]
-                .entries
-                .insert(path.clone(), dir_entry.clone());
-        }
-
-        // Encrypt each shard with shard-bound AAD. We deliberately do
-        // NOT enforce per-shard plaintext caps here: at N=16 a 1 MiB
-        // shard implies a ~16 MiB total dir-index, far past anything
-        // the SDK should be writing. The next plan-D5b would split
-        // further or change N upstream.
-        let mut shards = Vec::with_capacity(DIR_INDEX_V8_NUM_SHARDS as usize);
-        for shard_idx in 0..DIR_INDEX_V8_NUM_SHARDS {
-            let json = serde_json::to_vec(&sub_indices[shard_idx as usize])
-                .map_err(|e| CryptoError::Serialization(e.to_string()))?;
-            let nonce = Nonce::generate();
-            let aead = Aead::new_default(dek);
-            let aad = dir_index_v8_aad(bucket, shard_idx, sequence);
-            let ciphertext = aead.encrypt_with_aad(&nonce, &json, &aad)?;
-            shards.push(EncryptedDirectoryIndexV8Shard {
+        let json = serde_json::to_vec(sub_index)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+        if json.len() >= DIR_INDEX_SHARD_MAX_PLAINTEXT {
+            return Err(CryptoError::Serialization(format!(
+                "dir-index shard {} plaintext size {} bytes exceeds the per-shard cap of {} bytes \
+                 ({} entries in this shard). The shard's serialized envelope would approach the \
+                 1 MiB IPFS block limit. This bucket has an unusually large / skewed directory set; \
+                 it needs plan-D5b (more shards, or an internally-sharded DirEntry.subdirs). Existing \
+                 data remains readable; only NEW writes to this shard are blocked.",
                 shard_idx,
-                ciphertext,
-                nonce: nonce.as_bytes().to_vec(),
-            });
+                json.len(),
+                DIR_INDEX_SHARD_MAX_PLAINTEXT,
+                sub_index.entries.len(),
+            )));
         }
-
+        let nonce = Nonce::generate();
+        let aead = Aead::new_default(dek);
+        let aad = dir_index_v8_aad(bucket, shard_idx, seq);
+        let ciphertext = aead.encrypt_with_aad(&nonce, &json, &aad)?;
         Ok(Self {
             version: 8,
-            num_shards: DIR_INDEX_V8_NUM_SHARDS,
-            sequence,
-            shards,
+            shard_idx,
+            seq,
+            nonce: nonce.as_bytes().to_vec(),
+            ciphertext,
         })
     }
 
-    /// Decrypt + verify a 16-shard envelope, merging the 16 sub-indices
-    /// back into a single [`DirectoryIndex`]. Returns the index along
-    /// with the sealed `sequence`.
+    /// Decrypt + verify one shard, returning its sub-index and sealed `seq`.
     ///
-    /// Validates: `version == 8`, `num_shards == DIR_INDEX_V8_NUM_SHARDS`,
-    /// `shards.len() == num_shards`, every shard's `shard_idx` matches
-    /// its position. Each AEAD failure surfaces as `CryptoError::Decryption`.
-    pub fn decrypt_sharded(
-        &self,
-        dek: &DekKey,
-        bucket: &str,
-    ) -> Result<(DirectoryIndex, u64)> {
+    /// Verifies `version == 8`, AEAD (AAD binds bucket + shard_idx + seq), and
+    /// — belt-and-suspenders, since AAD already binds `shard_idx` — that every
+    /// entry routes back to this shard under the bucket's keyed routing
+    /// (derived internally from `(dek, bucket)`). The CALLER is responsible for
+    /// the rollback pin: reject the returned `seq` if it is below the manifest
+    /// root's `DirIndexShardRef.seq` (see `load_directory_index`).
+    pub fn decrypt(&self, dek: &DekKey, bucket: &str) -> Result<(DirectoryIndex, u64)> {
         if self.version != 8 {
             return Err(CryptoError::Decryption(format!(
-                "expected EncryptedDirectoryIndexV8 version 8, got {}",
+                "expected EncryptedDirectoryIndexShard version 8, got {}",
                 self.version
             )));
         }
-        if self.num_shards != DIR_INDEX_V8_NUM_SHARDS {
+        // Reject an out-of-range shard_idx up front (strictness). A legitimate
+        // shard always has `shard_idx < DIR_INDEX_V8_NUM_SHARDS` (the routing
+        // nibble); AEAD already binds shard_idx, so an out-of-range value can
+        // only come from a corrupt/forged blob — fail closed early.
+        if self.shard_idx >= DIR_INDEX_V8_NUM_SHARDS {
             return Err(CryptoError::Decryption(format!(
-                "expected num_shards={}, got {}",
-                DIR_INDEX_V8_NUM_SHARDS, self.num_shards
+                "dir-index shard_idx {} out of range (>= {})",
+                self.shard_idx, DIR_INDEX_V8_NUM_SHARDS
             )));
         }
-        if self.shards.len() != self.num_shards as usize {
-            return Err(CryptoError::Decryption(format!(
-                "shards vec length {} does not match num_shards {}",
-                self.shards.len(),
-                self.num_shards
-            )));
-        }
-        let mut merged = DirectoryIndex {
-            version: DirectoryIndex::default_version(),
-            entries: HashMap::new(),
-        };
-        for (i, shard) in self.shards.iter().enumerate() {
-            if shard.shard_idx as usize != i {
+        let nonce = Nonce::from_bytes(&self.nonce)?;
+        let aead = Aead::new_default(dek);
+        let aad = dir_index_v8_aad(bucket, self.shard_idx, self.seq);
+        let plaintext = aead.decrypt_with_aad(&nonce, &self.ciphertext, &aad)?;
+        let sub: DirectoryIndex = serde_json::from_slice(&plaintext)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))?;
+        let route_key = derive_dir_index_route_key(dek, bucket);
+        for path in sub.entries.keys() {
+            let routed = shard_index_for_path(path, &route_key);
+            if routed != self.shard_idx {
                 return Err(CryptoError::Decryption(format!(
-                    "shard at position {} has shard_idx={} (mismatch)",
-                    i, shard.shard_idx
+                    "dir-index shard {} contains path '{}' that routes to shard {}",
+                    self.shard_idx, path, routed
                 )));
             }
-            let nonce = Nonce::from_bytes(&shard.nonce)?;
-            let aead = Aead::new_default(dek);
-            let aad = dir_index_v8_aad(bucket, shard.shard_idx, self.sequence);
-            let plaintext =
-                aead.decrypt_with_aad(&nonce, &shard.ciphertext, &aad)?;
-            let sub: DirectoryIndex = serde_json::from_slice(&plaintext)
-                .map_err(|e| CryptoError::Serialization(e.to_string()))?;
-            // Guard: every entry in the sub-index must route to this
-            // shard. Otherwise an attacker who knows the DEK could try
-            // a cross-shard plaintext swap (within the same bucket /
-            // sequence). AAD already binds shard_idx, so the AEAD itself
-            // catches this — the explicit check is belt-and-suspenders
-            // and gives a clearer error.
-            for path in sub.entries.keys() {
-                let routed = shard_index_for_path(path);
-                if routed != shard.shard_idx {
-                    return Err(CryptoError::Decryption(format!(
-                        "shard {} contains path '{}' that routes to shard {}",
-                        shard.shard_idx, path, routed
-                    )));
-                }
-            }
-            // Pick up the version from the first non-empty sub-index;
-            // they should all agree (they were all built from the same
-            // input index).
-            if !sub.entries.is_empty() {
-                merged.version = sub.version;
-            }
-            merged.entries.extend(sub.entries);
         }
-        Ok((merged, self.sequence))
+        Ok((sub, self.seq))
+    }
+
+    /// Serialize this shard's envelope for storage. MUST fit one IPFS block
+    /// (`MAX_MANIFEST_BLOCK_SIZE`); `encrypt`'s plaintext guard keeps it so.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))
+    }
+
+    /// Deserialize a shard envelope from storage bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| CryptoError::Serialization(e.to_string()))
     }
 }
 
@@ -3493,9 +3561,10 @@ mod tests {
     // message). It passes both pre- and post-fix because the v7 envelope
     // contract is unchanged.
     //
-    // Test 2 asserts the post-fix property: a new sharded encrypt path
-    // (`EncryptedDirectoryIndexV8`) handles the same 30k-entry index
-    // without hitting the cliff. Won't compile until the fix lands.
+    // Test 2 asserts the post-fix property: the per-shard
+    // `EncryptedDirectoryIndexShard` path (plan-D5 / v8) handles the same
+    // 30k-entry index without hitting the cliff, splitting it across
+    // keyed-routed shards each well under the 1 MiB block cap.
     // ----------------------------------------------------------------------
 
     /// Build a DirectoryIndex large enough to push the JSON serialization
@@ -3563,227 +3632,466 @@ mod tests {
         );
     }
 
-    /// plan-D5 / Test 2 — the post-fix property. A new sharded encrypt
-    /// path must accept the same 30k-entry index and produce 16 separate
-    /// shard blobs, each well under `MAX_MANIFEST_BLOCK_SIZE`. Round-trip
-    /// must reproduce the original `DirectoryIndex`.
-    ///
-    /// Pre-fix: this test won't compile because `EncryptedDirectoryIndexV8`
-    /// doesn't exist. Post-fix: it compiles and passes.
+    /// Test helper — encrypt every NON-EMPTY shard of `index` (mirrors the
+    /// client write path applied to ALL shards at once), keyed by shard_idx.
+    #[cfg(test)]
+    fn encrypt_all_dir_index_shards(
+        index: &DirectoryIndex,
+        dek: &DekKey,
+        bucket: &str,
+        seq: u64,
+    ) -> std::collections::BTreeMap<u8, EncryptedDirectoryIndexShard> {
+        let route_key = derive_dir_index_route_key(dek, bucket);
+        split_directory_index_into_shards(index, &route_key)
+            .into_iter()
+            .map(|(idx, sub)| {
+                let env = EncryptedDirectoryIndexShard::encrypt(&sub, dek, bucket, idx, seq)
+                    .expect("encrypt shard");
+                (idx, env)
+            })
+            .collect()
+    }
+
+    /// Test helper — decrypt + merge a set of shard envelopes back into one
+    /// `DirectoryIndex` (mirrors the client read-path merge), enforcing the
+    /// per-shard seq floor against `expected_seq`.
+    #[cfg(test)]
+    fn decrypt_merge_dir_index_shards(
+        shards: &std::collections::BTreeMap<u8, EncryptedDirectoryIndexShard>,
+        dek: &DekKey,
+        bucket: &str,
+        expected_seq: u64,
+    ) -> Result<DirectoryIndex> {
+        // Start from a TRULY-empty index (not `DirectoryIndex::new()`, which
+        // pre-seeds a root "/" entry) and fill purely from the shards — this
+        // mirrors the real client read path, where the shards collectively
+        // hold every entry including the root.
+        let mut merged = DirectoryIndex {
+            version: 1,
+            entries: std::collections::HashMap::new(),
+        };
+        for (idx, env) in shards {
+            let (sub, seq) = env.decrypt(dek, bucket)?;
+            assert!(
+                seq >= expected_seq,
+                "shard {} seq {} below floor {}",
+                idx, seq, expected_seq
+            );
+            merged.entries.extend(sub.entries);
+        }
+        Ok(merged)
+    }
+
+    /// plan-D5 — a 30k-entry index that hits the v7 cliff is handled by
+    /// sharding: every non-empty shard's serialized envelope fits well
+    /// under the 1 MiB IPFS block cap, and decrypt+merge reproduces the
+    /// original DirectoryIndex.
     #[test]
     fn dir_index_v8_30k_entries_handled_via_sharding_d5() {
         let dek = DekKey::generate();
         let index = build_d5_cliff_index();
         let bucket = "bucket-d5-post";
-        let sequence = 1u64;
+        let seq = 1u64;
 
-        // Encrypt-sharded: must split entries across 16 hash-prefix shards
-        // and emit a `Vec<EncryptedDirectoryIndexV8Shard>` whose
-        // serialized envelope per shard is < 1 MiB.
-        let envelope = EncryptedDirectoryIndexV8::encrypt_sharded(
-            &index, &dek, bucket, sequence,
-        )
-        .expect("sharded encrypt must accept a 30k-entry DirectoryIndex");
+        let shards = encrypt_all_dir_index_shards(&index, &dek, bucket, seq);
+        assert!(!shards.is_empty(), "30k entries must populate shards");
+        assert!(shards.len() <= DIR_INDEX_V8_NUM_SHARDS as usize);
 
-        assert_eq!(
-            envelope.num_shards(),
-            16,
-            "plan-D5 picks N=16 hash-prefix shards"
-        );
-
-        // Each shard's serialized envelope must comfortably fit one IPFS
-        // block. 1 MiB hard cap; assert ≤ 256 KB to surface a regression
-        // long before the cliff returns.
-        for shard in envelope.shards() {
-            let bytes = shard.to_bytes().expect("serialize shard");
+        // Every shard's serialized envelope must comfortably fit one IPFS
+        // block (assert < 256 KiB to surface a regression long before the
+        // 1 MiB cliff returns).
+        for (idx, env) in &shards {
+            let bytes = env.to_bytes().expect("serialize shard");
             assert!(
                 bytes.len() < 256 * 1024,
-                "shard {} serialized to {} bytes; want < 256 KiB to keep \
-                 a comfortable margin under the IPFS block cap",
-                shard.shard_idx(),
+                "shard {} serialized to {} bytes; want < 256 KiB",
+                idx,
                 bytes.len()
             );
         }
 
-        // Round-trip must reproduce the original DirectoryIndex exactly.
-        let (decoded, decoded_seq) = envelope
-            .decrypt_sharded(&dek, bucket)
-            .expect("sharded decrypt round-trip");
-        assert_eq!(decoded_seq, sequence);
+        let decoded = decrypt_merge_dir_index_shards(&shards, &dek, bucket, seq)
+            .expect("decrypt+merge round-trip");
         assert_eq!(
-            decoded, index,
+            decoded.entries, index.entries,
             "sharded round-trip must reconstruct the original DirectoryIndex"
         );
     }
 
-    /// plan-D5 — small-input round-trip. The 16-shard envelope must
-    /// also work for low-entry buckets (the common case) so callers can
-    /// adopt v8 unconditionally once the auto-shard threshold logic
-    /// lands. Empty shards (no entries routed there) are still part of
-    /// the envelope; deserialization handles them as
-    /// `DirectoryIndex { entries: empty_map }`.
+    /// plan-D5 — small-input round-trip. Few directories → only a handful
+    /// of non-empty shards, each round-trips and merges back identically.
     #[test]
     fn dir_index_v8_small_input_round_trips_d5() {
         let dek = DekKey::generate();
         let bucket = "bucket-d5-small";
         let mut index = DirectoryIndex::new();
-        for path in &[
-            "/photos",
-            "/photos/2024",
-            "/photos/2024/jan",
-            "/docs",
-            "/docs/tax",
-        ] {
+        for path in &["/photos", "/photos/2024", "/photos/2024/jan", "/docs", "/docs/tax"] {
             index.ensure_dir(path);
         }
 
-        let envelope =
-            EncryptedDirectoryIndexV8::encrypt_sharded(&index, &dek, bucket, 7)
-                .expect("encrypt small input");
-        assert_eq!(envelope.num_shards(), 16);
-        assert_eq!(envelope.shards().len(), 16);
-        assert_eq!(envelope.sequence(), 7);
-
-        let (decoded, seq) = envelope
-            .decrypt_sharded(&dek, bucket)
+        let shards = encrypt_all_dir_index_shards(&index, &dek, bucket, 7);
+        assert!(!shards.is_empty());
+        let decoded = decrypt_merge_dir_index_shards(&shards, &dek, bucket, 7)
             .expect("round-trip");
-        assert_eq!(seq, 7);
-        assert_eq!(decoded, index);
+        assert_eq!(decoded.entries, index.entries);
     }
 
-    /// plan-D5 — cross-shard ciphertext swap is rejected.
-    ///
-    /// AEAD AAD binds `shard_idx`, so swapping two shards' ciphertexts
-    /// in the envelope must fail decryption. Belt-and-suspenders: the
-    /// decoder also re-routes every entry post-decrypt and rejects a
-    /// shard whose entries don't all hash to its `shard_idx`.
+    /// plan-D5 (audit fix) — keyed routing is deterministic per (dek,bucket)
+    /// and differs across buckets/users, denying the known-path confirmation
+    /// oracle an external observer would have with unkeyed routing.
+    #[test]
+    fn dir_index_v8_keyed_routing_is_deterministic_and_per_bucket_d5() {
+        let dek = DekKey::generate();
+        let rk_a = derive_dir_index_route_key(&dek, "bucket-A");
+        let rk_a2 = derive_dir_index_route_key(&dek, "bucket-A");
+        assert_eq!(rk_a, rk_a2, "route key must be deterministic per (dek,bucket)");
+        let rk_b = derive_dir_index_route_key(&dek, "bucket-B");
+        assert_ne!(rk_a, rk_b, "different buckets must derive different route keys");
+
+        for p in &["/a", "/a/b", "/photos/2024/jan", "/x/y/z"] {
+            assert_eq!(shard_index_for_path(p, &rk_a), shard_index_for_path(p, &rk_a));
+            assert!(shard_index_for_path(p, &rk_a) < DIR_INDEX_V8_NUM_SHARDS);
+        }
+        // Across enough paths, the two buckets' routings are not identical
+        // (so an attacker can't precompute a path's shard without the dek).
+        let differs = (0..256)
+            .map(|i| format!("/dir{:04}", i))
+            .any(|p| shard_index_for_path(&p, &rk_a) != shard_index_for_path(&p, &rk_b));
+        assert!(differs, "keyed routing must differ across buckets for some paths");
+    }
+
+    /// plan-D5 — keyed routing distributes ~uniformly across the 16 shards,
+    /// so the per-shard cliff headroom is real (not concentrated in one).
+    #[test]
+    fn dir_index_v8_routing_distribution_is_balanced_d5() {
+        let dek = DekKey::generate();
+        let rk = derive_dir_index_route_key(&dek, "bucket-dist");
+        let mut counts = [0u32; DIR_INDEX_V8_NUM_SHARDS as usize];
+        for i in 0..16_000 {
+            let idx = shard_index_for_path(&format!("/sec{}/dir{:06}", i % 50, i), &rk);
+            counts[idx as usize] += 1;
+        }
+        // Expected ~1000/shard; allow ±50% to avoid flakiness while still
+        // catching a badly-skewed routing function.
+        for (i, c) in counts.iter().enumerate() {
+            assert!(
+                *c > 500 && *c < 1500,
+                "shard {} got {} of 16000 entries; routing too skewed",
+                i, c
+            );
+        }
+    }
+
+    /// plan-D5 — `split` returns only non-empty shards, routes every entry
+    /// to its keyed shard, and partitions the index without loss.
+    #[test]
+    fn dir_index_v8_split_routes_entries_correctly_d5() {
+        let dek = DekKey::generate();
+        let bucket = "bucket-split";
+        let route_key = derive_dir_index_route_key(&dek, bucket);
+        let mut index = DirectoryIndex::new();
+        for i in 0..200 {
+            index.ensure_dir(&format!("/d{:03}", i));
+        }
+        let shards = split_directory_index_into_shards(&index, &route_key);
+        for (idx, sub) in &shards {
+            assert!(!sub.entries.is_empty(), "shard {} must be non-empty in the map", idx);
+            for path in sub.entries.keys() {
+                assert_eq!(shard_index_for_path(path, &route_key), *idx);
+            }
+        }
+        let total: usize = shards.values().map(|s| s.entries.len()).sum();
+        assert_eq!(total, index.entries.len(), "split must not lose entries");
+    }
+
+    /// plan-D5 — the per-shard size guard fails LOUDLY rather than emitting
+    /// an over-1-MiB object. 16 shards RAISE the cliff ~16×, they don't
+    /// remove it: a single pathologically-large shard must error.
+    #[test]
+    fn dir_index_v8_oversize_shard_fails_loudly_d5() {
+        let dek = DekKey::generate();
+        // One directory with a huge subdirs set pushes a single shard's
+        // serialized sub-index past the per-shard plaintext cap.
+        let mut sub = DirectoryIndex::new();
+        let mut big = DirEntry::default();
+        for i in 0..60_000 {
+            big.subdirs.insert(format!("child-directory-with-a-longish-name-{:08}", i));
+        }
+        sub.entries.insert("/huge".to_string(), big);
+        let json_len = serde_json::to_vec(&sub).unwrap().len();
+        assert!(
+            json_len >= DIR_INDEX_SHARD_MAX_PLAINTEXT,
+            "test setup: sub-index must exceed the per-shard cap; got {} bytes",
+            json_len
+        );
+
+        let err = EncryptedDirectoryIndexShard::encrypt(&sub, &dek, "bucket-big", 0, 1)
+            .expect_err("oversize shard must fail loudly");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("exceeds the per-shard cap"),
+            "expected the loud per-shard-cap error, got: {}",
+            msg
+        );
+    }
+
+    /// plan-D5 — an empty directory index produces zero shards (no objects,
+    /// no `DirIndexShardRef`s), and decrypt+merge of nothing yields an empty
+    /// index. Confirms the degenerate "bucket with no directories" case.
+    #[test]
+    fn dir_index_v8_empty_index_produces_no_shards_d5() {
+        let dek = DekKey::generate();
+        let bucket = "bucket-empty";
+        let route_key = derive_dir_index_route_key(&dek, bucket);
+        // A TRULY-empty index (zero entries). `DirectoryIndex::new()` would
+        // pre-seed a root "/" entry, which routes to exactly one shard.
+        let empty = DirectoryIndex {
+            version: 1,
+            entries: std::collections::HashMap::new(),
+        };
+        assert!(
+            split_directory_index_into_shards(&empty, &route_key).is_empty(),
+            "empty index must produce zero shards"
+        );
+        let envs = encrypt_all_dir_index_shards(&empty, &dek, bucket, 1);
+        assert!(envs.is_empty());
+        let merged = decrypt_merge_dir_index_shards(&envs, &dek, bucket, 1).expect("merge empty");
+        assert!(merged.entries.is_empty());
+    }
+
+    /// plan-D5 — validates the [`DIR_INDEX_SHARD_MAX_PLAINTEXT`] base64
+    /// headroom claim end-to-end: a near-cap shard's SERIALIZED envelope (not
+    /// just its plaintext) stays under the 1 MiB IPFS block cap, and still
+    /// round-trips. This is the assertion that proves the per-shard plaintext
+    /// cap actually keeps the on-wire object under the block limit.
+    #[test]
+    fn dir_index_v8_envelope_stays_under_block_cap_d5() {
+        let dek = DekKey::generate();
+        let bucket = "bucket-cap";
+        // A single-entry sub-index (no root) whose one directory has a large
+        // subdirs set, sized to land just UNDER the per-shard plaintext cap so
+        // `encrypt` accepts it. The shard is encrypted under the entry's OWN
+        // routed shard_idx so the decrypt re-route check passes.
+        let path = "/near-cap";
+        let route_key = derive_dir_index_route_key(&dek, bucket);
+        let shard_idx = shard_index_for_path(path, &route_key);
+        let mut sub = DirectoryIndex {
+            version: 1,
+            entries: std::collections::HashMap::new(),
+        };
+        let mut big = DirEntry::default();
+        for i in 0..16_000 {
+            big.subdirs.insert(format!("child-directory-with-name-{:010}", i));
+        }
+        sub.entries.insert(path.to_string(), big);
+        let plaintext_len = serde_json::to_vec(&sub).unwrap().len();
+        assert!(
+            plaintext_len < DIR_INDEX_SHARD_MAX_PLAINTEXT,
+            "test setup: plaintext {} must be under the cap {}",
+            plaintext_len, DIR_INDEX_SHARD_MAX_PLAINTEXT
+        );
+        assert!(
+            plaintext_len > 400 * 1024,
+            "test setup: want a near-cap plaintext to exercise the headroom, got {}",
+            plaintext_len
+        );
+
+        let env = EncryptedDirectoryIndexShard::encrypt(&sub, &dek, bucket, shard_idx, 1)
+            .expect("near-cap shard must encrypt");
+        let envelope_len = env.to_bytes().expect("to_bytes").len();
+        assert!(
+            envelope_len < MAX_MANIFEST_BLOCK_SIZE,
+            "serialized shard envelope {} must stay under the 1 MiB block cap {} \
+             (validates the per-shard plaintext cap's base64 headroom)",
+            envelope_len, MAX_MANIFEST_BLOCK_SIZE
+        );
+        let (decoded, _) = env.decrypt(&dek, bucket).expect("near-cap round-trip");
+        assert_eq!(decoded.entries, sub.entries);
+    }
+
+    /// plan-D5 — the length-prefixed AAD (advisor fix) is injective: buckets
+    /// containing `:` round-trip, and a shard for `"a:1"` does NOT decrypt as
+    /// bucket `"a"` (which a naive `:`-delimited AAD could alias).
+    #[test]
+    fn dir_index_v8_bucket_with_colon_does_not_alias_d5() {
+        let dek = DekKey::generate();
+        let mut index = DirectoryIndex::new();
+        index.ensure_dir("/a");
+
+        for bucket in &["a:1", "weird::name", "trailing:"] {
+            let shards = encrypt_all_dir_index_shards(&index, &dek, bucket, 1);
+            let merged = decrypt_merge_dir_index_shards(&shards, &dek, bucket, 1)
+                .expect("colon-bucket round-trip");
+            assert_eq!(merged.entries, index.entries);
+        }
+
+        // A shard sealed for "a:1" must not decrypt as "a" (length-prefix
+        // makes the two AADs distinct even though a delimiter form could
+        // produce overlapping bytes).
+        let s = encrypt_all_dir_index_shards(&index, &dek, "a:1", 1);
+        let (_, env) = s.iter().next().expect("one shard");
+        assert!(
+            env.decrypt(&dek, "a").is_err(),
+            "length-prefixed AAD must prevent 'a:1' aliasing 'a'"
+        );
+    }
+
+    /// plan-D5 (v8) — `insert_file` into a NON-existent deep path must report
+    /// EVERY touched entry key (root + every created ancestor) so the forest's
+    /// per-shard dirty tracking marks all affected shards. A miss here would be
+    /// a silently-stale shard on read (the load-bearing no-under-marking
+    /// property the advisors flagged).
+    #[test]
+    fn dir_index_v8_insert_deep_path_returns_all_touched_keys_d5() {
+        let mut index = DirectoryIndex { version: 1, entries: HashMap::new() };
+        let changed = index.insert_file("/a/b/c/file.txt");
+        let set: std::collections::HashSet<&str> = changed.iter().map(|s| s.as_str()).collect();
+        for k in ["/", "/a", "/a/b", "/a/b/c"] {
+            assert!(
+                set.contains(k),
+                "insert_file deep path must report touched key {}; got {:?}",
+                k, changed
+            );
+        }
+        // A second file into the now-existing dir changes only the parent's
+        // file_count → exactly the parent key (no over-reporting).
+        let again = index.insert_file("/a/b/c/file2.txt");
+        assert_eq!(
+            again,
+            vec!["/a/b/c".to_string()],
+            "a second file into an existing dir must report only the parent key"
+        );
+    }
+
+    /// plan-D5 (v8) — `ensure_dir` on an already-existing path is a no-op and
+    /// reports NO changed keys (so an idempotent mkdir marks no shard dirty).
+    #[test]
+    fn dir_index_v8_ensure_existing_dir_reports_no_change_d5() {
+        let mut index = DirectoryIndex { version: 1, entries: HashMap::new() };
+        let _ = index.ensure_dir("/x/y");
+        let again = index.ensure_dir("/x/y");
+        assert!(again.is_empty(), "re-ensuring an existing dir must report no change; got {:?}", again);
+    }
+
+    /// plan-D5 — a shard ciphertext cannot be moved into another shard's
+    /// slot: AAD binds `shard_idx`, so decrypting shard B's bytes while
+    /// claiming `shard_idx = A` fails AEAD.
     #[test]
     fn dir_index_v8_cross_shard_swap_rejected_d5() {
         let dek = DekKey::generate();
         let bucket = "bucket-d5-swap";
         let index = build_d5_cliff_index();
-
-        let mut envelope =
-            EncryptedDirectoryIndexV8::encrypt_sharded(&index, &dek, bucket, 1)
-                .expect("encrypt");
-        // Swap the ciphertext + nonce of shards 3 and 7. shard_idx
-        // fields are NOT changed (otherwise the post-decrypt routing
-        // check could short-circuit before AAD verification).
-        let s3_ct = envelope.shards[3].ciphertext.clone();
-        let s3_nonce = envelope.shards[3].nonce.clone();
-        envelope.shards[3].ciphertext = envelope.shards[7].ciphertext.clone();
-        envelope.shards[3].nonce = envelope.shards[7].nonce.clone();
-        envelope.shards[7].ciphertext = s3_ct;
-        envelope.shards[7].nonce = s3_nonce;
-
-        let err = envelope
-            .decrypt_sharded(&dek, bucket)
-            .expect_err("cross-shard swap must fail");
-        // AEAD layer rejects first because shard_idx 3's AAD doesn't
-        // match the AEAD tag generated for shard 7's plaintext (and
-        // vice versa). Any decryption-grade error is acceptable; we
-        // just want to confirm the swap doesn't silently succeed.
-        let msg = format!("{}", err);
+        let shards = encrypt_all_dir_index_shards(&index, &dek, bucket, 1);
+        let ids: Vec<u8> = shards.keys().copied().collect();
+        assert!(ids.len() >= 2, "need >=2 non-empty shards for a swap test");
+        let (a, b) = (ids[0], ids[1]);
+        // Forge a shard claiming idx=a but carrying b's ciphertext/nonce/seq.
+        let mut forged = shards[&b].clone();
+        forged.shard_idx = a;
+        let err = forged
+            .decrypt(&dek, bucket)
+            .expect_err("cross-shard swap must fail (AAD binds shard_idx)");
+        let msg = format!("{}", err).to_lowercase();
         assert!(
-            msg.to_lowercase().contains("decrypt")
-                || msg.to_lowercase().contains("aead")
-                || msg.to_lowercase().contains("aes")
-                || msg.to_lowercase().contains("invalid")
-                || msg.to_lowercase().contains("tag"),
+            msg.contains("decrypt")
+                || msg.contains("aead")
+                || msg.contains("aes")
+                || msg.contains("invalid")
+                || msg.contains("tag"),
             "expected an AEAD-grade rejection, got: {}",
             msg
         );
     }
 
-    /// plan-D5 — cross-bucket replay is rejected.
-    ///
-    /// Bucket name is bound into AAD, so a v8 envelope encrypted for
-    /// bucket A cannot be decrypted as bucket B even with the same DEK.
+    /// plan-D5 — cross-bucket replay is rejected: the bucket name is in
+    /// the AAD, so a shard for bucket A cannot decrypt as bucket B.
     #[test]
     fn dir_index_v8_cross_bucket_aad_rejected_d5() {
         let dek = DekKey::generate();
         let mut index = DirectoryIndex::new();
         index.ensure_dir("/some/path");
-        let envelope =
-            EncryptedDirectoryIndexV8::encrypt_sharded(&index, &dek, "bucket-A", 1)
-                .expect("encrypt for bucket-A");
-
-        let err = envelope
-            .decrypt_sharded(&dek, "bucket-B")
+        let shards = encrypt_all_dir_index_shards(&index, &dek, "bucket-A", 1);
+        let (_, env) = shards.iter().next().expect("one shard");
+        let err = env
+            .decrypt(&dek, "bucket-B")
             .expect_err("cross-bucket decrypt must fail");
-        let msg = format!("{}", err);
+        let msg = format!("{}", err).to_lowercase();
         assert!(
-            msg.to_lowercase().contains("decrypt")
-                || msg.to_lowercase().contains("aead")
-                || msg.to_lowercase().contains("aes")
-                || msg.to_lowercase().contains("invalid")
-                || msg.to_lowercase().contains("tag"),
+            msg.contains("decrypt")
+                || msg.contains("aead")
+                || msg.contains("aes")
+                || msg.contains("invalid")
+                || msg.contains("tag"),
             "expected AEAD rejection on cross-bucket attempt, got: {}",
             msg
         );
     }
 
-    /// plan-D5 — sequence-replay defense.
-    ///
-    /// `sequence` is bound into every shard's AAD. Mutating the
-    /// envelope-level sequence on a captured ciphertext must fail
-    /// decryption (the AEAD tag was computed with the original sequence).
+    /// plan-D5 — seq is bound into the shard AAD: claiming a different seq
+    /// than the one the ciphertext was sealed with fails AEAD.
     #[test]
     fn dir_index_v8_sequence_replay_rejected_d5() {
         let dek = DekKey::generate();
         let bucket = "bucket-d5-seq";
         let mut index = DirectoryIndex::new();
         index.ensure_dir("/x");
-        let mut envelope =
-            EncryptedDirectoryIndexV8::encrypt_sharded(&index, &dek, bucket, 42)
-                .expect("encrypt");
-
-        // Tamper: claim the envelope is sequence 100 (replay against a
-        // newer sequence number). AAD includes sequence per shard, so
-        // each shard's AEAD tag mismatches.
-        envelope.sequence = 100;
-        let err = envelope
-            .decrypt_sharded(&dek, bucket)
-            .expect_err("sequence-replay decrypt must fail");
-        let msg = format!("{}", err);
+        let shards = encrypt_all_dir_index_shards(&index, &dek, bucket, 42);
+        let (_, env) = shards.iter().next().expect("one shard");
+        let mut tampered = env.clone();
+        tampered.seq = 100; // AAD was sealed with seq=42
+        let err = tampered
+            .decrypt(&dek, bucket)
+            .expect_err("seq-replay decrypt must fail");
+        let msg = format!("{}", err).to_lowercase();
         assert!(
-            msg.to_lowercase().contains("decrypt")
-                || msg.to_lowercase().contains("aead")
-                || msg.to_lowercase().contains("aes")
-                || msg.to_lowercase().contains("invalid")
-                || msg.to_lowercase().contains("tag"),
-            "expected AEAD rejection on sequence replay, got: {}",
+            msg.contains("decrypt")
+                || msg.contains("aead")
+                || msg.contains("aes")
+                || msg.contains("invalid")
+                || msg.contains("tag"),
+            "expected AEAD rejection on seq replay, got: {}",
             msg
         );
     }
 
-    /// plan-D5 — version envelope rejects v7 ciphertext fed as v8.
-    ///
-    /// A v7 single-blob envelope cannot be decrypted as v8 (would
-    /// silently misinterpret bytes). Decoder explicitly checks
-    /// `version == 8`.
+    /// plan-D5 — splice defense the reader relies on: an OLD shard (lower
+    /// seq) served under a root pinning a NEWER seq is rejectable. The
+    /// old blob is still AEAD-valid (it was a real generation), but
+    /// `decrypt` surfaces its true (lower) seq so the caller's seq-floor
+    /// check (mirroring `load_manifest_pages`) rejects it.
     #[test]
-    fn dir_index_v8_decoder_rejects_v7_envelope_d5() {
-        let v7_envelope = EncryptedDirectoryIndex {
-            version: 7,
-            ciphertext: vec![0; 32],
-            nonce: vec![0; 12],
-            sequence: 1,
-        };
-        // Construct a v7-version-tagged value in v8's struct shape and
-        // confirm decrypt rejects. (Real cross-version protection is
-        // at the format-detection layer; this test guards the v8 decoder
-        // itself against an attacker who crafted a v8 envelope with
-        // version=7.)
-        let envelope = EncryptedDirectoryIndexV8 {
-            version: 7, // wrong
-            num_shards: DIR_INDEX_V8_NUM_SHARDS,
-            sequence: 1,
-            shards: Vec::new(),
-        };
+    fn dir_index_v8_old_shard_seq_below_floor_is_detectable_d5() {
         let dek = DekKey::generate();
-        let err = envelope
-            .decrypt_sharded(&dek, "bucket")
+        let bucket = "bucket-d5-splice";
+        let mut index = DirectoryIndex::new();
+        index.ensure_dir("/a");
+        // Generation 1 at seq=5; the current root has since advanced to seq=6.
+        let gen1 = encrypt_all_dir_index_shards(&index, &dek, bucket, 5);
+        let (idx, old_env) = gen1.iter().next().expect("one shard");
+        let (_, served_seq) = old_env
+            .decrypt(&dek, bucket)
+            .expect("an old generation's blob is still AEAD-valid");
+        assert_eq!(served_seq, 5, "decrypt surfaces the real shard seq");
+        assert!(
+            served_seq < 6,
+            "caller's seq-floor (root pins 6) must reject stale shard {}",
+            idx
+        );
+    }
+
+    /// plan-D5 — the v8 shard decoder rejects a non-v8 version byte.
+    #[test]
+    fn dir_index_v8_decoder_rejects_wrong_version_d5() {
+        let dek = DekKey::generate();
+        let bucket = "bucket-ver";
+        let mut index = DirectoryIndex::new();
+        index.ensure_dir("/a");
+        let shards = encrypt_all_dir_index_shards(&index, &dek, bucket, 1);
+        let (_, env) = shards.iter().next().expect("one shard");
+        let mut wrong = env.clone();
+        wrong.version = 7;
+        let err = wrong
+            .decrypt(&dek, bucket)
             .expect_err("v8 decoder must reject version=7");
         let msg = format!("{}", err);
         assert!(
@@ -3791,8 +4099,28 @@ mod tests {
             "expected version-mismatch error, got: {}",
             msg
         );
-        // Suppress unused-var warning on v7_envelope; it's documentation.
-        let _ = v7_envelope;
+    }
+
+    /// plan-D5 — a v7 single-blob envelope and a v8 shard envelope are not
+    /// interchangeable: v7 bytes don't decode/decrypt as a v8 shard.
+    #[test]
+    fn dir_index_v8_decoder_rejects_v7_envelope_d5() {
+        let dek = DekKey::generate();
+        let bucket = "bucket-x";
+        let mut index = DirectoryIndex::new();
+        index.ensure_dir("/a");
+        let v7 = EncryptedDirectoryIndex::encrypt(&index, &dek, bucket, 1).expect("v7 encrypt");
+        let v7_bytes = v7.to_bytes().expect("v7 to_bytes");
+        // v7 JSON lacks the required v8 `shard_idx`/`seq` fields, so
+        // `from_bytes` rejects it at decode; if a future shape change ever
+        // let it decode, decrypt must still fail.
+        match EncryptedDirectoryIndexShard::from_bytes(&v7_bytes) {
+            Err(_) => {}
+            Ok(env) => assert!(
+                env.decrypt(&dek, bucket).is_err(),
+                "a v7 blob decoded as a v8 shard must fail decrypt"
+            ),
+        }
     }
 
     /// plan-D5 — a v7 envelope still encrypts/decrypts correctly after

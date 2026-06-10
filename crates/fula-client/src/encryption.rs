@@ -23,6 +23,9 @@ use fula_crypto::{
         ManifestRoot, ManifestPage, EncryptedManifestPage, PageId, PageRef,
         derive_manifest_page_key,
         DirectoryIndex, EncryptedDirectoryIndex, derive_dir_index_key,
+        EncryptedDirectoryIndexShard, DirIndexShardRef,
+        derive_dir_index_route_key, derive_dir_index_shard_key,
+        split_directory_index_into_shards,
     },
     sharing::{ShareToken, AcceptedShare, ShareRecipient},
     rotation::{KeyRotationManager, WrappedKeyInfo},
@@ -237,6 +240,35 @@ pub mod test_faults {
     /// by the S-1.2 recovery integration test to assert the next flush
     /// re-drives the root PUT and leaves the forest consistent.
     pub static CRASH_AFTER_PAGE_PUT_BEFORE_ROOT_PUT: AtomicBool = AtomicBool::new(false);
+
+    /// plan-D5 (v8) — if `true`, `save_sharded_hamt_forest` aborts INSIDE the
+    /// Phase 1.6 dir-index shard loop, immediately after the FIRST dirty
+    /// shard's PUT + post-PUT WAL record + ref-recording, but before the
+    /// remaining shards are written (and before the root PUT). Leaves a
+    /// partially-committed dir-index: the lowest dirty `shard_idx` (the dirty
+    /// set is a `BTreeSet`, so iteration is deterministic) is on S3 with a
+    /// truthful post-PUT WAL record; later shards are not. Drives the
+    /// fine-grained WAL recovery test that a fresh client completes the
+    /// remaining shards + commits the root consistently. Off in production.
+    pub static CRASH_DURING_DIR_INDEX_SHARD_LOOP: AtomicBool = AtomicBool::new(false);
+
+    /// plan-D5 (v8) — if `true`, `save_sharded_hamt_forest` aborts INSIDE the
+    /// Phase 1.6 dir-index shard loop AFTER the pre-PUT WAL record for the first
+    /// dirty shard is fsync'd but BEFORE that shard's PUT fires (a "torn write":
+    /// the WAL holds a `new_etag: None` promise for a shard object that never
+    /// reached S3). Drives the nastier recovery case — replay must NOT trust the
+    /// absent etag and must re-drive the shard (or rebuild from the forest)
+    /// without leaving a dangling reference. Off in production.
+    pub static CRASH_BEFORE_DIR_INDEX_SHARD_PUT: AtomicBool = AtomicBool::new(false);
+
+    /// plan-D5 (v8) — if `true`, `save_sharded_hamt_forest` aborts immediately
+    /// AFTER the Phase 2 manifest-root PUT lands on storage but BEFORE returning
+    /// `Ok` (so the caller never reaches `wal::clear`). The committed root now
+    /// references this flush's writes AND the WAL still holds them — the gap
+    /// between root-commit and WAL-truncation. Drives the idempotency recovery
+    /// test: replay must re-apply the WAL on top of an already-committed root
+    /// WITHOUT a 412 create-race or duplicate entries. Off in production.
+    pub static CRASH_AFTER_ROOT_PUT_BEFORE_WAL_CLEAR: AtomicBool = AtomicBool::new(false);
 }
 
 /// If set, a v7 manifest that fails to decrypt triggers an automatic attempt
@@ -3155,6 +3187,10 @@ impl EncryptedClient {
                         // `from_manifest` below.
                         let dir_index_cid = manifest.root.dir_index_cid;
                         let dir_index_seq_pin = manifest.root.dir_index_seq;
+                        // plan-D5 (v8): the sharded dir-index pointers. Cloned
+                        // before `manifest` is moved into `from_manifest`; a
+                        // non-empty map routes the load through the sharded path.
+                        let dir_index_shards = manifest.root.dir_index_shards.clone();
                         let mut forest = ShardedHamtPrivateForest::from_manifest(
                             manifest,
                             bucket.to_string(),
@@ -3171,6 +3207,7 @@ impl EncryptedClient {
                                 dir_index_etag.as_deref(),
                                 dir_index_cid.as_ref(),
                                 dir_index_seq_pin,
+                                &dir_index_shards,
                             )
                             .await?
                         {
@@ -4412,15 +4449,16 @@ impl EncryptedClient {
         // is bound to the post-flush sequence we'll commit in phase 2.
         // Phase 1 also marks pages dirty automatically via `shard_mut`.
         let backend = Arc::new(S3BlobBackend::new(self.inner.clone(), bucket.to_string()));
-        let (mut manifest_snapshot, dir_index_snapshot, prior_dir_index_seq, dir_index_dirty) = {
+        let (mut manifest_snapshot, dir_index_snapshot, dir_index_dirty_shards) = {
             let mut guard = forest_arc.write().await;
             guard.flush_dirty(&backend).await
                 .map_err(ClientError::Encryption)?;
             (
                 guard.manifest().clone(),
                 guard.directory_index().clone(),
-                guard.dir_index_seq(),
-                guard.dir_index_dirty(),
+                // plan-D5 (v8): the SHARDS that changed since the last flush —
+                // the write loop re-PUTs only these (no amplification).
+                guard.dir_index_dirty_shards().clone(),
             )
         };
 
@@ -4596,128 +4634,175 @@ impl EncryptedClient {
             });
         }
 
-        // Phase 1.6 (F-1.3): flush the directory index if it changed since
-        // the last successful commit. AEAD binds `(bucket, seq)` so a stale
-        // rollback fails integrity; the new ETag is recorded in
-        // `manifest_snapshot.root.dir_index_etag` and becomes authoritative
-        // on the next successful root PUT.
+        // Phase 1.6 (F-1.3 / plan-D5 v8): flush the SHARDED directory index.
+        // Mirrors the Phase 1.5 page loop — for each shard that changed since
+        // the last commit (`dir_index_dirty_shards`), slice its sub-index, bump
+        // its per-shard seq, WAL-record, encrypt, conditionally PUT at its
+        // deterministic key (with the `fula-bucket-lookup-h` header so master's
+        // GC-retain + bucket-lookup population treat it like any page),
+        // walkable-v8 self-verify the CID, and record a `DirIndexShardRef` in
+        // the root. Only dirty shards are re-PUT — the common case is one small
+        // shard.
         //
-        // WAL::DirIndexWrote is appended+fsynced BEFORE the PUT so a crash
-        // between the fsync and the PUT replays as a retry at the same key
-        // under the same seq — idempotent under identical content.
-        let new_dir_index_seq = if dir_index_dirty {
-            let next_dir_seq = prior_dir_index_seq.saturating_add(1);
-            let old_dir_etag = manifest_snapshot.root.dir_index_etag.clone();
-            #[cfg(not(target_arch = "wasm32"))]
-            if let Err(e) = wal::append(
-                bucket,
-                &wal_mac,
-                WalEntry::DirIndexWrote {
-                    old_etag: old_dir_etag.clone(),
-                    new_etag: None,
-                    seq: next_dir_seq,
-                },
-            ) {
-                tracing::warn!(%bucket, error = %e, "WAL append DirIndexWrote failed");
+        // WAL::DirIndexShardWrote is appended+fsynced BEFORE each PUT so a crash
+        // between the fsync and the PUT replays idempotently at the same
+        // index-addressed key under the same seq.
+        let dir_index_shards_flushed = if !dir_index_dirty_shards.is_empty() {
+            // Read-only-old guard (mutual exclusivity, advisor F#3): a bucket
+            // still carrying a v7 single-blob dir-index (legacy `dir_index_etag`
+            // set, no shards) must never be written in v8 — old buckets are
+            // read-only, new buckets are born v8. Refuse loudly rather than
+            // create an ambiguous dual-format manifest.
+            if manifest_snapshot.root.dir_index_etag.is_some()
+                && manifest_snapshot.root.dir_index_shards.is_empty()
+            {
+                return Err(ClientError::Encryption(fula_crypto::CryptoError::Encryption(
+                    format!(
+                        "refusing to write a v8 sharded dir-index over bucket '{}' that already \
+                         has a v7 single-blob dir-index (old buckets are read-only; new uploads \
+                         go to new buckets)",
+                        bucket
+                    ),
+                )));
             }
-            let envelope = EncryptedDirectoryIndex::encrypt(
-                &dir_index_snapshot,
-                &forest_dek,
-                bucket,
-                next_dir_seq,
-            ).map_err(ClientError::Encryption)?;
-            let blob = envelope.to_bytes().map_err(ClientError::Encryption)?;
-            // Walkable-v8 (W.9.3): pre-compute `BLAKE3(dir-index blob)` for
-            // post-PUT self-verify. Reuses the same per-flush gate value
-            // captured before Phase 1.5 above (every page in this flush
-            // shares the same Config.walkable_v8_writer_enabled snapshot).
-            let expected_dir_cid = if walkable_v8 {
-                Some(crate::walkable_v8::local_blake3_raw_cid(&blob))
-            } else {
-                None
-            };
-            let dir_key = derive_dir_index_key(&forest_dek, bucket);
-            let metadata = ObjectMetadata::new()
-                .with_content_type("application/octet-stream")
-                .with_metadata("fula-bucket-lookup-h", &lookup_h_hex);
-            // TEMPORARY DIAGNOSTIC for #29 (same intent as the page-write
-            // site above; surface the SDK's view of the prior etag so the
-            // master 412 diag can confirm where a stale `If-Match` came from).
-            #[cfg(not(target_arch = "wasm32"))]
-            let metadata = {
-                let body_cid_hash = blake3::hash(&blob);
-                let body_cid_mh =
-                    cid::multihash::Multihash::<64>::wrap(0x1e, body_cid_hash.as_bytes())
-                        .expect("blake3 multihash wrap");
-                let body_cid = cid::Cid::new_v1(0x55, body_cid_mh);
-                tracing::warn!(
+
+            // One O(D) in-memory split; we encrypt + PUT only the dirty shards.
+            let route_key = derive_dir_index_route_key(&forest_dek, bucket);
+            let mut split = split_directory_index_into_shards(&dir_index_snapshot, &route_key);
+
+            for shard_idx in dir_index_dirty_shards.iter().copied() {
+                let old_ref = manifest_snapshot.root.dir_index_shards.get(&shard_idx).cloned();
+                let old_etag = old_ref.as_ref().and_then(|r| r.etag.clone());
+                // A dirty shard whose entries were all removed flushes an EMPTY
+                // sub-index (not a dropped ref): we keep the object + ref so a
+                // later repopulation can `If-Match` its etag. Dropping the ref
+                // while leaving the orphan object would deadlock the next
+                // `If-None-Match: *` create (object exists → 412 forever).
+                // (advisor fix). The reader merges an empty shard as a no-op.
+                let sub = split.remove(&shard_idx).unwrap_or_else(|| DirectoryIndex {
+                    version: dir_index_snapshot.version,
+                    entries: HashMap::new(),
+                });
+                let next_shard_seq =
+                    old_ref.as_ref().map(|r| r.seq).unwrap_or(0).saturating_add(1);
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Err(e) = wal::append(
                     bucket,
-                    dir_key = %dir_key,
-                    prior_etag = ?old_dir_etag,
-                    body_cid = %body_cid,
-                    next_seq = next_dir_seq,
-                    "phase1.6 dir-index conditional PUT diag"
+                    &wal_mac,
+                    WalEntry::DirIndexShardWrote {
+                        shard_idx,
+                        old_etag: old_etag.clone(),
+                        new_etag: None,
+                        seq: next_shard_seq,
+                    },
+                ) {
+                    tracing::warn!(%bucket, shard_idx, error = %e, "WAL append DirIndexShardWrote (pre) failed");
+                }
+                // Fault injection (torn write): abort AFTER the pre-PUT WAL
+                // promise is durable but BEFORE this shard's PUT — the WAL holds
+                // a `new_etag: None` record for a shard that never reached S3.
+                #[cfg(feature = "test-fault-injection")]
+                if test_faults::CRASH_BEFORE_DIR_INDEX_SHARD_PUT
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Err(ClientError::Encryption(
+                        fula_crypto::CryptoError::Encryption(
+                            "test-fault-injection: CRASH_BEFORE_DIR_INDEX_SHARD_PUT".to_string(),
+                        ),
+                    ));
+                }
+                let envelope = EncryptedDirectoryIndexShard::encrypt(
+                    &sub, &forest_dek, bucket, shard_idx, next_shard_seq,
+                ).map_err(ClientError::Encryption)?;
+                let blob = envelope.to_bytes().map_err(ClientError::Encryption)?;
+                // Walkable-v8 (W.9.3): pre-compute `BLAKE3(blob)` for the
+                // post-PUT self-verify, before `Bytes::from` consumes it.
+                let expected_shard_cid = if walkable_v8 {
+                    Some(crate::walkable_v8::local_blake3_raw_cid(&blob))
+                } else {
+                    None
+                };
+                let shard_key = derive_dir_index_shard_key(&forest_dek, bucket, shard_idx);
+                let metadata = ObjectMetadata::new()
+                    .with_content_type("application/octet-stream")
+                    .with_metadata("fula-bucket-lookup-h", &lookup_h_hex);
+                // Conditional PUT: `If-Match` the recorded etag, or
+                // `If-None-Match: *` for a first-ever shard create, so a
+                // concurrent writer can't silently clobber the shard.
+                let (if_match, if_none_match) = match old_etag.as_deref() {
+                    Some(et) => (Some(et), None),
+                    None => (None, Some("*")),
+                };
+                let put = match self.inner.put_object_with_metadata_conditional(
+                    bucket,
+                    &shard_key,
+                    Bytes::from(blob),
+                    Some(metadata),
+                    if_match,
+                    if_none_match,
+                ).await {
+                    Ok(r) => r,
+                    Err(e) if e.is_concurrent_modification() => {
+                        // A concurrent writer advanced this shard. Evict the
+                        // cache so the retry reloads the winner's
+                        // dir_index_shards before re-attempting under the
+                        // correct `If-Match`. Mirrors the Phase 1.5 page eviction.
+                        self.forest_cache.remove(bucket);
+                        return Err(e);
+                    }
+                    Err(e) => return Err(e),
+                };
+                let new_etag = if put.etag.is_empty() { None } else { Some(put.etag) };
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Err(e) = wal::append(
+                    bucket,
+                    &wal_mac,
+                    WalEntry::DirIndexShardWrote {
+                        shard_idx,
+                        old_etag: old_etag.clone(),
+                        new_etag: new_etag.clone(),
+                        seq: next_shard_seq,
+                    },
+                ) {
+                    tracing::warn!(%bucket, shard_idx, error = %e, "WAL append post-PUT DirIndexShardWrote failed");
+                }
+                let shard_cid = match (walkable_v8, expected_shard_cid, new_etag.as_deref()) {
+                    (true, Some(expected), Some(et)) => {
+                        crate::walkable_v8::verify_etag_against_expected_cid(
+                            et, expected, bucket, &shard_key,
+                        )
+                    }
+                    _ => None,
+                };
+                manifest_snapshot.root.dir_index_shards.insert(
+                    shard_idx,
+                    DirIndexShardRef { etag: new_etag, seq: next_shard_seq, cid: shard_cid },
                 );
-                metadata
-                    .with_metadata("fula-debug-body-cid", &body_cid.to_string())
-                    .with_metadata(
-                        "fula-debug-prior-etag",
-                        old_dir_etag.as_deref().unwrap_or("<none>"),
-                    )
-            };
-            let put = match self.inner.put_object_with_metadata_conditional(
-                bucket,
-                &dir_key,
-                Bytes::from(blob),
-                Some(metadata),
-                old_dir_etag.as_deref(),
-                None,
-            ).await {
-                Ok(r) => r,
-                Err(e) if e.is_concurrent_modification() => {
-                    // Another writer advanced the dir-index between our load
-                    // and this PUT. Evict the cache so the retry loop reloads
-                    // the winner's dir-index etag from S3 before re-attempting
-                    // Phase 1.6 under the correct `If-Match`. Mirrors the
-                    // Phase-2 412 eviction below — the forest-cache must
-                    // never hold a stale dir-index etag across retries.
-                    self.forest_cache.remove(bucket);
-                    return Err(e);
+                // Fault injection (partial commit): abort AFTER the first dirty
+                // shard is fully committed (PUT + post-PUT WAL + ref recorded)
+                // but before the remaining shards / the root PUT. The `return`
+                // exits the loop after one iteration; the dirty set is a
+                // BTreeSet, so this is the lowest dirty shard_idx.
+                #[cfg(feature = "test-fault-injection")]
+                if test_faults::CRASH_DURING_DIR_INDEX_SHARD_LOOP
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Err(ClientError::Encryption(
+                        fula_crypto::CryptoError::Encryption(
+                            "test-fault-injection: CRASH_DURING_DIR_INDEX_SHARD_LOOP".to_string(),
+                        ),
+                    ));
                 }
-                Err(e) => return Err(e),
-            };
-            let new_dir_etag = if put.etag.is_empty() { None } else { Some(put.etag) };
-            // Post-PUT WAL record: pin the real dir-index etag so a
-            // crash between here and the Phase-2 root PUT can be recovered
-            // without re-reading the dir-index object. Mirrors the
-            // post-PUT PageWrote above.
-            #[cfg(not(target_arch = "wasm32"))]
-            if let Err(e) = wal::append(
-                bucket,
-                &wal_mac,
-                WalEntry::DirIndexWrote {
-                    old_etag: old_dir_etag.clone(),
-                    new_etag: new_dir_etag.clone(),
-                    seq: next_dir_seq,
-                },
-            ) {
-                tracing::warn!(%bucket, error = %e, "WAL append post-PUT DirIndexWrote failed");
             }
-            // Walkable-v8 (W.9.3): stamp dir_index_cid via self-verify.
-            let dir_index_cid = match (walkable_v8, expected_dir_cid, new_dir_etag.as_deref()) {
-                (true, Some(expected), Some(et)) => {
-                    crate::walkable_v8::verify_etag_against_expected_cid(
-                        et, expected, bucket, &dir_key,
-                    )
-                }
-                _ => None,
-            };
-            manifest_snapshot.root.dir_index_etag = new_dir_etag;
-            manifest_snapshot.root.dir_index_seq = Some(next_dir_seq);
-            manifest_snapshot.root.dir_index_cid = dir_index_cid;
-            Some(next_dir_seq)
+
+            // v8 bucket: keep the legacy single-blob dir-index fields cleared so
+            // the read-path dispatch (Step 3) routes through the shard map.
+            manifest_snapshot.root.dir_index_etag = None;
+            manifest_snapshot.root.dir_index_seq = None;
+            manifest_snapshot.root.dir_index_cid = None;
+            true
         } else {
-            None
+            false
         };
 
         // Fault injection point: simulate a client crash between Phase 1.5 /
@@ -4824,6 +4909,23 @@ impl EncryptedClient {
 
         let new_etag = if put_result.etag.is_empty() { None } else { Some(put_result.etag) };
 
+        // Fault injection: abort AFTER the root commit lands on storage but
+        // BEFORE the caller (`flush_forest`) reaches `wal::clear` (which runs
+        // only on `Ok`). The committed root references this flush's writes AND
+        // the WAL still holds them — recovery must re-apply the WAL idempotently
+        // (no 412 create-race on already-committed pages/shards, no duplicate
+        // entries) rather than corrupt the bucket.
+        #[cfg(feature = "test-fault-injection")]
+        if test_faults::CRASH_AFTER_ROOT_PUT_BEFORE_WAL_CLEAR
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(ClientError::Encryption(
+                fula_crypto::CryptoError::Encryption(
+                    "test-fault-injection: CRASH_AFTER_ROOT_PUT_BEFORE_WAL_CLEAR".to_string(),
+                ),
+            ));
+        }
+
         // Reconcile Phase 1.5 + Phase 1.6 + Phase 2 back into the live
         // forest. Without this, the forest's own manifest retains the
         // pre-flush `dirty_pages` + stale `page_index`, so a subsequent
@@ -4833,8 +4935,10 @@ impl EncryptedClient {
         {
             let mut guard = forest_arc.write().await;
             guard.reconcile_flush(manifest_snapshot.root.clone(), &dirty_pages);
-            if let Some(new_seq) = new_dir_index_seq {
-                guard.reconcile_dir_index_flush(new_seq);
+            if dir_index_shards_flushed {
+                // Clear only the shards we actually flushed (the snapshot set),
+                // not the whole live set — defensive against any future window.
+                guard.reconcile_dir_index_shards_flush(&dir_index_dirty_shards);
             }
         }
 
@@ -5408,6 +5512,130 @@ impl EncryptedClient {
             .map_err(ClientError::Encryption)
     }
 
+    /// plan-D5 (v8) — load the SHARDED directory index: fetch every shard
+    /// listed in the root's `dir_index_shards`, decrypt with the per-shard
+    /// seq-floor pin, and merge into one `DirectoryIndex`.
+    ///
+    /// Returns `Ok(None)` on ANY shard fetch / decode / decrypt / seq-floor
+    /// failure so the caller rebuilds from the forest — a missing or tampered
+    /// shard must NEVER degrade to a silently-truncated listing (advisor
+    /// must-fix). The dir-index is a derived cache; the HAMT is the truth.
+    ///
+    /// Shards are fetched in bounded parallel via `buffer_unordered` (wasm-safe;
+    /// no `tokio::spawn`). Each fetch uses the walkable-v8 CID hint for the
+    /// offline gateway race when master is down (native); wasm uses the no-hint
+    /// master path. Returns `(merged, 0, None)`: the single `dir_index_seq` /
+    /// `observed_etag` are v7-only and unused for v8 (the per-shard seqs/etags
+    /// already live in `dir_index_shards`).
+    async fn load_directory_index_sharded(
+        &self,
+        bucket: &str,
+        forest_dek: &fula_crypto::keys::DekKey,
+        dir_index_shards: &std::collections::BTreeMap<u8, DirIndexShardRef>,
+    ) -> std::result::Result<Option<(DirectoryIndex, u64, Option<String>)>, ClientError> {
+        use futures::StreamExt;
+        // Build OWNED per-shard work items up front (this borrows forest_dek /
+        // bucket / dir_index_shards synchronously, with no await), so the fetch
+        // futures capture nothing borrowed from `self` — that keeps the combined
+        // future `Send` for the background auto-flush spawn path.
+        let client = self.inner.clone();
+        let bucket_owned = bucket.to_string();
+        let items: Vec<(u8, u64, Option<cid::Cid>, String)> = dir_index_shards
+            .iter()
+            .map(|(idx, r)| {
+                let key = derive_dir_index_shard_key(forest_dek, bucket, *idx);
+                #[cfg(not(target_arch = "wasm32"))]
+                let cid_hint = crate::walkable_v8::cid_hint_from_manifest_field_or_etag(
+                    r.cid.as_ref(),
+                    r.etag.as_deref(),
+                );
+                #[cfg(target_arch = "wasm32")]
+                let cid_hint: Option<cid::Cid> = None;
+                (*idx, r.seq, cid_hint, key)
+            })
+            .collect();
+        let futs = items.into_iter().map(move |(idx, pinned_seq, cid_hint, key)| {
+            let client = client.clone();
+            let bucket_owned = bucket_owned.clone();
+            async move {
+                #[cfg(not(target_arch = "wasm32"))]
+                let fetched = match cid_hint {
+                    Some(cid) => {
+                        client
+                            .get_object_with_offline_fallback_known_cid(&bucket_owned, &key, &cid)
+                            .await
+                    }
+                    None => {
+                        client
+                            .get_object_with_offline_fallback(&bucket_owned, &key)
+                            .await
+                    }
+                };
+                #[cfg(target_arch = "wasm32")]
+                let fetched = {
+                    let _ = &cid_hint; // unused on wasm (no offline cid-hint path)
+                    client
+                        .get_object_with_offline_fallback(&bucket_owned, &key)
+                        .await
+                };
+                (idx, pinned_seq, fetched)
+            }
+        });
+        let results: Vec<_> = futures::stream::iter(futs)
+            .buffer_unordered(Self::MAX_CONCURRENT_CHUNK_DOWNLOADS)
+            .collect()
+            .await;
+
+        let mut merged = DirectoryIndex {
+            version: 1,
+            entries: HashMap::new(),
+        };
+        for (shard_idx, pinned_seq, fetched) in results {
+            // ANY failure → Ok(None) → caller rebuilds from forest. Never a
+            // partial / empty listing for a missing or tampered shard.
+            let blob = match fetched {
+                Ok(r) => r.inner.data,
+                Err(e) => {
+                    tracing::debug!(%bucket, shard_idx, error = %e, "dir-index shard fetch failed; will rebuild");
+                    return Ok(None);
+                }
+            };
+            let envelope = match EncryptedDirectoryIndexShard::from_bytes(&blob) {
+                Ok(env) => env,
+                Err(e) => {
+                    tracing::warn!(%bucket, shard_idx, error = %e, "dir-index shard decode failed; will rebuild");
+                    return Ok(None);
+                }
+            };
+            let (sub, seq) = match envelope.decrypt(forest_dek, bucket) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(%bucket, shard_idx, error = %e, "dir-index shard decrypt failed; will rebuild");
+                    return Ok(None);
+                }
+            };
+            // Seq pin (rollback / torn-read defense): require the shard's
+            // plaintext seq to EXACTLY match the seq the root committed to.
+            //
+            // Unlike manifest pages (which are authoritative and accept `>=` to
+            // keep a fresh reader reading after a Phase-1.5-landed/Phase-2-
+            // crashed write), the dir-index is a DERIVED cache that rebuilds
+            // from the forest. Requiring `==` (advisor fix) closes the
+            // reorder surface — a server can't serve a mix of current-pinned
+            // and future-seq shards to synthesize a directory state that never
+            // atomically existed. The cost is one rebuild-from-forest in the
+            // rare crash window where a shard advanced but the root didn't (WAL
+            // replay normally heals the pin first); the rebuild is always
+            // correct and re-dirties every shard to reconverge.
+            if seq != pinned_seq {
+                tracing::warn!(%bucket, shard_idx, loaded_seq = seq, pinned_seq, "dir-index shard seq != root pin; will rebuild");
+                return Ok(None);
+            }
+            merged.entries.extend(sub.entries);
+        }
+        Ok(Some((merged, 0, None)))
+    }
+
     /// Try to load the directory index (F-1.3) for this bucket.
     ///
     /// Returns `Ok(Some((index, seq, observed_etag)))` if the object decrypts
@@ -5428,7 +5656,19 @@ impl EncryptedClient {
         expected_etag: Option<&str>,
         expected_cid: Option<&cid::Cid>,
         expected_seq: Option<u64>,
+        dir_index_shards: &std::collections::BTreeMap<u8, DirIndexShardRef>,
     ) -> std::result::Result<Option<(DirectoryIndex, u64, Option<String>)>, ClientError> {
+        // plan-D5 (v8) two-way dispatch: a NON-EMPTY shard map means this bucket
+        // uses the SHARDED directory index — fetch + decrypt + merge the shards.
+        // An EMPTY map (legacy v7 single-blob buckets, which are read-only)
+        // falls through to the unchanged v7 single-blob path below. Either way,
+        // any failure returns Ok(None) so the caller rebuilds from the forest
+        // (never a partial / empty listing).
+        if !dir_index_shards.is_empty() {
+            return self
+                .load_directory_index_sharded(bucket, forest_dek, dir_index_shards)
+                .await;
+        }
         let key = derive_dir_index_key(forest_dek, bucket);
         // Phase 2.4 — route through offline-fallback wrapper. Same
         // security model as the manifest + page fetches: the dir-index
@@ -8336,6 +8576,20 @@ impl EncryptedClient {
                 }
             }
 
+            // plan-D5 (v8): fold DirIndexShardWrote entries by shard_idx, same
+            // as PageWrote — highest-seq post-PUT record wins. Applied to
+            // `root.dir_index_shards[idx]` via `reconcile_dir_index_shard_etag`.
+            let mut dir_index_shard_writes: std::collections::HashMap<u8, (u64, Option<String>)> =
+                std::collections::HashMap::new();
+            for wentry in &entries {
+                if let WalEntry::DirIndexShardWrote { shard_idx, new_etag: Some(et), seq, .. } = wentry {
+                    let slot = dir_index_shard_writes.entry(*shard_idx).or_insert((0u64, None));
+                    if *seq >= slot.0 {
+                        *slot = (*seq, Some(et.clone()));
+                    }
+                }
+            }
+
             {
                 let mut guard = forest_arc.write().await;
                 if !shard_writes.is_empty() {
@@ -8351,6 +8605,9 @@ impl EncryptedClient {
                 }
                 if let Some((seq, etag)) = dir_index_write {
                     guard.reconcile_dir_index_etag(seq, etag);
+                }
+                for (shard_idx, (seq, etag)) in dir_index_shard_writes {
+                    guard.reconcile_dir_index_shard_etag(shard_idx, seq, etag);
                 }
 
                 // Phase 2 (v7): replay Insert/Remove in the same order they
@@ -8373,7 +8630,8 @@ impl EncryptedClient {
                         }
                         WalEntry::ShardWrote { .. }
                         | WalEntry::PageWrote { .. }
-                        | WalEntry::DirIndexWrote { .. } => {
+                        | WalEntry::DirIndexWrote { .. }
+                        | WalEntry::DirIndexShardWrote { .. } => {
                             // Handled above in the fold/reconcile phase.
                         }
                     }
@@ -8405,7 +8663,9 @@ impl EncryptedClient {
                 WalEntry::ShardWrote { .. } => {
                     // v7-only; ignored for monolithic replay.
                 }
-                WalEntry::PageWrote { .. } | WalEntry::DirIndexWrote { .. } => {
+                WalEntry::PageWrote { .. }
+                | WalEntry::DirIndexWrote { .. }
+                | WalEntry::DirIndexShardWrote { .. } => {
                     // v7-only meta-HAMT entries; ignored on monolithic replay.
                 }
             }
@@ -8419,6 +8679,33 @@ impl EncryptedClient {
             .get(bucket)
             .map(|entry| entry.is_dirty())
             .unwrap_or(false)
+    }
+
+    /// Test-only: force the loaded forest for `bucket` into the legacy v7
+    /// single-blob dir-index shape so a test can trip the read-only-old
+    /// write-path guard deterministically (the forest's `page_index` stays
+    /// consistent with storage — unlike forging a manifest out-of-band). The
+    /// forest must already be loaded. Compiled out of production builds.
+    #[cfg(feature = "test-fault-injection")]
+    pub async fn test_force_single_blob_dir_index(&self, bucket: &str) -> Result<()> {
+        let forest_arc = {
+            let entry = self.forest_cache.get(bucket).ok_or_else(|| {
+                ClientError::Encryption(fula_crypto::CryptoError::Encryption(
+                    "test_force_single_blob_dir_index: no forest in cache (load it first)".into(),
+                ))
+            })?;
+            match entry.value() {
+                ForestCacheEntry::ShardedHamt { forest, .. } => forest.clone(),
+                _ => {
+                    return Err(ClientError::Encryption(fula_crypto::CryptoError::Encryption(
+                        "test_force_single_blob_dir_index: forest is not v7 sharded-HAMT".into(),
+                    )))
+                }
+            }
+        };
+        let mut guard = forest_arc.write().await;
+        guard.test_force_single_blob_dir_index();
+        Ok(())
     }
 
     /// Invalidate the forest cache for a specific bucket

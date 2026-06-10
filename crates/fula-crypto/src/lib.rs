@@ -123,6 +123,11 @@ pub use private_forest::{
     // Directory index (F-1.3)
     DirectoryIndex, DirEntry, EncryptedDirectoryIndex,
     derive_dir_index_key, dir_index_aad,
+    // Sharded directory index (plan-D5 / v8)
+    EncryptedDirectoryIndexShard, DirIndexShardRef,
+    derive_dir_index_shard_key, derive_dir_index_route_key,
+    shard_index_for_path, split_directory_index_into_shards,
+    DIR_INDEX_V8_NUM_SHARDS,
 };
 pub use wnfs_hamt::{BlobBackend, BlobPutResult, V7NodeStore, V7_NODE_PREFIX};
 pub use private_metadata::{PrivateMetadata, EncryptedPrivateMetadata, PublicMetadata, KeyObfuscation, obfuscate_key};
