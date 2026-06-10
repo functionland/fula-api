@@ -76,6 +76,15 @@ pub struct AppState {
     /// `FULA_PINS_DATABASE_URL` is set; `None` (default) → those endpoints 503.
     /// No other code path touches it; lazily connected.
     pub pins_db: Option<sqlx::PgPool>,
+    /// JWT revocation deny-list (audit F3). `Some` when
+    /// `FULA_REVOCATION_CHECK_ENABLED` is set AND a pins DB is configured;
+    /// `None` (default) → `revocation::ensure_not_revoked` is a no-op and auth
+    /// behaves byte-identically to before. A background refresher
+    /// (`revocation::spawn_if_enabled`) mirrors `api_keys.is_deleted=1` key
+    /// hashes into it; `auth_middleware` rejects a token whose sha256 hex is
+    /// present. Deny-list + fail-open: a valid/legacy/unknown token is never
+    /// rejected, and a DB outage never locks anyone out.
+    pub revocation: Option<Arc<crate::revocation::RevocationState>>,
 }
 
 impl AppState {
@@ -311,6 +320,17 @@ impl AppState {
             }
         };
 
+        // Audit F3 — JWT revocation deny-list. Allocated EMPTY here (= allow
+        // all) only when the env switch is set AND a pins DB exists; the
+        // background refresher (`revocation::spawn_if_enabled`, started in
+        // `server`) performs the first load. Default OFF → `None` → no-op.
+        let revocation = if crate::revocation::env_enabled() && pins_db.is_some() {
+            info!("✓ Revocation deny-list enabled (FULA_REVOCATION_CHECK_ENABLED); honoring manual key revocation, loads on first refresh");
+            Some(Arc::new(crate::revocation::RevocationState::empty()))
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             block_store,
@@ -323,6 +343,7 @@ impl AppState {
             local_retain,
             index_pin_set,
             pins_db,
+            revocation,
         })
     }
 

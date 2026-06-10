@@ -48,6 +48,7 @@ pub mod pin_drainer;
 pub mod pin_queue;
 pub mod pinning;
 pub mod recovery_fallback;
+pub mod revocation;
 pub mod routes;
 pub mod server;
 pub mod state;

@@ -105,6 +105,13 @@ pub async fn run_server(config: GatewayConfig) -> anyhow::Result<()> {
     // cluster URL / memory store). Healthy reads are never affected.
     crate::recovery_fallback::spawn_reconcile_if_enabled(&state);
 
+    // Audit F3 — JWT revocation deny-list refresher. Mirrors the issuer's
+    // manually-revoked keys (`api_keys.is_deleted=1`) into memory so a revoked
+    // token stops working at this gateway too (it intentionally has no `exp`).
+    // No-op when disabled (default) / no pins DB. Deny-list + fail-open: a
+    // currently-valid token is never rejected, and a DB outage never locks out.
+    crate::revocation::spawn_if_enabled(&state);
+
     // Create router
     let app = routes::create_router(state);
 
@@ -208,6 +215,11 @@ pub async fn run_server_with_shutdown(
     // 404/410 into a 200). No-op when disabled (kill switch / no pins DB / no
     // cluster URL / memory store). Healthy reads are never affected.
     crate::recovery_fallback::spawn_reconcile_if_enabled(&state);
+
+    // Audit F3 — JWT revocation deny-list refresher (see run_server). No-op when
+    // disabled (default) / no pins DB. Deny-list + fail-open: never rejects a
+    // currently-valid token; a DB outage never locks anyone out.
+    crate::revocation::spawn_if_enabled(&state);
 
     let app = routes::create_router(state);
 

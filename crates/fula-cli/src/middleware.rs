@@ -77,6 +77,11 @@ pub async fn auth_middleware(
                 .ok_or_else(|| ApiError::s3(S3ErrorCode::InternalError, "JWT secret not configured"))?;
 
             let claims = validate_token(&token, secret)?;
+            // Audit F3: honor a manually-revoked key. No-op unless the revocation
+            // deny-list is enabled (env switch + pins DB). Deny-list + fail-open,
+            // so a currently-valid token is never rejected. `token` is the raw
+            // JWT — the issuer hashes the same string into `api_keys.key_hash`.
+            crate::revocation::ensure_not_revoked(state.revocation.as_deref(), &token)?;
             // Pass the raw JWT token to the session for forwarding to pinning service
             claims_to_session(claims, token)
         }

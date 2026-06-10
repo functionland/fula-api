@@ -58,6 +58,9 @@ uuid = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 blake3 = { workspace = true }
+# SHA-256 for the JWT revocation deny-list (audit F3): hash the raw JWT to match
+# the issuer's `api_keys.key_hash`. Same workspace sha2 fula-crypto already uses.
+sha2 = { workspace = true }
 urlencoding = "2.1"
 url = "2.5"
 mime = "0.3"
