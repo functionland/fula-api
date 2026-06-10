@@ -1,4 +1,4 @@
-//! Issue #11 — offline share-token creation fails because
+﻿//! Issue #11 â€” offline share-token creation fails because
 //! `crates/fula-flutter/src/api/sharing.rs:47,144` calls
 //! `client.inner().head_object(...)` directly, bypassing the offline-fallback
 //! infrastructure that the download path already uses
@@ -10,11 +10,11 @@
 //!   2. Shut down the gateway (simulates the FxFiles `s33.cloud.fx.land`
 //!      offline scenario from issue #11).
 //!   3. Call the FFI `create_share_token` on the uploaded file.
-//!   4. **Expected (post-fix):** `Ok(token_json)` — the wrapped DEK is in
+//!   4. **Expected (post-fix):** `Ok(token_json)` â€” the wrapped DEK is in
 //!      `forest_entry.user_metadata["x-fula-encryption"]` (populated at
 //!      upload by `encryption.rs:5955-5968`), so no network call is needed.
 //!   5. **Today (buggy):** `Err("Failed to fetch object metadata: HTTP error
-//!      ... dns error ... No address associated with hostname")` —
+//!      ... dns error ... No address associated with hostname")` â€”
 //!      `sharing.rs:47` hits the now-dead gateway.
 //!
 //! Run with: `cargo test --test issue_11_share_token_offline_test -- --nocapture`
@@ -61,14 +61,14 @@ async fn spawn_server() -> (String, JoinHandle<()>) {
 
 /// Build the deterministic 32-byte secret key fula_flutter expects. In real
 /// FxFiles this is Argon2id over OAuth identity; for the test a constant is
-/// fine — we just need the same key throughout the test.
+/// fine â€” we just need the same key throughout the test.
 fn test_secret_key() -> Vec<u8> {
     blake3::hash(b"issue-11-test-secret-key-v1").as_bytes().to_vec()
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Main repro — end-to-end via the FFI surface FxFiles invokes
-// ═══════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Main repro â€” end-to-end via the FFI surface FxFiles invokes
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 /// **Should fail on current main; should pass after the issue #11 fix.**
 ///
@@ -98,7 +98,7 @@ async fn issue_11_create_share_token_should_work_offline() {
     };
 
     let handle = create_encrypted_client(fula_config, enc_config)
-        .expect("create encrypted client");
+        .await.expect("create encrypted client");
 
     let bucket = "issue-11-bucket".to_string();
     let key = "/secret.txt".to_string();
@@ -108,7 +108,7 @@ async fn issue_11_create_share_token_should_work_offline() {
         .await
         .expect("create bucket");
 
-    // FxFiles uses `put_flat` (not `put_encrypted`) — `put_flat` populates
+    // FxFiles uses `put_flat` (not `put_encrypted`) â€” `put_flat` populates
     // the forest entry, which is what the offline path relies on.
     put_flat(
         &handle,
@@ -121,7 +121,7 @@ async fn issue_11_create_share_token_should_work_offline() {
     .expect("FFI put_flat upload");
 
     // Step 2: snapshot the storage_key via the offline-safe forest listing.
-    // `list_from_forest` reads only the local forest — no network — so it
+    // `list_from_forest` reads only the local forest â€” no network â€” so it
     // works both before and after we abort the gateway.
     let files = list_from_forest(&handle, bucket.clone())
         .await
@@ -133,7 +133,7 @@ async fn issue_11_create_share_token_should_work_offline() {
         .expect("uploaded file present in forest");
 
     // Step 3: tear down the gateway. From here on any request that reaches
-    // the master returns a connection error — exactly the FxFiles
+    // the master returns a connection error â€” exactly the FxFiles
     // `s33.cloud.fx.land` log signature.
     server_handle.abort();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

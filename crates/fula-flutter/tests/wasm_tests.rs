@@ -78,7 +78,7 @@ fn test_share_permissions_wasm() {
 }
 
 #[wasm_bindgen_test]
-fn test_rotation_report_wasm() {
+async fn test_rotation_report_wasm() {
     let report = RotationReport {
         total: 10,
         rotated: 8,
@@ -86,8 +86,8 @@ fn test_rotation_report_wasm() {
         failed: 1,
         failures: vec![],
     };
-    assert!(!report.is_success());
-    assert_eq!(report.success_rate(), 90.0);
+    assert!(!report.is_success().await);
+    assert_eq!(report.success_rate().await, 90.0);
 }
 
 #[wasm_bindgen_test]
@@ -101,17 +101,17 @@ fn test_upload_progress_wasm() {
 // ============================================================================
 
 #[wasm_bindgen_test]
-fn test_chunked_threshold_wasm() {
+async fn test_chunked_threshold_wasm() {
     use fula_flutter::api::chunked::{should_use_chunked, CHUNKED_THRESHOLD};
 
     // Small files should not use chunked
-    assert!(!should_use_chunked(1024));
+    assert!(!should_use_chunked(1024).await);
 
     // At threshold, don't use chunked (implementation is >)
-    assert!(!should_use_chunked(CHUNKED_THRESHOLD));
+    assert!(!should_use_chunked(CHUNKED_THRESHOLD).await);
 
     // Files larger than threshold should use chunked
-    assert!(should_use_chunked(CHUNKED_THRESHOLD + 1));
+    assert!(should_use_chunked(CHUNKED_THRESHOLD + 1).await);
 }
 
 // ============================================================================

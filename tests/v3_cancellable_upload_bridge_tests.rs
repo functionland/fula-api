@@ -1,13 +1,13 @@
-//! Bridge tests for the cooperative cancellation token (issue #18).
+﻿//! Bridge tests for the cooperative cancellation token (issue #18).
 //!
 //! New API surface to be bridged:
-//!   * `CancelHandle` type — opaque FRB handle wrapping `Arc<AtomicBool>`.
+//!   * `CancelHandle` type â€” opaque FRB handle wrapping `Arc<AtomicBool>`.
 //!   * `create_cancel_handle()` / `cancel_handle_trigger()` /
 //!     `cancel_handle_is_cancelled()`.
-//!   * `put_flat_resumable_from_path_cancellable` — same as
+//!   * `put_flat_resumable_from_path_cancellable` â€” same as
 //!     `put_flat_resumable_from_path` (issue #17) but accepts a
 //!     `&CancelHandle`.
-//!   * `resume_flat_upload_from_path_cancellable` — same as
+//!   * `resume_flat_upload_from_path_cancellable` â€” same as
 //!     `resume_flat_upload_from_path` but cancellable.
 //!
 //! Until the bridge + SDK changes land, these tests fail to compile
@@ -16,18 +16,18 @@
 //!
 //! Once the bridge lands:
 //!
-//!   * `test_cancel_handle_default_state` — newly-created handle is not
+//!   * `test_cancel_handle_default_state` â€” newly-created handle is not
 //!     cancelled. Sanity check of the opaque type.
-//!   * `test_cancel_handle_trigger_flips_state` — trigger flips it.
+//!   * `test_cancel_handle_trigger_flips_state` â€” trigger flips it.
 //!     Idempotent (second trigger is a no-op).
-//!   * `test_cancel_mid_upload_stops_further_chunks` — kick off a
+//!   * `test_cancel_mid_upload_stops_further_chunks` â€” kick off a
 //!     32 MB resumable upload, sleep ~100ms, trigger cancel. Verify:
 //!       * the upload returns a typed cancellation error,
-//!       * the manifest is still on disk (cancel ≠ abort_upload — the
+//!       * the manifest is still on disk (cancel â‰  abort_upload â€” the
 //!         caller may want to resume later),
 //!       * future `resume_flat_upload_from_path` against the same
 //!         manifest + the unchanged file completes the upload.
-//!   * `test_cancel_with_none_handle_equivalent_to_non_cancellable` —
+//!   * `test_cancel_with_none_handle_equivalent_to_non_cancellable` â€”
 //!     happy-path smoke: the cancellable variant with a never-triggered
 //!     handle behaves identically to `put_flat_resumable_from_path`.
 
@@ -53,9 +53,9 @@ use fula_flutter::api::types::{
     EncryptionConfig as FlutterEncCfg, FulaConfig, ObfuscationMode,
 };
 
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Harness (lifted from v2_resumable_upload_bridge_tests.rs)
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 async fn spawn_gateway() -> (String, JoinHandle<()>) {
     let mut config = GatewayConfig::default();
@@ -100,57 +100,57 @@ fn enc_config(label: &str) -> FlutterEncCfg {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// Test 1: CancelHandle default state — newly created, not cancelled.
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Test 1: CancelHandle default state â€” newly created, not cancelled.
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 #[tokio::test]
 async fn test_cancel_handle_default_state() {
-    let handle = create_cancel_handle();
+    let handle = create_cancel_handle().await;
     assert!(
-        !cancel_handle_is_cancelled(&handle),
+        !cancel_handle_is_cancelled(&handle).await,
         "newly-created CancelHandle must not be in cancelled state"
     );
 }
 
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Test 2: trigger flips state; second trigger is idempotent.
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 #[tokio::test]
 async fn test_cancel_handle_trigger_flips_state() {
-    let handle = create_cancel_handle();
-    cancel_handle_trigger(&handle);
+    let handle = create_cancel_handle().await;
+    cancel_handle_trigger(&handle).await;
     assert!(
-        cancel_handle_is_cancelled(&handle),
+        cancel_handle_is_cancelled(&handle).await,
         "after trigger, CancelHandle must be in cancelled state"
     );
     // Second trigger must be a no-op (no panic, state stays cancelled).
-    cancel_handle_trigger(&handle);
+    cancel_handle_trigger(&handle).await;
     assert!(
-        cancel_handle_is_cancelled(&handle),
+        cancel_handle_is_cancelled(&handle).await,
         "second trigger must not regress state"
     );
 }
 
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Test 3: cancel mid-upload returns typed error; manifest survives;
 // subsequent resume against unchanged file completes.
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 #[tokio::test]
 async fn test_cancel_mid_upload_stops_further_chunks() {
     let (endpoint, _server) = spawn_gateway().await;
 
     let client = create_encrypted_client(flutter_config(&endpoint), enc_config("cancel-mid"))
-        .expect("create encrypted client");
+        .await.expect("create encrypted client");
 
     let bucket = "cancel-mid-bucket".to_string();
     enc_create_bucket(&client, bucket.clone())
         .await
         .expect("create bucket");
 
-    // 32 MB — deterministically multi-chunk; chunked encrypt + PUT can't
+    // 32 MB â€” deterministically multi-chunk; chunked encrypt + PUT can't
     // finish in <100ms against the in-memory gateway.
     let payload: Vec<u8> = (0..32 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let file = NamedTempFile::new().expect("temp file");
@@ -164,7 +164,7 @@ async fn test_cancel_mid_upload_stops_further_chunks() {
         .to_string_lossy()
         .to_string();
 
-    let cancel = create_cancel_handle();
+    let cancel = create_cancel_handle().await;
 
     // Kick off the upload; trigger cancel after 100ms.
     let upload_client = client.clone();
@@ -185,7 +185,7 @@ async fn test_cancel_mid_upload_stops_further_chunks() {
         .await
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    cancel_handle_trigger(&cancel);
+    cancel_handle_trigger(&cancel).await;
 
     let result = upload_task.await.expect("join upload task");
     let err = result.expect_err(
@@ -198,7 +198,7 @@ async fn test_cancel_mid_upload_stops_further_chunks() {
         "expected a Cancelled-class error, got: {err}"
     );
 
-    // Manifest contract: cancel ≠ abort_upload. The manifest survives so
+    // Manifest contract: cancel â‰  abort_upload. The manifest survives so
     // the caller can resume later (or call abort_upload to clean up).
     assert!(
         std::path::Path::new(&manifest_path).exists(),
@@ -232,10 +232,10 @@ async fn test_cancel_mid_upload_stops_further_chunks() {
     );
 }
 
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Test 4: cancellable variant with a never-triggered handle behaves
 // identically to the non-cancellable function (regression check).
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 #[tokio::test]
 async fn test_cancel_with_never_triggered_handle_equivalent_to_non_cancellable() {
@@ -245,7 +245,7 @@ async fn test_cancel_with_never_triggered_handle_equivalent_to_non_cancellable()
         flutter_config(&endpoint),
         enc_config("cancel-equiv"),
     )
-    .expect("create encrypted client");
+    .await.expect("create encrypted client");
 
     let bucket = "cancel-equiv-bucket".to_string();
     enc_create_bucket(&client, bucket.clone())
@@ -264,7 +264,7 @@ async fn test_cancel_with_never_triggered_handle_equivalent_to_non_cancellable()
         .to_string_lossy()
         .to_string();
 
-    let cancel = create_cancel_handle();
+    let cancel = create_cancel_handle().await;
     // Never trigger.
 
     let result = put_flat_resumable_from_path_cancellable(

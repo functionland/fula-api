@@ -1,4 +1,4 @@
-//! Bridge test for issue functionland/fula-api#20 — exposing
+﻿//! Bridge test for issue functionland/fula-api#20 â€” exposing
 //! `EncryptedClient::abort_upload` through fula-flutter as
 //! `abort_resumable_upload`.
 //!
@@ -7,7 +7,7 @@
 //! Phase C needs it for the explicit-discard flow (cancel-and-throw-
 //! away vs cancel-and-resume-later).
 //!
-//! Until the bridge lands these imports fail to compile — that's the
+//! Until the bridge lands these imports fail to compile â€” that's the
 //! proof the gap is real. Once the bridge lands the test compiles and
 //! exercises:
 //!   * `abort_resumable_upload` runs idempotently on a fresh manifest
@@ -34,9 +34,9 @@ use fula_flutter::api::types::{
     EncryptionConfig as FlutterEncCfg, FulaConfig, ObfuscationMode,
 };
 
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Test harness (same shape as v2/v3 bridge tests)
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 async fn spawn_gateway() -> (String, JoinHandle<()>) {
     let mut config = GatewayConfig::default();
@@ -81,22 +81,22 @@ fn enc_config(label: &str) -> FlutterEncCfg {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Test 1: abort on a missing manifest is a no-op (idempotent).
 //
 // Codex contract decision: the bridge wrapper short-circuits when the
 // manifest file is missing and returns Ok(()). This matches Phase C's
-// "discard cancelled upload" UX — the button always leaves a clean
+// "discard cancelled upload" UX â€” the button always leaves a clean
 // state regardless of prior state. Malformed/unreadable manifests
 // still surface as errors (covered implicitly by Test 2's positive-
 // case assertion).
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 #[tokio::test]
 async fn test_abort_no_op_on_missing_manifest() {
     let (endpoint, _server) = spawn_gateway().await;
     let client = create_encrypted_client(flutter_config(&endpoint), enc_config("abort-noop"))
-        .expect("create encrypted client");
+        .await.expect("create encrypted client");
 
     let manifest_dir = TempDir::new().expect("temp dir");
     let missing_manifest = manifest_dir
@@ -110,22 +110,22 @@ async fn test_abort_no_op_on_missing_manifest() {
         .expect("abort on a missing manifest MUST be idempotent (return Ok)");
 }
 
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Test 2: abort after an interrupted upload deletes the manifest.
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 #[tokio::test]
 async fn test_abort_after_interrupted_upload_deletes_manifest() {
     let (endpoint, server_handle) = spawn_gateway().await;
     let client = create_encrypted_client(flutter_config(&endpoint), enc_config("abort-discard"))
-        .expect("create encrypted client");
+        .await.expect("create encrypted client");
 
     let bucket = "abort-bucket".to_string();
     enc_create_bucket(&client, bucket.clone())
         .await
         .expect("create bucket");
 
-    // 32 MB — deterministic interruption via gateway abort (same pattern
+    // 32 MB â€” deterministic interruption via gateway abort (same pattern
     // as v2/v3 bridge tests).
     let payload: Vec<u8> = (0..32 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let file = NamedTempFile::new().expect("temp file");
@@ -175,7 +175,7 @@ async fn test_abort_after_interrupted_upload_deletes_manifest() {
         flutter_config(&endpoint_after),
         enc_config("abort-discard"),
     )
-    .expect("create encrypted client (post-abort)");
+    .await.expect("create encrypted client (post-abort)");
     enc_create_bucket(&post_abort_client, bucket.clone())
         .await
         .expect("re-create bucket on the new gateway");

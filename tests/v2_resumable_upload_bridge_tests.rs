@@ -1,4 +1,4 @@
-//! Bridge tests for `resume_upload` + `put_object_encrypted_resumable` exposure
+﻿//! Bridge tests for `resume_upload` + `put_object_encrypted_resumable` exposure
 //! through the fula-flutter FFI surface (issue #17).
 //!
 //! Today these functions are NOT exposed; the new bridge functions are:
@@ -8,18 +8,18 @@
 //! Until the bridge lands these tests fail to compile, which IS the proof
 //! that the gap is real. Once the bridge lands:
 //!
-//!   * `test_put_flat_resumable_happy_path` — happy path: manifest auto-
+//!   * `test_put_flat_resumable_happy_path` â€” happy path: manifest auto-
 //!     deletes on success, content reads back identical.
-//!   * `test_resume_bridge_shape_smoke` — server dies mid-upload, manifest
+//!   * `test_resume_bridge_shape_smoke` â€” server dies mid-upload, manifest
 //!     persists, fresh gateway + resume returns SOMETHING (Ok or typed
 //!     Err). Documents the bridge shape works end-to-end; NOT a "resume
 //!     actually completes" gate. The full resume-state correctness is
 //!     covered by the SDK's internal logic which the bridge wraps.
-//!   * `test_resume_rejects_tampered_bytes` — deterministic partial-
+//!   * `test_resume_rejects_tampered_bytes` â€” deterministic partial-
 //!     manifest setup (interrupt with predictable timing), tamper file
 //!     bytes between attempts, expect BAO mismatch error from the SDK's
 //!     F1 nonce-reuse protection.
-//!   * `test_concurrent_resume_same_manifest_path_serializes` — two
+//!   * `test_concurrent_resume_same_manifest_path_serializes` â€” two
 //!     concurrent `resume_flat_upload_from_path` calls against the SAME
 //!     manifest_path must serialize (via the bucket_write_mutex from B1
 //!     extended to cover the resumable path). Without protection the
@@ -47,9 +47,9 @@ use fula_flutter::api::types::{
     EncryptionConfig as FlutterEncCfg, FulaConfig, ObfuscationMode,
 };
 
-// ════════════════════════════════════════════════════════════════════════
-// Test harness — spins up an in-memory gateway, hands back a kill handle.
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Test harness â€” spins up an in-memory gateway, hands back a kill handle.
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 /// Spawn an in-memory gateway. Returns the endpoint URL and a task handle
 /// that, when aborted, simulates the gateway dying mid-upload.
@@ -96,23 +96,23 @@ fn enc_config(label: &str) -> FlutterEncCfg {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// Test 1: happy path — manifest auto-deletes on success
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Test 1: happy path â€” manifest auto-deletes on success
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 #[tokio::test]
 async fn test_put_flat_resumable_happy_path() {
     let (endpoint, _server) = spawn_gateway().await;
 
     let client = create_encrypted_client(flutter_config(&endpoint), enc_config("happy"))
-        .expect("create encrypted client");
+        .await.expect("create encrypted client");
 
     let bucket = "resumable-happy".to_string();
     enc_create_bucket(&client, bucket.clone())
         .await
         .expect("create bucket");
 
-    // Small payload — single chunk path is fine for the happy-path
+    // Small payload â€” single chunk path is fine for the happy-path
     // smoke test. The bridge wrapper is the same shape regardless of
     // chunk count.
     let payload = b"hello resumable bridge".to_vec();
@@ -155,29 +155,29 @@ async fn test_put_flat_resumable_happy_path() {
     assert_eq!(readback, payload, "readback bytes mismatch");
 }
 
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Test 2: bridge shape under mid-upload server failure
 //
 // Documents the bridge correctly forwards `(manifest_path, file_path)` to
 // the SDK and surfaces a typed result. Does NOT prove "resume reconstructs
-// to the same final etag as a clean upload" — the SDK's resume-state
+// to the same final etag as a clean upload" â€” the SDK's resume-state
 // correctness is unit-tested separately. The bridge wrapper is a thin
 // passthrough; this test guards against the shape regressing.
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 #[tokio::test]
 async fn test_resume_bridge_shape_smoke() {
     let (endpoint, server_handle) = spawn_gateway().await;
 
     let client = create_encrypted_client(flutter_config(&endpoint), enc_config("resume"))
-        .expect("create encrypted client");
+        .await.expect("create encrypted client");
 
     let bucket = "resumable-resume".to_string();
     enc_create_bucket(&client, bucket.clone())
         .await
         .expect("create bucket");
 
-    // ~6 MB content — exceeds the IPFS-block 1 MB threshold so the SDK
+    // ~6 MB content â€” exceeds the IPFS-block 1 MB threshold so the SDK
     // takes the chunked path with multiple chunk PUTs. Gives the abort
     // a window to interrupt mid-stream.
     let payload: Vec<u8> = (0..6 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
@@ -235,7 +235,7 @@ async fn test_resume_bridge_shape_smoke() {
         "manifest must persist after a mid-upload failure"
     );
 
-    // SHAPE smoke (per the test name) — we've already proven the bridge's
+    // SHAPE smoke (per the test name) â€” we've already proven the bridge's
     // contract under mid-upload failure: the call errored, the manifest
     // persists, the caller has the state needed to resume. That IS the
     // value of this test.
@@ -244,20 +244,20 @@ async fn test_resume_bridge_shape_smoke() {
     // of issue #22's CI flakiness:
     //
     //   * The SDK's `resume_upload` trusts `manifest.chunks[i].uploaded`
-    //     — chunks marked uploaded against gateway 1 are NOT re-PUT.
+    //     â€” chunks marked uploaded against gateway 1 are NOT re-PUT.
     //   * Gateway 2 has none of those chunks.
     //   * Resume writes the final index pointing at chunks that exist
-    //     only on gateway 1 (now dead) — returns Ok.
+    //     only on gateway 1 (now dead) â€” returns Ok.
     //   * A subsequent readback against gateway 2 fails because the
     //     chunks aren't there.
     //   * Whether the SDK returns Ok or Err depends on how many chunks
-    //     landed before the abort fired — flaky timing.
+    //     landed before the abort fired â€” flaky timing.
     //
     // The real-world contract is "resume on the SAME backend the upload
     // started on." That's covered deterministically by
     // `v3_cancellable_upload_bridge_tests::test_cancel_mid_upload_stops_further_chunks`,
     // which uses issue #18's CancelHandle to interrupt the upload
-    // mid-flight without killing the gateway — same backend across
+    // mid-flight without killing the gateway â€” same backend across
     // abort+resume, chunks are still on the backend, round-trip readback
     // is deterministic. That test already covers what the cross-gateway
     // follow-up here was trying (and failing) to test.
@@ -267,30 +267,30 @@ async fn test_resume_bridge_shape_smoke() {
     let _ = key;
 }
 
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Test 3: BAO content-hash check (F1) rejects tampered bytes on resume.
 //
-// Uses a 32 MB payload + 100ms pre-abort window — large enough that the
+// Uses a 32 MB payload + 100ms pre-abort window â€” large enough that the
 // upload is guaranteed to be mid-chunk-loop when the abort fires (the
 // SDK takes hundreds of milliseconds to encrypt + PUT 32 MB of chunks
 // against a real backend). Deterministic vs the previous 4 MB timing
 // race. If the upload still completes within 100ms we have a different
 // performance characteristic to investigate, not a flaky test.
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 #[tokio::test]
 async fn test_resume_rejects_tampered_bytes() {
     let (endpoint, server_handle) = spawn_gateway().await;
 
     let client = create_encrypted_client(flutter_config(&endpoint), enc_config("tamper"))
-        .expect("create encrypted client");
+        .await.expect("create encrypted client");
 
     let bucket = "resumable-tamper".to_string();
     enc_create_bucket(&client, bucket.clone())
         .await
         .expect("create bucket");
 
-    // 32 MB — comfortably above the threshold where the SDK can't finish
+    // 32 MB â€” comfortably above the threshold where the SDK can't finish
     // the chunked encrypt + PUT loop in <100ms against the in-memory
     // gateway. Deterministic partial-manifest state at abort time.
     let payload: Vec<u8> = (0..32 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
@@ -337,7 +337,7 @@ async fn test_resume_rejects_tampered_bytes() {
     );
 
     // Tamper: flip one byte in the original file. The SDK's BAO root
-    // hash check (encryption.rs, F1 nonce-reuse protection — locate via
+    // hash check (encryption.rs, F1 nonce-reuse protection â€” locate via
     // grep for "BaoVerification" or "data content does not match")
     // must reject this on resume.
     let mut tampered = payload.clone();
@@ -349,7 +349,7 @@ async fn test_resume_rejects_tampered_bytes() {
         flutter_config(&endpoint_resumed),
         enc_config("tamper"),
     )
-    .expect("create encrypted client (resume)");
+    .await.expect("create encrypted client (resume)");
     enc_create_bucket(&resumed_client, bucket.clone())
         .await
         .expect("re-create bucket on the new gateway");
@@ -371,10 +371,10 @@ async fn test_resume_rejects_tampered_bytes() {
     );
 }
 
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // Test 4: concurrent resume on the same manifest_path must serialize.
 //
-// Codex's catch — Option 1 (bucket_write_mutex extension to resumable
+// Codex's catch â€” Option 1 (bucket_write_mutex extension to resumable
 // path) protects bucket state, but two concurrent `resume_upload` calls
 // against the SAME local manifest can still race on the manifest file
 // itself (load/save/delete). With the SDK's per-bucket mutex held
@@ -387,7 +387,7 @@ async fn test_resume_rejects_tampered_bytes() {
 // callers race on `wal::load` / `wal::clear` and one or both can
 // corrupt state. This test gates the SDK extension to the resumable
 // path.
-// ════════════════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 #[tokio::test]
 async fn test_concurrent_resume_same_manifest_path_serializes() {
@@ -397,7 +397,7 @@ async fn test_concurrent_resume_same_manifest_path_serializes() {
         flutter_config(&endpoint),
         enc_config("concurrent-resume"),
     )
-    .expect("create encrypted client");
+    .await.expect("create encrypted client");
 
     let bucket = "resumable-concurrent".to_string();
     enc_create_bucket(&client, bucket.clone())
@@ -451,7 +451,7 @@ async fn test_concurrent_resume_same_manifest_path_serializes() {
             flutter_config(&endpoint_resumed),
             enc_config("concurrent-resume"),
         )
-        .expect("create encrypted client (resume)"),
+        .await.expect("create encrypted client (resume)"),
     );
     enc_create_bucket(&resumed_client, bucket.clone())
         .await
@@ -490,7 +490,7 @@ async fn test_concurrent_resume_same_manifest_path_serializes() {
     //     the absence and reports cleanly.
     //   * Two Errs: ONLY acceptable if both errors are the same
     //     well-defined "manifest not found / already finalized" shape
-    //     — meaning the second caller saw the first's deletion AND
+    //     â€” meaning the second caller saw the first's deletion AND
     //     the first hit a transport error pre-finalization. Even then
     //     no panic / no corruption is the actual gate.
     //
