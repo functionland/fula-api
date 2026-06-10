@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.7] - 2026-06-10
+
+### Fixed
+
+- **Flutter Web actually works now.** Three fixes that together make
+  `flutter build web` + browser runtime functional for apps depending on
+  this package:
+  - `lib/fula_client_web.dart` registrant stub added — the pubspec's
+    `web:` plugin block named a file that only existed under `web/`, so
+    Flutter's generated web plugin registrant failed to resolve and every
+    consumer's web build broke at compile time.
+  - **All bridge fns are now `async` on the Rust side.** flutter_rust_bridge
+    dispatches sync fns to its Web-Worker pool on wasm32, which panics
+    (`fail to create WorkerPool`) unless the site is cross-origin-isolated —
+    impossible on plain static hosts like GitHub Pages. Async fns run on the
+    JS event loop instead. No Dart signature changes (everything was already
+    `Future`-typed) and no native behavior change.
+  - `flutter_rust_bridge` Dart dependency pinned to exactly `2.11.1` and the
+    release CI now installs the same pinned codegen in every job, so the
+    published bindings, native binaries, and the new wasm bundle are
+    hash-consistent by construction (0.6.6 shipped pub bindings from a
+    different codegen run than the repo tree, so a wasm built from source
+    was rejected at `RustLib.init()`).
+
+### Added
+
+- **`flutter-wasm-pkg.zip` release asset** — wasm-pack `--target no-modules`
+  build of `crates/fula-flutter` (`pkg/fula_flutter.js` +
+  `pkg/fula_flutter_bg.wasm`) for Flutter Web apps to ship under `web/pkg/`,
+  plus a `VERSION` stamp for CI guards. Measured in headless Chrome from a
+  plain static server: `RustLib.init()` ~224 ms, Argon2id `deriveKey`
+  ~261 ms.
+
 ## [0.6.2] - 2026-05-23
 
 ### Fixed

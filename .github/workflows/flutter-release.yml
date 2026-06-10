@@ -1,4 +1,4 @@
-name: Flutter Release
+﻿name: Flutter Release
 
 # Triggered by pushing a tag (v*)
 # pub.dev OIDC requires tag context, so we trigger on tag push
@@ -16,6 +16,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
   FLUTTER_VERSION: '3.38.0'
+  # MUST equal the flutter_rust_bridge version pinned in
+  # crates/fula-flutter/Cargo.toml AND packages/fula_client/pubspec.yaml.
+  # FRB hard-fails at RustLib.init() unless codegen version == runtime
+  # version; 0.6.6 shipped pub bindings from an UNPINNED (newer) codegen
+  # than the committed tree, making source-built wasm unusable. Every job
+  # below installs this exact codegen so all artifacts of one release are
+  # consistent by construction.
+  FRB_CODEGEN_VERSION: '2.11.1'
 
 jobs:
   # Get version from tag
@@ -57,7 +65,7 @@ jobs:
           shared-key: rust-frb-release
 
       - name: Install flutter_rust_bridge_codegen
-        run: cargo install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen --version ${{ env.FRB_CODEGEN_VERSION }}
 
       - name: Get Flutter dependencies
         working-directory: packages/fula_client
@@ -126,7 +134,7 @@ jobs:
           shared-key: rust-android-release-${{ matrix.target }}
 
       - name: Install flutter_rust_bridge_codegen
-        run: cargo install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen --version ${{ env.FRB_CODEGEN_VERSION }}
 
       - name: Get Flutter dependencies
         working-directory: packages/fula_client
@@ -199,7 +207,7 @@ jobs:
           shared-key: rust-ios-release
 
       - name: Install flutter_rust_bridge_codegen
-        run: cargo install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen --version ${{ env.FRB_CODEGEN_VERSION }}
 
       - name: Get Flutter dependencies
         working-directory: packages/fula_client
@@ -303,6 +311,67 @@ jobs:
           path: wasm-package/
           retention-days: 1
 
+  # Build the flutter_rust_bridge WASM bundle for Flutter Web consumers.
+  # This is DIFFERENT from build-wasm above: fula-js is the wasm-bindgen
+  # JS/TS API (npm @functionland/fula-client), while this job builds
+  # crates/fula-flutter with the FRB wire protocol, loaded by the pub
+  # package's RustLib.init() on web from the app's web/pkg/ folder
+  # (loader config: stem fula_flutter, webPrefix pkg/, no-modules).
+  # It re-runs the SAME pinned codegen as generate-bindings so the wasm
+  # is hash-consistent with the published Dart bindings.
+  build-flutter-wasm:
+    needs: get-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install LLVM/Clang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev llvm-dev
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-flutter-wasm-release
+
+      - name: Install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen --version ${{ env.FRB_CODEGEN_VERSION }}
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
+
+      - name: Get Flutter dependencies
+        working-directory: packages/fula_client
+        run: flutter pub get
+
+      - name: Generate bindings (CRITICAL - must match published Dart bindings)
+        run: flutter_rust_bridge_codegen generate
+
+      - name: Build FRB wasm (no-modules target for the FRB web loader)
+        run: wasm-pack build crates/fula-flutter --release --target no-modules --out-name fula_flutter --out-dir ../../flutter-wasm-pkg
+
+      - name: Stamp version + clean wasm-pack scaffolding
+        run: |
+          rm -f flutter-wasm-pkg/.gitignore
+          echo "${{ needs.get-version.outputs.version }}" > flutter-wasm-pkg/VERSION
+
+      - name: Upload FRB wasm package
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-wasm-pkg
+          path: flutter-wasm-pkg/
+          retention-days: 1
+
   # Publish to pub.dev (Android only - iOS downloads from GitHub Releases)
   publish-pubdev:
     needs: [generate-bindings, build-android]
@@ -364,8 +433,8 @@ jobs:
   # Publish to npm via Trusted Publishing (OIDC, no long-lived token).
   #
   # Configured against npm's trusted-publisher entry on the
-  # @functionland/fula-client package (npmjs.com → package settings →
-  # Publishing → Trusted Publishers). The matching parameters are:
+  # @functionland/fula-client package (npmjs.com â†’ package settings â†’
+  # Publishing â†’ Trusted Publishers). The matching parameters are:
   #   * Organization or username: functionland
   #   * Repository:               fula-api
   #   * Workflow filename:        flutter-release.yml
@@ -383,8 +452,8 @@ jobs:
     # publisher entry. The npm side stores it as a string compare; any
     # drift here re-introduces the 404-from-PUT we just fixed. Also
     # requires a GitHub Environment named `NPM_TOKEN` to exist under
-    # repo Settings → Environments (create it without protection rules
-    # — the OIDC binding is the security control).
+    # repo Settings â†’ Environments (create it without protection rules
+    # â€” the OIDC binding is the security control).
     environment: NPM_TOKEN
     permissions:
       id-token: write   # mint OIDC token for npm trusted publishing
@@ -400,20 +469,20 @@ jobs:
         uses: actions/setup-node@v4
         with:
           # Node 22 LTS ships npm 10.9+; OIDC trusted publishing
-          # requires npm ≥ 11.5, so we explicitly install latest npm
+          # requires npm â‰¥ 11.5, so we explicitly install latest npm
           # below regardless of the Node version's bundled npm.
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
           always-auth: true
 
-      - name: Install latest npm (OIDC support — needs >= 11.5)
+      - name: Install latest npm (OIDC support â€” needs >= 11.5)
         run: npm install --global npm@latest
 
       - name: Verify npm + OIDC readiness
         run: |
           echo "npm version: $(npm --version)"
           echo "node version: $(node --version)"
-          # Trusted publishing needs npm ≥ 11.5. Fail fast if older.
+          # Trusted publishing needs npm â‰¥ 11.5. Fail fast if older.
           npm --version | awk -F. '$1*1000 + $2 < 11005 { exit 1 }'
 
       - name: Verify package contents
@@ -432,7 +501,7 @@ jobs:
 
   # Upload artifacts to GitHub Release (created automatically from tag)
   upload-release-assets:
-    needs: [get-version, build-android, build-ios, build-wasm]
+    needs: [get-version, build-android, build-ios, build-wasm, build-flutter-wasm]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -456,8 +525,11 @@ jobs:
           cp -r ios-xcframework/* ios-package/Frameworks/
           cd ios-package && zip -r ../ios-libs.zip Frameworks/ && cd ..
 
-          # Package WASM
+          # Package WASM (fula-js / npm bundle)
           zip -r wasm-package.zip wasm-package/
+
+          # Package FRB wasm for Flutter Web (web/pkg/ payload)
+          zip -r flutter-wasm-pkg.zip flutter-wasm-pkg/
 
       - name: Create GitHub Release and upload artifacts
         uses: softprops/action-gh-release@v1
@@ -469,5 +541,6 @@ jobs:
             artifacts/android-libs.zip
             artifacts/ios-libs.zip
             artifacts/wasm-package.zip
+            artifacts/flutter-wasm-pkg.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
