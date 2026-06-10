@@ -1,4 +1,4 @@
-//! Forest/FlatNamespace operations
+﻿//! Forest/FlatNamespace operations
 //!
 //! These functions manage the encrypted file index (PrivateForest)
 //! for organized file storage with human-readable paths.
@@ -17,10 +17,10 @@ use crate::api::types::*;
 /// For v7 (sharded-HAMT) forests the underlying `load_forest` returns a
 /// marker error `"forest is sharded; use sharded API methods"` so that
 /// callers using the monolithic `PrivateForest` API know to switch. All
-/// real I/O paths on this client (`get_flat`, `put_flat`, …) go through
+/// real I/O paths on this client (`get_flat`, `put_flat`, â€¦) go through
 /// `ensure_forest_loaded` which already handles the sharded path
 /// transparently, so from a Flutter caller's perspective that marker is
-/// not an error — the forest *is* loaded, just in sharded form. Swallow
+/// not an error â€” the forest *is* loaded, just in sharded form. Swallow
 /// the marker here so apps don't have to special-case it.
 pub async fn load_forest(
     client: &EncryptedClientHandle,
@@ -234,7 +234,7 @@ pub async fn put_flat_from_path_deferred(
 /// **Bytes contract.** The SDK's BAO root-hash check (F1 nonce-reuse
 /// protection) on the resume path requires bit-identical `data` between
 /// the original attempt and the resume. Metadata, permissions, mtime,
-/// and the file's location on disk do NOT matter — only the bytes. If
+/// and the file's location on disk do NOT matter â€” only the bytes. If
 /// the file changed between attempts, the resume fails fast with a
 /// content-hash-mismatch error and the manifest stays on disk so the
 /// caller can decide whether to give up or restart.
@@ -259,7 +259,7 @@ pub async fn put_flat_resumable_from_path(
 ) -> anyhow::Result<PutResult> {
     let data = tokio::fs::read(&file_path).await
         .with_context(|| format!("Failed to read file: {}", file_path))?;
-    // Read lock at the bridge — per-bucket serialization lives inside
+    // Read lock at the bridge â€” per-bucket serialization lives inside
     // `EncryptedClient::put_object_encrypted_resumable` via the
     // `bucket_write_mutex` extension (issue #17). Different buckets
     // parallelize through this `read().await`.
@@ -307,7 +307,7 @@ pub async fn resume_flat_upload_from_path(
 ) -> anyhow::Result<PutResult> {
     let data = tokio::fs::read(&file_path).await
         .with_context(|| format!("Failed to read file: {}", file_path))?;
-    // Read lock at the bridge — per-bucket serialization lives inside
+    // Read lock at the bridge â€” per-bucket serialization lives inside
     // `EncryptedClient::resume_upload`, which loads the manifest first
     // (bucket name lives there) and acquires the bucket_write_mutex
     // post-load (issue #17).
@@ -353,23 +353,23 @@ pub struct CancelHandle {
 }
 
 /// Create a fresh, untriggered cancellation handle.
-pub fn create_cancel_handle() -> CancelHandle {
+pub async fn create_cancel_handle() -> CancelHandle {
     CancelHandle {
         inner: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
 
-/// Trigger cancellation. Idempotent — second trigger is a no-op.
+/// Trigger cancellation. Idempotent â€” second trigger is a no-op.
 /// Any in-flight `_cancellable` upload using this handle (or a clone)
 /// will short-circuit at its next chunk-PUT check.
-pub fn cancel_handle_trigger(handle: &CancelHandle) {
+pub async fn cancel_handle_trigger(handle: &CancelHandle) {
     handle.inner.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Check whether the handle has been triggered. Mostly useful for
 /// tests and UI status checks; the upload functions themselves do
 /// not need to be polled.
-pub fn cancel_handle_is_cancelled(handle: &CancelHandle) -> bool {
+pub async fn cancel_handle_is_cancelled(handle: &CancelHandle) -> bool {
     handle.inner.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -451,7 +451,7 @@ pub async fn resume_flat_upload_from_path_cancellable(
 /// already-uploaded chunks on the storage backend (issue #20).
 ///
 /// Use when the caller decides to give up on a cancelled or failed
-/// upload rather than resume. **Idempotent** — calling on a manifest
+/// upload rather than resume. **Idempotent** â€” calling on a manifest
 /// that doesn't exist (e.g. already aborted, or SDK auto-deleted it on
 /// a prior clean completion) succeeds as a no-op. This matches Phase C
 /// "discard cancelled upload" UX semantics: pressing the button always
@@ -461,7 +461,7 @@ pub async fn resume_flat_upload_from_path_cancellable(
 /// abort, see [`cancel_handle_trigger`] on a [`CancelHandle`] passed to
 /// the `_cancellable` variants (issue #18).
 ///
-/// **Lock scope.** `client.inner.read().await` — same as the resumable
+/// **Lock scope.** `client.inner.read().await` â€” same as the resumable
 /// bridge functions. The underlying `abort_upload` doesn't touch the
 /// encrypted forest (only the raw storage backend for chunk deletes
 /// plus the local manifest file), so B1's per-bucket write mutex is
@@ -474,7 +474,7 @@ pub async fn abort_resumable_upload(
     let manifest = std::path::PathBuf::from(&manifest_path);
     // Idempotency short-circuit: missing manifest means cleanup already
     // happened (prior abort, or SDK auto-delete on a successful clean
-    // upload). Surface as success — the caller's intent ("ensure this
+    // upload). Surface as success â€” the caller's intent ("ensure this
     // upload's local state is gone") is already satisfied. Other I/O
     // errors during the abort itself (malformed manifest, permission
     // denied, etc.) DO propagate so corruption + path bugs don't get

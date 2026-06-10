@@ -1,4 +1,4 @@
-//! Chunked/streaming operations
+﻿//! Chunked/streaming operations
 //!
 //! Functions for handling large files using chunked encryption.
 //! Files above a certain threshold are automatically split into chunks.
@@ -64,6 +64,6 @@ pub async fn get_range(
 /// Check if a file size warrants chunked upload
 ///
 /// Returns true if the size is above the chunked threshold.
-pub fn should_use_chunked(size: u64) -> bool {
+pub async fn should_use_chunked(size: u64) -> bool {
     size > CHUNKED_THRESHOLD
 }

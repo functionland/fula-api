@@ -1,4 +1,4 @@
-//! Operational metrics exposed to the binding layer.
+﻿//! Operational metrics exposed to the binding layer.
 //!
 //! F11: process-wide WAL append-failure count. The WAL is the crash-recovery
 //! log for in-memory forest upserts; when `wal::append` fails, the in-memory
@@ -9,15 +9,15 @@
 /// Monotonic count of WAL append failures since process start.
 ///
 /// Process-wide (not per-client). Not reset. Returns 0 on WASM where the
-/// WAL module does not compile — a uniform shape across platforms simplifies
+/// WAL module does not compile â€” a uniform shape across platforms simplifies
 /// shared Dart code that monitors both mobile and web.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn wal_append_failure_count() -> u64 {
+pub async fn wal_append_failure_count() -> u64 {
     fula_client::wal_append_failure_count()
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn wal_append_failure_count() -> u64 {
+pub async fn wal_append_failure_count() -> u64 {
     0
 }
 
@@ -29,12 +29,12 @@ pub fn wal_append_failure_count() -> u64 {
 /// Returns 0 on WASM where `flush_forest` does a single attempt with no
 /// retry/backoff.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn flush_backoff_count() -> u64 {
+pub async fn flush_backoff_count() -> u64 {
     fula_client::flush_backoff_count()
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn flush_backoff_count() -> u64 {
+pub async fn flush_backoff_count() -> u64 {
     0
 }
 
@@ -48,11 +48,11 @@ pub fn flush_backoff_count() -> u64 {
 /// increments once per discarded group. Returns 0 on WASM where the WAL is
 /// compiled out.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn wal_truncated_groups_count() -> u64 {
+pub async fn wal_truncated_groups_count() -> u64 {
     fula_client::wal_truncated_groups_count()
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn wal_truncated_groups_count() -> u64 {
+pub async fn wal_truncated_groups_count() -> u64 {
     0
 }

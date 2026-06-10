@@ -1,4 +1,4 @@
-//! Sharing operations
+﻿//! Sharing operations
 //!
 //! Functions for creating and accepting share tokens to share
 //! encrypted files with other users.
@@ -276,7 +276,7 @@ pub async fn get_with_token(
 // ============================================================================
 
 /// Get permissions granted by an accepted share
-pub fn get_share_permissions(share: &AcceptedShareHandle) -> SharePermissions {
+pub async fn get_share_permissions(share: &AcceptedShareHandle) -> SharePermissions {
     SharePermissions {
         can_read: share.inner.permissions.can_read,
         can_write: share.inner.permissions.can_write,
@@ -285,7 +285,7 @@ pub fn get_share_permissions(share: &AcceptedShareHandle) -> SharePermissions {
 }
 
 /// Check if an accepted share has expired
-pub fn is_share_expired(share: &AcceptedShareHandle) -> bool {
+pub async fn is_share_expired(share: &AcceptedShareHandle) -> bool {
     if let Some(expires_at) = share.inner.expires_at {
         let now = chrono::Utc::now().timestamp();
         now > expires_at

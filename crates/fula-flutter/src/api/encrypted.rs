@@ -1,4 +1,4 @@
-//! Encrypted client operations
+﻿//! Encrypted client operations
 //!
 //! These functions wrap EncryptedClient for client-side encrypted storage.
 
@@ -228,7 +228,7 @@ pub async fn get_public_key(client: &EncryptedClientHandle) -> Vec<u8> {
 /// // Now use publicKeyBytes for createShareToken
 /// // and secretKeyBytes in the share URL
 /// ```
-pub fn derive_public_key_from_secret(secret_key_bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+pub async fn derive_public_key_from_secret(secret_key_bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
     if secret_key_bytes.len() != 32 {
         anyhow::bail!("Secret key must be exactly 32 bytes, got {}", secret_key_bytes.len());
     }
@@ -271,7 +271,7 @@ pub fn derive_public_key_from_secret(secret_key_bytes: Vec<u8>) -> anyhow::Resul
 ///
 /// // Use secretKey for createEncryptedClient
 /// ```
-pub fn derive_key(context: String, input: Vec<u8>) -> Vec<u8> {
+pub async fn derive_key(context: String, input: Vec<u8>) -> Vec<u8> {
     fula_crypto::hashing::derive_key_argon2id(&context, &input).to_vec()
 }
 
@@ -282,7 +282,7 @@ pub fn derive_key(context: String, input: Vec<u8>) -> Vec<u8> {
 /// from the user's already-derived `KEK_seed` (= `_encryptionKey` in
 /// FxFiles, produced by Argon2id). BLAKE3-derive is the right primitive
 /// here because:
-/// 1. Input is already key-strength (32 bytes from Argon2id) — no need
+/// 1. Input is already key-strength (32 bytes from Argon2id) â€” no need
 ///    for memory-hardness again.
 /// 2. Output is byte-identical to the Rust side's
 ///    `derive_entry_signing_seed` / `derive_user_buckets_index_key`,
@@ -292,12 +292,12 @@ pub fn derive_key(context: String, input: Vec<u8>) -> Vec<u8> {
 /// a user-typed passphrase into a master key).
 ///
 /// # Arguments
-/// * `context` — domain-separation tag (e.g., `"fula:user-buckets-index:v1"`)
-/// * `input`   — parent key bytes (e.g., the 32-byte `KEK_seed`)
+/// * `context` â€” domain-separation tag (e.g., `"fula:user-buckets-index:v1"`)
+/// * `input`   â€” parent key bytes (e.g., the 32-byte `KEK_seed`)
 ///
 /// # Returns
 /// * 32-byte derived sub-key.
-pub fn blake3_derive_key(context: String, input: Vec<u8>) -> Vec<u8> {
+pub async fn blake3_derive_key(context: String, input: Vec<u8>) -> Vec<u8> {
     fula_crypto::hashing::derive_key(&context, &input).as_bytes().to_vec()
 }
 
@@ -306,7 +306,7 @@ pub fn blake3_derive_key(context: String, input: Vec<u8>) -> Vec<u8> {
 /// This is the audit F-A1 / issue #14 Mode B variant. Compared to
 /// [`derive_key`], which uses the `context` bytes as the salt, this
 /// variant takes the salt as a separate parameter so callers can
-/// supply a per-user random salt — closing the F-A1 finding (the
+/// supply a per-user random salt â€” closing the F-A1 finding (the
 /// master key is no longer derivable from public identity attributes
 /// alone).
 ///
@@ -321,14 +321,14 @@ pub fn blake3_derive_key(context: String, input: Vec<u8>) -> Vec<u8> {
 /// random salt.
 ///
 /// # Arguments
-/// * `context` — domain-separation tag (e.g., `"fula-files-v1-google-pw"`)
-/// * `input`   — UTF-8 bytes of the identity-plus-seed string
+/// * `context` â€” domain-separation tag (e.g., `"fula-files-v1-google-pw"`)
+/// * `input`   â€” UTF-8 bytes of the identity-plus-seed string
 ///               (e.g., `"google:<sub>:<email>:<seed>"`)
-/// * `salt`    — per-user random salt; minimum 8 bytes, recommended 32
+/// * `salt`    â€” per-user random salt; minimum 8 bytes, recommended 32
 ///
 /// # Returns
 /// * 32-byte derived key, or an error string if the salt is too short
-pub fn derive_key_with_salt(
+pub async fn derive_key_with_salt(
     context: String,
     input: Vec<u8>,
     salt: Vec<u8>,
@@ -348,14 +348,14 @@ pub fn derive_key_with_salt(
 /// hex encoding). The seed never leaves the device; whoever can
 /// compute this id IS that user.
 ///
-/// `provider` should be a canonical lowercase tag — `"google"` or
+/// `provider` should be a canonical lowercase tag â€” `"google"` or
 /// `"apple"`. `oauth_sub` is the IDP-issued opaque identifier. `seed`
 /// is the user-entered passphrase / password; it is NFKC-normalized
 /// internally before hashing.
 ///
 /// See `fula_crypto::effective_user_id::compute_effective_user_id_mode_b`
 /// for the full derivation specification.
-pub fn compute_effective_user_id_mode_b(
+pub async fn compute_effective_user_id_mode_b(
     provider: String,
     oauth_sub: String,
     seed: String,
@@ -368,11 +368,11 @@ pub fn compute_effective_user_id_mode_b(
 ///
 /// Returns a 16-byte identifier suitable as the JWT `sub` claim (after
 /// hex encoding). Two callers with the same seed produce the same
-/// id — by design (the seed IS the identity). High-entropy seeds make
+/// id â€” by design (the seed IS the identity). High-entropy seeds make
 /// accidental collisions infeasible.
 ///
 /// `seed` is NFKC-normalized internally before hashing.
-pub fn compute_effective_user_id_mode_c(seed: String) -> Vec<u8> {
+pub async fn compute_effective_user_id_mode_c(seed: String) -> Vec<u8> {
     fula_crypto::effective_user_id::compute_effective_user_id_mode_c(&seed).to_vec()
 }
 
@@ -388,7 +388,7 @@ pub fn compute_effective_user_id_mode_c(seed: String) -> Vec<u8> {
 /// Domain-separated from the `effective_user_id` derivations so the
 /// signing seed and the user-id are independent functions of the
 /// user's input.
-pub fn derive_signing_seed(seed: String) -> Vec<u8> {
+pub async fn derive_signing_seed(seed: String) -> Vec<u8> {
     fula_crypto::effective_user_id::derive_signing_seed_from_seed(&seed).to_vec()
 }
 

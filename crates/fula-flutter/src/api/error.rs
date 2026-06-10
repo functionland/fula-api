@@ -1,4 +1,4 @@
-//! Error types for Flutter bindings
+﻿//! Error types for Flutter bindings
 //!
 //! Provides a unified error type that maps from various internal error types
 //! and is suitable for FFI/flutter_rust_bridge serialization.
@@ -86,15 +86,15 @@ pub enum FulaError {
     #[error("Cache error: {0}")]
     CacheError(String),
 
-    /// Phase 3.3 — cold-start hybrid resolver could not resolve the
+    /// Phase 3.3 â€” cold-start hybrid resolver could not resolve the
     /// master-published global users-index CID via IPNS or chain.
     /// Surface to Dart apps as "offline mode unavailable for this
-    /// device until master is reachable again" — distinct from
+    /// device until master is reachable again" â€” distinct from
     /// `Network` (which is a transient master-side glitch).
     #[error("Users-index resolution failed: {0}")]
     UsersIndexResolutionFailed(String),
 
-    /// **#81 (2026-05-09)** — wire format version unsupported.
+    /// **#81 (2026-05-09)** â€” wire format version unsupported.
     /// Surfaced when the SDK encounters a postcard-encoded blob with
     /// an unknown enum variant tag (e.g. an old SDK reading a newer
     /// wire format the master upgraded to). Apps should display "this
@@ -109,7 +109,7 @@ pub enum FulaError {
         postcard_error: String,
     },
 
-    /// Phase 3.3 — replay defense: a payload's embedded sequence
+    /// Phase 3.3 â€” replay defense: a payload's embedded sequence
     /// regressed below what the SDK has seen before. Dart apps
     /// should NOT silently retry; surface as a clear "stale-state"
     /// signal (possibly with a retry-after-N-minutes hint).
@@ -184,14 +184,14 @@ impl From<fula_client::ClientError> for FulaError {
                 format!("migration lock held for bucket {} (expires at {} ms)", bucket, expires_at),
             ),
             // Phase 2.1 of master-independent reads: surface as a Network
-            // error to existing Flutter callers — the closest existing
+            // error to existing Flutter callers â€” the closest existing
             // category, since the master is effectively unreachable.
             // Phase 2.4 catches this variant earlier and falls back to the
             // gateway race before reaching this conversion.
             ClientError::MasterUnreachable { down_for_secs } => FulaError::Network(
                 format!("master unreachable (health gate; down for ~{}s)", down_for_secs),
             ),
-            // Phase 2.2 — block cache surface. Map to first-class
+            // Phase 2.2 â€” block cache surface. Map to first-class
             // FulaError variants so Dart code can pattern-match without
             // string parsing. Identical shape on every target (native +
             // wasm) so flutter-js / web builds compile against the same
@@ -207,13 +207,13 @@ impl From<fula_client::ClientError> for FulaError {
             ClientError::SequenceRegression { observed, highest_seen, channel } => {
                 FulaError::SequenceRegression { observed, highest_seen, channel }
             }
-            // #81 — propagate the typed variant so Dart code can
+            // #81 â€” propagate the typed variant so Dart code can
             // pattern-match on `FulaError::WireVersionUnsupported`
             // without parsing the generic `Encryption(...)` string.
             ClientError::WireVersionUnsupported { context, postcard_error } => {
                 FulaError::WireVersionUnsupported { context, postcard_error }
             }
-            // D6 (#102) — multipart 10000-part precondition. Surface as
+            // D6 (#102) â€” multipart 10000-part precondition. Surface as
             // a precondition-grade upload failure so Dart callers can
             // surface the operator-actionable suggestion (raise
             // `multipart_chunk_size`). Mapped to `UploadFailed` rather
@@ -229,7 +229,7 @@ impl From<fula_client::ClientError> for FulaError {
                  of {}; increase multipart_chunk_size to at least {} bytes",
                 computed_parts, max, suggested_chunk_size
             )),
-            // Issue #18 + #21 — cooperative cancellation from the chunked
+            // Issue #18 + #21 â€” cooperative cancellation from the chunked
             // resumable path. The typed FulaError::Cancelled variant lets
             // Dart callers pattern-match cleanly (user-cancel vs network-
             // failure) without substring parsing. The variant's `#[error]`
@@ -243,7 +243,7 @@ impl From<fula_client::ClientError> for FulaError {
 
 impl From<fula_crypto::CryptoError> for FulaError {
     fn from(err: fula_crypto::CryptoError) -> Self {
-        // #81 (2026-05-09) — preserve the typed variant when a raw
+        // #81 (2026-05-09) â€” preserve the typed variant when a raw
         // CryptoError is converted directly (bypassing the ClientError
         // route). Without this arm the variant gets flattened to
         // generic `Encryption(...)` and Dart pattern-match on
@@ -281,27 +281,27 @@ impl From<std::io::Error> for FulaError {
 
 impl FulaError {
     /// Check if this is a "not found" error
-    pub fn is_not_found(&self) -> bool {
+    pub async fn is_not_found(&self) -> bool {
         matches!(self, FulaError::NotFound { .. } | FulaError::BucketNotFound(_))
     }
 
     /// Check if this is an access denied error
-    pub fn is_access_denied(&self) -> bool {
+    pub async fn is_access_denied(&self) -> bool {
         matches!(self, FulaError::AccessDenied(_))
     }
 
     /// Check if this is a network error
-    pub fn is_network_error(&self) -> bool {
+    pub async fn is_network_error(&self) -> bool {
         matches!(self, FulaError::Network(_))
     }
 
     /// Check if this is an encryption error
-    pub fn is_encryption_error(&self) -> bool {
+    pub async fn is_encryption_error(&self) -> bool {
         matches!(self, FulaError::Encryption(_))
     }
 
     /// Get error code for categorization
-    pub fn error_code(&self) -> &'static str {
+    pub async fn error_code(&self) -> &'static str {
         match self {
             FulaError::Network(_) => "NETWORK",
             FulaError::NotFound { .. } => "NOT_FOUND",
@@ -322,7 +322,7 @@ impl FulaError {
             FulaError::SequenceRegression { .. } => "SEQUENCE_REGRESSION",
             FulaError::WireVersionUnsupported { .. } => "WIRE_VERSION_UNSUPPORTED",
             FulaError::Internal(_) => "INTERNAL",
-            // Issue #21 — typed cancellation. The category string is
+            // Issue #21 â€” typed cancellation. The category string is
             // stable so any Dart code matching on category strings sees
             // a clean "CANCELLED" instead of "UPLOAD_FAILED".
             FulaError::Cancelled => "CANCELLED",
@@ -332,15 +332,15 @@ impl FulaError {
     /// Phase 2.2 helper: detect block-cache-related errors so app code
     /// can offer a "retry without cache" or "raise budget" prompt
     /// without string-parsing the underlying message.
-    pub fn is_cache_error(&self) -> bool {
+    pub async fn is_cache_error(&self) -> bool {
         matches!(self, FulaError::CacheBudgetExceeded { .. } | FulaError::CacheError(_))
     }
 
     /// Phase 3.3 helper: detect cold-start resolution errors. Apps
     /// should surface this as "offline mode unavailable" instead of
-    /// a generic "download failed" — the file is fine; we just can't
+    /// a generic "download failed" â€” the file is fine; we just can't
     /// learn its CID without master.
-    pub fn is_users_index_error(&self) -> bool {
+    pub async fn is_users_index_error(&self) -> bool {
         matches!(
             self,
             FulaError::UsersIndexResolutionFailed(_) | FulaError::SequenceRegression { .. }

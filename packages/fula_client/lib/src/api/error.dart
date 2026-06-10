@@ -61,8 +61,66 @@ sealed class FulaError with _$FulaError {
   /// Forest/index error
   const factory FulaError.forestError(String field0) = FulaError_ForestError;
 
+  /// Phase 2.2 of master-independent reads: a single block exceeds
+  /// the configured `block_cache_max_bytes` budget. Surface to the
+  /// user with guidance to raise the cache size or skip the cache.
+  /// Native-only signal in practice (BlockCache is compiled out on
+  /// wasm32) but defined unconditionally so the Dart binding always
+  /// has the same enum shape across Android, iOS, Ubuntu, Windows,
+  /// and web (flutter-js + wasm).
+  const factory FulaError.cacheBudgetExceeded({
+    required BigInt size,
+    required BigInt budget,
+  }) = FulaError_CacheBudgetExceeded;
+
+  /// Phase 2.2 of master-independent reads: catch-all for the
+  /// persistent block cache's I/O / storage / commit errors.
+  /// Stringified at the FFI boundary; Dart code doesn't depend on
+  /// any Rust storage-engine specifics. Native-only in practice.
+  const factory FulaError.cacheError(String field0) = FulaError_CacheError;
+
+  /// Phase 3.3 â€” cold-start hybrid resolver could not resolve the
+  /// master-published global users-index CID via IPNS or chain.
+  /// Surface to Dart apps as "offline mode unavailable for this
+  /// device until master is reachable again" â€” distinct from
+  /// `Network` (which is a transient master-side glitch).
+  const factory FulaError.usersIndexResolutionFailed(String field0) =
+      FulaError_UsersIndexResolutionFailed;
+
+  /// **#81 (2026-05-09)** â€” wire format version unsupported.
+  /// Surfaced when the SDK encounters a postcard-encoded blob with
+  /// an unknown enum variant tag (e.g. an old SDK reading a newer
+  /// wire format the master upgraded to). Apps should display "this
+  /// bucket requires FxFiles vX.Y or later" to the user. The bucket
+  /// data itself is intact; the SDK just can't decode the new wire
+  /// format. Defined unconditionally so the Dart binding has the
+  /// same enum shape across native (Android, iOS, desktop) and wasm
+  /// (web).
+  const factory FulaError.wireVersionUnsupported({
+    required String context,
+    required String postcardError,
+  }) = FulaError_WireVersionUnsupported;
+
+  /// Phase 3.3 â€” replay defense: a payload's embedded sequence
+  /// regressed below what the SDK has seen before. Dart apps
+  /// should NOT silently retry; surface as a clear "stale-state"
+  /// signal (possibly with a retry-after-N-minutes hint).
+  const factory FulaError.sequenceRegression({
+    required BigInt observed,
+    required BigInt highestSeen,
+    required String channel,
+  }) = FulaError_SequenceRegression;
+
   /// Internal error
   const factory FulaError.internal(String field0) = FulaError_Internal;
+
+  /// Upload cancelled cooperatively by the caller via a CancelHandle
+  /// trigger (issue #18). Display string is intentionally preserved
+  /// at `"upload cancelled by caller"` so any Dart code written
+  /// against the pre-#21 substring-match contract continues to work
+  /// after the variant promotion. New code should pattern-match the
+  /// typed variant directly.
+  const factory FulaError.cancelled() = FulaError_Cancelled;
 
   /// Get error code for categorization
   Future<void> errorCode() =>
@@ -71,6 +129,12 @@ sealed class FulaError with _$FulaError {
   /// Check if this is an access denied error
   Future<bool> isAccessDenied() =>
       RustLib.instance.api.crateApiErrorFulaErrorIsAccessDenied(that: this);
+
+  /// Phase 2.2 helper: detect block-cache-related errors so app code
+  /// can offer a "retry without cache" or "raise budget" prompt
+  /// without string-parsing the underlying message.
+  Future<bool> isCacheError() =>
+      RustLib.instance.api.crateApiErrorFulaErrorIsCacheError(that: this);
 
   /// Check if this is an encryption error
   Future<bool> isEncryptionError() =>
@@ -83,4 +147,11 @@ sealed class FulaError with _$FulaError {
   /// Check if this is a "not found" error
   Future<bool> isNotFound() =>
       RustLib.instance.api.crateApiErrorFulaErrorIsNotFound(that: this);
+
+  /// Phase 3.3 helper: detect cold-start resolution errors. Apps
+  /// should surface this as "offline mode unavailable" instead of
+  /// a generic "download failed" â€” the file is fine; we just can't
+  /// learn its CID without master.
+  Future<bool> isUsersIndexError() =>
+      RustLib.instance.api.crateApiErrorFulaErrorIsUsersIndexError(that: this);
 }

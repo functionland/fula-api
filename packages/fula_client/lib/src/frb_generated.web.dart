@@ -34,6 +34,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle;
 
   CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_CancelHandlePtr => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle;
+
+  CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_EncryptedClientHandlePtr => wire
       .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle;
 
@@ -55,6 +59,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   AcceptedShareHandle
   dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    dynamic raw,
+  );
+
+  @protected
+  CancelHandle
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
     dynamic raw,
   );
 
@@ -89,6 +99,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  CancelHandle
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    dynamic raw,
+  );
+
+  @protected
   EncryptedClientHandle
   dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     dynamic raw,
@@ -115,6 +131,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   AcceptedShareHandle
   dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    dynamic raw,
+  );
+
+  @protected
+  CancelHandle
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
     dynamic raw,
   );
 
@@ -164,6 +186,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ListOptions dco_decode_box_autoadd_list_options(dynamic raw);
 
   @protected
+  MasterHealthEvent dco_decode_box_autoadd_master_health_event(dynamic raw);
+
+  @protected
   ObjectMetadata dco_decode_box_autoadd_object_metadata(dynamic raw);
 
   @protected
@@ -209,6 +234,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   FulaError dco_decode_fula_error(dynamic raw);
 
   @protected
+  FulaReadFreshness dco_decode_fula_read_freshness(dynamic raw);
+
+  @protected
+  FulaReadSource dco_decode_fula_read_source(dynamic raw);
+
+  @protected
   GetObjectResult dco_decode_get_object_result(dynamic raw);
 
   @protected
@@ -233,6 +264,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<FileMetadata> dco_decode_list_file_metadata(dynamic raw);
 
   @protected
+  List<MasterHealthEvent> dco_decode_list_master_health_event(dynamic raw);
+
+  @protected
   List<MetadataEntry> dco_decode_list_metadata_entry(dynamic raw);
 
   @protected
@@ -254,6 +288,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<RotationFailure> dco_decode_list_rotation_failure(dynamic raw);
 
   @protected
+  MasterHealthEvent dco_decode_master_health_event(dynamic raw);
+
+  @protected
   MetadataEntry dco_decode_metadata_entry(dynamic raw);
 
   @protected
@@ -266,10 +303,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ObjectMetadata dco_decode_object_metadata(dynamic raw);
 
   @protected
+  OfflineGetResult dco_decode_offline_get_result(dynamic raw);
+
+  @protected
   String? dco_decode_opt_String(dynamic raw);
 
   @protected
   PlatformInt64? dco_decode_opt_box_autoadd_i_64(dynamic raw);
+
+  @protected
+  MasterHealthEvent? dco_decode_opt_box_autoadd_master_health_event(
+    dynamic raw,
+  );
 
   @protected
   int? dco_decode_opt_box_autoadd_u_32(dynamic raw);
@@ -323,6 +368,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  CancelHandle
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   EncryptedClientHandle
   sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     SseDeserializer deserializer,
@@ -353,6 +404,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  CancelHandle
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   EncryptedClientHandle
   sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     SseDeserializer deserializer,
@@ -379,6 +436,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   AcceptedShareHandle
   sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CancelHandle
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
     SseDeserializer deserializer,
   );
 
@@ -428,6 +491,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ListOptions sse_decode_box_autoadd_list_options(SseDeserializer deserializer);
+
+  @protected
+  MasterHealthEvent sse_decode_box_autoadd_master_health_event(
+    SseDeserializer deserializer,
+  );
 
   @protected
   ObjectMetadata sse_decode_box_autoadd_object_metadata(
@@ -483,6 +551,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   FulaError sse_decode_fula_error(SseDeserializer deserializer);
 
   @protected
+  FulaReadFreshness sse_decode_fula_read_freshness(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  FulaReadSource sse_decode_fula_read_source(SseDeserializer deserializer);
+
+  @protected
   GetObjectResult sse_decode_get_object_result(SseDeserializer deserializer);
 
   @protected
@@ -507,6 +583,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<FileMetadata> sse_decode_list_file_metadata(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<MasterHealthEvent> sse_decode_list_master_health_event(
     SseDeserializer deserializer,
   );
 
@@ -538,6 +619,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  MasterHealthEvent sse_decode_master_health_event(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   MetadataEntry sse_decode_metadata_entry(SseDeserializer deserializer);
 
   @protected
@@ -550,10 +636,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ObjectMetadata sse_decode_object_metadata(SseDeserializer deserializer);
 
   @protected
+  OfflineGetResult sse_decode_offline_get_result(SseDeserializer deserializer);
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
 
   @protected
   PlatformInt64? sse_decode_opt_box_autoadd_i_64(SseDeserializer deserializer);
+
+  @protected
+  MasterHealthEvent? sse_decode_opt_box_autoadd_master_health_event(
+    SseDeserializer deserializer,
+  );
 
   @protected
   int? sse_decode_opt_box_autoadd_u_32(SseDeserializer deserializer);
@@ -637,6 +731,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   JSAny cst_encode_box_autoadd_list_options(ListOptions raw) {
     // Codec=Cst (C-struct based), see doc to use other codecs
     return cst_encode_list_options(raw);
+  }
+
+  @protected
+  JSAny cst_encode_box_autoadd_master_health_event(MasterHealthEvent raw) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    return cst_encode_master_health_event(raw);
   }
 
   @protected
@@ -753,6 +853,23 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       cst_encode_u_32(raw.maxRetries),
       cst_encode_u_64(raw.perChunkDownloadTimeoutSeconds),
       cst_encode_u_64(raw.bufferedDownloadMaxBytes),
+      cst_encode_bool(raw.healthGateEnabled),
+      cst_encode_u_64(raw.healthGateTtlSeconds),
+      cst_encode_bool(raw.blockCacheEnabled),
+      cst_encode_String(raw.blockCachePath),
+      cst_encode_u_64(raw.blockCacheMaxBytes),
+      cst_encode_bool(raw.gatewayFallbackEnabled),
+      cst_encode_list_String(raw.gatewayFallbackUrls),
+      cst_encode_u_32(raw.gatewayRaceConcurrency),
+      cst_encode_String(raw.usersIndexChainRpcUrl),
+      cst_encode_String(raw.usersIndexAnchorAddress),
+      cst_encode_String(raw.usersIndexIpnsName),
+      cst_encode_String(raw.usersIndexUserKey),
+      cst_encode_list_String(raw.usersIndexIpnsGatewayUrls),
+      cst_encode_list_String(raw.usersIndexIpfsGatewayUrls),
+      cst_encode_bool(raw.walkableV8WriterEnabled),
+      cst_encode_list_prim_u_8_strict(raw.encryptedUserBucketsIndexKey),
+      cst_encode_list_prim_u_8_strict(raw.userEntrySigningSeed),
     ].jsify()!;
   }
 
@@ -802,8 +919,74 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     if (raw is FulaError_ForestError) {
       return [12, cst_encode_String(raw.field0)].jsify()!;
     }
+    if (raw is FulaError_CacheBudgetExceeded) {
+      return [
+        13,
+        cst_encode_u_64(raw.size),
+        cst_encode_u_64(raw.budget),
+      ].jsify()!;
+    }
+    if (raw is FulaError_CacheError) {
+      return [14, cst_encode_String(raw.field0)].jsify()!;
+    }
+    if (raw is FulaError_UsersIndexResolutionFailed) {
+      return [15, cst_encode_String(raw.field0)].jsify()!;
+    }
+    if (raw is FulaError_WireVersionUnsupported) {
+      return [
+        16,
+        cst_encode_String(raw.context),
+        cst_encode_String(raw.postcardError),
+      ].jsify()!;
+    }
+    if (raw is FulaError_SequenceRegression) {
+      return [
+        17,
+        cst_encode_u_64(raw.observed),
+        cst_encode_u_64(raw.highestSeen),
+        cst_encode_String(raw.channel),
+      ].jsify()!;
+    }
     if (raw is FulaError_Internal) {
-      return [13, cst_encode_String(raw.field0)].jsify()!;
+      return [18, cst_encode_String(raw.field0)].jsify()!;
+    }
+    if (raw is FulaError_Cancelled) {
+      return [19].jsify()!;
+    }
+
+    throw Exception('unreachable');
+  }
+
+  @protected
+  JSAny cst_encode_fula_read_freshness(FulaReadFreshness raw) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    if (raw is FulaReadFreshness_Live) {
+      return [0].jsify()!;
+    }
+    if (raw is FulaReadFreshness_Cached) {
+      return [1, cst_encode_u_64(raw.observedAt)].jsify()!;
+    }
+    if (raw is FulaReadFreshness_StaleByDesign) {
+      return [2, cst_encode_u_64(raw.snapshotAgeSecs)].jsify()!;
+    }
+    if (raw is FulaReadFreshness_StaleByOutage) {
+      return [3, cst_encode_u_64(raw.snapshotAgeSecs)].jsify()!;
+    }
+
+    throw Exception('unreachable');
+  }
+
+  @protected
+  JSAny cst_encode_fula_read_source(FulaReadSource raw) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    if (raw is FulaReadSource_Master) {
+      return [0].jsify()!;
+    }
+    if (raw is FulaReadSource_LocalCache) {
+      return [1].jsify()!;
+    }
+    if (raw is FulaReadSource_Gateway) {
+      return [2, cst_encode_String(raw.field0)].jsify()!;
     }
 
     throw Exception('unreachable');
@@ -865,6 +1048,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   }
 
   @protected
+  JSAny cst_encode_list_master_health_event(List<MasterHealthEvent> raw) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    return raw.map(cst_encode_master_health_event).toList().jsify()!;
+  }
+
+  @protected
   JSAny cst_encode_list_metadata_entry(List<MetadataEntry> raw) {
     // Codec=Cst (C-struct based), see doc to use other codecs
     return raw.map(cst_encode_metadata_entry).toList().jsify()!;
@@ -917,6 +1106,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   }
 
   @protected
+  JSAny cst_encode_master_health_event(MasterHealthEvent raw) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    if (raw is MasterHealthEvent_Online) {
+      return [0].jsify()!;
+    }
+    if (raw is MasterHealthEvent_OfflineFallbackActive) {
+      return [1, cst_encode_String(raw.reason)].jsify()!;
+    }
+    if (raw is MasterHealthEvent_SeverelyDegraded) {
+      return [2, cst_encode_String(raw.reason)].jsify()!;
+    }
+
+    throw Exception('unreachable');
+  }
+
+  @protected
   JSAny cst_encode_metadata_entry(MetadataEntry raw) {
     // Codec=Cst (C-struct based), see doc to use other codecs
     return [cst_encode_String(raw.key), cst_encode_String(raw.value)].jsify()!;
@@ -945,6 +1150,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   }
 
   @protected
+  JSAny cst_encode_offline_get_result(OfflineGetResult raw) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    return [
+      cst_encode_get_object_result(raw.inner),
+      cst_encode_fula_read_source(raw.source),
+      cst_encode_fula_read_freshness(raw.freshness),
+    ].jsify()!;
+  }
+
+  @protected
   String? cst_encode_opt_String(String? raw) {
     // Codec=Cst (C-struct based), see doc to use other codecs
     return raw == null ? null : cst_encode_String(raw);
@@ -954,6 +1169,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   JSAny? cst_encode_opt_box_autoadd_i_64(PlatformInt64? raw) {
     // Codec=Cst (C-struct based), see doc to use other codecs
     return raw == null ? null : cst_encode_box_autoadd_i_64(raw);
+  }
+
+  @protected
+  JSAny? cst_encode_opt_box_autoadd_master_health_event(
+    MasterHealthEvent? raw,
+  ) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    return raw == null ? null : cst_encode_box_autoadd_master_health_event(raw);
   }
 
   @protected
@@ -1049,6 +1272,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle raw,
+  );
+
+  @protected
+  int
   cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     EncryptedClientHandle raw,
   );
@@ -1079,6 +1308,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle raw,
+  );
+
+  @protected
+  int
   cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     EncryptedClientHandle raw,
   );
@@ -1105,6 +1340,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   int
   cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
     AcceptedShareHandle raw,
+  );
+
+  @protected
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle raw,
   );
 
   @protected
@@ -1170,6 +1411,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
   sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     EncryptedClientHandle self,
     SseSerializer serializer,
@@ -1205,6 +1453,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
   sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     EncryptedClientHandle self,
     SseSerializer serializer,
@@ -1235,6 +1490,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void
   sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
     AcceptedShareHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle self,
     SseSerializer serializer,
   );
 
@@ -1299,6 +1561,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_list_options(
     ListOptions self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_master_health_event(
+    MasterHealthEvent self,
     SseSerializer serializer,
   );
 
@@ -1369,6 +1637,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_fula_error(FulaError self, SseSerializer serializer);
 
   @protected
+  void sse_encode_fula_read_freshness(
+    FulaReadFreshness self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_fula_read_source(
+    FulaReadSource self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_get_object_result(
     GetObjectResult self,
     SseSerializer serializer,
@@ -1401,6 +1681,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_list_file_metadata(
     List<FileMetadata> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_master_health_event(
+    List<MasterHealthEvent> self,
     SseSerializer serializer,
   );
 
@@ -1441,6 +1727,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_master_health_event(
+    MasterHealthEvent self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_metadata_entry(MetadataEntry self, SseSerializer serializer);
 
   @protected
@@ -1459,11 +1751,23 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_offline_get_result(
+    OfflineGetResult self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
 
   @protected
   void sse_encode_opt_box_autoadd_i_64(
     PlatformInt64? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_master_health_event(
+    MasterHealthEvent? self,
     SseSerializer serializer,
   );
 
@@ -1535,6 +1839,16 @@ class RustLibWire implements BaseWire {
     int handle,
   ) => wasmModule.wire__crate__api__multipart__abort_multipart(port_, handle);
 
+  void wire__crate__api__forest__abort_resumable_upload(
+    NativePortType port_,
+    int client,
+    String manifest_path,
+  ) => wasmModule.wire__crate__api__forest__abort_resumable_upload(
+    port_,
+    client,
+    manifest_path,
+  );
+
   void wire__crate__api__sharing__accept_share(
     NativePortType port_,
     int client,
@@ -1545,17 +1859,61 @@ class RustLibWire implements BaseWire {
     token_json,
   );
 
+  void wire__crate__api__encrypted__blake3_derive_key(
+    NativePortType port_,
+    String context,
+    JSAny input,
+  ) => wasmModule.wire__crate__api__encrypted__blake3_derive_key(
+    port_,
+    context,
+    input,
+  );
+
   void wire__crate__api__client__bucket_exists(
     NativePortType port_,
     int client,
     String name,
   ) => wasmModule.wire__crate__api__client__bucket_exists(port_, client, name);
 
+  void wire__crate__api__forest__cancel_handle_is_cancelled(
+    NativePortType port_,
+    int handle,
+  ) => wasmModule.wire__crate__api__forest__cancel_handle_is_cancelled(
+    port_,
+    handle,
+  );
+
+  void wire__crate__api__forest__cancel_handle_trigger(
+    NativePortType port_,
+    int handle,
+  ) =>
+      wasmModule.wire__crate__api__forest__cancel_handle_trigger(port_, handle);
+
   void wire__crate__api__multipart__complete_multipart(
     NativePortType port_,
     int handle,
   ) =>
       wasmModule.wire__crate__api__multipart__complete_multipart(port_, handle);
+
+  void wire__crate__api__encrypted__compute_effective_user_id_mode_b(
+    NativePortType port_,
+    String provider,
+    String oauth_sub,
+    String seed,
+  ) => wasmModule.wire__crate__api__encrypted__compute_effective_user_id_mode_b(
+    port_,
+    provider,
+    oauth_sub,
+    seed,
+  );
+
+  void wire__crate__api__encrypted__compute_effective_user_id_mode_c(
+    NativePortType port_,
+    String seed,
+  ) => wasmModule.wire__crate__api__encrypted__compute_effective_user_id_mode_c(
+    port_,
+    seed,
+  );
 
   void wire__crate__api__client__copy_object(
     NativePortType port_,
@@ -1578,6 +1936,9 @@ class RustLibWire implements BaseWire {
     int client,
     String name,
   ) => wasmModule.wire__crate__api__client__create_bucket(port_, client, name);
+
+  void wire__crate__api__forest__create_cancel_handle(NativePortType port_) =>
+      wasmModule.wire__crate__api__forest__create_cancel_handle(port_);
 
   void wire__crate__api__client__create_client(
     NativePortType port_,
@@ -1710,6 +2071,18 @@ class RustLibWire implements BaseWire {
   ) =>
       wasmModule.wire__crate__api__encrypted__derive_key(port_, context, input);
 
+  void wire__crate__api__encrypted__derive_key_with_salt(
+    NativePortType port_,
+    String context,
+    JSAny input,
+    JSAny salt,
+  ) => wasmModule.wire__crate__api__encrypted__derive_key_with_salt(
+    port_,
+    context,
+    input,
+    salt,
+  );
+
   void wire__crate__api__encrypted__derive_public_key_from_secret(
     NativePortType port_,
     JSAny secret_key_bytes,
@@ -1717,6 +2090,32 @@ class RustLibWire implements BaseWire {
     port_,
     secret_key_bytes,
   );
+
+  void wire__crate__api__encrypted__derive_signing_seed(
+    NativePortType port_,
+    String seed,
+  ) => wasmModule.wire__crate__api__encrypted__derive_signing_seed(port_, seed);
+
+  void wire__crate__api__client__derive_user_key_from_email(
+    NativePortType port_,
+    String email,
+  ) => wasmModule.wire__crate__api__client__derive_user_key_from_email(
+    port_,
+    email,
+  );
+
+  void wire__crate__api__client__derive_user_key_from_jwt_sub(
+    NativePortType port_,
+    String jwt_sub,
+  ) => wasmModule.wire__crate__api__client__derive_user_key_from_jwt_sub(
+    port_,
+    jwt_sub,
+  );
+
+  void wire__crate__api__multipart__detach_multipart(
+    NativePortType port_,
+    int handle,
+  ) => wasmModule.wire__crate__api__multipart__detach_multipart(port_, handle);
 
   void wire__crate__api__encrypted__enc_create_bucket(
     NativePortType port_,
@@ -1752,6 +2151,9 @@ class RustLibWire implements BaseWire {
     int client,
   ) => wasmModule.wire__crate__api__encrypted__export_secret_key(port_, client);
 
+  void wire__crate__api__metrics__flush_backoff_count(NativePortType port_) =>
+      wasmModule.wire__crate__api__metrics__flush_backoff_count(port_);
+
   void wire__crate__api__forest__flush_forest(
     NativePortType port_,
     int client,
@@ -1770,6 +2172,14 @@ class RustLibWire implements BaseWire {
     NativePortType port_,
     JSAny that,
   ) => wasmModule.wire__crate__api__error__fula_error_is_access_denied(
+    port_,
+    that,
+  );
+
+  void wire__crate__api__error__fula_error_is_cache_error(
+    NativePortType port_,
+    JSAny that,
+  ) => wasmModule.wire__crate__api__error__fula_error_is_cache_error(
     port_,
     that,
   );
@@ -1794,6 +2204,14 @@ class RustLibWire implements BaseWire {
     NativePortType port_,
     JSAny that,
   ) => wasmModule.wire__crate__api__error__fula_error_is_not_found(port_, that);
+
+  void wire__crate__api__error__fula_error_is_users_index_error(
+    NativePortType port_,
+    JSAny that,
+  ) => wasmModule.wire__crate__api__error__fula_error_is_users_index_error(
+    port_,
+    that,
+  );
 
   void wire__crate__api__chunked__get_chunked(
     NativePortType port_,
@@ -1864,6 +2282,11 @@ class RustLibWire implements BaseWire {
     storage_key,
   );
 
+  void wire__crate__api__forest__get_file_size(
+    NativePortType port_,
+    String file_path,
+  ) => wasmModule.wire__crate__api__forest__get_file_size(port_, file_path);
+
   void wire__crate__api__forest__get_flat(
     NativePortType port_,
     int client,
@@ -1900,6 +2323,23 @@ class RustLibWire implements BaseWire {
     storage_key,
   );
 
+  void wire__crate__api__client__get_last_master_health_event(
+    NativePortType port_,
+    int client,
+  ) => wasmModule.wire__crate__api__client__get_last_master_health_event(
+    port_,
+    client,
+  );
+
+  void wire__crate__api__client__get_last_master_health_event_encrypted(
+    NativePortType port_,
+    int client,
+  ) => wasmModule
+      .wire__crate__api__client__get_last_master_health_event_encrypted(
+        port_,
+        client,
+      );
+
   void wire__crate__api__client__get_object(
     NativePortType port_,
     int client,
@@ -1918,6 +2358,18 @@ class RustLibWire implements BaseWire {
     String bucket,
     String key,
   ) => wasmModule.wire__crate__api__client__get_object_with_metadata(
+    port_,
+    client,
+    bucket,
+    key,
+  );
+
+  void wire__crate__api__client__get_object_with_offline_fallback(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  ) => wasmModule.wire__crate__api__client__get_object_with_offline_fallback(
     port_,
     client,
     bucket,
@@ -2123,6 +2575,22 @@ class RustLibWire implements BaseWire {
   void wire__crate__api__types__object_metadata_default(NativePortType port_) =>
       wasmModule.wire__crate__api__types__object_metadata_default(port_);
 
+  void wire__crate__api__client__poll_master_health_events(
+    NativePortType port_,
+    int client,
+  ) => wasmModule.wire__crate__api__client__poll_master_health_events(
+    port_,
+    client,
+  );
+
+  void wire__crate__api__client__poll_master_health_events_encrypted(
+    NativePortType port_,
+    int client,
+  ) => wasmModule.wire__crate__api__client__poll_master_health_events_encrypted(
+    port_,
+    client,
+  );
+
   void wire__crate__api__chunked__put_chunked(
     NativePortType port_,
     int client,
@@ -2201,6 +2669,77 @@ class RustLibWire implements BaseWire {
     content_type,
   );
 
+  void wire__crate__api__forest__put_flat_from_path(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    String file_path,
+    String? content_type,
+  ) => wasmModule.wire__crate__api__forest__put_flat_from_path(
+    port_,
+    client,
+    bucket,
+    path,
+    file_path,
+    content_type,
+  );
+
+  void wire__crate__api__forest__put_flat_from_path_deferred(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    String file_path,
+    String? content_type,
+  ) => wasmModule.wire__crate__api__forest__put_flat_from_path_deferred(
+    port_,
+    client,
+    bucket,
+    path,
+    file_path,
+    content_type,
+  );
+
+  void wire__crate__api__forest__put_flat_resumable_from_path(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    String file_path,
+    String manifest_path,
+    String? content_type,
+  ) => wasmModule.wire__crate__api__forest__put_flat_resumable_from_path(
+    port_,
+    client,
+    bucket,
+    path,
+    file_path,
+    manifest_path,
+    content_type,
+  );
+
+  void wire__crate__api__forest__put_flat_resumable_from_path_cancellable(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    String file_path,
+    String manifest_path,
+    String? content_type,
+    int cancel,
+  ) => wasmModule
+      .wire__crate__api__forest__put_flat_resumable_from_path_cancellable(
+        port_,
+        client,
+        bucket,
+        path,
+        file_path,
+        manifest_path,
+        content_type,
+        cancel,
+      );
+
   void wire__crate__api__client__put_object(
     NativePortType port_,
     int client,
@@ -2230,6 +2769,33 @@ class RustLibWire implements BaseWire {
     data,
     metadata,
   );
+
+  void wire__crate__api__forest__resume_flat_upload_from_path(
+    NativePortType port_,
+    int client,
+    String manifest_path,
+    String file_path,
+  ) => wasmModule.wire__crate__api__forest__resume_flat_upload_from_path(
+    port_,
+    client,
+    manifest_path,
+    file_path,
+  );
+
+  void wire__crate__api__forest__resume_flat_upload_from_path_cancellable(
+    NativePortType port_,
+    int client,
+    String manifest_path,
+    String file_path,
+    int cancel,
+  ) => wasmModule
+      .wire__crate__api__forest__resume_flat_upload_from_path_cancellable(
+        port_,
+        client,
+        manifest_path,
+        file_path,
+        cancel,
+      );
 
   void wire__crate__api__rotation__rewrap_object(
     NativePortType port_,
@@ -2296,6 +2862,20 @@ class RustLibWire implements BaseWire {
     key,
   );
 
+  void wire__crate__api__multipart__start_multipart_with_concurrency(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    int max_concurrency,
+  ) => wasmModule.wire__crate__api__multipart__start_multipart_with_concurrency(
+    port_,
+    client,
+    bucket,
+    key,
+    max_concurrency,
+  );
+
   void wire__crate__api__multipart__upload_large_file_simple(
     NativePortType port_,
     int client,
@@ -2342,6 +2922,10 @@ class RustLibWire implements BaseWire {
     NativePortType port_,
   ) => wasmModule.wire__crate__api__metrics__wal_append_failure_count(port_);
 
+  void wire__crate__api__metrics__wal_truncated_groups_count(
+    NativePortType port_,
+  ) => wasmModule.wire__crate__api__metrics__wal_truncated_groups_count(port_);
+
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
     int ptr,
@@ -2355,6 +2939,22 @@ class RustLibWire implements BaseWire {
     int ptr,
   ) => wasmModule
       .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+        ptr,
+      );
+
+  void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+        ptr,
+      );
+
+  void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
         ptr,
       );
 
@@ -2434,10 +3034,22 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     int handle,
   );
 
+  external void wire__crate__api__forest__abort_resumable_upload(
+    NativePortType port_,
+    int client,
+    String manifest_path,
+  );
+
   external void wire__crate__api__sharing__accept_share(
     NativePortType port_,
     int client,
     String token_json,
+  );
+
+  external void wire__crate__api__encrypted__blake3_derive_key(
+    NativePortType port_,
+    String context,
+    JSAny input,
   );
 
   external void wire__crate__api__client__bucket_exists(
@@ -2446,9 +3058,31 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     String name,
   );
 
+  external void wire__crate__api__forest__cancel_handle_is_cancelled(
+    NativePortType port_,
+    int handle,
+  );
+
+  external void wire__crate__api__forest__cancel_handle_trigger(
+    NativePortType port_,
+    int handle,
+  );
+
   external void wire__crate__api__multipart__complete_multipart(
     NativePortType port_,
     int handle,
+  );
+
+  external void wire__crate__api__encrypted__compute_effective_user_id_mode_b(
+    NativePortType port_,
+    String provider,
+    String oauth_sub,
+    String seed,
+  );
+
+  external void wire__crate__api__encrypted__compute_effective_user_id_mode_c(
+    NativePortType port_,
+    String seed,
   );
 
   external void wire__crate__api__client__copy_object(
@@ -2464,6 +3098,10 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     NativePortType port_,
     int client,
     String name,
+  );
+
+  external void wire__crate__api__forest__create_cancel_handle(
+    NativePortType port_,
   );
 
   external void wire__crate__api__client__create_client(
@@ -2548,9 +3186,36 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     JSAny input,
   );
 
+  external void wire__crate__api__encrypted__derive_key_with_salt(
+    NativePortType port_,
+    String context,
+    JSAny input,
+    JSAny salt,
+  );
+
   external void wire__crate__api__encrypted__derive_public_key_from_secret(
     NativePortType port_,
     JSAny secret_key_bytes,
+  );
+
+  external void wire__crate__api__encrypted__derive_signing_seed(
+    NativePortType port_,
+    String seed,
+  );
+
+  external void wire__crate__api__client__derive_user_key_from_email(
+    NativePortType port_,
+    String email,
+  );
+
+  external void wire__crate__api__client__derive_user_key_from_jwt_sub(
+    NativePortType port_,
+    String jwt_sub,
+  );
+
+  external void wire__crate__api__multipart__detach_multipart(
+    NativePortType port_,
+    int handle,
   );
 
   external void wire__crate__api__encrypted__enc_create_bucket(
@@ -2579,6 +3244,10 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     int client,
   );
 
+  external void wire__crate__api__metrics__flush_backoff_count(
+    NativePortType port_,
+  );
+
   external void wire__crate__api__forest__flush_forest(
     NativePortType port_,
     int client,
@@ -2599,6 +3268,11 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     JSAny that,
   );
 
+  external void wire__crate__api__error__fula_error_is_cache_error(
+    NativePortType port_,
+    JSAny that,
+  );
+
   external void wire__crate__api__error__fula_error_is_encryption_error(
     NativePortType port_,
     JSAny that,
@@ -2610,6 +3284,11 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
   );
 
   external void wire__crate__api__error__fula_error_is_not_found(
+    NativePortType port_,
+    JSAny that,
+  );
+
+  external void wire__crate__api__error__fula_error_is_users_index_error(
     NativePortType port_,
     JSAny that,
   );
@@ -2655,6 +3334,11 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     String storage_key,
   );
 
+  external void wire__crate__api__forest__get_file_size(
+    NativePortType port_,
+    String file_path,
+  );
+
   external void wire__crate__api__forest__get_flat(
     NativePortType port_,
     int client,
@@ -2676,6 +3360,17 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     String storage_key,
   );
 
+  external void wire__crate__api__client__get_last_master_health_event(
+    NativePortType port_,
+    int client,
+  );
+
+  external void
+  wire__crate__api__client__get_last_master_health_event_encrypted(
+    NativePortType port_,
+    int client,
+  );
+
   external void wire__crate__api__client__get_object(
     NativePortType port_,
     int client,
@@ -2684,6 +3379,13 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
   );
 
   external void wire__crate__api__client__get_object_with_metadata(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+  );
+
+  external void wire__crate__api__client__get_object_with_offline_fallback(
     NativePortType port_,
     int client,
     String bucket,
@@ -2826,6 +3528,16 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     NativePortType port_,
   );
 
+  external void wire__crate__api__client__poll_master_health_events(
+    NativePortType port_,
+    int client,
+  );
+
+  external void wire__crate__api__client__poll_master_health_events_encrypted(
+    NativePortType port_,
+    int client,
+  );
+
   external void wire__crate__api__chunked__put_chunked(
     NativePortType port_,
     int client,
@@ -2870,6 +3582,46 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     String? content_type,
   );
 
+  external void wire__crate__api__forest__put_flat_from_path(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    String file_path,
+    String? content_type,
+  );
+
+  external void wire__crate__api__forest__put_flat_from_path_deferred(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    String file_path,
+    String? content_type,
+  );
+
+  external void wire__crate__api__forest__put_flat_resumable_from_path(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    String file_path,
+    String manifest_path,
+    String? content_type,
+  );
+
+  external void
+  wire__crate__api__forest__put_flat_resumable_from_path_cancellable(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    String file_path,
+    String manifest_path,
+    String? content_type,
+    int cancel,
+  );
+
   external void wire__crate__api__client__put_object(
     NativePortType port_,
     int client,
@@ -2885,6 +3637,22 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     String key,
     JSAny data,
     JSAny metadata,
+  );
+
+  external void wire__crate__api__forest__resume_flat_upload_from_path(
+    NativePortType port_,
+    int client,
+    String manifest_path,
+    String file_path,
+  );
+
+  external void
+  wire__crate__api__forest__resume_flat_upload_from_path_cancellable(
+    NativePortType port_,
+    int client,
+    String manifest_path,
+    String file_path,
+    int cancel,
   );
 
   external void wire__crate__api__rotation__rewrap_object(
@@ -2930,6 +3698,14 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     String key,
   );
 
+  external void wire__crate__api__multipart__start_multipart_with_concurrency(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    int max_concurrency,
+  );
+
   external void wire__crate__api__multipart__upload_large_file_simple(
     NativePortType port_,
     int client,
@@ -2958,6 +3734,10 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     NativePortType port_,
   );
 
+  external void wire__crate__api__metrics__wal_truncated_groups_count(
+    NativePortType port_,
+  );
+
   external void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
     int ptr,
@@ -2965,6 +3745,16 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
 
   external void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    int ptr,
+  );
+
+  external void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    int ptr,
+  );
+
+  external void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
     int ptr,
   );
 

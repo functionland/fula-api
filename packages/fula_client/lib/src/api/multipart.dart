@@ -9,7 +9,8 @@ import 'types.dart';
 
 /// Start a new multipart upload
 ///
-/// Returns a handle that can be used to upload parts.
+/// Returns a handle that can be used to upload parts. Uses the default
+/// concurrency cap (`DEFAULT_MAX_CONCURRENT_PARTS`) for `upload_part` calls.
 Future<MultipartHandle> startMultipart({
   required FulaClientHandle client,
   required String bucket,
@@ -20,10 +21,27 @@ Future<MultipartHandle> startMultipart({
   key: key,
 );
 
+/// Start a new multipart upload with an explicit concurrency cap.
+///
+/// `max_concurrency` bounds how many `upload_part` calls can be in flight on
+/// this handle at once. Values of 0 are coerced to 1 (fully serial).
+Future<MultipartHandle> startMultipartWithConcurrency({
+  required FulaClientHandle client,
+  required String bucket,
+  required String key,
+  required int maxConcurrency,
+}) => RustLib.instance.api.crateApiMultipartStartMultipartWithConcurrency(
+  client: client,
+  bucket: bucket,
+  key: key,
+  maxConcurrency: maxConcurrency,
+);
+
 /// Upload a part
 ///
 /// Part numbers must be between 1 and 10000.
-/// Parts can be uploaded in any order.
+/// Parts can be uploaded in any order, and concurrent calls on the same
+/// handle run their HTTP I/O in parallel up to the handle's concurrency cap.
 Future<void> uploadPart({
   required MultipartHandle handle,
   required int partNumber,
@@ -46,6 +64,16 @@ Future<String> completeMultipart({required MultipartHandle handle}) =>
 /// Cancels the upload and removes any uploaded parts.
 Future<void> abortMultipart({required MultipartHandle handle}) =>
     RustLib.instance.api.crateApiMultipartAbortMultipart(handle: handle);
+
+/// Detach the multipart upload without aborting.
+///
+/// Suppresses the drop-time auto-abort so uploaded parts survive the
+/// handle being GC'd. Use this when pausing a resumable upload — e.g.,
+/// the user backgrounds the app mid-upload and you plan to resume later
+/// with the same upload_id. Without detach, dropping the handle issues
+/// a best-effort AbortMultipartUpload. (R4.)
+Future<void> detachMultipart({required MultipartHandle handle}) =>
+    RustLib.instance.api.crateApiMultipartDetachMultipart(handle: handle);
 
 /// Get the upload ID
 Future<String> getUploadId({required MultipartHandle handle}) =>

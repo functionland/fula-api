@@ -1,12 +1,16 @@
 [package]
 name = "fula-flutter"
 description = "Flutter bindings for Fula decentralized storage - works on Android and Web"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
-rust-version.workspace = true
+# Hard-coded (not workspace-inherited) because wasm-pack <= 0.13 fails
+# to parse `*.workspace = true` keys in its own manifest scan. Keep
+# these in sync with `[workspace.package]` in the root Cargo.toml.
+# (Same workaround as crates/fula-js.)
+version = "0.6.6"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/functionland/fula-api"
+authors = ["Functionland <hi@fx.land>"]
+rust-version = "1.83"
 
 [lib]
 crate-type = ["cdylib", "staticlib", "lib"]

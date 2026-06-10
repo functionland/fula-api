@@ -7,9 +7,18 @@ import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'types.dart';
 
-// These functions are ignored (category: IgnoreBecauseExplicitAttribute): `get_file_size`, `put_flat_from_path_deferred`, `put_flat_from_path`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`
 
-/// Load the forest index from storage
+/// Load the forest index from storage.
+///
+/// For v7 (sharded-HAMT) forests the underlying `load_forest` returns a
+/// marker error `"forest is sharded; use sharded API methods"` so that
+/// callers using the monolithic `PrivateForest` API know to switch. All
+/// real I/O paths on this client (`get_flat`, `put_flat`, â€¦) go through
+/// `ensure_forest_loaded` which already handles the sharded path
+/// transparently, so from a Flutter caller's perspective that marker is
+/// not an error â€” the forest *is* loaded, just in sharded form. Swallow
+/// the marker here so apps don't have to special-case it.
 Future<void> loadForest({
   required EncryptedClientHandle client,
   required String bucket,
@@ -118,6 +127,183 @@ Future<List<FileMetadata>> listFromForest({
   bucket: bucket,
 );
 
+/// Upload a file from a local path with immediate forest save
+///
+/// Unlike `put_flat`, this reads the file on the Rust side, avoiding the need
+/// to pass the entire file contents across the Flutter-Rust FFI boundary.
+/// This is critical for large files (1GB+) where passing `Vec<u8>` through
+/// FFI would cause out-of-memory errors.
+Future<PutResult> putFlatFromPath({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String path,
+  required String filePath,
+  String? contentType,
+}) => RustLib.instance.api.crateApiForestPutFlatFromPath(
+  client: client,
+  bucket: bucket,
+  path: path,
+  filePath: filePath,
+  contentType: contentType,
+);
+
+/// Upload a file from a local path without immediate forest save (deferred)
+///
+/// Same as `put_flat_from_path` but defers the forest save for batch efficiency.
+Future<PutResult> putFlatFromPathDeferred({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String path,
+  required String filePath,
+  String? contentType,
+}) => RustLib.instance.api.crateApiForestPutFlatFromPathDeferred(
+  client: client,
+  bucket: bucket,
+  path: path,
+  filePath: filePath,
+  contentType: contentType,
+);
+
+/// Upload a file from a local path with chunk-level resumable support.
+///
+/// Writes a manifest at `manifest_path` recording which chunks succeeded.
+/// On clean completion the manifest is auto-deleted. On failure the
+/// manifest stays on disk; call [`resume_flat_upload_from_path`] with the
+/// SAME `manifest_path` AND the SAME `file_path` to pick up where this
+/// attempt left off.
+///
+/// **Bytes contract.** The SDK's BAO root-hash check (F1 nonce-reuse
+/// protection) on the resume path requires bit-identical `data` between
+/// the original attempt and the resume. Metadata, permissions, mtime,
+/// and the file's location on disk do NOT matter â€” only the bytes. If
+/// the file changed between attempts, the resume fails fast with a
+/// content-hash-mismatch error and the manifest stays on disk so the
+/// caller can decide whether to give up or restart.
+///
+/// **Manifest path semantics.** Caller-owned local state, NOT bytes on
+/// the storage backend. Recommended: place under the app's documents/
+/// state directory, named by SyncTask ID or by hash of `(bucket, key)`.
+/// Two concurrent calls against the SAME `manifest_path` are serialized
+/// by the per-bucket write mutex (issue #16 + #17); the second caller
+/// either re-finalizes the now-empty manifest cleanly or observes its
+/// deletion and returns a typed error.
+///
+/// **WASM:** unsupported (no filesystem manifest available).
+Future<PutResult> putFlatResumableFromPath({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String path,
+  required String filePath,
+  required String manifestPath,
+  String? contentType,
+}) => RustLib.instance.api.crateApiForestPutFlatResumableFromPath(
+  client: client,
+  bucket: bucket,
+  path: path,
+  filePath: filePath,
+  manifestPath: manifestPath,
+  contentType: contentType,
+);
+
+/// Resume a previously-failed chunked upload from its manifest file.
+///
+/// Reads the manifest, re-encrypts and uploads only the chunks that
+/// didn't complete on the previous attempt, finalizes the index object,
+/// and deletes the manifest on success. See
+/// [`put_flat_resumable_from_path`] for the bytes contract and manifest
+/// semantics.
+///
+/// **WASM:** unsupported (no filesystem manifest available).
+Future<PutResult> resumeFlatUploadFromPath({
+  required EncryptedClientHandle client,
+  required String manifestPath,
+  required String filePath,
+}) => RustLib.instance.api.crateApiForestResumeFlatUploadFromPath(
+  client: client,
+  manifestPath: manifestPath,
+  filePath: filePath,
+);
+
+/// Create a fresh, untriggered cancellation handle.
+Future<CancelHandle> createCancelHandle() =>
+    RustLib.instance.api.crateApiForestCreateCancelHandle();
+
+/// Trigger cancellation. Idempotent â€” second trigger is a no-op.
+/// Any in-flight `_cancellable` upload using this handle (or a clone)
+/// will short-circuit at its next chunk-PUT check.
+Future<void> cancelHandleTrigger({required CancelHandle handle}) =>
+    RustLib.instance.api.crateApiForestCancelHandleTrigger(handle: handle);
+
+/// Check whether the handle has been triggered. Mostly useful for
+/// tests and UI status checks; the upload functions themselves do
+/// not need to be polled.
+Future<bool> cancelHandleIsCancelled({required CancelHandle handle}) =>
+    RustLib.instance.api.crateApiForestCancelHandleIsCancelled(handle: handle);
+
+/// Cancellable variant of `put_flat_resumable_from_path`. Cancellation
+/// semantics are documented on [`CancelHandle`].
+Future<PutResult> putFlatResumableFromPathCancellable({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String path,
+  required String filePath,
+  required String manifestPath,
+  String? contentType,
+  required CancelHandle cancel,
+}) => RustLib.instance.api.crateApiForestPutFlatResumableFromPathCancellable(
+  client: client,
+  bucket: bucket,
+  path: path,
+  filePath: filePath,
+  manifestPath: manifestPath,
+  contentType: contentType,
+  cancel: cancel,
+);
+
+/// Cancellable variant of `resume_flat_upload_from_path`.
+Future<PutResult> resumeFlatUploadFromPathCancellable({
+  required EncryptedClientHandle client,
+  required String manifestPath,
+  required String filePath,
+  required CancelHandle cancel,
+}) => RustLib.instance.api.crateApiForestResumeFlatUploadFromPathCancellable(
+  client: client,
+  manifestPath: manifestPath,
+  filePath: filePath,
+  cancel: cancel,
+);
+
+/// Discard a resumable upload's local state and best-effort delete its
+/// already-uploaded chunks on the storage backend (issue #20).
+///
+/// Use when the caller decides to give up on a cancelled or failed
+/// upload rather than resume. **Idempotent** â€” calling on a manifest
+/// that doesn't exist (e.g. already aborted, or SDK auto-deleted it on
+/// a prior clean completion) succeeds as a no-op. This matches Phase C
+/// "discard cancelled upload" UX semantics: pressing the button always
+/// leaves the system in a clean state, regardless of prior state.
+///
+/// **NOT a graceful stop.** This is POST-cancel cleanup. For mid-flight
+/// abort, see [`cancel_handle_trigger`] on a [`CancelHandle`] passed to
+/// the `_cancellable` variants (issue #18).
+///
+/// **Lock scope.** `client.inner.read().await` â€” same as the resumable
+/// bridge functions. The underlying `abort_upload` doesn't touch the
+/// encrypted forest (only the raw storage backend for chunk deletes
+/// plus the local manifest file), so B1's per-bucket write mutex is
+/// not needed here.
+Future<void> abortResumableUpload({
+  required EncryptedClientHandle client,
+  required String manifestPath,
+}) => RustLib.instance.api.crateApiForestAbortResumableUpload(
+  client: client,
+  manifestPath: manifestPath,
+);
+
+/// Get the size of a file without reading it into memory
+Future<BigInt> getFileSize({required String filePath}) =>
+    RustLib.instance.api.crateApiForestGetFileSize(filePath: filePath);
+
 /// Extract a subtree from the forest for sharing
 ///
 /// This creates a serialized subtree that can be shared with others.
@@ -131,3 +317,6 @@ Future<ForestSubtree> getForestSubtree({
   bucket: bucket,
   prefix: prefix,
 );
+
+// Rust type: RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<CancelHandle>>
+abstract class CancelHandle implements RustOpaqueInterface {}

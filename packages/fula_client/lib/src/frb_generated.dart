@@ -73,7 +73,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => 1451949050;
+  int get rustContentHash => 2120515634;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -88,9 +88,19 @@ abstract class RustLibApi extends BaseApi {
     required MultipartHandle handle,
   });
 
+  Future<void> crateApiForestAbortResumableUpload({
+    required EncryptedClientHandle client,
+    required String manifestPath,
+  });
+
   Future<AcceptedShareHandle> crateApiSharingAcceptShare({
     required EncryptedClientHandle client,
     required String tokenJson,
+  });
+
+  Future<Uint8List> crateApiEncryptedBlake3DeriveKey({
+    required String context,
+    required List<int> input,
   });
 
   Future<bool> crateApiClientBucketExists({
@@ -98,8 +108,26 @@ abstract class RustLibApi extends BaseApi {
     required String name,
   });
 
+  Future<bool> crateApiForestCancelHandleIsCancelled({
+    required CancelHandle handle,
+  });
+
+  Future<void> crateApiForestCancelHandleTrigger({
+    required CancelHandle handle,
+  });
+
   Future<String> crateApiMultipartCompleteMultipart({
     required MultipartHandle handle,
+  });
+
+  Future<Uint8List> crateApiEncryptedComputeEffectiveUserIdModeB({
+    required String provider,
+    required String oauthSub,
+    required String seed,
+  });
+
+  Future<Uint8List> crateApiEncryptedComputeEffectiveUserIdModeC({
+    required String seed,
   });
 
   Future<CopyResult> crateApiClientCopyObject({
@@ -114,6 +142,8 @@ abstract class RustLibApi extends BaseApi {
     required FulaClientHandle client,
     required String name,
   });
+
+  Future<CancelHandle> crateApiForestCreateCancelHandle();
 
   Future<FulaClientHandle> crateApiClientCreateClient({
     required FulaConfig config,
@@ -185,8 +215,26 @@ abstract class RustLibApi extends BaseApi {
     required List<int> input,
   });
 
+  Future<Uint8List> crateApiEncryptedDeriveKeyWithSalt({
+    required String context,
+    required List<int> input,
+    required List<int> salt,
+  });
+
   Future<Uint8List> crateApiEncryptedDerivePublicKeyFromSecret({
     required List<int> secretKeyBytes,
+  });
+
+  Future<Uint8List> crateApiEncryptedDeriveSigningSeed({required String seed});
+
+  Future<String> crateApiClientDeriveUserKeyFromEmail({required String email});
+
+  Future<String> crateApiClientDeriveUserKeyFromJwtSub({
+    required String jwtSub,
+  });
+
+  Future<void> crateApiMultipartDetachMultipart({
+    required MultipartHandle handle,
   });
 
   Future<void> crateApiEncryptedEncCreateBucket({
@@ -209,6 +257,8 @@ abstract class RustLibApi extends BaseApi {
     required EncryptedClientHandle client,
   });
 
+  Future<BigInt> crateApiMetricsFlushBackoffCount();
+
   Future<void> crateApiForestFlushForest({
     required EncryptedClientHandle client,
     required String bucket,
@@ -220,6 +270,8 @@ abstract class RustLibApi extends BaseApi {
 
   Future<bool> crateApiErrorFulaErrorIsAccessDenied({required FulaError that});
 
+  Future<bool> crateApiErrorFulaErrorIsCacheError({required FulaError that});
+
   Future<bool> crateApiErrorFulaErrorIsEncryptionError({
     required FulaError that,
   });
@@ -227,6 +279,10 @@ abstract class RustLibApi extends BaseApi {
   Future<bool> crateApiErrorFulaErrorIsNetworkError({required FulaError that});
 
   Future<bool> crateApiErrorFulaErrorIsNotFound({required FulaError that});
+
+  Future<bool> crateApiErrorFulaErrorIsUsersIndexError({
+    required FulaError that,
+  });
 
   Future<Uint8List> crateApiChunkedGetChunked({
     required EncryptedClientHandle client,
@@ -262,6 +318,8 @@ abstract class RustLibApi extends BaseApi {
     required String storageKey,
   });
 
+  Future<BigInt> crateApiForestGetFileSize({required String filePath});
+
   Future<Uint8List> crateApiForestGetFlat({
     required EncryptedClientHandle client,
     required String bucket,
@@ -280,6 +338,14 @@ abstract class RustLibApi extends BaseApi {
     required String storageKey,
   });
 
+  Future<MasterHealthEvent?> crateApiClientGetLastMasterHealthEvent({
+    required FulaClientHandle client,
+  });
+
+  Future<MasterHealthEvent?> crateApiClientGetLastMasterHealthEventEncrypted({
+    required EncryptedClientHandle client,
+  });
+
   Future<Uint8List> crateApiClientGetObject({
     required FulaClientHandle client,
     required String bucket,
@@ -287,6 +353,12 @@ abstract class RustLibApi extends BaseApi {
   });
 
   Future<GetObjectResult> crateApiClientGetObjectWithMetadata({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  });
+
+  Future<OfflineGetResult> crateApiClientGetObjectWithOfflineFallback({
     required FulaClientHandle client,
     required String bucket,
     required String key,
@@ -403,6 +475,15 @@ abstract class RustLibApi extends BaseApi {
 
   Future<ObjectMetadata> crateApiTypesObjectMetadataDefault();
 
+  Future<List<MasterHealthEvent>> crateApiClientPollMasterHealthEvents({
+    required FulaClientHandle client,
+  });
+
+  Future<List<MasterHealthEvent>>
+  crateApiClientPollMasterHealthEventsEncrypted({
+    required EncryptedClientHandle client,
+  });
+
   Future<PutResult> crateApiChunkedPutChunked({
     required EncryptedClientHandle client,
     required String bucket,
@@ -442,6 +523,41 @@ abstract class RustLibApi extends BaseApi {
     String? contentType,
   });
 
+  Future<PutResult> crateApiForestPutFlatFromPath({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required String filePath,
+    String? contentType,
+  });
+
+  Future<PutResult> crateApiForestPutFlatFromPathDeferred({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required String filePath,
+    String? contentType,
+  });
+
+  Future<PutResult> crateApiForestPutFlatResumableFromPath({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required String filePath,
+    required String manifestPath,
+    String? contentType,
+  });
+
+  Future<PutResult> crateApiForestPutFlatResumableFromPathCancellable({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required String filePath,
+    required String manifestPath,
+    String? contentType,
+    required CancelHandle cancel,
+  });
+
   Future<PutResult> crateApiClientPutObject({
     required FulaClientHandle client,
     required String bucket,
@@ -455,6 +571,19 @@ abstract class RustLibApi extends BaseApi {
     required String key,
     required List<int> data,
     required ObjectMetadata metadata,
+  });
+
+  Future<PutResult> crateApiForestResumeFlatUploadFromPath({
+    required EncryptedClientHandle client,
+    required String manifestPath,
+    required String filePath,
+  });
+
+  Future<PutResult> crateApiForestResumeFlatUploadFromPathCancellable({
+    required EncryptedClientHandle client,
+    required String manifestPath,
+    required String filePath,
+    required CancelHandle cancel,
   });
 
   Future<int> crateApiRotationRewrapObject({
@@ -491,6 +620,13 @@ abstract class RustLibApi extends BaseApi {
     required String key,
   });
 
+  Future<MultipartHandle> crateApiMultipartStartMultipartWithConcurrency({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+    required int maxConcurrency,
+  });
+
   Future<String> crateApiMultipartUploadLargeFileSimple({
     required FulaClientHandle client,
     required String bucket,
@@ -514,6 +650,8 @@ abstract class RustLibApi extends BaseApi {
 
   Future<BigInt> crateApiMetricsWalAppendFailureCount();
 
+  Future<BigInt> crateApiMetricsWalTruncatedGroupsCount();
+
   RustArcIncrementStrongCountFnType
   get rust_arc_increment_strong_count_AcceptedShareHandle;
 
@@ -522,6 +660,14 @@ abstract class RustLibApi extends BaseApi {
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_AcceptedShareHandlePtr;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_CancelHandle;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_CancelHandle;
+
+  CrossPlatformFinalizerArg get rust_arc_decrement_strong_count_CancelHandlePtr;
 
   RustArcIncrementStrongCountFnType
   get rust_arc_increment_strong_count_EncryptedClientHandle;
@@ -596,6 +742,42 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "abort_multipart", argNames: ["handle"]);
 
   @override
+  Future<void> crateApiForestAbortResumableUpload({
+    required EncryptedClientHandle client,
+    required String manifestPath,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(manifestPath);
+          return wire.wire__crate__api__forest__abort_resumable_upload(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestAbortResumableUploadConstMeta,
+        argValues: [client, manifestPath],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestAbortResumableUploadConstMeta =>
+      const TaskConstMeta(
+        debugName: "abort_resumable_upload",
+        argNames: ["client", "manifestPath"],
+      );
+
+  @override
   Future<AcceptedShareHandle> crateApiSharingAcceptShare({
     required EncryptedClientHandle client,
     required String tokenJson,
@@ -630,6 +812,39 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     debugName: "accept_share",
     argNames: ["client", "tokenJson"],
   );
+
+  @override
+  Future<Uint8List> crateApiEncryptedBlake3DeriveKey({
+    required String context,
+    required List<int> input,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_String(context);
+          var arg1 = cst_encode_list_prim_u_8_loose(input);
+          return wire.wire__crate__api__encrypted__blake3_derive_key(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiEncryptedBlake3DeriveKeyConstMeta,
+        argValues: [context, input],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiEncryptedBlake3DeriveKeyConstMeta =>
+      const TaskConstMeta(
+        debugName: "blake3_derive_key",
+        argNames: ["context", "input"],
+      );
 
   @override
   Future<bool> crateApiClientBucketExists({
@@ -667,6 +882,72 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
+  Future<bool> crateApiForestCancelHandleIsCancelled({
+    required CancelHandle handle,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+                handle,
+              );
+          return wire.wire__crate__api__forest__cancel_handle_is_cancelled(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiForestCancelHandleIsCancelledConstMeta,
+        argValues: [handle],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestCancelHandleIsCancelledConstMeta =>
+      const TaskConstMeta(
+        debugName: "cancel_handle_is_cancelled",
+        argNames: ["handle"],
+      );
+
+  @override
+  Future<void> crateApiForestCancelHandleTrigger({
+    required CancelHandle handle,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+                handle,
+              );
+          return wire.wire__crate__api__forest__cancel_handle_trigger(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiForestCancelHandleTriggerConstMeta,
+        argValues: [handle],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestCancelHandleTriggerConstMeta =>
+      const TaskConstMeta(
+        debugName: "cancel_handle_trigger",
+        argNames: ["handle"],
+      );
+
+  @override
   Future<String> crateApiMultipartCompleteMultipart({
     required MultipartHandle handle,
   }) {
@@ -697,6 +978,74 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(
         debugName: "complete_multipart",
         argNames: ["handle"],
+      );
+
+  @override
+  Future<Uint8List> crateApiEncryptedComputeEffectiveUserIdModeB({
+    required String provider,
+    required String oauthSub,
+    required String seed,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_String(provider);
+          var arg1 = cst_encode_String(oauthSub);
+          var arg2 = cst_encode_String(seed);
+          return wire
+              .wire__crate__api__encrypted__compute_effective_user_id_mode_b(
+                port_,
+                arg0,
+                arg1,
+                arg2,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiEncryptedComputeEffectiveUserIdModeBConstMeta,
+        argValues: [provider, oauthSub, seed],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiEncryptedComputeEffectiveUserIdModeBConstMeta =>
+      const TaskConstMeta(
+        debugName: "compute_effective_user_id_mode_b",
+        argNames: ["provider", "oauthSub", "seed"],
+      );
+
+  @override
+  Future<Uint8List> crateApiEncryptedComputeEffectiveUserIdModeC({
+    required String seed,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_String(seed);
+          return wire
+              .wire__crate__api__encrypted__compute_effective_user_id_mode_c(
+                port_,
+                arg0,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiEncryptedComputeEffectiveUserIdModeCConstMeta,
+        argValues: [seed],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiEncryptedComputeEffectiveUserIdModeCConstMeta =>
+      const TaskConstMeta(
+        debugName: "compute_effective_user_id_mode_c",
+        argNames: ["seed"],
       );
 
   @override
@@ -777,6 +1126,28 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     debugName: "create_bucket",
     argNames: ["client", "name"],
   );
+
+  @override
+  Future<CancelHandle> crateApiForestCreateCancelHandle() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          return wire.wire__crate__api__forest__create_cancel_handle(port_);
+        },
+        codec: DcoCodec(
+          decodeSuccessData:
+              dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiForestCreateCancelHandleConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestCreateCancelHandleConstMeta =>
+      const TaskConstMeta(debugName: "create_cancel_handle", argNames: []);
 
   @override
   Future<FulaClientHandle> crateApiClientCreateClient({
@@ -1244,6 +1615,42 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
+  Future<Uint8List> crateApiEncryptedDeriveKeyWithSalt({
+    required String context,
+    required List<int> input,
+    required List<int> salt,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_String(context);
+          var arg1 = cst_encode_list_prim_u_8_loose(input);
+          var arg2 = cst_encode_list_prim_u_8_loose(salt);
+          return wire.wire__crate__api__encrypted__derive_key_with_salt(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: dco_decode_String,
+        ),
+        constMeta: kCrateApiEncryptedDeriveKeyWithSaltConstMeta,
+        argValues: [context, input, salt],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiEncryptedDeriveKeyWithSaltConstMeta =>
+      const TaskConstMeta(
+        debugName: "derive_key_with_salt",
+        argNames: ["context", "input", "salt"],
+      );
+
+  @override
   Future<Uint8List> crateApiEncryptedDerivePublicKeyFromSecret({
     required List<int> secretKeyBytes,
   }) {
@@ -1273,6 +1680,119 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         debugName: "derive_public_key_from_secret",
         argNames: ["secretKeyBytes"],
       );
+
+  @override
+  Future<Uint8List> crateApiEncryptedDeriveSigningSeed({required String seed}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_String(seed);
+          return wire.wire__crate__api__encrypted__derive_signing_seed(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_prim_u_8_strict,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiEncryptedDeriveSigningSeedConstMeta,
+        argValues: [seed],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiEncryptedDeriveSigningSeedConstMeta =>
+      const TaskConstMeta(debugName: "derive_signing_seed", argNames: ["seed"]);
+
+  @override
+  Future<String> crateApiClientDeriveUserKeyFromEmail({required String email}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_String(email);
+          return wire.wire__crate__api__client__derive_user_key_from_email(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_String,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiClientDeriveUserKeyFromEmailConstMeta,
+        argValues: [email],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiClientDeriveUserKeyFromEmailConstMeta =>
+      const TaskConstMeta(
+        debugName: "derive_user_key_from_email",
+        argNames: ["email"],
+      );
+
+  @override
+  Future<String> crateApiClientDeriveUserKeyFromJwtSub({
+    required String jwtSub,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_String(jwtSub);
+          return wire.wire__crate__api__client__derive_user_key_from_jwt_sub(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_String,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiClientDeriveUserKeyFromJwtSubConstMeta,
+        argValues: [jwtSub],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiClientDeriveUserKeyFromJwtSubConstMeta =>
+      const TaskConstMeta(
+        debugName: "derive_user_key_from_jwt_sub",
+        argNames: ["jwtSub"],
+      );
+
+  @override
+  Future<void> crateApiMultipartDetachMultipart({
+    required MultipartHandle handle,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle(
+                handle,
+              );
+          return wire.wire__crate__api__multipart__detach_multipart(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiMultipartDetachMultipartConstMeta,
+        argValues: [handle],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMultipartDetachMultipartConstMeta =>
+      const TaskConstMeta(debugName: "detach_multipart", argNames: ["handle"]);
 
   @override
   Future<void> crateApiEncryptedEncCreateBucket({
@@ -1428,6 +1948,27 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "export_secret_key", argNames: ["client"]);
 
   @override
+  Future<BigInt> crateApiMetricsFlushBackoffCount() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          return wire.wire__crate__api__metrics__flush_backoff_count(port_);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_u_64,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiMetricsFlushBackoffCountConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMetricsFlushBackoffCountConstMeta =>
+      const TaskConstMeta(debugName: "flush_backoff_count", argNames: []);
+
+  @override
   Future<void> crateApiForestFlushForest({
     required EncryptedClientHandle client,
     required String bucket,
@@ -1536,6 +2077,34 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<bool> crateApiErrorFulaErrorIsCacheError({required FulaError that}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_box_autoadd_fula_error(that);
+          return wire.wire__crate__api__error__fula_error_is_cache_error(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiErrorFulaErrorIsCacheErrorConstMeta,
+        argValues: [that],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiErrorFulaErrorIsCacheErrorConstMeta =>
+      const TaskConstMeta(
+        debugName: "fula_error_is_cache_error",
+        argNames: ["that"],
+      );
+
+  @override
   Future<bool> crateApiErrorFulaErrorIsEncryptionError({
     required FulaError that,
   }) {
@@ -1618,6 +2187,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiErrorFulaErrorIsNotFoundConstMeta =>
       const TaskConstMeta(
         debugName: "fula_error_is_not_found",
+        argNames: ["that"],
+      );
+
+  @override
+  Future<bool> crateApiErrorFulaErrorIsUsersIndexError({
+    required FulaError that,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_box_autoadd_fula_error(that);
+          return wire.wire__crate__api__error__fula_error_is_users_index_error(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_bool,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiErrorFulaErrorIsUsersIndexErrorConstMeta,
+        argValues: [that],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiErrorFulaErrorIsUsersIndexErrorConstMeta =>
+      const TaskConstMeta(
+        debugName: "fula_error_is_users_index_error",
         argNames: ["that"],
       );
 
@@ -1851,6 +2450,28 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<BigInt> crateApiForestGetFileSize({required String filePath}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_String(filePath);
+          return wire.wire__crate__api__forest__get_file_size(port_, arg0);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_u_64,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestGetFileSizeConstMeta,
+        argValues: [filePath],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestGetFileSizeConstMeta =>
+      const TaskConstMeta(debugName: "get_file_size", argNames: ["filePath"]);
+
+  @override
   Future<Uint8List> crateApiForestGetFlat({
     required EncryptedClientHandle client,
     required String bucket,
@@ -1967,6 +2588,73 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<MasterHealthEvent?> crateApiClientGetLastMasterHealthEvent({
+    required FulaClientHandle client,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          return wire.wire__crate__api__client__get_last_master_health_event(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_opt_box_autoadd_master_health_event,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiClientGetLastMasterHealthEventConstMeta,
+        argValues: [client],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiClientGetLastMasterHealthEventConstMeta =>
+      const TaskConstMeta(
+        debugName: "get_last_master_health_event",
+        argNames: ["client"],
+      );
+
+  @override
+  Future<MasterHealthEvent?> crateApiClientGetLastMasterHealthEventEncrypted({
+    required EncryptedClientHandle client,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          return wire
+              .wire__crate__api__client__get_last_master_health_event_encrypted(
+                port_,
+                arg0,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_opt_box_autoadd_master_health_event,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiClientGetLastMasterHealthEventEncryptedConstMeta,
+        argValues: [client],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiClientGetLastMasterHealthEventEncryptedConstMeta =>
+      const TaskConstMeta(
+        debugName: "get_last_master_health_event_encrypted",
+        argNames: ["client"],
+      );
+
+  @override
   Future<Uint8List> crateApiClientGetObject({
     required FulaClientHandle client,
     required String bucket,
@@ -2040,6 +2728,46 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiClientGetObjectWithMetadataConstMeta =>
       const TaskConstMeta(
         debugName: "get_object_with_metadata",
+        argNames: ["client", "bucket", "key"],
+      );
+
+  @override
+  Future<OfflineGetResult> crateApiClientGetObjectWithOfflineFallback({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          return wire
+              .wire__crate__api__client__get_object_with_offline_fallback(
+                port_,
+                arg0,
+                arg1,
+                arg2,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_offline_get_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiClientGetObjectWithOfflineFallbackConstMeta,
+        argValues: [client, bucket, key],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiClientGetObjectWithOfflineFallbackConstMeta =>
+      const TaskConstMeta(
+        debugName: "get_object_with_offline_fallback",
         argNames: ["client", "bucket", "key"],
       );
 
@@ -2794,6 +3522,74 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "object_metadata_default", argNames: []);
 
   @override
+  Future<List<MasterHealthEvent>> crateApiClientPollMasterHealthEvents({
+    required FulaClientHandle client,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          return wire.wire__crate__api__client__poll_master_health_events(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_master_health_event,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiClientPollMasterHealthEventsConstMeta,
+        argValues: [client],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiClientPollMasterHealthEventsConstMeta =>
+      const TaskConstMeta(
+        debugName: "poll_master_health_events",
+        argNames: ["client"],
+      );
+
+  @override
+  Future<List<MasterHealthEvent>>
+  crateApiClientPollMasterHealthEventsEncrypted({
+    required EncryptedClientHandle client,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          return wire
+              .wire__crate__api__client__poll_master_health_events_encrypted(
+                port_,
+                arg0,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_list_master_health_event,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiClientPollMasterHealthEventsEncryptedConstMeta,
+        argValues: [client],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiClientPollMasterHealthEventsEncryptedConstMeta =>
+      const TaskConstMeta(
+        debugName: "poll_master_health_events_encrypted",
+        argNames: ["client"],
+      );
+
+  @override
   Future<PutResult> crateApiChunkedPutChunked({
     required EncryptedClientHandle client,
     required String bucket,
@@ -3014,6 +3810,223 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<PutResult> crateApiForestPutFlatFromPath({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required String filePath,
+    String? contentType,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(path);
+          var arg3 = cst_encode_String(filePath);
+          var arg4 = cst_encode_opt_String(contentType);
+          return wire.wire__crate__api__forest__put_flat_from_path(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestPutFlatFromPathConstMeta,
+        argValues: [client, bucket, path, filePath, contentType],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestPutFlatFromPathConstMeta =>
+      const TaskConstMeta(
+        debugName: "put_flat_from_path",
+        argNames: ["client", "bucket", "path", "filePath", "contentType"],
+      );
+
+  @override
+  Future<PutResult> crateApiForestPutFlatFromPathDeferred({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required String filePath,
+    String? contentType,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(path);
+          var arg3 = cst_encode_String(filePath);
+          var arg4 = cst_encode_opt_String(contentType);
+          return wire.wire__crate__api__forest__put_flat_from_path_deferred(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestPutFlatFromPathDeferredConstMeta,
+        argValues: [client, bucket, path, filePath, contentType],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestPutFlatFromPathDeferredConstMeta =>
+      const TaskConstMeta(
+        debugName: "put_flat_from_path_deferred",
+        argNames: ["client", "bucket", "path", "filePath", "contentType"],
+      );
+
+  @override
+  Future<PutResult> crateApiForestPutFlatResumableFromPath({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required String filePath,
+    required String manifestPath,
+    String? contentType,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(path);
+          var arg3 = cst_encode_String(filePath);
+          var arg4 = cst_encode_String(manifestPath);
+          var arg5 = cst_encode_opt_String(contentType);
+          return wire.wire__crate__api__forest__put_flat_resumable_from_path(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+            arg5,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestPutFlatResumableFromPathConstMeta,
+        argValues: [client, bucket, path, filePath, manifestPath, contentType],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestPutFlatResumableFromPathConstMeta =>
+      const TaskConstMeta(
+        debugName: "put_flat_resumable_from_path",
+        argNames: [
+          "client",
+          "bucket",
+          "path",
+          "filePath",
+          "manifestPath",
+          "contentType",
+        ],
+      );
+
+  @override
+  Future<PutResult> crateApiForestPutFlatResumableFromPathCancellable({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required String filePath,
+    required String manifestPath,
+    String? contentType,
+    required CancelHandle cancel,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(path);
+          var arg3 = cst_encode_String(filePath);
+          var arg4 = cst_encode_String(manifestPath);
+          var arg5 = cst_encode_opt_String(contentType);
+          var arg6 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+                cancel,
+              );
+          return wire
+              .wire__crate__api__forest__put_flat_resumable_from_path_cancellable(
+                port_,
+                arg0,
+                arg1,
+                arg2,
+                arg3,
+                arg4,
+                arg5,
+                arg6,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestPutFlatResumableFromPathCancellableConstMeta,
+        argValues: [
+          client,
+          bucket,
+          path,
+          filePath,
+          manifestPath,
+          contentType,
+          cancel,
+        ],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta
+  get kCrateApiForestPutFlatResumableFromPathCancellableConstMeta =>
+      const TaskConstMeta(
+        debugName: "put_flat_resumable_from_path_cancellable",
+        argNames: [
+          "client",
+          "bucket",
+          "path",
+          "filePath",
+          "manifestPath",
+          "contentType",
+          "cancel",
+        ],
+      );
+
+  @override
   Future<PutResult> crateApiClientPutObject({
     required FulaClientHandle client,
     required String bucket,
@@ -3097,6 +4110,92 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(
         debugName: "put_object_with_metadata",
         argNames: ["client", "bucket", "key", "data", "metadata"],
+      );
+
+  @override
+  Future<PutResult> crateApiForestResumeFlatUploadFromPath({
+    required EncryptedClientHandle client,
+    required String manifestPath,
+    required String filePath,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(manifestPath);
+          var arg2 = cst_encode_String(filePath);
+          return wire.wire__crate__api__forest__resume_flat_upload_from_path(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestResumeFlatUploadFromPathConstMeta,
+        argValues: [client, manifestPath, filePath],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestResumeFlatUploadFromPathConstMeta =>
+      const TaskConstMeta(
+        debugName: "resume_flat_upload_from_path",
+        argNames: ["client", "manifestPath", "filePath"],
+      );
+
+  @override
+  Future<PutResult> crateApiForestResumeFlatUploadFromPathCancellable({
+    required EncryptedClientHandle client,
+    required String manifestPath,
+    required String filePath,
+    required CancelHandle cancel,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(manifestPath);
+          var arg2 = cst_encode_String(filePath);
+          var arg3 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+                cancel,
+              );
+          return wire
+              .wire__crate__api__forest__resume_flat_upload_from_path_cancellable(
+                port_,
+                arg0,
+                arg1,
+                arg2,
+                arg3,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestResumeFlatUploadFromPathCancellableConstMeta,
+        argValues: [client, manifestPath, filePath, cancel],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta
+  get kCrateApiForestResumeFlatUploadFromPathCancellableConstMeta =>
+      const TaskConstMeta(
+        debugName: "resume_flat_upload_from_path_cancellable",
+        argNames: ["client", "manifestPath", "filePath", "cancel"],
       );
 
   @override
@@ -3343,6 +4442,50 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<MultipartHandle> crateApiMultipartStartMultipartWithConcurrency({
+    required FulaClientHandle client,
+    required String bucket,
+    required String key,
+    required int maxConcurrency,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerFulaClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          var arg3 = cst_encode_u_32(maxConcurrency);
+          return wire
+              .wire__crate__api__multipart__start_multipart_with_concurrency(
+                port_,
+                arg0,
+                arg1,
+                arg2,
+                arg3,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData:
+              dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiMultipartStartMultipartWithConcurrencyConstMeta,
+        argValues: [client, bucket, key, maxConcurrency],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMultipartStartMultipartWithConcurrencyConstMeta =>
+      const TaskConstMeta(
+        debugName: "start_multipart_with_concurrency",
+        argNames: ["client", "bucket", "key", "maxConcurrency"],
+      );
+
+  @override
   Future<String> crateApiMultipartUploadLargeFileSimple({
     required FulaClientHandle client,
     required String bucket,
@@ -3488,6 +4631,32 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiMetricsWalAppendFailureCountConstMeta =>
       const TaskConstMeta(debugName: "wal_append_failure_count", argNames: []);
 
+  @override
+  Future<BigInt> crateApiMetricsWalTruncatedGroupsCount() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          return wire.wire__crate__api__metrics__wal_truncated_groups_count(
+            port_,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_u_64,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiMetricsWalTruncatedGroupsCountConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMetricsWalTruncatedGroupsCountConstMeta =>
+      const TaskConstMeta(
+        debugName: "wal_truncated_groups_count",
+        argNames: [],
+      );
+
   RustArcIncrementStrongCountFnType
   get rust_arc_increment_strong_count_AcceptedShareHandle => wire
       .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle;
@@ -3495,6 +4664,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   RustArcDecrementStrongCountFnType
   get rust_arc_decrement_strong_count_AcceptedShareHandle => wire
       .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_CancelHandle => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_CancelHandle => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle;
 
   RustArcIncrementStrongCountFnType
   get rust_arc_increment_strong_count_EncryptedClientHandle => wire
@@ -3544,6 +4721,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  CancelHandle
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return CancelHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
   EncryptedClientHandle
   dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     dynamic raw,
@@ -3589,6 +4775,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  CancelHandle
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return CancelHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
   EncryptedClientHandle
   dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     dynamic raw,
@@ -3631,6 +4826,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return AcceptedShareHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  CancelHandle
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return CancelHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
@@ -3709,6 +4913,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ListOptions dco_decode_box_autoadd_list_options(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_list_options(raw);
+  }
+
+  @protected
+  MasterHealthEvent dco_decode_box_autoadd_master_health_event(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_master_health_event(raw);
   }
 
   @protected
@@ -3849,8 +5059,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   FulaConfig dco_decode_fula_config(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 6)
-      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
+    if (arr.length != 23)
+      throw Exception('unexpected arr length: expect 23 but see ${arr.length}');
     return FulaConfig(
       endpoint: dco_decode_String(arr[0]),
       accessToken: dco_decode_opt_String(arr[1]),
@@ -3858,6 +5068,23 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       maxRetries: dco_decode_u_32(arr[3]),
       perChunkDownloadTimeoutSeconds: dco_decode_u_64(arr[4]),
       bufferedDownloadMaxBytes: dco_decode_u_64(arr[5]),
+      healthGateEnabled: dco_decode_bool(arr[6]),
+      healthGateTtlSeconds: dco_decode_u_64(arr[7]),
+      blockCacheEnabled: dco_decode_bool(arr[8]),
+      blockCachePath: dco_decode_String(arr[9]),
+      blockCacheMaxBytes: dco_decode_u_64(arr[10]),
+      gatewayFallbackEnabled: dco_decode_bool(arr[11]),
+      gatewayFallbackUrls: dco_decode_list_String(arr[12]),
+      gatewayRaceConcurrency: dco_decode_u_32(arr[13]),
+      usersIndexChainRpcUrl: dco_decode_String(arr[14]),
+      usersIndexAnchorAddress: dco_decode_String(arr[15]),
+      usersIndexIpnsName: dco_decode_String(arr[16]),
+      usersIndexUserKey: dco_decode_String(arr[17]),
+      usersIndexIpnsGatewayUrls: dco_decode_list_String(arr[18]),
+      usersIndexIpfsGatewayUrls: dco_decode_list_String(arr[19]),
+      walkableV8WriterEnabled: dco_decode_bool(arr[20]),
+      encryptedUserBucketsIndexKey: dco_decode_list_prim_u_8_strict(arr[21]),
+      userEntrySigningSeed: dco_decode_list_prim_u_8_strict(arr[22]),
     );
   }
 
@@ -3895,7 +5122,65 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       case 12:
         return FulaError_ForestError(dco_decode_String(raw[1]));
       case 13:
+        return FulaError_CacheBudgetExceeded(
+          size: dco_decode_u_64(raw[1]),
+          budget: dco_decode_u_64(raw[2]),
+        );
+      case 14:
+        return FulaError_CacheError(dco_decode_String(raw[1]));
+      case 15:
+        return FulaError_UsersIndexResolutionFailed(dco_decode_String(raw[1]));
+      case 16:
+        return FulaError_WireVersionUnsupported(
+          context: dco_decode_String(raw[1]),
+          postcardError: dco_decode_String(raw[2]),
+        );
+      case 17:
+        return FulaError_SequenceRegression(
+          observed: dco_decode_u_64(raw[1]),
+          highestSeen: dco_decode_u_64(raw[2]),
+          channel: dco_decode_String(raw[3]),
+        );
+      case 18:
         return FulaError_Internal(dco_decode_String(raw[1]));
+      case 19:
+        return FulaError_Cancelled();
+      default:
+        throw Exception("unreachable");
+    }
+  }
+
+  @protected
+  FulaReadFreshness dco_decode_fula_read_freshness(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    switch (raw[0]) {
+      case 0:
+        return FulaReadFreshness_Live();
+      case 1:
+        return FulaReadFreshness_Cached(observedAt: dco_decode_u_64(raw[1]));
+      case 2:
+        return FulaReadFreshness_StaleByDesign(
+          snapshotAgeSecs: dco_decode_u_64(raw[1]),
+        );
+      case 3:
+        return FulaReadFreshness_StaleByOutage(
+          snapshotAgeSecs: dco_decode_u_64(raw[1]),
+        );
+      default:
+        throw Exception("unreachable");
+    }
+  }
+
+  @protected
+  FulaReadSource dco_decode_fula_read_source(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    switch (raw[0]) {
+      case 0:
+        return FulaReadSource_Master();
+      case 1:
+        return FulaReadSource_LocalCache();
+      case 2:
+        return FulaReadSource_Gateway(dco_decode_String(raw[1]));
       default:
         throw Exception("unreachable");
     }
@@ -3969,6 +5254,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<MasterHealthEvent> dco_decode_list_master_health_event(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_master_health_event).toList();
+  }
+
+  @protected
   List<MetadataEntry> dco_decode_list_metadata_entry(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return (raw as List<dynamic>).map(dco_decode_metadata_entry).toList();
@@ -4027,6 +5318,25 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MasterHealthEvent dco_decode_master_health_event(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    switch (raw[0]) {
+      case 0:
+        return MasterHealthEvent_Online();
+      case 1:
+        return MasterHealthEvent_OfflineFallbackActive(
+          reason: dco_decode_String(raw[1]),
+        );
+      case 2:
+        return MasterHealthEvent_SeverelyDegraded(
+          reason: dco_decode_String(raw[1]),
+        );
+      default:
+        throw Exception("unreachable");
+    }
+  }
+
+  @protected
   MetadataEntry dco_decode_metadata_entry(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
@@ -4073,6 +5383,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  OfflineGetResult dco_decode_offline_get_result(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 3)
+      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    return OfflineGetResult(
+      inner: dco_decode_get_object_result(arr[0]),
+      source: dco_decode_fula_read_source(arr[1]),
+      freshness: dco_decode_fula_read_freshness(arr[2]),
+    );
+  }
+
+  @protected
   String? dco_decode_opt_String(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_String(raw);
@@ -4082,6 +5405,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   PlatformInt64? dco_decode_opt_box_autoadd_i_64(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_box_autoadd_i_64(raw);
+  }
+
+  @protected
+  MasterHealthEvent? dco_decode_opt_box_autoadd_master_health_event(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_master_health_event(raw);
   }
 
   @protected
@@ -4231,6 +5562,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  CancelHandle
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return CancelHandleImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
   EncryptedClientHandle
   sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     SseDeserializer deserializer,
@@ -4291,6 +5634,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  CancelHandle
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return CancelHandleImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
   EncryptedClientHandle
   sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     SseDeserializer deserializer,
@@ -4345,6 +5700,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return AcceptedShareHandleImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  CancelHandle
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return CancelHandleImpl.frbInternalSseDecode(
       sse_decode_usize(deserializer),
       sse_decode_i_32(deserializer),
     );
@@ -4443,6 +5810,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_list_options(deserializer));
+  }
+
+  @protected
+  MasterHealthEvent sse_decode_box_autoadd_master_health_event(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_master_health_event(deserializer));
   }
 
   @protected
@@ -4592,6 +5967,27 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_maxRetries = sse_decode_u_32(deserializer);
     var var_perChunkDownloadTimeoutSeconds = sse_decode_u_64(deserializer);
     var var_bufferedDownloadMaxBytes = sse_decode_u_64(deserializer);
+    var var_healthGateEnabled = sse_decode_bool(deserializer);
+    var var_healthGateTtlSeconds = sse_decode_u_64(deserializer);
+    var var_blockCacheEnabled = sse_decode_bool(deserializer);
+    var var_blockCachePath = sse_decode_String(deserializer);
+    var var_blockCacheMaxBytes = sse_decode_u_64(deserializer);
+    var var_gatewayFallbackEnabled = sse_decode_bool(deserializer);
+    var var_gatewayFallbackUrls = sse_decode_list_String(deserializer);
+    var var_gatewayRaceConcurrency = sse_decode_u_32(deserializer);
+    var var_usersIndexChainRpcUrl = sse_decode_String(deserializer);
+    var var_usersIndexAnchorAddress = sse_decode_String(deserializer);
+    var var_usersIndexIpnsName = sse_decode_String(deserializer);
+    var var_usersIndexUserKey = sse_decode_String(deserializer);
+    var var_usersIndexIpnsGatewayUrls = sse_decode_list_String(deserializer);
+    var var_usersIndexIpfsGatewayUrls = sse_decode_list_String(deserializer);
+    var var_walkableV8WriterEnabled = sse_decode_bool(deserializer);
+    var var_encryptedUserBucketsIndexKey = sse_decode_list_prim_u_8_strict(
+      deserializer,
+    );
+    var var_userEntrySigningSeed = sse_decode_list_prim_u_8_strict(
+      deserializer,
+    );
     return FulaConfig(
       endpoint: var_endpoint,
       accessToken: var_accessToken,
@@ -4599,6 +5995,23 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       maxRetries: var_maxRetries,
       perChunkDownloadTimeoutSeconds: var_perChunkDownloadTimeoutSeconds,
       bufferedDownloadMaxBytes: var_bufferedDownloadMaxBytes,
+      healthGateEnabled: var_healthGateEnabled,
+      healthGateTtlSeconds: var_healthGateTtlSeconds,
+      blockCacheEnabled: var_blockCacheEnabled,
+      blockCachePath: var_blockCachePath,
+      blockCacheMaxBytes: var_blockCacheMaxBytes,
+      gatewayFallbackEnabled: var_gatewayFallbackEnabled,
+      gatewayFallbackUrls: var_gatewayFallbackUrls,
+      gatewayRaceConcurrency: var_gatewayRaceConcurrency,
+      usersIndexChainRpcUrl: var_usersIndexChainRpcUrl,
+      usersIndexAnchorAddress: var_usersIndexAnchorAddress,
+      usersIndexIpnsName: var_usersIndexIpnsName,
+      usersIndexUserKey: var_usersIndexUserKey,
+      usersIndexIpnsGatewayUrls: var_usersIndexIpnsGatewayUrls,
+      usersIndexIpfsGatewayUrls: var_usersIndexIpfsGatewayUrls,
+      walkableV8WriterEnabled: var_walkableV8WriterEnabled,
+      encryptedUserBucketsIndexKey: var_encryptedUserBucketsIndexKey,
+      userEntrySigningSeed: var_userEntrySigningSeed,
     );
   }
 
@@ -4649,8 +6062,85 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         var var_field0 = sse_decode_String(deserializer);
         return FulaError_ForestError(var_field0);
       case 13:
+        var var_size = sse_decode_u_64(deserializer);
+        var var_budget = sse_decode_u_64(deserializer);
+        return FulaError_CacheBudgetExceeded(
+          size: var_size,
+          budget: var_budget,
+        );
+      case 14:
+        var var_field0 = sse_decode_String(deserializer);
+        return FulaError_CacheError(var_field0);
+      case 15:
+        var var_field0 = sse_decode_String(deserializer);
+        return FulaError_UsersIndexResolutionFailed(var_field0);
+      case 16:
+        var var_context = sse_decode_String(deserializer);
+        var var_postcardError = sse_decode_String(deserializer);
+        return FulaError_WireVersionUnsupported(
+          context: var_context,
+          postcardError: var_postcardError,
+        );
+      case 17:
+        var var_observed = sse_decode_u_64(deserializer);
+        var var_highestSeen = sse_decode_u_64(deserializer);
+        var var_channel = sse_decode_String(deserializer);
+        return FulaError_SequenceRegression(
+          observed: var_observed,
+          highestSeen: var_highestSeen,
+          channel: var_channel,
+        );
+      case 18:
         var var_field0 = sse_decode_String(deserializer);
         return FulaError_Internal(var_field0);
+      case 19:
+        return FulaError_Cancelled();
+      default:
+        throw UnimplementedError('');
+    }
+  }
+
+  @protected
+  FulaReadFreshness sse_decode_fula_read_freshness(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var tag_ = sse_decode_i_32(deserializer);
+    switch (tag_) {
+      case 0:
+        return FulaReadFreshness_Live();
+      case 1:
+        var var_observedAt = sse_decode_u_64(deserializer);
+        return FulaReadFreshness_Cached(observedAt: var_observedAt);
+      case 2:
+        var var_snapshotAgeSecs = sse_decode_u_64(deserializer);
+        return FulaReadFreshness_StaleByDesign(
+          snapshotAgeSecs: var_snapshotAgeSecs,
+        );
+      case 3:
+        var var_snapshotAgeSecs = sse_decode_u_64(deserializer);
+        return FulaReadFreshness_StaleByOutage(
+          snapshotAgeSecs: var_snapshotAgeSecs,
+        );
+      default:
+        throw UnimplementedError('');
+    }
+  }
+
+  @protected
+  FulaReadSource sse_decode_fula_read_source(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var tag_ = sse_decode_i_32(deserializer);
+    switch (tag_) {
+      case 0:
+        return FulaReadSource_Master();
+      case 1:
+        return FulaReadSource_LocalCache();
+      case 2:
+        var var_field0 = sse_decode_String(deserializer);
+        return FulaReadSource_Gateway(var_field0);
       default:
         throw UnimplementedError('');
     }
@@ -4757,6 +6247,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<MasterHealthEvent> sse_decode_list_master_health_event(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <MasterHealthEvent>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_master_health_event(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   List<MetadataEntry> sse_decode_list_metadata_entry(
     SseDeserializer deserializer,
   ) {
@@ -4843,6 +6347,27 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MasterHealthEvent sse_decode_master_health_event(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var tag_ = sse_decode_i_32(deserializer);
+    switch (tag_) {
+      case 0:
+        return MasterHealthEvent_Online();
+      case 1:
+        var var_reason = sse_decode_String(deserializer);
+        return MasterHealthEvent_OfflineFallbackActive(reason: var_reason);
+      case 2:
+        var var_reason = sse_decode_String(deserializer);
+        return MasterHealthEvent_SeverelyDegraded(reason: var_reason);
+      default:
+        throw UnimplementedError('');
+    }
+  }
+
+  @protected
   MetadataEntry sse_decode_metadata_entry(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_key = sse_decode_String(deserializer);
@@ -4888,6 +6413,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  OfflineGetResult sse_decode_offline_get_result(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_inner = sse_decode_get_object_result(deserializer);
+    var var_source = sse_decode_fula_read_source(deserializer);
+    var var_freshness = sse_decode_fula_read_freshness(deserializer);
+    return OfflineGetResult(
+      inner: var_inner,
+      source: var_source,
+      freshness: var_freshness,
+    );
+  }
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -4904,6 +6442,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
     if (sse_decode_bool(deserializer)) {
       return (sse_decode_box_autoadd_i_64(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  MasterHealthEvent? sse_decode_opt_box_autoadd_master_health_event(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_master_health_event(deserializer));
     } else {
       return null;
     }
@@ -5050,6 +6601,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle raw,
+  ) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    // ignore: invalid_use_of_internal_member
+    return (raw as CancelHandleImpl).frbInternalCstEncode(move: true);
+  }
+
+  @protected
+  int
   cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     EncryptedClientHandle raw,
   ) {
@@ -5100,6 +6661,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle raw,
+  ) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    // ignore: invalid_use_of_internal_member
+    return (raw as CancelHandleImpl).frbInternalCstEncode(move: false);
+  }
+
+  @protected
+  int
   cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     EncryptedClientHandle raw,
   ) {
@@ -5146,6 +6717,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Cst (C-struct based), see doc to use other codecs
     // ignore: invalid_use_of_internal_member
     return (raw as AcceptedShareHandleImpl).frbInternalCstEncode();
+  }
+
+  @protected
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle raw,
+  ) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    // ignore: invalid_use_of_internal_member
+    return (raw as CancelHandleImpl).frbInternalCstEncode();
   }
 
   @protected
@@ -5260,6 +6841,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as CancelHandleImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
+  }
+
+  @protected
+  void
   sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     EncryptedClientHandle self,
     SseSerializer serializer,
@@ -5325,6 +6919,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as CancelHandleImpl).frbInternalSseEncode(move: false),
+      serializer,
+    );
+  }
+
+  @protected
+  void
   sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     EncryptedClientHandle self,
     SseSerializer serializer,
@@ -5384,6 +6991,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
       (self as AcceptedShareHandleImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as CancelHandleImpl).frbInternalSseEncode(move: null),
       serializer,
     );
   }
@@ -5495,6 +7115,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_list_options(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_master_health_event(
+    MasterHealthEvent self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_master_health_event(self, serializer);
   }
 
   @protected
@@ -5623,6 +7252,26 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_u_32(self.maxRetries, serializer);
     sse_encode_u_64(self.perChunkDownloadTimeoutSeconds, serializer);
     sse_encode_u_64(self.bufferedDownloadMaxBytes, serializer);
+    sse_encode_bool(self.healthGateEnabled, serializer);
+    sse_encode_u_64(self.healthGateTtlSeconds, serializer);
+    sse_encode_bool(self.blockCacheEnabled, serializer);
+    sse_encode_String(self.blockCachePath, serializer);
+    sse_encode_u_64(self.blockCacheMaxBytes, serializer);
+    sse_encode_bool(self.gatewayFallbackEnabled, serializer);
+    sse_encode_list_String(self.gatewayFallbackUrls, serializer);
+    sse_encode_u_32(self.gatewayRaceConcurrency, serializer);
+    sse_encode_String(self.usersIndexChainRpcUrl, serializer);
+    sse_encode_String(self.usersIndexAnchorAddress, serializer);
+    sse_encode_String(self.usersIndexIpnsName, serializer);
+    sse_encode_String(self.usersIndexUserKey, serializer);
+    sse_encode_list_String(self.usersIndexIpnsGatewayUrls, serializer);
+    sse_encode_list_String(self.usersIndexIpfsGatewayUrls, serializer);
+    sse_encode_bool(self.walkableV8WriterEnabled, serializer);
+    sse_encode_list_prim_u_8_strict(
+      self.encryptedUserBucketsIndexKey,
+      serializer,
+    );
+    sse_encode_list_prim_u_8_strict(self.userEntrySigningSeed, serializer);
   }
 
   @protected
@@ -5669,8 +7318,81 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       case FulaError_ForestError(field0: final field0):
         sse_encode_i_32(12, serializer);
         sse_encode_String(field0, serializer);
-      case FulaError_Internal(field0: final field0):
+      case FulaError_CacheBudgetExceeded(
+        size: final size,
+        budget: final budget,
+      ):
         sse_encode_i_32(13, serializer);
+        sse_encode_u_64(size, serializer);
+        sse_encode_u_64(budget, serializer);
+      case FulaError_CacheError(field0: final field0):
+        sse_encode_i_32(14, serializer);
+        sse_encode_String(field0, serializer);
+      case FulaError_UsersIndexResolutionFailed(field0: final field0):
+        sse_encode_i_32(15, serializer);
+        sse_encode_String(field0, serializer);
+      case FulaError_WireVersionUnsupported(
+        context: final context,
+        postcardError: final postcardError,
+      ):
+        sse_encode_i_32(16, serializer);
+        sse_encode_String(context, serializer);
+        sse_encode_String(postcardError, serializer);
+      case FulaError_SequenceRegression(
+        observed: final observed,
+        highestSeen: final highestSeen,
+        channel: final channel,
+      ):
+        sse_encode_i_32(17, serializer);
+        sse_encode_u_64(observed, serializer);
+        sse_encode_u_64(highestSeen, serializer);
+        sse_encode_String(channel, serializer);
+      case FulaError_Internal(field0: final field0):
+        sse_encode_i_32(18, serializer);
+        sse_encode_String(field0, serializer);
+      case FulaError_Cancelled():
+        sse_encode_i_32(19, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_fula_read_freshness(
+    FulaReadFreshness self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    switch (self) {
+      case FulaReadFreshness_Live():
+        sse_encode_i_32(0, serializer);
+      case FulaReadFreshness_Cached(observedAt: final observedAt):
+        sse_encode_i_32(1, serializer);
+        sse_encode_u_64(observedAt, serializer);
+      case FulaReadFreshness_StaleByDesign(
+        snapshotAgeSecs: final snapshotAgeSecs,
+      ):
+        sse_encode_i_32(2, serializer);
+        sse_encode_u_64(snapshotAgeSecs, serializer);
+      case FulaReadFreshness_StaleByOutage(
+        snapshotAgeSecs: final snapshotAgeSecs,
+      ):
+        sse_encode_i_32(3, serializer);
+        sse_encode_u_64(snapshotAgeSecs, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_fula_read_source(
+    FulaReadSource self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    switch (self) {
+      case FulaReadSource_Master():
+        sse_encode_i_32(0, serializer);
+      case FulaReadSource_LocalCache():
+        sse_encode_i_32(1, serializer);
+      case FulaReadSource_Gateway(field0: final field0):
+        sse_encode_i_32(2, serializer);
         sse_encode_String(field0, serializer);
     }
   }
@@ -5757,6 +7479,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_master_health_event(
+    List<MasterHealthEvent> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_master_health_event(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_list_metadata_entry(
     List<MetadataEntry> self,
     SseSerializer serializer,
@@ -5836,6 +7570,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_master_health_event(
+    MasterHealthEvent self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    switch (self) {
+      case MasterHealthEvent_Online():
+        sse_encode_i_32(0, serializer);
+      case MasterHealthEvent_OfflineFallbackActive(reason: final reason):
+        sse_encode_i_32(1, serializer);
+        sse_encode_String(reason, serializer);
+      case MasterHealthEvent_SeverelyDegraded(reason: final reason):
+        sse_encode_i_32(2, serializer);
+        sse_encode_String(reason, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_metadata_entry(MetadataEntry self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.key, serializer);
@@ -5873,6 +7625,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_offline_get_result(
+    OfflineGetResult self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_get_object_result(self.inner, serializer);
+    sse_encode_fula_read_source(self.source, serializer);
+    sse_encode_fula_read_freshness(self.freshness, serializer);
+  }
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -5892,6 +7655,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_bool(self != null, serializer);
     if (self != null) {
       sse_encode_box_autoadd_i_64(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_master_health_event(
+    MasterHealthEvent? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_master_health_event(self, serializer);
     }
   }
 
@@ -6041,6 +7817,26 @@ class AcceptedShareHandleImpl extends RustOpaque
         .instance
         .api
         .rust_arc_decrement_strong_count_AcceptedShareHandlePtr,
+  );
+}
+
+@sealed
+class CancelHandleImpl extends RustOpaque implements CancelHandle {
+  // Not to be used by end users
+  CancelHandleImpl.frbInternalDcoDecode(List<dynamic> wire)
+    : super.frbInternalDcoDecode(wire, _kStaticData);
+
+  // Not to be used by end users
+  CancelHandleImpl.frbInternalSseDecode(BigInt ptr, int externalSizeOnNative)
+    : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+
+  static final _kStaticData = RustArcStaticData(
+    rustArcIncrementStrongCount:
+        RustLib.instance.api.rust_arc_increment_strong_count_CancelHandle,
+    rustArcDecrementStrongCount:
+        RustLib.instance.api.rust_arc_decrement_strong_count_CancelHandle,
+    rustArcDecrementStrongCountPtr:
+        RustLib.instance.api.rust_arc_decrement_strong_count_CancelHandlePtr,
   );
 }
 

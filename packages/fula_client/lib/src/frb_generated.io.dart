@@ -32,6 +32,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       ._rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandlePtr;
 
   CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_CancelHandlePtr => wire
+      ._rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandlePtr;
+
+  CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_EncryptedClientHandlePtr => wire
       ._rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandlePtr;
 
@@ -53,6 +57,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   AcceptedShareHandle
   dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    dynamic raw,
+  );
+
+  @protected
+  CancelHandle
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
     dynamic raw,
   );
 
@@ -87,6 +97,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  CancelHandle
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    dynamic raw,
+  );
+
+  @protected
   EncryptedClientHandle
   dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     dynamic raw,
@@ -113,6 +129,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   AcceptedShareHandle
   dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    dynamic raw,
+  );
+
+  @protected
+  CancelHandle
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
     dynamic raw,
   );
 
@@ -162,6 +184,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ListOptions dco_decode_box_autoadd_list_options(dynamic raw);
 
   @protected
+  MasterHealthEvent dco_decode_box_autoadd_master_health_event(dynamic raw);
+
+  @protected
   ObjectMetadata dco_decode_box_autoadd_object_metadata(dynamic raw);
 
   @protected
@@ -207,6 +232,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   FulaError dco_decode_fula_error(dynamic raw);
 
   @protected
+  FulaReadFreshness dco_decode_fula_read_freshness(dynamic raw);
+
+  @protected
+  FulaReadSource dco_decode_fula_read_source(dynamic raw);
+
+  @protected
   GetObjectResult dco_decode_get_object_result(dynamic raw);
 
   @protected
@@ -231,6 +262,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<FileMetadata> dco_decode_list_file_metadata(dynamic raw);
 
   @protected
+  List<MasterHealthEvent> dco_decode_list_master_health_event(dynamic raw);
+
+  @protected
   List<MetadataEntry> dco_decode_list_metadata_entry(dynamic raw);
 
   @protected
@@ -252,6 +286,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<RotationFailure> dco_decode_list_rotation_failure(dynamic raw);
 
   @protected
+  MasterHealthEvent dco_decode_master_health_event(dynamic raw);
+
+  @protected
   MetadataEntry dco_decode_metadata_entry(dynamic raw);
 
   @protected
@@ -264,10 +301,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ObjectMetadata dco_decode_object_metadata(dynamic raw);
 
   @protected
+  OfflineGetResult dco_decode_offline_get_result(dynamic raw);
+
+  @protected
   String? dco_decode_opt_String(dynamic raw);
 
   @protected
   PlatformInt64? dco_decode_opt_box_autoadd_i_64(dynamic raw);
+
+  @protected
+  MasterHealthEvent? dco_decode_opt_box_autoadd_master_health_event(
+    dynamic raw,
+  );
 
   @protected
   int? dco_decode_opt_box_autoadd_u_32(dynamic raw);
@@ -321,6 +366,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  CancelHandle
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   EncryptedClientHandle
   sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     SseDeserializer deserializer,
@@ -351,6 +402,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  CancelHandle
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   EncryptedClientHandle
   sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     SseDeserializer deserializer,
@@ -377,6 +434,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   AcceptedShareHandle
   sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CancelHandle
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
     SseDeserializer deserializer,
   );
 
@@ -426,6 +489,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ListOptions sse_decode_box_autoadd_list_options(SseDeserializer deserializer);
+
+  @protected
+  MasterHealthEvent sse_decode_box_autoadd_master_health_event(
+    SseDeserializer deserializer,
+  );
 
   @protected
   ObjectMetadata sse_decode_box_autoadd_object_metadata(
@@ -481,6 +549,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   FulaError sse_decode_fula_error(SseDeserializer deserializer);
 
   @protected
+  FulaReadFreshness sse_decode_fula_read_freshness(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  FulaReadSource sse_decode_fula_read_source(SseDeserializer deserializer);
+
+  @protected
   GetObjectResult sse_decode_get_object_result(SseDeserializer deserializer);
 
   @protected
@@ -505,6 +581,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<FileMetadata> sse_decode_list_file_metadata(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<MasterHealthEvent> sse_decode_list_master_health_event(
     SseDeserializer deserializer,
   );
 
@@ -536,6 +617,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  MasterHealthEvent sse_decode_master_health_event(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   MetadataEntry sse_decode_metadata_entry(SseDeserializer deserializer);
 
   @protected
@@ -548,10 +634,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ObjectMetadata sse_decode_object_metadata(SseDeserializer deserializer);
 
   @protected
+  OfflineGetResult sse_decode_offline_get_result(SseDeserializer deserializer);
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
 
   @protected
   PlatformInt64? sse_decode_opt_box_autoadd_i_64(SseDeserializer deserializer);
+
+  @protected
+  MasterHealthEvent? sse_decode_opt_box_autoadd_master_health_event(
+    SseDeserializer deserializer,
+  );
 
   @protected
   int? sse_decode_opt_box_autoadd_u_32(SseDeserializer deserializer);
@@ -655,6 +749,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   }
 
   @protected
+  ffi.Pointer<wire_cst_master_health_event>
+  cst_encode_box_autoadd_master_health_event(MasterHealthEvent raw) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    final ptr = wire.cst_new_box_autoadd_master_health_event();
+    cst_api_fill_to_wire_master_health_event(raw, ptr.ref);
+    return ptr;
+  }
+
+  @protected
   ffi.Pointer<wire_cst_object_metadata> cst_encode_box_autoadd_object_metadata(
     ObjectMetadata raw,
   ) {
@@ -743,6 +846,17 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   }
 
   @protected
+  ffi.Pointer<wire_cst_list_master_health_event>
+  cst_encode_list_master_health_event(List<MasterHealthEvent> raw) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    final ans = wire.cst_new_list_master_health_event(raw.length);
+    for (var i = 0; i < raw.length; ++i) {
+      cst_api_fill_to_wire_master_health_event(raw[i], ans.ref.ptr[i]);
+    }
+    return ans;
+  }
+
+  @protected
   ffi.Pointer<wire_cst_list_metadata_entry> cst_encode_list_metadata_entry(
     List<MetadataEntry> raw,
   ) {
@@ -813,6 +927,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   }
 
   @protected
+  ffi.Pointer<wire_cst_master_health_event>
+  cst_encode_opt_box_autoadd_master_health_event(MasterHealthEvent? raw) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    return raw == null
+        ? ffi.nullptr
+        : cst_encode_box_autoadd_master_health_event(raw);
+  }
+
+  @protected
   ffi.Pointer<ffi.Uint32> cst_encode_opt_box_autoadd_u_32(int? raw) {
     // Codec=Cst (C-struct based), see doc to use other codecs
     return raw == null ? ffi.nullptr : cst_encode_box_autoadd_u_32(raw);
@@ -867,6 +990,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     ffi.Pointer<wire_cst_list_options> wireObj,
   ) {
     cst_api_fill_to_wire_list_options(apiObj, wireObj.ref);
+  }
+
+  @protected
+  void cst_api_fill_to_wire_box_autoadd_master_health_event(
+    MasterHealthEvent apiObj,
+    ffi.Pointer<wire_cst_master_health_event> wireObj,
+  ) {
+    cst_api_fill_to_wire_master_health_event(apiObj, wireObj.ref);
   }
 
   @protected
@@ -994,6 +1125,47 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     wireObj.buffered_download_max_bytes = cst_encode_u_64(
       apiObj.bufferedDownloadMaxBytes,
     );
+    wireObj.health_gate_enabled = cst_encode_bool(apiObj.healthGateEnabled);
+    wireObj.health_gate_ttl_seconds = cst_encode_u_64(
+      apiObj.healthGateTtlSeconds,
+    );
+    wireObj.block_cache_enabled = cst_encode_bool(apiObj.blockCacheEnabled);
+    wireObj.block_cache_path = cst_encode_String(apiObj.blockCachePath);
+    wireObj.block_cache_max_bytes = cst_encode_u_64(apiObj.blockCacheMaxBytes);
+    wireObj.gateway_fallback_enabled = cst_encode_bool(
+      apiObj.gatewayFallbackEnabled,
+    );
+    wireObj.gateway_fallback_urls = cst_encode_list_String(
+      apiObj.gatewayFallbackUrls,
+    );
+    wireObj.gateway_race_concurrency = cst_encode_u_32(
+      apiObj.gatewayRaceConcurrency,
+    );
+    wireObj.users_index_chain_rpc_url = cst_encode_String(
+      apiObj.usersIndexChainRpcUrl,
+    );
+    wireObj.users_index_anchor_address = cst_encode_String(
+      apiObj.usersIndexAnchorAddress,
+    );
+    wireObj.users_index_ipns_name = cst_encode_String(
+      apiObj.usersIndexIpnsName,
+    );
+    wireObj.users_index_user_key = cst_encode_String(apiObj.usersIndexUserKey);
+    wireObj.users_index_ipns_gateway_urls = cst_encode_list_String(
+      apiObj.usersIndexIpnsGatewayUrls,
+    );
+    wireObj.users_index_ipfs_gateway_urls = cst_encode_list_String(
+      apiObj.usersIndexIpfsGatewayUrls,
+    );
+    wireObj.walkable_v8_writer_enabled = cst_encode_bool(
+      apiObj.walkableV8WriterEnabled,
+    );
+    wireObj.encrypted_user_buckets_index_key = cst_encode_list_prim_u_8_strict(
+      apiObj.encryptedUserBucketsIndexKey,
+    );
+    wireObj.user_entry_signing_seed = cst_encode_list_prim_u_8_strict(
+      apiObj.userEntrySigningSeed,
+    );
   }
 
   @protected
@@ -1081,10 +1253,102 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       wireObj.kind.ForestError.field0 = pre_field0;
       return;
     }
+    if (apiObj is FulaError_CacheBudgetExceeded) {
+      var pre_size = cst_encode_u_64(apiObj.size);
+      var pre_budget = cst_encode_u_64(apiObj.budget);
+      wireObj.tag = 13;
+      wireObj.kind.CacheBudgetExceeded.size = pre_size;
+      wireObj.kind.CacheBudgetExceeded.budget = pre_budget;
+      return;
+    }
+    if (apiObj is FulaError_CacheError) {
+      var pre_field0 = cst_encode_String(apiObj.field0);
+      wireObj.tag = 14;
+      wireObj.kind.CacheError.field0 = pre_field0;
+      return;
+    }
+    if (apiObj is FulaError_UsersIndexResolutionFailed) {
+      var pre_field0 = cst_encode_String(apiObj.field0);
+      wireObj.tag = 15;
+      wireObj.kind.UsersIndexResolutionFailed.field0 = pre_field0;
+      return;
+    }
+    if (apiObj is FulaError_WireVersionUnsupported) {
+      var pre_context = cst_encode_String(apiObj.context);
+      var pre_postcard_error = cst_encode_String(apiObj.postcardError);
+      wireObj.tag = 16;
+      wireObj.kind.WireVersionUnsupported.context = pre_context;
+      wireObj.kind.WireVersionUnsupported.postcard_error = pre_postcard_error;
+      return;
+    }
+    if (apiObj is FulaError_SequenceRegression) {
+      var pre_observed = cst_encode_u_64(apiObj.observed);
+      var pre_highest_seen = cst_encode_u_64(apiObj.highestSeen);
+      var pre_channel = cst_encode_String(apiObj.channel);
+      wireObj.tag = 17;
+      wireObj.kind.SequenceRegression.observed = pre_observed;
+      wireObj.kind.SequenceRegression.highest_seen = pre_highest_seen;
+      wireObj.kind.SequenceRegression.channel = pre_channel;
+      return;
+    }
     if (apiObj is FulaError_Internal) {
       var pre_field0 = cst_encode_String(apiObj.field0);
-      wireObj.tag = 13;
+      wireObj.tag = 18;
       wireObj.kind.Internal.field0 = pre_field0;
+      return;
+    }
+    if (apiObj is FulaError_Cancelled) {
+      wireObj.tag = 19;
+      return;
+    }
+  }
+
+  @protected
+  void cst_api_fill_to_wire_fula_read_freshness(
+    FulaReadFreshness apiObj,
+    wire_cst_fula_read_freshness wireObj,
+  ) {
+    if (apiObj is FulaReadFreshness_Live) {
+      wireObj.tag = 0;
+      return;
+    }
+    if (apiObj is FulaReadFreshness_Cached) {
+      var pre_observed_at = cst_encode_u_64(apiObj.observedAt);
+      wireObj.tag = 1;
+      wireObj.kind.Cached.observed_at = pre_observed_at;
+      return;
+    }
+    if (apiObj is FulaReadFreshness_StaleByDesign) {
+      var pre_snapshot_age_secs = cst_encode_u_64(apiObj.snapshotAgeSecs);
+      wireObj.tag = 2;
+      wireObj.kind.StaleByDesign.snapshot_age_secs = pre_snapshot_age_secs;
+      return;
+    }
+    if (apiObj is FulaReadFreshness_StaleByOutage) {
+      var pre_snapshot_age_secs = cst_encode_u_64(apiObj.snapshotAgeSecs);
+      wireObj.tag = 3;
+      wireObj.kind.StaleByOutage.snapshot_age_secs = pre_snapshot_age_secs;
+      return;
+    }
+  }
+
+  @protected
+  void cst_api_fill_to_wire_fula_read_source(
+    FulaReadSource apiObj,
+    wire_cst_fula_read_source wireObj,
+  ) {
+    if (apiObj is FulaReadSource_Master) {
+      wireObj.tag = 0;
+      return;
+    }
+    if (apiObj is FulaReadSource_LocalCache) {
+      wireObj.tag = 1;
+      return;
+    }
+    if (apiObj is FulaReadSource_Gateway) {
+      var pre_field0 = cst_encode_String(apiObj.field0);
+      wireObj.tag = 2;
+      wireObj.kind.Gateway.field0 = pre_field0;
       return;
     }
   }
@@ -1139,6 +1403,29 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   }
 
   @protected
+  void cst_api_fill_to_wire_master_health_event(
+    MasterHealthEvent apiObj,
+    wire_cst_master_health_event wireObj,
+  ) {
+    if (apiObj is MasterHealthEvent_Online) {
+      wireObj.tag = 0;
+      return;
+    }
+    if (apiObj is MasterHealthEvent_OfflineFallbackActive) {
+      var pre_reason = cst_encode_String(apiObj.reason);
+      wireObj.tag = 1;
+      wireObj.kind.OfflineFallbackActive.reason = pre_reason;
+      return;
+    }
+    if (apiObj is MasterHealthEvent_SeverelyDegraded) {
+      var pre_reason = cst_encode_String(apiObj.reason);
+      wireObj.tag = 2;
+      wireObj.kind.SeverelyDegraded.reason = pre_reason;
+      return;
+    }
+  }
+
+  @protected
   void cst_api_fill_to_wire_metadata_entry(
     MetadataEntry apiObj,
     wire_cst_metadata_entry wireObj,
@@ -1167,6 +1454,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     wireObj.content_type = cst_encode_opt_String(apiObj.contentType);
     wireObj.cache_control = cst_encode_opt_String(apiObj.cacheControl);
     wireObj.user_metadata = cst_encode_list_metadata_entry(apiObj.userMetadata);
+  }
+
+  @protected
+  void cst_api_fill_to_wire_offline_get_result(
+    OfflineGetResult apiObj,
+    wire_cst_offline_get_result wireObj,
+  ) {
+    cst_api_fill_to_wire_get_object_result(apiObj.inner, wireObj.inner);
+    cst_api_fill_to_wire_fula_read_source(apiObj.source, wireObj.source);
+    cst_api_fill_to_wire_fula_read_freshness(
+      apiObj.freshness,
+      wireObj.freshness,
+    );
   }
 
   @protected
@@ -1238,6 +1538,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle raw,
+  );
+
+  @protected
+  int
   cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     EncryptedClientHandle raw,
   );
@@ -1268,6 +1574,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle raw,
+  );
+
+  @protected
+  int
   cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     EncryptedClientHandle raw,
   );
@@ -1294,6 +1606,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   int
   cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
     AcceptedShareHandle raw,
+  );
+
+  @protected
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle raw,
   );
 
   @protected
@@ -1359,6 +1677,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
   sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     EncryptedClientHandle self,
     SseSerializer serializer,
@@ -1394,6 +1719,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
   sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
     EncryptedClientHandle self,
     SseSerializer serializer,
@@ -1424,6 +1756,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void
   sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
     AcceptedShareHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    CancelHandle self,
     SseSerializer serializer,
   );
 
@@ -1488,6 +1827,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_list_options(
     ListOptions self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_master_health_event(
+    MasterHealthEvent self,
     SseSerializer serializer,
   );
 
@@ -1558,6 +1903,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_fula_error(FulaError self, SseSerializer serializer);
 
   @protected
+  void sse_encode_fula_read_freshness(
+    FulaReadFreshness self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_fula_read_source(
+    FulaReadSource self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_get_object_result(
     GetObjectResult self,
     SseSerializer serializer,
@@ -1590,6 +1947,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_list_file_metadata(
     List<FileMetadata> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_master_health_event(
+    List<MasterHealthEvent> self,
     SseSerializer serializer,
   );
 
@@ -1630,6 +1993,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_master_health_event(
+    MasterHealthEvent self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_metadata_entry(MetadataEntry self, SseSerializer serializer);
 
   @protected
@@ -1648,11 +2017,23 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_offline_get_result(
+    OfflineGetResult self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
 
   @protected
   void sse_encode_opt_box_autoadd_i_64(
     PlatformInt64? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_master_health_event(
+    MasterHealthEvent? self,
     SseSerializer serializer,
   );
 
@@ -1763,6 +2144,34 @@ class RustLibWire implements BaseWire {
       _wire__crate__api__multipart__abort_multipartPtr
           .asFunction<void Function(int, int)>();
 
+  void wire__crate__api__forest__abort_resumable_upload(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> manifest_path,
+  ) {
+    return _wire__crate__api__forest__abort_resumable_upload(
+      port_,
+      client,
+      manifest_path,
+    );
+  }
+
+  late final _wire__crate__api__forest__abort_resumable_uploadPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >('frbgen_fula_client_wire__crate__api__forest__abort_resumable_upload');
+  late final _wire__crate__api__forest__abort_resumable_upload =
+      _wire__crate__api__forest__abort_resumable_uploadPtr
+          .asFunction<
+            void Function(int, int, ffi.Pointer<wire_cst_list_prim_u_8_strict>)
+          >();
+
   void wire__crate__api__sharing__accept_share(
     int port_,
     int client,
@@ -1785,6 +2194,38 @@ class RustLibWire implements BaseWire {
       _wire__crate__api__sharing__accept_sharePtr
           .asFunction<
             void Function(int, int, ffi.Pointer<wire_cst_list_prim_u_8_strict>)
+          >();
+
+  void wire__crate__api__encrypted__blake3_derive_key(
+    int port_,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> context,
+    ffi.Pointer<wire_cst_list_prim_u_8_loose> input,
+  ) {
+    return _wire__crate__api__encrypted__blake3_derive_key(
+      port_,
+      context,
+      input,
+    );
+  }
+
+  late final _wire__crate__api__encrypted__blake3_derive_keyPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+          )
+        >
+      >('frbgen_fula_client_wire__crate__api__encrypted__blake3_derive_key');
+  late final _wire__crate__api__encrypted__blake3_derive_key =
+      _wire__crate__api__encrypted__blake3_derive_keyPtr
+          .asFunction<
+            void Function(
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+            )
           >();
 
   void wire__crate__api__client__bucket_exists(
@@ -1811,6 +2252,33 @@ class RustLibWire implements BaseWire {
             void Function(int, int, ffi.Pointer<wire_cst_list_prim_u_8_strict>)
           >();
 
+  void wire__crate__api__forest__cancel_handle_is_cancelled(
+    int port_,
+    int handle,
+  ) {
+    return _wire__crate__api__forest__cancel_handle_is_cancelled(port_, handle);
+  }
+
+  late final _wire__crate__api__forest__cancel_handle_is_cancelledPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64, ffi.UintPtr)>>(
+        'frbgen_fula_client_wire__crate__api__forest__cancel_handle_is_cancelled',
+      );
+  late final _wire__crate__api__forest__cancel_handle_is_cancelled =
+      _wire__crate__api__forest__cancel_handle_is_cancelledPtr
+          .asFunction<void Function(int, int)>();
+
+  void wire__crate__api__forest__cancel_handle_trigger(int port_, int handle) {
+    return _wire__crate__api__forest__cancel_handle_trigger(port_, handle);
+  }
+
+  late final _wire__crate__api__forest__cancel_handle_triggerPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64, ffi.UintPtr)>>(
+        'frbgen_fula_client_wire__crate__api__forest__cancel_handle_trigger',
+      );
+  late final _wire__crate__api__forest__cancel_handle_trigger =
+      _wire__crate__api__forest__cancel_handle_triggerPtr
+          .asFunction<void Function(int, int)>();
+
   void wire__crate__api__multipart__complete_multipart(int port_, int handle) {
     return _wire__crate__api__multipart__complete_multipart(port_, handle);
   }
@@ -1822,6 +2290,71 @@ class RustLibWire implements BaseWire {
   late final _wire__crate__api__multipart__complete_multipart =
       _wire__crate__api__multipart__complete_multipartPtr
           .asFunction<void Function(int, int)>();
+
+  void wire__crate__api__encrypted__compute_effective_user_id_mode_b(
+    int port_,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> provider,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> oauth_sub,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> seed,
+  ) {
+    return _wire__crate__api__encrypted__compute_effective_user_id_mode_b(
+      port_,
+      provider,
+      oauth_sub,
+      seed,
+    );
+  }
+
+  late final _wire__crate__api__encrypted__compute_effective_user_id_mode_bPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__encrypted__compute_effective_user_id_mode_b',
+      );
+  late final _wire__crate__api__encrypted__compute_effective_user_id_mode_b =
+      _wire__crate__api__encrypted__compute_effective_user_id_mode_bPtr
+          .asFunction<
+            void Function(
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            )
+          >();
+
+  void wire__crate__api__encrypted__compute_effective_user_id_mode_c(
+    int port_,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> seed,
+  ) {
+    return _wire__crate__api__encrypted__compute_effective_user_id_mode_c(
+      port_,
+      seed,
+    );
+  }
+
+  late final _wire__crate__api__encrypted__compute_effective_user_id_mode_cPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__encrypted__compute_effective_user_id_mode_c',
+      );
+  late final _wire__crate__api__encrypted__compute_effective_user_id_mode_c =
+      _wire__crate__api__encrypted__compute_effective_user_id_mode_cPtr
+          .asFunction<
+            void Function(int, ffi.Pointer<wire_cst_list_prim_u_8_strict>)
+          >();
 
   void wire__crate__api__client__copy_object(
     int port_,
@@ -1890,6 +2423,18 @@ class RustLibWire implements BaseWire {
           .asFunction<
             void Function(int, int, ffi.Pointer<wire_cst_list_prim_u_8_strict>)
           >();
+
+  void wire__crate__api__forest__create_cancel_handle(int port_) {
+    return _wire__crate__api__forest__create_cancel_handle(port_);
+  }
+
+  late final _wire__crate__api__forest__create_cancel_handlePtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64)>>(
+        'frbgen_fula_client_wire__crate__api__forest__create_cancel_handle',
+      );
+  late final _wire__crate__api__forest__create_cancel_handle =
+      _wire__crate__api__forest__create_cancel_handlePtr
+          .asFunction<void Function(int)>();
 
   void wire__crate__api__client__create_client(
     int port_,
@@ -2275,6 +2820,42 @@ class RustLibWire implements BaseWire {
             )
           >();
 
+  void wire__crate__api__encrypted__derive_key_with_salt(
+    int port_,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> context,
+    ffi.Pointer<wire_cst_list_prim_u_8_loose> input,
+    ffi.Pointer<wire_cst_list_prim_u_8_loose> salt,
+  ) {
+    return _wire__crate__api__encrypted__derive_key_with_salt(
+      port_,
+      context,
+      input,
+      salt,
+    );
+  }
+
+  late final _wire__crate__api__encrypted__derive_key_with_saltPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+            ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+          )
+        >
+      >('frbgen_fula_client_wire__crate__api__encrypted__derive_key_with_salt');
+  late final _wire__crate__api__encrypted__derive_key_with_salt =
+      _wire__crate__api__encrypted__derive_key_with_saltPtr
+          .asFunction<
+            void Function(
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+              ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+            )
+          >();
+
   void wire__crate__api__encrypted__derive_public_key_from_secret(
     int port_,
     ffi.Pointer<wire_cst_list_prim_u_8_loose> secret_key_bytes,
@@ -2301,6 +2882,91 @@ class RustLibWire implements BaseWire {
           .asFunction<
             void Function(int, ffi.Pointer<wire_cst_list_prim_u_8_loose>)
           >();
+
+  void wire__crate__api__encrypted__derive_signing_seed(
+    int port_,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> seed,
+  ) {
+    return _wire__crate__api__encrypted__derive_signing_seed(port_, seed);
+  }
+
+  late final _wire__crate__api__encrypted__derive_signing_seedPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >('frbgen_fula_client_wire__crate__api__encrypted__derive_signing_seed');
+  late final _wire__crate__api__encrypted__derive_signing_seed =
+      _wire__crate__api__encrypted__derive_signing_seedPtr
+          .asFunction<
+            void Function(int, ffi.Pointer<wire_cst_list_prim_u_8_strict>)
+          >();
+
+  void wire__crate__api__client__derive_user_key_from_email(
+    int port_,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> email,
+  ) {
+    return _wire__crate__api__client__derive_user_key_from_email(port_, email);
+  }
+
+  late final _wire__crate__api__client__derive_user_key_from_emailPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__client__derive_user_key_from_email',
+      );
+  late final _wire__crate__api__client__derive_user_key_from_email =
+      _wire__crate__api__client__derive_user_key_from_emailPtr
+          .asFunction<
+            void Function(int, ffi.Pointer<wire_cst_list_prim_u_8_strict>)
+          >();
+
+  void wire__crate__api__client__derive_user_key_from_jwt_sub(
+    int port_,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> jwt_sub,
+  ) {
+    return _wire__crate__api__client__derive_user_key_from_jwt_sub(
+      port_,
+      jwt_sub,
+    );
+  }
+
+  late final _wire__crate__api__client__derive_user_key_from_jwt_subPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__client__derive_user_key_from_jwt_sub',
+      );
+  late final _wire__crate__api__client__derive_user_key_from_jwt_sub =
+      _wire__crate__api__client__derive_user_key_from_jwt_subPtr
+          .asFunction<
+            void Function(int, ffi.Pointer<wire_cst_list_prim_u_8_strict>)
+          >();
+
+  void wire__crate__api__multipart__detach_multipart(int port_, int handle) {
+    return _wire__crate__api__multipart__detach_multipart(port_, handle);
+  }
+
+  late final _wire__crate__api__multipart__detach_multipartPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64, ffi.UintPtr)>>(
+        'frbgen_fula_client_wire__crate__api__multipart__detach_multipart',
+      );
+  late final _wire__crate__api__multipart__detach_multipart =
+      _wire__crate__api__multipart__detach_multipartPtr
+          .asFunction<void Function(int, int)>();
 
   void wire__crate__api__encrypted__enc_create_bucket(
     int port_,
@@ -2386,6 +3052,18 @@ class RustLibWire implements BaseWire {
       _wire__crate__api__encrypted__export_secret_keyPtr
           .asFunction<void Function(int, int)>();
 
+  void wire__crate__api__metrics__flush_backoff_count(int port_) {
+    return _wire__crate__api__metrics__flush_backoff_count(port_);
+  }
+
+  late final _wire__crate__api__metrics__flush_backoff_countPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64)>>(
+        'frbgen_fula_client_wire__crate__api__metrics__flush_backoff_count',
+      );
+  late final _wire__crate__api__metrics__flush_backoff_count =
+      _wire__crate__api__metrics__flush_backoff_countPtr
+          .asFunction<void Function(int)>();
+
   void wire__crate__api__forest__flush_forest(
     int port_,
     int client,
@@ -2458,6 +3136,25 @@ class RustLibWire implements BaseWire {
       _wire__crate__api__error__fula_error_is_access_deniedPtr
           .asFunction<void Function(int, ffi.Pointer<wire_cst_fula_error>)>();
 
+  void wire__crate__api__error__fula_error_is_cache_error(
+    int port_,
+    ffi.Pointer<wire_cst_fula_error> that,
+  ) {
+    return _wire__crate__api__error__fula_error_is_cache_error(port_, that);
+  }
+
+  late final _wire__crate__api__error__fula_error_is_cache_errorPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(ffi.Int64, ffi.Pointer<wire_cst_fula_error>)
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__error__fula_error_is_cache_error',
+      );
+  late final _wire__crate__api__error__fula_error_is_cache_error =
+      _wire__crate__api__error__fula_error_is_cache_errorPtr
+          .asFunction<void Function(int, ffi.Pointer<wire_cst_fula_error>)>();
+
   void wire__crate__api__error__fula_error_is_encryption_error(
     int port_,
     ffi.Pointer<wire_cst_fula_error> that,
@@ -2514,6 +3211,28 @@ class RustLibWire implements BaseWire {
       >('frbgen_fula_client_wire__crate__api__error__fula_error_is_not_found');
   late final _wire__crate__api__error__fula_error_is_not_found =
       _wire__crate__api__error__fula_error_is_not_foundPtr
+          .asFunction<void Function(int, ffi.Pointer<wire_cst_fula_error>)>();
+
+  void wire__crate__api__error__fula_error_is_users_index_error(
+    int port_,
+    ffi.Pointer<wire_cst_fula_error> that,
+  ) {
+    return _wire__crate__api__error__fula_error_is_users_index_error(
+      port_,
+      that,
+    );
+  }
+
+  late final _wire__crate__api__error__fula_error_is_users_index_errorPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(ffi.Int64, ffi.Pointer<wire_cst_fula_error>)
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__error__fula_error_is_users_index_error',
+      );
+  late final _wire__crate__api__error__fula_error_is_users_index_error =
+      _wire__crate__api__error__fula_error_is_users_index_errorPtr
           .asFunction<void Function(int, ffi.Pointer<wire_cst_fula_error>)>();
 
   void wire__crate__api__chunked__get_chunked(
@@ -2709,6 +3428,28 @@ class RustLibWire implements BaseWire {
             )
           >();
 
+  void wire__crate__api__forest__get_file_size(
+    int port_,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> file_path,
+  ) {
+    return _wire__crate__api__forest__get_file_size(port_, file_path);
+  }
+
+  late final _wire__crate__api__forest__get_file_sizePtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >('frbgen_fula_client_wire__crate__api__forest__get_file_size');
+  late final _wire__crate__api__forest__get_file_size =
+      _wire__crate__api__forest__get_file_sizePtr
+          .asFunction<
+            void Function(int, ffi.Pointer<wire_cst_list_prim_u_8_strict>)
+          >();
+
   void wire__crate__api__forest__get_flat(
     int port_,
     int client,
@@ -2812,6 +3553,42 @@ class RustLibWire implements BaseWire {
             )
           >();
 
+  void wire__crate__api__client__get_last_master_health_event(
+    int port_,
+    int client,
+  ) {
+    return _wire__crate__api__client__get_last_master_health_event(
+      port_,
+      client,
+    );
+  }
+
+  late final _wire__crate__api__client__get_last_master_health_eventPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64, ffi.UintPtr)>>(
+        'frbgen_fula_client_wire__crate__api__client__get_last_master_health_event',
+      );
+  late final _wire__crate__api__client__get_last_master_health_event =
+      _wire__crate__api__client__get_last_master_health_eventPtr
+          .asFunction<void Function(int, int)>();
+
+  void wire__crate__api__client__get_last_master_health_event_encrypted(
+    int port_,
+    int client,
+  ) {
+    return _wire__crate__api__client__get_last_master_health_event_encrypted(
+      port_,
+      client,
+    );
+  }
+
+  late final _wire__crate__api__client__get_last_master_health_event_encryptedPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64, ffi.UintPtr)>>(
+        'frbgen_fula_client_wire__crate__api__client__get_last_master_health_event_encrypted',
+      );
+  late final _wire__crate__api__client__get_last_master_health_event_encrypted =
+      _wire__crate__api__client__get_last_master_health_event_encryptedPtr
+          .asFunction<void Function(int, int)>();
+
   void wire__crate__api__client__get_object(
     int port_,
     int client,
@@ -2872,6 +3649,44 @@ class RustLibWire implements BaseWire {
       );
   late final _wire__crate__api__client__get_object_with_metadata =
       _wire__crate__api__client__get_object_with_metadataPtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            )
+          >();
+
+  void wire__crate__api__client__get_object_with_offline_fallback(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> bucket,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> key,
+  ) {
+    return _wire__crate__api__client__get_object_with_offline_fallback(
+      port_,
+      client,
+      bucket,
+      key,
+    );
+  }
+
+  late final _wire__crate__api__client__get_object_with_offline_fallbackPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__client__get_object_with_offline_fallback',
+      );
+  late final _wire__crate__api__client__get_object_with_offline_fallback =
+      _wire__crate__api__client__get_object_with_offline_fallbackPtr
           .asFunction<
             void Function(
               int,
@@ -3441,6 +4256,39 @@ class RustLibWire implements BaseWire {
       _wire__crate__api__types__object_metadata_defaultPtr
           .asFunction<void Function(int)>();
 
+  void wire__crate__api__client__poll_master_health_events(
+    int port_,
+    int client,
+  ) {
+    return _wire__crate__api__client__poll_master_health_events(port_, client);
+  }
+
+  late final _wire__crate__api__client__poll_master_health_eventsPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64, ffi.UintPtr)>>(
+        'frbgen_fula_client_wire__crate__api__client__poll_master_health_events',
+      );
+  late final _wire__crate__api__client__poll_master_health_events =
+      _wire__crate__api__client__poll_master_health_eventsPtr
+          .asFunction<void Function(int, int)>();
+
+  void wire__crate__api__client__poll_master_health_events_encrypted(
+    int port_,
+    int client,
+  ) {
+    return _wire__crate__api__client__poll_master_health_events_encrypted(
+      port_,
+      client,
+    );
+  }
+
+  late final _wire__crate__api__client__poll_master_health_events_encryptedPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64, ffi.UintPtr)>>(
+        'frbgen_fula_client_wire__crate__api__client__poll_master_health_events_encrypted',
+      );
+  late final _wire__crate__api__client__poll_master_health_events_encrypted =
+      _wire__crate__api__client__poll_master_health_events_encryptedPtr
+          .asFunction<void Function(int, int)>();
+
   void wire__crate__api__chunked__put_chunked(
     int port_,
     int client,
@@ -3659,6 +4507,200 @@ class RustLibWire implements BaseWire {
             )
           >();
 
+  void wire__crate__api__forest__put_flat_from_path(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> bucket,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> file_path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> content_type,
+  ) {
+    return _wire__crate__api__forest__put_flat_from_path(
+      port_,
+      client,
+      bucket,
+      path,
+      file_path,
+      content_type,
+    );
+  }
+
+  late final _wire__crate__api__forest__put_flat_from_pathPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >('frbgen_fula_client_wire__crate__api__forest__put_flat_from_path');
+  late final _wire__crate__api__forest__put_flat_from_path =
+      _wire__crate__api__forest__put_flat_from_pathPtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            )
+          >();
+
+  void wire__crate__api__forest__put_flat_from_path_deferred(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> bucket,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> file_path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> content_type,
+  ) {
+    return _wire__crate__api__forest__put_flat_from_path_deferred(
+      port_,
+      client,
+      bucket,
+      path,
+      file_path,
+      content_type,
+    );
+  }
+
+  late final _wire__crate__api__forest__put_flat_from_path_deferredPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__forest__put_flat_from_path_deferred',
+      );
+  late final _wire__crate__api__forest__put_flat_from_path_deferred =
+      _wire__crate__api__forest__put_flat_from_path_deferredPtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            )
+          >();
+
+  void wire__crate__api__forest__put_flat_resumable_from_path(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> bucket,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> file_path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> manifest_path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> content_type,
+  ) {
+    return _wire__crate__api__forest__put_flat_resumable_from_path(
+      port_,
+      client,
+      bucket,
+      path,
+      file_path,
+      manifest_path,
+      content_type,
+    );
+  }
+
+  late final _wire__crate__api__forest__put_flat_resumable_from_pathPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__forest__put_flat_resumable_from_path',
+      );
+  late final _wire__crate__api__forest__put_flat_resumable_from_path =
+      _wire__crate__api__forest__put_flat_resumable_from_pathPtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            )
+          >();
+
+  void wire__crate__api__forest__put_flat_resumable_from_path_cancellable(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> bucket,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> file_path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> manifest_path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> content_type,
+    int cancel,
+  ) {
+    return _wire__crate__api__forest__put_flat_resumable_from_path_cancellable(
+      port_,
+      client,
+      bucket,
+      path,
+      file_path,
+      manifest_path,
+      content_type,
+      cancel,
+    );
+  }
+
+  late final _wire__crate__api__forest__put_flat_resumable_from_path_cancellablePtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.UintPtr,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__forest__put_flat_resumable_from_path_cancellable',
+      );
+  late final _wire__crate__api__forest__put_flat_resumable_from_path_cancellable =
+      _wire__crate__api__forest__put_flat_resumable_from_path_cancellablePtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              int,
+            )
+          >();
+
   void wire__crate__api__client__put_object(
     int port_,
     int client,
@@ -3742,6 +4784,86 @@ class RustLibWire implements BaseWire {
               ffi.Pointer<wire_cst_list_prim_u_8_strict>,
               ffi.Pointer<wire_cst_list_prim_u_8_loose>,
               ffi.Pointer<wire_cst_object_metadata>,
+            )
+          >();
+
+  void wire__crate__api__forest__resume_flat_upload_from_path(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> manifest_path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> file_path,
+  ) {
+    return _wire__crate__api__forest__resume_flat_upload_from_path(
+      port_,
+      client,
+      manifest_path,
+      file_path,
+    );
+  }
+
+  late final _wire__crate__api__forest__resume_flat_upload_from_pathPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__forest__resume_flat_upload_from_path',
+      );
+  late final _wire__crate__api__forest__resume_flat_upload_from_path =
+      _wire__crate__api__forest__resume_flat_upload_from_pathPtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            )
+          >();
+
+  void wire__crate__api__forest__resume_flat_upload_from_path_cancellable(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> manifest_path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> file_path,
+    int cancel,
+  ) {
+    return _wire__crate__api__forest__resume_flat_upload_from_path_cancellable(
+      port_,
+      client,
+      manifest_path,
+      file_path,
+      cancel,
+    );
+  }
+
+  late final _wire__crate__api__forest__resume_flat_upload_from_path_cancellablePtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.UintPtr,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__forest__resume_flat_upload_from_path_cancellable',
+      );
+  late final _wire__crate__api__forest__resume_flat_upload_from_path_cancellable =
+      _wire__crate__api__forest__resume_flat_upload_from_path_cancellablePtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              int,
             )
           >();
 
@@ -3935,6 +5057,48 @@ class RustLibWire implements BaseWire {
             )
           >();
 
+  void wire__crate__api__multipart__start_multipart_with_concurrency(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> bucket,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> key,
+    int max_concurrency,
+  ) {
+    return _wire__crate__api__multipart__start_multipart_with_concurrency(
+      port_,
+      client,
+      bucket,
+      key,
+      max_concurrency,
+    );
+  }
+
+  late final _wire__crate__api__multipart__start_multipart_with_concurrencyPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Uint32,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__multipart__start_multipart_with_concurrency',
+      );
+  late final _wire__crate__api__multipart__start_multipart_with_concurrency =
+      _wire__crate__api__multipart__start_multipart_with_concurrencyPtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              int,
+            )
+          >();
+
   void wire__crate__api__multipart__upload_large_file_simple(
     int port_,
     int client,
@@ -4061,6 +5225,18 @@ class RustLibWire implements BaseWire {
       _wire__crate__api__metrics__wal_append_failure_countPtr
           .asFunction<void Function(int)>();
 
+  void wire__crate__api__metrics__wal_truncated_groups_count(int port_) {
+    return _wire__crate__api__metrics__wal_truncated_groups_count(port_);
+  }
+
+  late final _wire__crate__api__metrics__wal_truncated_groups_countPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64)>>(
+        'frbgen_fula_client_wire__crate__api__metrics__wal_truncated_groups_count',
+      );
+  late final _wire__crate__api__metrics__wal_truncated_groups_count =
+      _wire__crate__api__metrics__wal_truncated_groups_countPtr
+          .asFunction<void Function(int)>();
+
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
     ffi.Pointer<ffi.Void> ptr,
@@ -4093,6 +5269,40 @@ class RustLibWire implements BaseWire {
       );
   late final _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle =
       _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandlePtr
+          .asFunction<void Function(ffi.Pointer<ffi.Void>)>();
+
+  void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    ffi.Pointer<ffi.Void> ptr,
+  ) {
+    return _rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+      ptr,
+    );
+  }
+
+  late final _rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandlePtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void>)>>(
+        'frbgen_fula_client_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle',
+      );
+  late final _rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle =
+      _rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandlePtr
+          .asFunction<void Function(ffi.Pointer<ffi.Void>)>();
+
+  void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+    ffi.Pointer<ffi.Void> ptr,
+  ) {
+    return _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+      ptr,
+    );
+  }
+
+  late final _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandlePtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void>)>>(
+        'frbgen_fula_client_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle',
+      );
+  late final _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle =
+      _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandlePtr
           .asFunction<void Function(ffi.Pointer<ffi.Void>)>();
 
   void
@@ -4291,6 +5501,19 @@ class RustLibWire implements BaseWire {
       _cst_new_box_autoadd_list_optionsPtr
           .asFunction<ffi.Pointer<wire_cst_list_options> Function()>();
 
+  ffi.Pointer<wire_cst_master_health_event>
+  cst_new_box_autoadd_master_health_event() {
+    return _cst_new_box_autoadd_master_health_event();
+  }
+
+  late final _cst_new_box_autoadd_master_health_eventPtr =
+      _lookup<
+        ffi.NativeFunction<ffi.Pointer<wire_cst_master_health_event> Function()>
+      >('frbgen_fula_client_cst_new_box_autoadd_master_health_event');
+  late final _cst_new_box_autoadd_master_health_event =
+      _cst_new_box_autoadd_master_health_eventPtr
+          .asFunction<ffi.Pointer<wire_cst_master_health_event> Function()>();
+
   ffi.Pointer<wire_cst_object_metadata> cst_new_box_autoadd_object_metadata() {
     return _cst_new_box_autoadd_object_metadata();
   }
@@ -4391,6 +5614,23 @@ class RustLibWire implements BaseWire {
       >('frbgen_fula_client_cst_new_list_file_metadata');
   late final _cst_new_list_file_metadata = _cst_new_list_file_metadataPtr
       .asFunction<ffi.Pointer<wire_cst_list_file_metadata> Function(int)>();
+
+  ffi.Pointer<wire_cst_list_master_health_event>
+  cst_new_list_master_health_event(int len) {
+    return _cst_new_list_master_health_event(len);
+  }
+
+  late final _cst_new_list_master_health_eventPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Pointer<wire_cst_list_master_health_event> Function(ffi.Int32)
+        >
+      >('frbgen_fula_client_cst_new_list_master_health_event');
+  late final _cst_new_list_master_health_event =
+      _cst_new_list_master_health_eventPtr
+          .asFunction<
+            ffi.Pointer<wire_cst_list_master_health_event> Function(int)
+          >();
 
   ffi.Pointer<wire_cst_list_metadata_entry> cst_new_list_metadata_entry(
     int len,
@@ -4493,6 +5733,20 @@ final class wire_cst_list_prim_u_8_strict extends ffi.Struct {
   external int len;
 }
 
+final class wire_cst_list_prim_u_8_loose extends ffi.Struct {
+  external ffi.Pointer<ffi.Uint8> ptr;
+
+  @ffi.Int32()
+  external int len;
+}
+
+final class wire_cst_list_String extends ffi.Struct {
+  external ffi.Pointer<ffi.Pointer<wire_cst_list_prim_u_8_strict>> ptr;
+
+  @ffi.Int32()
+  external int len;
+}
+
 final class wire_cst_fula_config extends ffi.Struct {
   external ffi.Pointer<wire_cst_list_prim_u_8_strict> endpoint;
 
@@ -4509,6 +5763,49 @@ final class wire_cst_fula_config extends ffi.Struct {
 
   @ffi.Uint64()
   external int buffered_download_max_bytes;
+
+  @ffi.Bool()
+  external bool health_gate_enabled;
+
+  @ffi.Uint64()
+  external int health_gate_ttl_seconds;
+
+  @ffi.Bool()
+  external bool block_cache_enabled;
+
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict> block_cache_path;
+
+  @ffi.Uint64()
+  external int block_cache_max_bytes;
+
+  @ffi.Bool()
+  external bool gateway_fallback_enabled;
+
+  external ffi.Pointer<wire_cst_list_String> gateway_fallback_urls;
+
+  @ffi.Uint32()
+  external int gateway_race_concurrency;
+
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict> users_index_chain_rpc_url;
+
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict>
+  users_index_anchor_address;
+
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict> users_index_ipns_name;
+
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict> users_index_user_key;
+
+  external ffi.Pointer<wire_cst_list_String> users_index_ipns_gateway_urls;
+
+  external ffi.Pointer<wire_cst_list_String> users_index_ipfs_gateway_urls;
+
+  @ffi.Bool()
+  external bool walkable_v8_writer_enabled;
+
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict>
+  encrypted_user_buckets_index_key;
+
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict> user_entry_signing_seed;
 }
 
 final class wire_cst_encryption_config extends ffi.Struct {
@@ -4525,13 +5822,6 @@ final class wire_cst_pinning_config extends ffi.Struct {
   external ffi.Pointer<wire_cst_list_prim_u_8_strict> endpoint;
 
   external ffi.Pointer<wire_cst_list_prim_u_8_strict> token;
-}
-
-final class wire_cst_list_prim_u_8_loose extends ffi.Struct {
-  external ffi.Pointer<ffi.Uint8> ptr;
-
-  @ffi.Int32()
-  external int len;
 }
 
 final class wire_cst_FulaError_Network extends ffi.Struct {
@@ -4588,6 +5878,38 @@ final class wire_cst_FulaError_ForestError extends ffi.Struct {
   external ffi.Pointer<wire_cst_list_prim_u_8_strict> field0;
 }
 
+final class wire_cst_FulaError_CacheBudgetExceeded extends ffi.Struct {
+  @ffi.Uint64()
+  external int size;
+
+  @ffi.Uint64()
+  external int budget;
+}
+
+final class wire_cst_FulaError_CacheError extends ffi.Struct {
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict> field0;
+}
+
+final class wire_cst_FulaError_UsersIndexResolutionFailed extends ffi.Struct {
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict> field0;
+}
+
+final class wire_cst_FulaError_WireVersionUnsupported extends ffi.Struct {
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict> context;
+
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict> postcard_error;
+}
+
+final class wire_cst_FulaError_SequenceRegression extends ffi.Struct {
+  @ffi.Uint64()
+  external int observed;
+
+  @ffi.Uint64()
+  external int highest_seen;
+
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict> channel;
+}
+
 final class wire_cst_FulaError_Internal extends ffi.Struct {
   external ffi.Pointer<wire_cst_list_prim_u_8_strict> field0;
 }
@@ -4618,6 +5940,17 @@ final class FulaErrorKind extends ffi.Union {
   external wire_cst_FulaError_RotationError RotationError;
 
   external wire_cst_FulaError_ForestError ForestError;
+
+  external wire_cst_FulaError_CacheBudgetExceeded CacheBudgetExceeded;
+
+  external wire_cst_FulaError_CacheError CacheError;
+
+  external wire_cst_FulaError_UsersIndexResolutionFailed
+  UsersIndexResolutionFailed;
+
+  external wire_cst_FulaError_WireVersionUnsupported WireVersionUnsupported;
+
+  external wire_cst_FulaError_SequenceRegression SequenceRegression;
 
   external wire_cst_FulaError_Internal Internal;
 }
@@ -4689,11 +6022,27 @@ final class wire_cst_rotation_report extends ffi.Struct {
   external ffi.Pointer<wire_cst_list_rotation_failure> failures;
 }
 
-final class wire_cst_list_String extends ffi.Struct {
-  external ffi.Pointer<ffi.Pointer<wire_cst_list_prim_u_8_strict>> ptr;
+final class wire_cst_MasterHealthEvent_OfflineFallbackActive
+    extends ffi.Struct {
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict> reason;
+}
 
+final class wire_cst_MasterHealthEvent_SeverelyDegraded extends ffi.Struct {
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict> reason;
+}
+
+final class MasterHealthEventKind extends ffi.Union {
+  external wire_cst_MasterHealthEvent_OfflineFallbackActive
+  OfflineFallbackActive;
+
+  external wire_cst_MasterHealthEvent_SeverelyDegraded SeverelyDegraded;
+}
+
+final class wire_cst_master_health_event extends ffi.Struct {
   @ffi.Int32()
-  external int len;
+  external int tag;
+
+  external MasterHealthEventKind kind;
 }
 
 final class wire_cst_bucket_info extends ffi.Struct {
@@ -4746,6 +6095,13 @@ final class wire_cst_directory_entry extends ffi.Struct {
 
 final class wire_cst_list_directory_entry extends ffi.Struct {
   external ffi.Pointer<wire_cst_directory_entry> ptr;
+
+  @ffi.Int32()
+  external int len;
+}
+
+final class wire_cst_list_master_health_event extends ffi.Struct {
+  external ffi.Pointer<wire_cst_master_health_event> ptr;
 
   @ffi.Int32()
   external int len;
@@ -4804,6 +6160,51 @@ final class wire_cst_forest_subtree extends ffi.Struct {
   external ffi.Pointer<wire_cst_list_prim_u_8_strict> serialized;
 }
 
+final class wire_cst_FulaReadFreshness_Cached extends ffi.Struct {
+  @ffi.Uint64()
+  external int observed_at;
+}
+
+final class wire_cst_FulaReadFreshness_StaleByDesign extends ffi.Struct {
+  @ffi.Uint64()
+  external int snapshot_age_secs;
+}
+
+final class wire_cst_FulaReadFreshness_StaleByOutage extends ffi.Struct {
+  @ffi.Uint64()
+  external int snapshot_age_secs;
+}
+
+final class FulaReadFreshnessKind extends ffi.Union {
+  external wire_cst_FulaReadFreshness_Cached Cached;
+
+  external wire_cst_FulaReadFreshness_StaleByDesign StaleByDesign;
+
+  external wire_cst_FulaReadFreshness_StaleByOutage StaleByOutage;
+}
+
+final class wire_cst_fula_read_freshness extends ffi.Struct {
+  @ffi.Int32()
+  external int tag;
+
+  external FulaReadFreshnessKind kind;
+}
+
+final class wire_cst_FulaReadSource_Gateway extends ffi.Struct {
+  external ffi.Pointer<wire_cst_list_prim_u_8_strict> field0;
+}
+
+final class FulaReadSourceKind extends ffi.Union {
+  external wire_cst_FulaReadSource_Gateway Gateway;
+}
+
+final class wire_cst_fula_read_source extends ffi.Struct {
+  @ffi.Int32()
+  external int tag;
+
+  external FulaReadSourceKind kind;
+}
+
 final class wire_cst_get_object_result extends ffi.Struct {
   external ffi.Pointer<wire_cst_list_prim_u_8_strict> data;
 
@@ -4843,6 +6244,14 @@ final class wire_cst_list_objects_result extends ffi.Struct {
   external bool is_truncated;
 
   external ffi.Pointer<wire_cst_list_prim_u_8_strict> next_token;
+}
+
+final class wire_cst_offline_get_result extends ffi.Struct {
+  external wire_cst_get_object_result inner;
+
+  external wire_cst_fula_read_source source;
+
+  external wire_cst_fula_read_freshness freshness;
 }
 
 final class wire_cst_put_result extends ffi.Struct {

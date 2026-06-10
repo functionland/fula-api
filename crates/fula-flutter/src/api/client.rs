@@ -1,4 +1,4 @@
-//! Core FulaClient wrapper operations
+﻿//! Core FulaClient wrapper operations
 //!
 //! These functions wrap the underlying FulaClient for plain (unencrypted) operations.
 
@@ -19,7 +19,7 @@ use crate::api::types::*;
 /// `FulaConfig`, plumbing every Phase 1.2 / 2.x / 3.3 / 19 field
 /// through. Used by `create_client`, `create_encrypted_client`, and
 /// `create_encrypted_client_with_pinning` to keep the three
-/// constructors in lockstep — adding a new field to FulaConfig only
+/// constructors in lockstep â€” adding a new field to FulaConfig only
 /// requires a change here.
 ///
 /// `dispatcher` is the per-handle dispatcher that the FRB layer
@@ -37,11 +37,11 @@ fn build_inner_config(
         Duration::from_secs(config.per_chunk_download_timeout_seconds);
     inner.buffered_download_max_bytes = config.buffered_download_max_bytes;
 
-    // Phase 2.1 — health gate.
+    // Phase 2.1 â€” health gate.
     inner.health_gate_enabled = config.health_gate_enabled;
     inner.health_gate_ttl = Duration::from_secs(config.health_gate_ttl_seconds);
 
-    // Phase 2.2 — block cache. The path-string conversion treats
+    // Phase 2.2 â€” block cache. The path-string conversion treats
     // empty string as `None` so the SDK's `dirs`-based platform
     // default kicks in.
     inner.block_cache_enabled = config.block_cache_enabled;
@@ -52,15 +52,15 @@ fn build_inner_config(
     };
     inner.block_cache_max_bytes = config.block_cache_max_bytes;
 
-    // Phase 2.3 / 2.4 — gateway race + offline fallback.
+    // Phase 2.3 / 2.4 â€” gateway race + offline fallback.
     inner.gateway_fallback_enabled = config.gateway_fallback_enabled;
     inner.gateway_fallback_urls = config.gateway_fallback_urls.clone();
     inner.gateway_race_concurrency = config.gateway_race_concurrency as usize;
 
-    // Phase 3.3 — cold-start hybrid resolver. The resolver activates
+    // Phase 3.3 â€” cold-start hybrid resolver. The resolver activates
     // iff all four required strings (rpc_url, anchor_address,
     // ipns_name, user_key) are non-empty AND the user_key is `Some`.
-    // Empty strings collapse to "disabled" — same default behavior as
+    // Empty strings collapse to "disabled" â€” same default behavior as
     // pre-Phase-3.3 builds.
     inner.users_index_chain_rpc_url = config.users_index_chain_rpc_url.clone();
     inner.users_index_anchor_address = config.users_index_anchor_address.clone();
@@ -75,7 +75,7 @@ fn build_inner_config(
     inner.users_index_ipfs_gateway_urls =
         config.users_index_ipfs_gateway_urls.clone();
 
-    // Walkable-v8 (W.9.3) — writer flag. Cross-platform: works on
+    // Walkable-v8 (W.9.3) â€” writer flag. Cross-platform: works on
     // every fula-flutter target (Android/iOS/Windows/macOS/Ubuntu)
     // and on the wasm32 browser target. Default `false` keeps writes
     // byte-identical to v0.5; flipping `true` activates the v8 wire
@@ -83,7 +83,7 @@ fn build_inner_config(
     // the full self-verify rationale.
     inner.walkable_v8_writer_enabled = config.walkable_v8_writer_enabled;
 
-    // E2E plan Phase 5 — encrypted bucketsIndex keys. Empty Vec is
+    // E2E plan Phase 5 â€” encrypted bucketsIndex keys. Empty Vec is
     // treated as `None` (Mode A behavior preserved). Non-empty must
     // be exactly 32 bytes; on length mismatch we silently fall back
     // to `None` so the SDK keeps working in legacy mode rather than
@@ -101,10 +101,10 @@ fn build_inner_config(
         None
     };
 
-    // Phase 19 — always wire a forwarding callback into the gate so
+    // Phase 19 â€” always wire a forwarding callback into the gate so
     // Dart-side subscribers can observe health transitions. The
     // dispatcher is per-handle, so events from this client never
-    // leak to a different client's subscribers. Native-only — wasm
+    // leak to a different client's subscribers. Native-only â€” wasm
     // doesn't include the health-callback Arc in fula_client::Config
     // because `Arc<dyn Fn>` doesn't cross wasm-bindgen cleanly; the
     // wasm path surfaces via typed errors.
@@ -134,7 +134,7 @@ fn build_inner_config(
 // ============================================================================
 
 /// Create a new Fula client with the given configuration
-pub fn create_client(config: FulaConfig) -> anyhow::Result<FulaClientHandle> {
+pub async fn create_client(config: FulaConfig) -> anyhow::Result<FulaClientHandle> {
     let dispatcher = Arc::new(HealthEventDispatcher::new());
     let inner_config = build_inner_config(&config, &dispatcher);
     let client = fula_client::FulaClient::new(inner_config)?;
@@ -146,7 +146,7 @@ pub fn create_client(config: FulaConfig) -> anyhow::Result<FulaClientHandle> {
 }
 
 /// Create a new encrypted client with the given configuration
-pub fn create_encrypted_client(
+pub async fn create_encrypted_client(
     config: FulaConfig,
     encryption: EncryptionConfig,
 ) -> anyhow::Result<EncryptedClientHandle> {
@@ -155,7 +155,7 @@ pub fn create_encrypted_client(
 
     // Create encryption config.
     //
-    // `encryption.secret_key` MUST be supplied — fula derives every per-user
+    // `encryption.secret_key` MUST be supplied â€” fula derives every per-user
     // identifier (X25519 keypair, content_encryption_key, userKey) from a
     // stable OAuth-derived seed so that the same user logging in on a fresh
     // device reaches the same data. Falling back to a random keypair here
@@ -205,7 +205,7 @@ pub fn create_encrypted_client(
 }
 
 /// Create encrypted client with pinning support
-pub fn create_encrypted_client_with_pinning(
+pub async fn create_encrypted_client_with_pinning(
     config: FulaConfig,
     encryption: EncryptionConfig,
     pinning: PinningConfig,
@@ -268,36 +268,36 @@ pub fn create_encrypted_client_with_pinning(
 }
 
 // ============================================================================
-// Phase 3.3 — userKey derivation
+// Phase 3.3 â€” userKey derivation
 // ============================================================================
 
-/// **PREFERRED** — derive the canonical fula `userKey` directly from a
+/// **PREFERRED** â€” derive the canonical fula `userKey` directly from a
 /// JWT `sub` claim. Mirrors `fula_client::derive_user_key_from_jwt_sub`.
 ///
 /// Use this whenever the app has access to the JWT (which is at every
-/// sign-in — the issued token carries the sub). Works correctly for
+/// sign-in â€” the issued token carries the sub). Works correctly for
 /// BOTH pre-migration-011 users (sub = plaintext email) and modern
 /// users (sub = sha256(email).hex()), because master's
 /// `state.rs::hash_user_id` does not transform the sub before hashing
-/// — and this function does not transform either.
+/// â€” and this function does not transform either.
 ///
 /// Apps should cache the JWT sub at sign-in and pass it here whenever
 /// (re-)setting `FulaConfig::users_index_user_key`. The SDK never sees
 /// the raw email.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn derive_user_key_from_jwt_sub(jwt_sub: String) -> String {
+pub async fn derive_user_key_from_jwt_sub(jwt_sub: String) -> String {
     fula_client::derive_user_key_from_jwt_sub(&jwt_sub)
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn derive_user_key_from_jwt_sub(_jwt_sub: String) -> String {
+pub async fn derive_user_key_from_jwt_sub(_jwt_sub: String) -> String {
     // wasm32 doesn't run the cold-start resolver natively; return an
     // empty key so resolver self-disables. Mirrors the wasm stub for
     // `derive_user_key_from_email` below.
     String::new()
 }
 
-/// **DEPRECATED — broken for pre-migration-011 users.** Use
+/// **DEPRECATED â€” broken for pre-migration-011 users.** Use
 /// [`derive_user_key_from_jwt_sub`] instead.
 ///
 /// Apps that have already shipped using this function continue to
@@ -311,21 +311,21 @@ pub fn derive_user_key_from_jwt_sub(_jwt_sub: String) -> String {
 /// `derive_user_key_from_jwt_sub`; switching the call is a one-line
 /// app change.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn derive_user_key_from_email(email: String) -> String {
+pub async fn derive_user_key_from_email(email: String) -> String {
     fula_client::derive_user_key_from_email(&email)
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn derive_user_key_from_email(_email: String) -> String {
+pub async fn derive_user_key_from_email(_email: String) -> String {
     // The Rust cold-start resolver isn't wired on wasm32; expose
     // the function for API symmetry but emit an empty key so the
     // resolver self-disables (per build_inner_config: empty user_key
-    // → users_index_user_key=None → resolver inactive).
+    // â†’ users_index_user_key=None â†’ resolver inactive).
     String::new()
 }
 
 // ============================================================================
-// Phase 19 — health-event subscription
+// Phase 19 â€” health-event subscription
 // ============================================================================
 
 /// Drain every `MasterHealthEvent` observed since the last call to
@@ -334,15 +334,15 @@ pub fn derive_user_key_from_email(_email: String) -> String {
 ///
 /// Apps poll this on a timer (or on UI rebuilds) and update their
 /// online/offline indicator. Internal buffer is bounded at 64
-/// entries — if an app falls so far behind that the buffer
+/// entries â€” if an app falls so far behind that the buffer
 /// overflows, the oldest events are dropped first; the latest state
 /// is preserved. For latest-only consumers, see
 /// [`get_last_master_health_event`].
 ///
 /// Events delivered:
-///   - `Online` — master went Up after being Down
-///   - `OfflineFallbackActive { reason }` — master went Down
-///   - `SeverelyDegraded { reason }` — both master AND cold-start
+///   - `Online` â€” master went Up after being Down
+///   - `OfflineFallbackActive { reason }` â€” master went Down
+///   - `SeverelyDegraded { reason }` â€” both master AND cold-start
 ///     channels (IPNS + chain) are unreachable; cold-start GETs
 ///     will fail
 ///
@@ -350,7 +350,7 @@ pub fn derive_user_key_from_email(_email: String) -> String {
 /// symmetry but never returns events because the health-callback
 /// Arc isn't wired on wasm (`Arc<dyn Fn>` doesn't cross
 /// wasm-bindgen cleanly).
-pub fn poll_master_health_events(
+pub async fn poll_master_health_events(
     client: &FulaClientHandle,
 ) -> Vec<MasterHealthEvent> {
     client.health_dispatcher.drain_events()
@@ -360,7 +360,7 @@ pub fn poll_master_health_events(
 /// Exposed separately because Dart-side the encrypted client has
 /// its own handle type and FRB doesn't auto-reflect "this method
 /// works on either handle".
-pub fn poll_master_health_events_encrypted(
+pub async fn poll_master_health_events_encrypted(
     client: &EncryptedClientHandle,
 ) -> Vec<MasterHealthEvent> {
     client.health_dispatcher.drain_events()
@@ -370,21 +370,21 @@ pub fn poll_master_health_events_encrypted(
 /// without draining the buffer. Returns `None` if no transition has
 /// happened yet (master has been Up the whole session). Useful for
 /// apps that build UI state from a single field on mount.
-pub fn get_last_master_health_event(
+pub async fn get_last_master_health_event(
     client: &FulaClientHandle,
 ) -> Option<MasterHealthEvent> {
     client.health_dispatcher.last_event()
 }
 
 /// Encrypted-client variant of `get_last_master_health_event`.
-pub fn get_last_master_health_event_encrypted(
+pub async fn get_last_master_health_event_encrypted(
     client: &EncryptedClientHandle,
 ) -> Option<MasterHealthEvent> {
     client.health_dispatcher.last_event()
 }
 
 // ============================================================================
-// Phase 19 — get_object_with_offline_fallback
+// Phase 19 â€” get_object_with_offline_fallback
 // ============================================================================
 
 /// Phase 19 GET wrapper that returns transparency fields alongside
@@ -406,7 +406,7 @@ pub fn get_last_master_health_event_encrypted(
 ///
 /// Native-only at runtime: on wasm32 the SDK currently only wraps
 /// `get_object_with_metadata` (no offline fallback infrastructure on
-/// browsers — block_cache + gateway_fetch are gated out). The wasm
+/// browsers â€” block_cache + gateway_fetch are gated out). The wasm
 /// path returns `OfflineGetResult` with `source = Master, freshness =
 /// Live` so the API shape is identical across platforms.
 pub async fn get_object_with_offline_fallback(
@@ -596,7 +596,7 @@ mod tests {
         );
     }
 
-    /// Phase 2.x — verify all new fields plumb from FulaConfig
+    /// Phase 2.x â€” verify all new fields plumb from FulaConfig
     /// (Dart-facing) through `build_inner_config` into the underlying
     /// `fula_client::Config`. Without this test, a future refactor of
     /// `build_inner_config` could silently drop a field and Dart apps
@@ -691,7 +691,7 @@ mod tests {
         // both in the Dart-side and the inner Rust-side config.
         assert!(
             inner.walkable_v8_writer_enabled,
-            "walkable_v8_writer_enabled must default to true post-#89 — \
+            "walkable_v8_writer_enabled must default to true post-#89 â€” \
              flipping back is a deliberate operator action only"
         );
     }
@@ -711,7 +711,7 @@ mod tests {
         assert!(
             inner.walkable_v8_writer_enabled,
             "Dart-side walkable_v8_writer_enabled = true must plumb to \
-             fula_client::Config — otherwise the FRB binding would silently \
+             fula_client::Config â€” otherwise the FRB binding would silently \
              swallow the operator's opt-in"
         );
     }

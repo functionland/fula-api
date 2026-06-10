@@ -1,4 +1,4 @@
-//! Key rotation operations
+﻿//! Key rotation operations
 //!
 //! Functions for rotating encryption keys to maintain security.
 //! Key rotation re-wraps data encryption keys with a new key encryption key.
@@ -84,12 +84,12 @@ pub async fn rotate_bucket(
 
 impl RotationReport {
     /// Check if all rotations succeeded
-    pub fn is_success(&self) -> bool {
+    pub async fn is_success(&self) -> bool {
         self.failed == 0
     }
 
     /// Get success rate as percentage
-    pub fn success_rate(&self) -> f64 {
+    pub async fn success_rate(&self) -> f64 {
         if self.total == 0 {
             100.0
         } else {

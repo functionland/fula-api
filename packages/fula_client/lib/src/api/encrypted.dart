@@ -232,6 +232,124 @@ Future<Uint8List> deriveKey({
   input: input,
 );
 
+/// Derive a 32-byte sub-key from a high-entropy parent key using
+/// BLAKE3's keyed-derivation mode (`blake3::Hasher::new_derive_key`).
+///
+/// Used by the E2E plan Phase 5 to derive `K_index` and `K_entry_seed`
+/// from the user's already-derived `KEK_seed` (= `_encryptionKey` in
+/// FxFiles, produced by Argon2id). BLAKE3-derive is the right primitive
+/// here because:
+/// 1. Input is already key-strength (32 bytes from Argon2id) â€” no need
+///    for memory-hardness again.
+/// 2. Output is byte-identical to the Rust side's
+///    `derive_entry_signing_seed` / `derive_user_buckets_index_key`,
+///    which use the same `blake3::Hasher::new_derive_key(context)`.
+///
+/// Distinct from [`derive_key`] (Argon2id, memory-hard, for stretching
+/// a user-typed passphrase into a master key).
+///
+/// # Arguments
+/// * `context` â€” domain-separation tag (e.g., `"fula:user-buckets-index:v1"`)
+/// * `input`   â€” parent key bytes (e.g., the 32-byte `KEK_seed`)
+///
+/// # Returns
+/// * 32-byte derived sub-key.
+Future<Uint8List> blake3DeriveKey({
+  required String context,
+  required List<int> input,
+}) => RustLib.instance.api.crateApiEncryptedBlake3DeriveKey(
+  context: context,
+  input: input,
+);
+
+/// Derive a 32-byte key using Argon2id with an EXPLICIT per-user salt.
+///
+/// This is the audit F-A1 / issue #14 Mode B variant. Compared to
+/// [`derive_key`], which uses the `context` bytes as the salt, this
+/// variant takes the salt as a separate parameter so callers can
+/// supply a per-user random salt â€” closing the F-A1 finding (the
+/// master key is no longer derivable from public identity attributes
+/// alone).
+///
+/// Cross-platform parity: the underlying
+/// `fula_crypto::hashing::derive_key_argon2id_with_salt` is pure Rust
+/// and is reachable from both native (FxFiles) and WASM (WebUI) so the
+/// derived key is byte-identical across platforms for the same
+/// (context, input, salt) triple.
+///
+/// Mode A users continue to call [`derive_key`] (legacy behavior,
+/// unchanged). Mode B users call this function with their per-user
+/// random salt.
+///
+/// # Arguments
+/// * `context` â€” domain-separation tag (e.g., `"fula-files-v1-google-pw"`)
+/// * `input`   â€” UTF-8 bytes of the identity-plus-seed string
+///               (e.g., `"google:<sub>:<email>:<seed>"`)
+/// * `salt`    â€” per-user random salt; minimum 8 bytes, recommended 32
+///
+/// # Returns
+/// * 32-byte derived key, or an error string if the salt is too short
+Future<Uint8List> deriveKeyWithSalt({
+  required String context,
+  required List<int> input,
+  required List<int> salt,
+}) => RustLib.instance.api.crateApiEncryptedDeriveKeyWithSalt(
+  context: context,
+  input: input,
+  salt: salt,
+);
+
+/// Compute the **Mode B** `effective_user_id` (OAuth + seed).
+///
+/// Returns a 16-byte identifier suitable as the JWT `sub` claim (after
+/// hex encoding). The seed never leaves the device; whoever can
+/// compute this id IS that user.
+///
+/// `provider` should be a canonical lowercase tag â€” `"google"` or
+/// `"apple"`. `oauth_sub` is the IDP-issued opaque identifier. `seed`
+/// is the user-entered passphrase / password; it is NFKC-normalized
+/// internally before hashing.
+///
+/// See `fula_crypto::effective_user_id::compute_effective_user_id_mode_b`
+/// for the full derivation specification.
+Future<Uint8List> computeEffectiveUserIdModeB({
+  required String provider,
+  required String oauthSub,
+  required String seed,
+}) => RustLib.instance.api.crateApiEncryptedComputeEffectiveUserIdModeB(
+  provider: provider,
+  oauthSub: oauthSub,
+  seed: seed,
+);
+
+/// Compute the **Mode C** (seed-only) `effective_user_id`.
+///
+/// Returns a 16-byte identifier suitable as the JWT `sub` claim (after
+/// hex encoding). Two callers with the same seed produce the same
+/// id â€” by design (the seed IS the identity). High-entropy seeds make
+/// accidental collisions infeasible.
+///
+/// `seed` is NFKC-normalized internally before hashing.
+Future<Uint8List> computeEffectiveUserIdModeC({required String seed}) => RustLib
+    .instance
+    .api
+    .crateApiEncryptedComputeEffectiveUserIdModeC(seed: seed);
+
+/// Derive a deterministic 32-byte Ed25519 signing-key seed from the
+/// user's seed.
+///
+/// Use the returned bytes to construct an Ed25519 signing key (e.g.,
+/// in Dart via the `cryptography` package or the `ed25519` package).
+/// The corresponding public key is what the token issuer stores at
+/// registration time; subsequent sign-ins use challenge-response
+/// (issuer sends a nonce, client signs with this key, issuer verifies).
+///
+/// Domain-separated from the `effective_user_id` derivations so the
+/// signing seed and the user-id are independent functions of the
+/// user's input.
+Future<Uint8List> deriveSigningSeed({required String seed}) =>
+    RustLib.instance.api.crateApiEncryptedDeriveSigningSeed(seed: seed);
+
 /// Check if client uses FlatNamespace mode
 Future<bool> isFlatNamespace({required EncryptedClientHandle client}) =>
     RustLib.instance.api.crateApiEncryptedIsFlatNamespace(client: client);

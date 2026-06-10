@@ -7,6 +7,8 @@ import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'types.dart';
 
+// These functions are ignored because they are not marked as `pub`: `build_inner_config`
+
 /// Create a new Fula client with the given configuration
 Future<FulaClientHandle> createClient({required FulaConfig config}) =>
     RustLib.instance.api.crateApiClientCreateClient(config: config);
@@ -29,6 +31,122 @@ Future<EncryptedClientHandle> createEncryptedClientWithPinning({
   config: config,
   encryption: encryption,
   pinning: pinning,
+);
+
+/// **PREFERRED** â€” derive the canonical fula `userKey` directly from a
+/// JWT `sub` claim. Mirrors `fula_client::derive_user_key_from_jwt_sub`.
+///
+/// Use this whenever the app has access to the JWT (which is at every
+/// sign-in â€” the issued token carries the sub). Works correctly for
+/// BOTH pre-migration-011 users (sub = plaintext email) and modern
+/// users (sub = sha256(email).hex()), because master's
+/// `state.rs::hash_user_id` does not transform the sub before hashing
+/// â€” and this function does not transform either.
+///
+/// Apps should cache the JWT sub at sign-in and pass it here whenever
+/// (re-)setting `FulaConfig::users_index_user_key`. The SDK never sees
+/// the raw email.
+Future<String> deriveUserKeyFromJwtSub({required String jwtSub}) =>
+    RustLib.instance.api.crateApiClientDeriveUserKeyFromJwtSub(jwtSub: jwtSub);
+
+/// **DEPRECATED â€” broken for pre-migration-011 users.** Use
+/// [`derive_user_key_from_jwt_sub`] instead.
+///
+/// Apps that have already shipped using this function continue to
+/// work for post-migration users by accident (the SDK's internal
+/// `sha256(email)` step happens to match what those users' JWT sub
+/// already is). Pre-migration users hit a silent cold-start failure
+/// because their JWT sub is plaintext email and master hashes it
+/// without the sha256 step.
+///
+/// Same wire format and length (32 hex chars) as
+/// `derive_user_key_from_jwt_sub`; switching the call is a one-line
+/// app change.
+Future<String> deriveUserKeyFromEmail({required String email}) =>
+    RustLib.instance.api.crateApiClientDeriveUserKeyFromEmail(email: email);
+
+/// Drain every `MasterHealthEvent` observed since the last call to
+/// this function. Returns events in the order they fired (oldest
+/// first). After draining the buffer is empty.
+///
+/// Apps poll this on a timer (or on UI rebuilds) and update their
+/// online/offline indicator. Internal buffer is bounded at 64
+/// entries â€” if an app falls so far behind that the buffer
+/// overflows, the oldest events are dropped first; the latest state
+/// is preserved. For latest-only consumers, see
+/// [`get_last_master_health_event`].
+///
+/// Events delivered:
+///   - `Online` â€” master went Up after being Down
+///   - `OfflineFallbackActive { reason }` â€” master went Down
+///   - `SeverelyDegraded { reason }` â€” both master AND cold-start
+///     channels (IPNS + chain) are unreachable; cold-start GETs
+///     will fail
+///
+/// Native-only at runtime: on wasm32 the function compiles for API
+/// symmetry but never returns events because the health-callback
+/// Arc isn't wired on wasm (`Arc<dyn Fn>` doesn't cross
+/// wasm-bindgen cleanly).
+Future<List<MasterHealthEvent>> pollMasterHealthEvents({
+  required FulaClientHandle client,
+}) => RustLib.instance.api.crateApiClientPollMasterHealthEvents(client: client);
+
+/// Same as `poll_master_health_events` for an `EncryptedClientHandle`.
+/// Exposed separately because Dart-side the encrypted client has
+/// its own handle type and FRB doesn't auto-reflect "this method
+/// works on either handle".
+Future<List<MasterHealthEvent>> pollMasterHealthEventsEncrypted({
+  required EncryptedClientHandle client,
+}) => RustLib.instance.api.crateApiClientPollMasterHealthEventsEncrypted(
+  client: client,
+);
+
+/// Read the most recent `MasterHealthEvent` observed by the SDK
+/// without draining the buffer. Returns `None` if no transition has
+/// happened yet (master has been Up the whole session). Useful for
+/// apps that build UI state from a single field on mount.
+Future<MasterHealthEvent?> getLastMasterHealthEvent({
+  required FulaClientHandle client,
+}) =>
+    RustLib.instance.api.crateApiClientGetLastMasterHealthEvent(client: client);
+
+/// Encrypted-client variant of `get_last_master_health_event`.
+Future<MasterHealthEvent?> getLastMasterHealthEventEncrypted({
+  required EncryptedClientHandle client,
+}) => RustLib.instance.api.crateApiClientGetLastMasterHealthEventEncrypted(
+  client: client,
+);
+
+/// Phase 19 GET wrapper that returns transparency fields alongside
+/// the bytes. Routes through the SDK's full Phase 2.x + 3.3 stack:
+///
+/// | State                             | Returns                                   |
+/// |-----------------------------------|-------------------------------------------|
+/// | Master up                         | source = Master, freshness = Live         |
+/// | Master down + warm cache hit      | source = LocalCache or Gateway(url),      |
+/// |                                   | freshness = Cached { observed_at }        |
+/// | Master down + cold-start          | source = Gateway(url),                    |
+/// |                                   | freshness = Cached { observed_at }        |
+/// | Master down + cache miss + no     | Err(UsersIndexResolutionFailed)           |
+/// | resolver configured               |                                           |
+///
+/// Apps that don't care about transparency can read `result.inner.data`.
+/// Apps that surface "you're offline" UI inspect `result.source` /
+/// `result.freshness`.
+///
+/// Native-only at runtime: on wasm32 the SDK currently only wraps
+/// `get_object_with_metadata` (no offline fallback infrastructure on
+/// browsers â€” block_cache + gateway_fetch are gated out). The wasm
+/// path returns `OfflineGetResult` with `source = Master, freshness =
+/// Live` so the API shape is identical across platforms.
+Future<OfflineGetResult> getObjectWithOfflineFallback({
+  required FulaClientHandle client,
+  required String bucket,
+  required String key,
+}) => RustLib.instance.api.crateApiClientGetObjectWithOfflineFallback(
+  client: client,
+  bucket: bucket,
+  key: key,
 );
 
 /// List all buckets

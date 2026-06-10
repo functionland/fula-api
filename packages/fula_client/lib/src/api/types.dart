@@ -5,8 +5,12 @@
 
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
+import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
+part 'types.freezed.dart';
 
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`
+// These functions are ignored because they are not marked as `pub`: `dispatch`, `drain_events`, `last_event`, `new`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `HealthEventDispatcher`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`
 
 // Rust type: RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<AcceptedShareHandle>>
 abstract class AcceptedShareHandle implements RustOpaqueInterface {}
@@ -313,6 +317,130 @@ class FulaConfig {
   /// Default: 256 MiB.
   final BigInt bufferedDownloadMaxBytes;
 
+  /// Enable the SDK's master health gate. Off by default
+  /// (backward-compat). When on, the SDK observes request outcomes
+  /// and short-circuits with `Network`/`MasterUnreachable` error
+  /// after two consecutive failures, instead of paying the per-read
+  /// timeout. Works on every platform fula-flutter ships against.
+  final bool healthGateEnabled;
+
+  /// TTL of the `Down` state when `health_gate_enabled = true`.
+  /// After this duration elapses, the next request is allowed
+  /// through as a probe. Default: 30 seconds.
+  final BigInt healthGateTtlSeconds;
+
+  /// Enable the on-disk LRU block cache.
+  ///
+  /// **Native-only.** The cache is `redb`-backed and not available
+  /// in browser-targeted builds. Setting `true` on a wasm32 target
+  /// is silently inert — the underlying SDK skips construction and
+  /// the offline path stays unavailable in the browser. On
+  /// Android/iOS/Ubuntu/Windows the field activates Phase 2.2.
+  final bool blockCacheEnabled;
+
+  /// Filesystem path for the block-cache redb database. Empty
+  /// string = use the platform default (`dirs::data_local_dir()/
+  /// fula/cache/blocks.redb`). Native-only; ignored on wasm32.
+  final String blockCachePath;
+
+  /// Maximum on-disk bytes for the block cache. Default: 256 MiB.
+  /// The cache evicts to 80 % of this watermark when a `put` would
+  /// push it past `max_bytes`. Native-only; ignored on wasm32.
+  final BigInt blockCacheMaxBytes;
+
+  /// Enable falling back to public IPFS gateways when master is
+  /// unreachable AND the SDK has previously cached the requested
+  /// object's CID via Phase 2.2's KEY_TO_CID table.
+  ///
+  /// Requires `block_cache_enabled = true` (the cache holds the
+  /// `(bucket, key) → cid` map the gateway race needs). Native-only;
+  /// ignored on wasm32.
+  final bool gatewayFallbackEnabled;
+
+  /// Custom gateway URL templates. Each must contain the literal
+  /// `{cid}` token, which the SDK substitutes per fetch. Empty Vec
+  /// means "use the SDK-shipped default list of six gateways"
+  /// (Cloudflare, dweb.link, ipfs.io, trustless-gateway.link,
+  /// 4everland.io, gateway.pinata.cloud). Native-only.
+  final List<String> gatewayFallbackUrls;
+
+  /// Number of gateways the SDK races in parallel for any single
+  /// CID. Default: 3. Capped at the gateway-pool length.
+  /// Native-only.
+  final int gatewayRaceConcurrency;
+
+  /// JSON-RPC URL for the chain anchor contract (Base or SKALE).
+  /// Required to enable Phase 3.3 cold-start. Empty → disabled.
+  final String usersIndexChainRpcUrl;
+
+  /// `FulaUsersIndexAnchor.sol` contract address (20 bytes hex,
+  /// optionally `0x`-prefixed). Required to enable Phase 3.3.
+  final String usersIndexAnchorAddress;
+
+  /// IPNS NAME (libp2p public-key hash, e.g. `k51qzi5...`) under
+  /// which the master publishes the global users-index CBOR.
+  /// Required to enable Phase 3.3.
+  final String usersIndexIpnsName;
+
+  /// 32-hex-char `userKey` (= `BLAKE3("fula:user_id:" || sha256(lower(email)))[..16]`).
+  /// Compute via the free function [`derive_user_key_from_email`]
+  /// at sign-in time and pass in here. The SDK does not store the
+  /// raw email. Required to enable Phase 3.3.
+  final String usersIndexUserKey;
+
+  /// IPNS-aware gateway URL templates (each must contain `{name}`).
+  /// Empty Vec = use SDK-shipped defaults
+  /// (Cloudflare/dweb.link/ipfs.io/4everland/Pinata).
+  /// Native-only — wasm cold-start uses the typed-error path.
+  final List<String> usersIndexIpnsGatewayUrls;
+
+  /// `/ipfs/{cid}` gateway URL templates (each must contain `{cid}`).
+  /// Empty Vec = use SDK-shipped 6-gateway default list.
+  /// Native-only.
+  final List<String> usersIndexIpfsGatewayUrls;
+
+  /// Emit walkable-v8 CID hints in HAMT internal-node pointers,
+  /// manifest pages, dir-index, and forest file-index entries from
+  /// master's PUT-response ETag (= `BLAKE3(ciphertext)` raw-codec).
+  ///
+  /// Default flipped to `true` on 2026-05-09 (#89) per user
+  /// decision ("when we roll out everyone will update"). Pre-v0.6
+  /// FxFiles installs reading newly-written buckets surface
+  /// `FulaError::WireVersionUnsupported` (Dart `error_code() ==
+  /// "WIRE_VERSION_UNSUPPORTED"`) on the `LinkV2` portions of the
+  /// tree; v7 portions still in the bucket read normally. Set this
+  /// to `false` to keep emitting the v0.5-readable wire form.
+  /// Mirrors `fula_client::Config::default()` for cross-platform
+  /// parity (non-negotiable project rule).
+  ///
+  /// Each parsed CID is **self-verified** locally before being
+  /// stamped: `BLAKE3(ciphertext)` is recomputed by the SDK and
+  /// compared to the master-returned CID. On mismatch the SDK
+  /// soft-fails to `None` (logging the divergence at warn level,
+  /// rate-limited per (bucket,key) per session) so a compromised
+  /// master cannot redirect future offline walkers to attacker-
+  /// controlled IPFS bytes.
+  ///
+  /// Cross-platform: works identically on every fula-flutter target
+  /// (Android, iOS, Windows, Ubuntu, macOS) and on the wasm32
+  /// browser target. Offline reading via these hints lands in
+  /// W.9.4; today the writer just records them for a future reader.
+  final bool walkableV8WriterEnabled;
+
+  /// E2E plan Phase 5 — 32-byte AEAD key for the encrypted
+  /// per-user bucketsIndex (`K_index` in the plan; derived
+  /// client-side from `KEK_seed` via the auth service). Empty
+  /// `Vec` is treated as `None` by the SDK and leaves the legacy
+  /// plaintext path active (Mode A behavior). Non-empty must be
+  /// exactly 32 bytes; the SDK validates length at config-build.
+  final Uint8List encryptedUserBucketsIndexKey;
+
+  /// E2E plan Phase 5 — 32-byte Ed25519 seed for signing the
+  /// global-CBOR entry (`K_entry_seed` in the plan). Empty `Vec`
+  /// leaves the signed-entry writer inert. Must be exactly 32
+  /// bytes when non-empty.
+  final Uint8List userEntrySigningSeed;
+
   const FulaConfig({
     required this.endpoint,
     this.accessToken,
@@ -320,6 +448,23 @@ class FulaConfig {
     required this.maxRetries,
     required this.perChunkDownloadTimeoutSeconds,
     required this.bufferedDownloadMaxBytes,
+    required this.healthGateEnabled,
+    required this.healthGateTtlSeconds,
+    required this.blockCacheEnabled,
+    required this.blockCachePath,
+    required this.blockCacheMaxBytes,
+    required this.gatewayFallbackEnabled,
+    required this.gatewayFallbackUrls,
+    required this.gatewayRaceConcurrency,
+    required this.usersIndexChainRpcUrl,
+    required this.usersIndexAnchorAddress,
+    required this.usersIndexIpnsName,
+    required this.usersIndexUserKey,
+    required this.usersIndexIpnsGatewayUrls,
+    required this.usersIndexIpfsGatewayUrls,
+    required this.walkableV8WriterEnabled,
+    required this.encryptedUserBucketsIndexKey,
+    required this.userEntrySigningSeed,
   });
 
   static Future<FulaConfig> default_() =>
@@ -332,7 +477,24 @@ class FulaConfig {
       timeoutSeconds.hashCode ^
       maxRetries.hashCode ^
       perChunkDownloadTimeoutSeconds.hashCode ^
-      bufferedDownloadMaxBytes.hashCode;
+      bufferedDownloadMaxBytes.hashCode ^
+      healthGateEnabled.hashCode ^
+      healthGateTtlSeconds.hashCode ^
+      blockCacheEnabled.hashCode ^
+      blockCachePath.hashCode ^
+      blockCacheMaxBytes.hashCode ^
+      gatewayFallbackEnabled.hashCode ^
+      gatewayFallbackUrls.hashCode ^
+      gatewayRaceConcurrency.hashCode ^
+      usersIndexChainRpcUrl.hashCode ^
+      usersIndexAnchorAddress.hashCode ^
+      usersIndexIpnsName.hashCode ^
+      usersIndexUserKey.hashCode ^
+      usersIndexIpnsGatewayUrls.hashCode ^
+      usersIndexIpfsGatewayUrls.hashCode ^
+      walkableV8WriterEnabled.hashCode ^
+      encryptedUserBucketsIndexKey.hashCode ^
+      userEntrySigningSeed.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -345,7 +507,67 @@ class FulaConfig {
           maxRetries == other.maxRetries &&
           perChunkDownloadTimeoutSeconds ==
               other.perChunkDownloadTimeoutSeconds &&
-          bufferedDownloadMaxBytes == other.bufferedDownloadMaxBytes;
+          bufferedDownloadMaxBytes == other.bufferedDownloadMaxBytes &&
+          healthGateEnabled == other.healthGateEnabled &&
+          healthGateTtlSeconds == other.healthGateTtlSeconds &&
+          blockCacheEnabled == other.blockCacheEnabled &&
+          blockCachePath == other.blockCachePath &&
+          blockCacheMaxBytes == other.blockCacheMaxBytes &&
+          gatewayFallbackEnabled == other.gatewayFallbackEnabled &&
+          gatewayFallbackUrls == other.gatewayFallbackUrls &&
+          gatewayRaceConcurrency == other.gatewayRaceConcurrency &&
+          usersIndexChainRpcUrl == other.usersIndexChainRpcUrl &&
+          usersIndexAnchorAddress == other.usersIndexAnchorAddress &&
+          usersIndexIpnsName == other.usersIndexIpnsName &&
+          usersIndexUserKey == other.usersIndexUserKey &&
+          usersIndexIpnsGatewayUrls == other.usersIndexIpnsGatewayUrls &&
+          usersIndexIpfsGatewayUrls == other.usersIndexIpfsGatewayUrls &&
+          walkableV8WriterEnabled == other.walkableV8WriterEnabled &&
+          encryptedUserBucketsIndexKey == other.encryptedUserBucketsIndexKey &&
+          userEntrySigningSeed == other.userEntrySigningSeed;
+}
+
+@freezed
+sealed class FulaReadFreshness with _$FulaReadFreshness {
+  const FulaReadFreshness._();
+
+  /// Master-served bytes (fresh, by definition).
+  const factory FulaReadFreshness.live() = FulaReadFreshness_Live;
+
+  /// Served from on-disk cache. `observed_at` is the unix-millis
+  /// when the entry was first written to cache.
+  const factory FulaReadFreshness.cached({required BigInt observedAt}) =
+      FulaReadFreshness_Cached;
+
+  /// Cold-start cross-device read; snapshot age within the
+  /// publisher cadence (≤ `USERS_INDEX_FLUSH_INTERVAL`). Apps
+  /// can surface "synced N min ago".
+  const factory FulaReadFreshness.staleByDesign({
+    required BigInt snapshotAgeSecs,
+  }) = FulaReadFreshness_StaleByDesign;
+
+  /// Cold-start cross-device read; snapshot age exceeds the
+  /// publisher cadence — likely indicates an actual master outage.
+  const factory FulaReadFreshness.staleByOutage({
+    required BigInt snapshotAgeSecs,
+  }) = FulaReadFreshness_StaleByOutage;
+}
+
+@freezed
+sealed class FulaReadSource with _$FulaReadSource {
+  const FulaReadSource._();
+
+  /// Master S3 served the request directly (fast path).
+  const factory FulaReadSource.master() = FulaReadSource_Master;
+
+  /// On-disk redb BLOCKS table served the bytes — no network at all.
+  const factory FulaReadSource.localCache() = FulaReadSource_LocalCache;
+
+  /// Public IPFS gateway served the bytes (master-down fallback).
+  /// The string is the URL template (e.g. `https://ipfs.io/ipfs/{cid}`)
+  /// that won the gateway race — useful for diagnostics or
+  /// "served by ipfs.io" labeling.
+  const factory FulaReadSource.gateway(String field0) = FulaReadSource_Gateway;
 }
 
 /// Result of a get operation with metadata
@@ -525,6 +747,29 @@ class ListOptions {
           continuationToken == other.continuationToken;
 }
 
+@freezed
+sealed class MasterHealthEvent with _$MasterHealthEvent {
+  const MasterHealthEvent._();
+
+  /// Master S3 is reachable; reads use the fast path.
+  const factory MasterHealthEvent.online() = MasterHealthEvent_Online;
+
+  /// Master S3 is unreachable; SDK is falling back to IPFS
+  /// gateways (Phase 2.4) or cold-start resolver (Phase 3.3).
+  const factory MasterHealthEvent.offlineFallbackActive({
+    required String reason,
+  }) = MasterHealthEvent_OfflineFallbackActive;
+
+  /// Both master S3 AND chain RPC are unreachable. Cold-start
+  /// reads fail; warm reads (cached metadata) still work via
+  /// gateways. Apps should disable "open new bucket" / "first-
+  /// read" UI affordances when this fires. Emitted only from
+  /// the cold-start failure path — the health gate alone can't
+  /// authoritatively detect "both down" without trying.
+  const factory MasterHealthEvent.severelyDegraded({required String reason}) =
+      MasterHealthEvent_SeverelyDegraded;
+}
+
 /// A key-value metadata entry
 class MetadataEntry {
   /// Metadata key
@@ -660,6 +905,39 @@ class ObjectMetadata {
           contentType == other.contentType &&
           cacheControl == other.cacheControl &&
           userMetadata == other.userMetadata;
+}
+
+/// Wrapper around `GetObjectResult` adding Phase 19 transparency
+/// fields. Mirrors `fula_client::OfflineGetResult`. Apps that
+/// don't care about transparency just read `.inner.data`.
+class OfflineGetResult {
+  /// Underlying `GetObjectResult` — `data`, `etag`, `content_type`,
+  /// `content_length`, `last_modified`, `metadata` are on `inner`.
+  final GetObjectResult inner;
+
+  /// Where the bytes ultimately came from.
+  final FulaReadSource source;
+
+  /// How fresh the bytes are.
+  final FulaReadFreshness freshness;
+
+  const OfflineGetResult({
+    required this.inner,
+    required this.source,
+    required this.freshness,
+  });
+
+  @override
+  int get hashCode => inner.hashCode ^ source.hashCode ^ freshness.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is OfflineGetResult &&
+          runtimeType == other.runtimeType &&
+          inner == other.inner &&
+          source == other.source &&
+          freshness == other.freshness;
 }
 
 /// Configuration for IPFS pinning service
