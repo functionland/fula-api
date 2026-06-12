@@ -22,8 +22,12 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates netcat-openbsd \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/fula-gateway /usr/local/bin/fula-gateway
-# Persistent state (pin queue, registry CID, block cache) belongs on a volume.
-VOLUME ["/data"]
+# Persistent state lives at HARDCODED /var/lib/fula-gateway (pin_queue.redb,
+# registry.cid, local_retain.redb — see crates/fula-cli/src/config.rs defaults).
+# Mount a volume here or pin retries/crash recovery silently degrade to
+# fire-and-forget and the bucket registry resets on restart.
+RUN mkdir -p /var/lib/fula-gateway
+VOLUME ["/var/lib/fula-gateway"]
 ENV FULA_HOST=0.0.0.0 \
     FULA_PORT=9000
 EXPOSE 9000
