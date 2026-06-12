@@ -61,6 +61,32 @@ where
         storage_key: StorageKey,
         cid: Cid,
     },
+    /// Issue #34 — persisted AND still memory-resident.
+    ///
+    /// Produced by `Node::store_sealing` when an `InMemory` child has been
+    /// successfully PUT: the subtree stays resident (reads resolve from
+    /// memory with zero I/O, exactly like `InMemory`), but store paths now
+    /// emit the recorded `storage_key`/`cid` reference WITHOUT re-uploading
+    /// the subtree. This is the write-back state that `InMemory` was
+    /// missing: before it existed, a flushed-but-resident subtree could
+    /// only be represented as `InMemory`, so every subsequent flush
+    /// re-serialized, re-encrypted (fresh nonce), and re-PUT the whole
+    /// ever-touched tree — O(N²) total upload cost for N sequential puts.
+    ///
+    /// Never serialized as a distinct wire variant: `to_wire` maps it to
+    /// the same `PointerWire::Link`/`LinkV2` the original PUT produced, so
+    /// the on-disk format is byte-identical to pre-#34 writers. Any
+    /// mutation through `set_value`/`remove_value`/`canonicalize` resolves
+    /// the Arc and re-attaches the subtree as `InMemory`, invalidating the
+    /// seal for exactly the changed path.
+    ///
+    /// `cid` is `Some` only when the backend attested one on the original
+    /// PUT (walkable-v8 master); mirrors the `LinkV2`-vs-`Link` split.
+    Sealed {
+        storage_key: StorageKey,
+        cid: Option<Cid>,
+        node: Arc<Node<K, V, H>>,
+    },
 }
 
 /// Each bit in the bitmask of a HAMT node maps to one `Pointer`. A `Pointer`
@@ -178,6 +204,11 @@ where
                 .await?;
                 Ok(Arc::new(node))
             }
+            // Issue #34 — the subtree is persisted but still resident;
+            // serve it from memory exactly like `InMemory`. No I/O, no
+            // integrity re-check needed: these are the same plaintext
+            // nodes the seal-time PUT serialized.
+            ChildPtr::Sealed { node, .. } => Ok(Arc::clone(node)),
         }
     }
 }
@@ -291,6 +322,19 @@ where
                 storage_key: *storage_key,
                 cid: cid.clone(),
             }),
+            // Issue #34 — already persisted by a prior `store_sealing`
+            // pass; emit the recorded reference WITHOUT re-uploading the
+            // subtree. Wire form matches what the original PUT produced
+            // (`LinkV2` when the backend attested a CID, legacy `Link`
+            // otherwise), so persisted bytes are identical to a pre-#34
+            // writer's.
+            Pointer::Link(ChildPtr::Sealed { storage_key, cid, .. }) => match cid {
+                Some(cid) => Ok(PointerWire::LinkV2 {
+                    storage_key: *storage_key,
+                    cid: cid.clone(),
+                }),
+                None => Ok(PointerWire::Link(*storage_key)),
+            },
             Pointer::Link(ChildPtr::InMemory(child)) => {
                 let result = child.store(store).await?;
                 match result.cid {
@@ -343,6 +387,11 @@ impl<K: Clone, V: Clone, H: Hasher> Clone for ChildPtr<K, V, H> {
                 storage_key: *storage_key,
                 cid: cid.clone(),
             },
+            ChildPtr::Sealed { storage_key, cid, node } => ChildPtr::Sealed {
+                storage_key: *storage_key,
+                cid: cid.clone(),
+                node: Arc::clone(node),
+            },
         }
     }
 }
@@ -365,6 +414,12 @@ impl<K: Debug, V: Debug, H: Hasher> Debug for ChildPtr<K, V, H> {
                 .debug_struct("StoredV2")
                 .field("storage_key", &hex::encode(storage_key))
                 .field("cid", cid)
+                .finish(),
+            ChildPtr::Sealed { storage_key, cid, node } => f
+                .debug_struct("Sealed")
+                .field("storage_key", &hex::encode(storage_key))
+                .field("cid", cid)
+                .field("node", node)
                 .finish(),
         }
     }
@@ -404,6 +459,17 @@ impl<K: PartialEq, V: PartialEq, H: Hasher> PartialEq for Pointer<K, V, H> {
             (
                 Pointer::Link(ChildPtr::StoredV2 { storage_key: a_sk, cid: a_cid }),
                 Pointer::Link(ChildPtr::StoredV2 { storage_key: b_sk, cid: b_cid }),
+            ) => a_sk == b_sk && a_cid == b_cid,
+            // Sealed equality compares the persisted identity only
+            // (storage_key is the content address; cid mirrors the
+            // LinkV2/Link split). The resident `node` Arc is deliberately
+            // not compared — it is derived state, same rationale as the
+            // InMemory `false` arm above. Cross-variant comparison
+            // (Sealed vs Stored/StoredV2/InMemory) stays `false` so the
+            // sealed-vs-loaded distinction remains observable in tests.
+            (
+                Pointer::Link(ChildPtr::Sealed { storage_key: a_sk, cid: a_cid, .. }),
+                Pointer::Link(ChildPtr::Sealed { storage_key: b_sk, cid: b_cid, .. }),
             ) => a_sk == b_sk && a_cid == b_cid,
             _ => false,
         }
