@@ -2085,9 +2085,18 @@ impl ShardedHamtPrivateForest {
     ///     mutated nodes while untouched subtree ciphertexts stay readable.
     ///   * If a shard's in-memory HAMT is empty, the root is recorded as
     ///     `None` and no nodes are written.
-    ///   * Failures leave partial state: the shard whose `Node::store` fails
-    ///     keeps its pre-flush root pointer but its `seq` has already been
-    ///     bumped. Callers are expected to treat flush failure as
+    ///   * Issue #34: node persistence goes through `Node::store_sealing`,
+    ///     which downgrades persisted `InMemory` children to
+    ///     `ChildPtr::Sealed` in place. Consequence: a flush PUTs only the
+    ///     nodes mutated since the previous flush (plus the shard root) —
+    ///     NOT the whole ever-touched tree — so per-flush cost is O(path)
+    ///     instead of O(bucket size). Persisted bytes are identical to the
+    ///     pre-sealing writer's (same plaintexts, same content addresses).
+    ///   * Failures leave partial state: the shard whose `store_sealing`
+    ///     fails keeps its pre-flush root pointer but its `seq` has already
+    ///     been bumped, and children persisted before the failure keep
+    ///     their seal (their PUTs succeeded; content-addressed references
+    ///     stay valid). Callers are expected to treat flush failure as
     ///     non-recoverable and drop the in-memory forest rather than
     ///     continuing to mutate it.
     pub async fn flush_dirty<B: BlobBackend + 'static>(
@@ -2129,8 +2138,18 @@ impl ShardedHamtPrivateForest {
             // pair atomically (next-flush logic only updates a shard's
             // `root` + `root_cid` when its dirty flag is set).
             let (new_root, new_root_cid) = {
-                let guard = self.loaded_shards[idx].read().await;
-                match &*guard {
+                // Issue #34: `write()` (not `read()`) because the sealing
+                // store mutates pointers in place — every InMemory child
+                // that persists is downgraded to `ChildPtr::Sealed`, so
+                // the NEXT flush of this shard re-PUTs only the path
+                // mutated since this one (plus the root) instead of the
+                // whole ever-touched tree. Writers already serialize on
+                // the outer forest `&mut self`, so taking the shard's
+                // write lock here cannot deadlock with a concurrent
+                // writer; readers briefly block exactly as they would on
+                // a concurrent upsert.
+                let mut guard = self.loaded_shards[idx].write().await;
+                match &mut *guard {
                     LoadedShard::NotLoaded => {
                         return Err(CryptoError::Hamt(format!(
                             "shard {} marked dirty but NotLoaded — internal invariant violation",
@@ -2142,7 +2161,7 @@ impl ShardedHamtPrivateForest {
                         if node.is_empty() {
                             (None, None)
                         } else {
-                            let result = node.store(&store).await?;
+                            let result = node.store_sealing(&store).await?;
                             (Some(result.storage_key), result.cid)
                         }
                     }
@@ -5390,5 +5409,478 @@ mod tests {
              (sibling-prefix ancestor overmatch). got keys {:?}",
             extracted.directories.keys().collect::<Vec<_>>()
         );
+    }
+
+    // =====================================================================
+    // Issue #34 — per-upload cost grows with bucket size (forest write
+    // amplification). FIXED — these are the inverted regression guards.
+    //
+    // Pre-fix mechanism (pinned at commit 2ed7fe0, measured: flush #150
+    // re-PUT 17 nodes / 161.7 KB; 150 × 4 KB files cost 1,630 node PUTs /
+    // 12.2 MB of index uploads): `Node::set_value` marks every node on a
+    // mutated path `ChildPtr::InMemory`; `Node::store(&self)` re-PUT every
+    // InMemory node but could never downgrade them, so in a long-lived
+    // session EVERY flush re-uploaded the whole ever-touched subtree —
+    // O(N²) total for the FxFiles pattern (N × `put_object_flat` =
+    // N × (upsert + flush) into one directory = one hot shard).
+    //
+    // The fix: `flush_dirty` persists via `Node::store_sealing`, which
+    // write-backs persisted children as `ChildPtr::Sealed` (resident for
+    // reads, reference-only for stores). Per-flush cost is now O(mutated
+    // path), independent of bucket size, and persisted bytes are
+    // byte-identical to the legacy writer's (see
+    // `node::round_trip_tests::issue_34_sealing_and_legacy_store_produce_
+    // identical_roots`).
+    // =====================================================================
+
+    /// PUT-call + PUT-byte counting backend, local to the #34 tests
+    /// (`CountingBlobBackend` counts ops but not payload bytes, and byte
+    /// growth is half the #34 story).
+    struct Issue34CountingBackend {
+        inner: InMemoryBackend,
+        puts: std::sync::atomic::AtomicU64,
+        put_bytes: std::sync::atomic::AtomicU64,
+    }
+
+    impl Issue34CountingBackend {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryBackend::new(),
+                puts: std::sync::atomic::AtomicU64::new(0),
+                put_bytes: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        /// `(total PUT calls, total PUT payload bytes)` so far.
+        fn snapshot(&self) -> (u64, u64) {
+            use std::sync::atomic::Ordering::Relaxed;
+            (self.puts.load(Relaxed), self.put_bytes.load(Relaxed))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::wnfs_hamt::v7_store::BlobBackend for Issue34CountingBackend {
+        async fn get(&self, path: &str) -> Result<Vec<u8>> {
+            self.inner.get(path).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            bytes: Vec<u8>,
+        ) -> Result<crate::wnfs_hamt::v7_store::BlobPutResult> {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.puts.fetch_add(1, Relaxed);
+            self.put_bytes.fetch_add(bytes.len() as u64, Relaxed);
+            self.inner.put(path, bytes).await
+        }
+    }
+
+    /// Entry weighted like production: `put_object_flat` stashes the
+    /// `x-fula-encryption` JSON (wrapped DEK + nonce + encrypted private
+    /// metadata, ~0.9 KB) into `user_metadata` before the upsert
+    /// (`fula-client/src/encryption.rs`), so each forest entry carries
+    /// ~1 KB. Per-node payloads — and therefore the re-upload bytes this
+    /// test measures — scale with that weight; using it keeps the numbers
+    /// representative of the FxFiles repro rather than artificially small.
+    fn issue34_entry(path: &str) -> ForestFileEntry {
+        let mut e = file_entry(path, 4096);
+        e.user_metadata.insert(
+            "x-fula-encryption".to_string(),
+            "x".repeat(900),
+        );
+        e
+    }
+
+    /// Issue #34 FIXED, guard 1: the marginal flush cost of
+    /// `upsert + flush_dirty` (= what every `put_object_flat` call does)
+    /// stays FLAT as the bucket fills — bounded PUT calls per flush
+    /// regardless of object count — and the full data set survives 150
+    /// sealed flushes intact (read back through a fresh forest).
+    ///
+    /// Pre-fix (pinned at 2ed7fe0): per-flush PUTs grew 1 → 17 and
+    /// per-flush bytes grew O(N) (~1.08 KB × bucket size; 161.7 KB at
+    /// flush #150), totalling 1,630 PUTs / 12.2 MB for 150 × 4 KB files.
+    /// Post-fix: a flush re-PUTs the shard root plus the path(s) mutated
+    /// by that one upsert (the `F:` file entry and the `D:` parent-dir
+    /// entry), so the count is bounded by tree DEPTH, not tree size.
+    #[tokio::test]
+    async fn issue_34_per_flush_put_cost_stays_flat_as_bucket_fills() {
+        const N: usize = 150;
+        // Pin the shard salt so the hot-shard index is stable run-to-run.
+        // (The HAMT shape itself is salt-independent — node hashing is
+        // `H::hash(key)` over fixed path strings — so the counts below are
+        // deterministic either way; the pinned salt also stabilizes which
+        // shard the directory routes to.)
+        const FIXED_SALT: [u8; 32] = [0x34; 32];
+
+        let backend = Arc::new(Issue34CountingBackend::new());
+        let mut manifest = crate::private_forest::ShardManifestV7::new(16);
+        manifest.root.shard_salt = FIXED_SALT.to_vec();
+        let mut forest =
+            ShardedHamtPrivateForest::from_manifest(manifest, "documents-v8", test_dek());
+
+        let mut puts_per_flush = Vec::with_capacity(N);
+        let mut bytes_per_flush = Vec::with_capacity(N);
+        for i in 0..N {
+            forest
+                .upsert_file(
+                    issue34_entry(&format!("/e2e/perf/file-{:03}.bin", i)),
+                    &backend,
+                )
+                .await
+                .unwrap();
+            let (p0, b0) = backend.snapshot();
+            forest.flush_dirty(&backend).await.unwrap();
+            let (p1, b1) = backend.snapshot();
+            puts_per_flush.push(p1 - p0);
+            bytes_per_flush.push(b1 - b0);
+        }
+
+        let (total_puts, total_bytes) = backend.snapshot();
+        eprintln!(
+            "\n[#34 FIXED] one directory, one hot shard, flush after every \
+             upsert (the `put_object_flat` pattern):"
+        );
+        eprintln!("  upload # | HAMT-node PUTs in that flush | bytes in that flush");
+        for &n in &[1usize, 10, 25, 50, 75, 100, 125, 150] {
+            eprintln!(
+                "  {:>8} | {:>28} | {:>19}",
+                n,
+                puts_per_flush[n - 1],
+                bytes_per_flush[n - 1]
+            );
+        }
+        eprintln!(
+            "  TOTAL for {} files of 4 KB: {} node PUTs, {:.1} MB uploaded \
+             (index alone, object bodies excluded; pre-fix: 1630 PUTs, 12.2 MB)",
+            N,
+            total_puts,
+            total_bytes as f64 / 1.0e6
+        );
+
+        // (1) FLAT marginal PUT count: every steady-state flush is bounded
+        // by tree depth (root + the F:/D: paths of one upsert), never by
+        // bucket size. Bound of 6 = root + 2 paths × depth 2 + slack for a
+        // bucket-split flush; pre-fix flush #150 alone was 17 and growing
+        // with N.
+        let max_steady_puts = puts_per_flush[14..].iter().copied().max().unwrap();
+        assert!(
+            max_steady_puts <= 6,
+            "issue #34 regression: a steady-state flush PUT {} nodes — \
+             per-flush cost must be bounded by tree depth (≤6), not bucket \
+             size. The write amplification is back; check that flush_dirty \
+             still seals via store_sealing and that mutations don't unseal \
+             untouched siblings.",
+            max_steady_puts
+        );
+
+        // (2) NO growth trend: the last 10 flushes must not PUT more than
+        // the flushes right after the root split settles (15-24). Pre-fix
+        // the late window was ~10× the early one.
+        let mid_puts: u64 = puts_per_flush[14..24].iter().sum();
+        let late_puts: u64 = puts_per_flush[N - 10..].iter().sum();
+        assert!(
+            late_puts <= mid_puts + 10,
+            "issue #34 regression: per-flush PUT count is growing with \
+             bucket size again (flushes 15-24: {} total; last 10: {} total).",
+            mid_puts,
+            late_puts
+        );
+
+        // (3) Per-flush BYTES are bounded by node sizes on the mutated
+        // path, not by bucket size. The largest steady-state flush carries
+        // the root + two ~10-entry children (~1 KB metadata each) ≈ 25 KB;
+        // pre-fix flush #150 carried 161.7 KB and grew ~1.08 KB per object.
+        let max_steady_bytes = bytes_per_flush[14..].iter().copied().max().unwrap();
+        assert!(
+            max_steady_bytes <= 60_000,
+            "issue #34 regression: a steady-state flush uploaded {} bytes — \
+             per-flush bytes must be bounded by the mutated path's node \
+             sizes (≲25 KB here), not by bucket size.",
+            max_steady_bytes
+        );
+
+        // (4) INTEGRITY — the fix must not lose or corrupt anything. A
+        // fresh forest over the final manifest (cold load path, exactly
+        // what another device or an app restart sees) must read every one
+        // of the 150 files and list the directory completely.
+        let final_manifest = forest.flush_dirty(&backend).await.unwrap().clone();
+        let mut fresh = ShardedHamtPrivateForest::from_manifest(
+            final_manifest,
+            "documents-v8",
+            test_dek(),
+        );
+        for i in 0..N {
+            let path = format!("/e2e/perf/file-{:03}.bin", i);
+            let got = fresh.get_file(&path, &backend).await.unwrap();
+            let entry = got.unwrap_or_else(|| {
+                panic!("file {} lost after 150 sealed flushes", path)
+            });
+            assert_eq!(entry.size, 4096, "entry metadata must survive sealing");
+            assert_eq!(
+                entry.user_metadata.get("x-fula-encryption").map(String::len),
+                Some(900),
+                "user_metadata must survive sealing"
+            );
+        }
+        let listing = fresh.list_directory("/e2e/perf", &backend).await.unwrap();
+        assert_eq!(
+            listing.len(),
+            N,
+            "directory listing must surface all {} files after sealed flushes",
+            N
+        );
+    }
+
+    /// Issue #34 FIXED, guard 2: a long-lived session's marginal flush
+    /// costs the same as a fresh session's over identical data.
+    ///
+    /// Pre-fix (pinned at 2ed7fe0) the long-lived session re-PUT the whole
+    /// ever-touched tree (17 nodes) where a fresh forest loaded from the
+    /// same manifest re-PUT only the touched path (3 nodes) — the gap WAS
+    /// the never-downgraded `InMemory` set. Sealing closes it: after every
+    /// flush the session tree is reference-equivalent to a freshly-loaded
+    /// one (resident children are `Sealed`, which store paths treat
+    /// exactly like `Stored`).
+    #[tokio::test]
+    async fn issue_34_long_session_marginal_flush_matches_fresh_session() {
+        const N: usize = 150;
+        const FIXED_SALT: [u8; 32] = [0x34; 32];
+
+        let backend = Arc::new(Issue34CountingBackend::new());
+        let mut manifest = crate::private_forest::ShardManifestV7::new(16);
+        manifest.root.shard_salt = FIXED_SALT.to_vec();
+        let mut forest =
+            ShardedHamtPrivateForest::from_manifest(manifest, "documents-v8", test_dek());
+
+        // The long-lived session: N × (upsert + flush), like FxFiles.
+        for i in 0..N {
+            forest
+                .upsert_file(
+                    issue34_entry(&format!("/e2e/perf/file-{:03}.bin", i)),
+                    &backend,
+                )
+                .await
+                .unwrap();
+            forest.flush_dirty(&backend).await.unwrap();
+        }
+
+        // Marginal cost of upload #151 in the long-lived session.
+        forest
+            .upsert_file(issue34_entry("/e2e/perf/file-150.bin"), &backend)
+            .await
+            .unwrap();
+        let (p0, _) = backend.snapshot();
+        let manifest_after = forest.flush_dirty(&backend).await.unwrap().clone();
+        let (p1, _) = backend.snapshot();
+        let long_session_puts = p1 - p0;
+
+        // Fresh session over the SAME persisted state: from_manifest is the
+        // production load path, so every shard-root pointer deserializes as
+        // `Stored`/`StoredV2` and only the genuinely mutated path goes
+        // `InMemory` on the next write.
+        let mut fresh = ShardedHamtPrivateForest::from_manifest(
+            manifest_after,
+            "documents-v8",
+            test_dek(),
+        );
+        fresh
+            .upsert_file(issue34_entry("/e2e/perf/file-151.bin"), &backend)
+            .await
+            .unwrap();
+        let (q0, _) = backend.snapshot();
+        fresh.flush_dirty(&backend).await.unwrap();
+        let (q1, _) = backend.snapshot();
+        let fresh_session_puts = q1 - q0;
+
+        eprintln!(
+            "\n[#34 FIXED] marginal flush after 150 uploads — long-lived \
+             session: {} node PUTs; fresh session (same data, loaded from \
+             manifest): {} node PUTs",
+            long_session_puts, fresh_session_puts
+        );
+
+        assert!(
+            fresh_session_puts >= 1,
+            "fresh session must persist at least the touched path"
+        );
+        // Identical workload, identical persisted state → the sealed
+        // long-lived session must pay the same marginal cost as a cold
+        // session (±2 nodes of slack for path-shape differences between
+        // the two inserted keys). Pre-fix the gap was 17 vs 3.
+        assert!(
+            long_session_puts <= fresh_session_puts + 2,
+            "issue #34 regression: the long-lived session's marginal flush \
+             re-PUT {} nodes vs {} for a fresh session over the same data — \
+             the never-downgraded InMemory set is accumulating again.",
+            long_session_puts,
+            fresh_session_puts
+        );
+
+        // Cross-session composition (two-client shape, sequential): the
+        // long-lived session wrote files 000-150, the second session
+        // (loaded from the first's manifest) wrote file-151. A THIRD cold
+        // session over the final manifest must see writes from BOTH
+        // sessions — proving sealed flushes from different sessions
+        // compose on shared storage with no loss.
+        let manifest_final = fresh.flush_dirty(&backend).await.unwrap().clone();
+        let mut third = ShardedHamtPrivateForest::from_manifest(
+            manifest_final,
+            "documents-v8",
+            test_dek(),
+        );
+        for path in [
+            "/e2e/perf/file-000.bin", // session 1, first write
+            "/e2e/perf/file-149.bin", // session 1, last bulk write
+            "/e2e/perf/file-150.bin", // session 1, marginal write
+            "/e2e/perf/file-151.bin", // session 2's write
+        ] {
+            assert!(
+                third.get_file(path, &backend).await.unwrap().is_some(),
+                "third session must read {} written across two prior sessions",
+                path
+            );
+        }
+        let listing = third.list_directory("/e2e/perf", &backend).await.unwrap();
+        assert_eq!(
+            listing.len(),
+            N + 2,
+            "third session must list all files from both prior sessions"
+        );
+    }
+
+    /// Issue #34 — aliasing guarantee: an in-flight reader holding the
+    /// shard-root `Arc` from BEFORE a flush is completely unaffected by the
+    /// sealing write-back (its view stays the pre-seal tree; the transient
+    /// placeholder used inside `store_sealing` is never observable).
+    /// `Arc::make_mut` clones any node whose refcount > 1, so the sealer
+    /// mutates a private copy — this test pins that copy-on-write contract
+    /// for the sealing path specifically.
+    #[tokio::test]
+    async fn issue_34_in_flight_reader_arc_unaffected_by_sealing() {
+        const N: usize = 30;
+        const FIXED_SALT: [u8; 32] = [0x34; 32];
+
+        let backend = Arc::new(Issue34CountingBackend::new());
+        let mut manifest = crate::private_forest::ShardManifestV7::new(16);
+        manifest.root.shard_salt = FIXED_SALT.to_vec();
+        let mut forest =
+            ShardedHamtPrivateForest::from_manifest(manifest, "documents-v8", test_dek());
+
+        for i in 0..N {
+            forest
+                .upsert_file(
+                    issue34_entry(&format!("/e2e/perf/file-{:03}.bin", i)),
+                    &backend,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Simulate an in-flight reader: grab the hot shard's root Arc the
+        // way resolve paths do, BEFORE the flush.
+        let idx = forest.shard_for_file("/e2e/perf/file-000.bin");
+        let pre_seal_root: Arc<ForestHamt> = {
+            let guard = forest.loaded_shards[idx].read().await;
+            match &*guard {
+                LoadedShard::Loaded(node) => Arc::clone(node),
+                other => panic!("hot shard must be Loaded, got {:?}", std::mem::discriminant(other)),
+            }
+        };
+
+        // Flush — seals the live tree (cloning shared nodes via make_mut).
+        forest.flush_dirty(&backend).await.unwrap();
+
+        // The reader's pre-seal view must still resolve every entry — no
+        // placeholder, no missing child, values intact.
+        let reader = forest.reader_store_for(idx, &backend);
+        for i in 0..N {
+            let key = file_key(&format!("/e2e/perf/file-{:03}.bin", i));
+            let got = pre_seal_root.get(&key, &reader).await.unwrap();
+            assert!(
+                got.is_some(),
+                "in-flight reader lost entry {} during sealing",
+                i
+            );
+        }
+
+        // And the post-seal live tree reads the same set.
+        for i in 0..N {
+            let path = format!("/e2e/perf/file-{:03}.bin", i);
+            assert!(
+                forest.get_file(&path, &backend).await.unwrap().is_some(),
+                "post-seal tree lost entry {}",
+                path
+            );
+        }
+    }
+
+    /// Issue #34 — deletion over a SEALED tree: `remove_file` resolves
+    /// sealed children (in-memory, zero fetches), unseals exactly the
+    /// touched path, and the following flush persists a tree from which a
+    /// cold reader sees the deletion and ALL surviving files. Exercises
+    /// `remove_value` + `canonicalize` over `ChildPtr::Sealed`, which the
+    /// upsert-only guards above never reach.
+    #[tokio::test]
+    async fn issue_34_delete_after_sealed_flushes_preserves_remaining_files() {
+        const N: usize = 40;
+        const FIXED_SALT: [u8; 32] = [0x34; 32];
+
+        let backend = Arc::new(Issue34CountingBackend::new());
+        let mut manifest = crate::private_forest::ShardManifestV7::new(16);
+        manifest.root.shard_salt = FIXED_SALT.to_vec();
+        let mut forest =
+            ShardedHamtPrivateForest::from_manifest(manifest, "documents-v8", test_dek());
+
+        // Seed with per-file flushes so the tree is fully sealed.
+        for i in 0..N {
+            forest
+                .upsert_file(
+                    issue34_entry(&format!("/e2e/perf/file-{:03}.bin", i)),
+                    &backend,
+                )
+                .await
+                .unwrap();
+            forest.flush_dirty(&backend).await.unwrap();
+        }
+
+        // Delete one file from the sealed tree and flush.
+        let victim = "/e2e/perf/file-013.bin";
+        let removed = forest.remove_file(victim, &backend).await.unwrap();
+        assert!(removed.is_some(), "remove_file must find the sealed entry");
+        let (p0, _) = backend.snapshot();
+        let manifest_after = forest.flush_dirty(&backend).await.unwrap().clone();
+        let (p1, _) = backend.snapshot();
+        let delete_flush_puts = p1 - p0;
+        assert!(
+            delete_flush_puts <= 6,
+            "deletion flush must also be path-bounded (got {} PUTs)",
+            delete_flush_puts
+        );
+
+        // Cold reader: the victim is gone, all 39 others fully intact.
+        let mut fresh = ShardedHamtPrivateForest::from_manifest(
+            manifest_after,
+            "documents-v8",
+            test_dek(),
+        );
+        assert!(
+            fresh.get_file(victim, &backend).await.unwrap().is_none(),
+            "deleted file must not resurface after a sealed flush"
+        );
+        for i in 0..N {
+            let path = format!("/e2e/perf/file-{:03}.bin", i);
+            if path == victim {
+                continue;
+            }
+            assert!(
+                fresh.get_file(&path, &backend).await.unwrap().is_some(),
+                "file {} must survive a sealed delete-flush",
+                path
+            );
+        }
+        let listing = fresh.list_directory("/e2e/perf", &backend).await.unwrap();
+        assert_eq!(listing.len(), N - 1, "listing must reflect exactly one deletion");
     }
 }
