@@ -165,19 +165,37 @@ pub async fn put_object(
                 "remote cid must be raw (0x55) + blake3 (0x1e) — the addressing fula-ingest verifies",
             ));
         }
-        match state.block_store.has_block(&declared_cid).await {
-            Ok(true) => {}
-            Ok(false) => {
+        // BOUNDED presence check: kubo's block lookup for an ABSENT cid is an
+        // unbounded network search (bitswap/DHT) — without a deadline this
+        // handler would hang for minutes per missing block. 5s is ample for a
+        // bitswap pull from the ingest peer (same box: instant; LAN/WAN peer:
+        // one round-trip); timeout ⇒ treat as absent ⇒ retryable 409, the
+        // client falls back to a full-bytes PUT.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.block_store.has_block(&declared_cid),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
                 return Err(ApiError::s3(
                     S3ErrorCode::OperationAborted,
                     "declared block not present/retrievable yet — retry or fall back to a full-bytes PUT",
                 ));
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, cid = %declared_cid, "remote-cid presence check failed");
                 return Err(ApiError::s3(
                     S3ErrorCode::OperationAborted,
                     "block presence check failed — retry or fall back to a full-bytes PUT",
+                ));
+            }
+            Err(_elapsed) => {
+                tracing::debug!(cid = %declared_cid, "remote-cid presence check timed out (treating as absent)");
+                return Err(ApiError::s3(
+                    S3ErrorCode::OperationAborted,
+                    "block presence check timed out — retry or fall back to a full-bytes PUT",
                 ));
             }
         }
