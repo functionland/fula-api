@@ -854,4 +854,87 @@ mod round_trip_tests {
             distinct_orders.len()
         );
     }
+
+    /// Issue #34 — root-cause pin at the node layer (CURRENT-BEHAVIOUR test:
+    /// it passes on the buggy code and documents the bug; invert it when
+    /// #34 is fixed).
+    ///
+    /// `set_value` replaces every node on a mutated root→leaf path with
+    /// `Pointer::Link(ChildPtr::InMemory(_))`. `store(&self)` recursively
+    /// persists every `InMemory` child — but, taking `&self`, it cannot
+    /// downgrade them back to `Stored` after the PUT succeeds, and nothing
+    /// else does (`ChildPtr::Stored` is only ever constructed by
+    /// `Pointer::from_wire`, i.e. the load path). Consequence: the
+    /// `InMemory` set of a long-lived tree only ever grows, and EVERY
+    /// `store()` re-serializes and re-PUTs the ENTIRE ever-touched subtree
+    /// — unchanged nodes included. That is the engine of the O(N²)
+    /// sequential-upload cost reported in issue #34 (each
+    /// `put_object_flat` = upsert + flush; each flush re-uploads the whole
+    /// accumulated tree).
+    ///
+    /// The pin: two consecutive `store()` calls with NO mutation in
+    /// between PUT the same number of nodes. An incremental design would
+    /// PUT ~0 on the second call (nothing changed; the tree is
+    /// content-addressed so the root key is provably identical).
+    #[tokio::test]
+    async fn issue_34_store_reputs_entire_unchanged_in_memory_tree() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct PutCountingStore {
+            inner: InMemoryStore,
+            puts: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl HamtNodeStore for PutCountingStore {
+            async fn get_node(&self, key: &StorageKey) -> Result<HamtNodeBytes> {
+                self.inner.get_node(key).await
+            }
+            async fn put_node(&self, bytes: HamtNodeBytes) -> Result<NodePutResult> {
+                self.puts.fetch_add(1, Ordering::Relaxed);
+                self.inner.put_node(bytes).await
+            }
+        }
+
+        let store = PutCountingStore {
+            inner: InMemoryStore::new(),
+            puts: AtomicUsize::new(0),
+        };
+        let mut root: Arc<TestNode> = Arc::new(TestNode::default());
+        // 64 fixed keys force most root slots past HAMT_VALUES_BUCKET_SIZE
+        // (= 3), splitting into Link children — a multi-node tree. Keys are
+        // constant strings, so the BLAKE3-driven shape (and therefore every
+        // count below) is fully deterministic.
+        for i in 0u64..64 {
+            let k = format!("issue34-key-{:04}", i).into_bytes();
+            root.set(k, i, &store).await.unwrap();
+        }
+
+        let first_key = root.store(&store).await.unwrap().storage_key;
+        let first = store.puts.load(Ordering::Relaxed);
+        assert!(
+            first >= 5,
+            "setup degenerate: 64 entries should split into several nodes, \
+             got only {} PUTs",
+            first
+        );
+
+        // NO mutation between the two stores.
+        let second_key = root.store(&store).await.unwrap().storage_key;
+        let second = store.puts.load(Ordering::Relaxed) - first;
+
+        assert_eq!(
+            first_key, second_key,
+            "tree unchanged → content address must be identical"
+        );
+        assert_eq!(
+            second, first,
+            "issue #34 write amplification: the second store() of a \
+             byte-identical tree re-PUT {} nodes (same as the first store's \
+             {}), because InMemory children are never downgraded to Stored \
+             after a successful persist. An incremental flush would re-PUT 0 \
+             nodes here. If this assertion starts failing with second ≈ 0, \
+             the bug is FIXED — invert the test into a regression guard.",
+            second, first
+        );
+    }
 }
