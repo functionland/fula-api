@@ -261,6 +261,64 @@ async fn dirty_forest_is_not_evicted_by_invalidate() {
     );
 }
 
+/// Per-bucket isolation: invalidating bucket A must not touch bucket
+/// B's cached forest — in EITHER direction (A refreshes, B stays
+/// pinned until ITS invalidate). Guards against key mangling in the
+/// cache map.
+#[tokio::test]
+async fn invalidate_is_per_bucket_isolated() {
+    let state = TempDir::new().expect("state dir");
+    std::env::set_var("FULA_STATE_DIR", state.path());
+
+    let (server, _stash) = start_mock().await;
+    let secret = SecretKey::generate();
+    let bucket_a = "issue36-isolated-a";
+    let bucket_b = "issue36-isolated-b";
+
+    let cache_1 = TempDir::new().unwrap();
+    let cache_2 = TempDir::new().unwrap();
+    let client = build_client(&server.uri(), &cache_1.path().join("c.redb"), secret.clone());
+    let other = build_client(&server.uri(), &cache_2.path().join("o.redb"), secret.clone());
+
+    // Both buckets cached on `client` with one file each.
+    for b in [bucket_a, bucket_b] {
+        client
+            .put_object_flat(b, "/docs/first.txt", Bytes::from(body_for(b)), None)
+            .await
+            .expect("seed put");
+    }
+    // Another device adds a second file to BOTH buckets.
+    for b in [bucket_a, bucket_b] {
+        other
+            .put_object_flat(b, "/docs/second.txt", Bytes::from(body_for("second")), None)
+            .await
+            .expect("other-device put");
+    }
+
+    // Invalidate ONLY bucket A.
+    client.invalidate_forest_cache(bucket_a);
+
+    assert_eq!(
+        client.list_files_from_forest(bucket_a).await.unwrap().len(),
+        2,
+        "invalidated bucket must refresh and see the cross-device upload"
+    );
+    assert_eq!(
+        client.list_files_from_forest(bucket_b).await.unwrap().len(),
+        1,
+        "NON-invalidated bucket must keep its session-pinned view — \
+         eviction leaked across bucket keys"
+    );
+
+    // And B refreshes once IT is invalidated.
+    client.invalidate_forest_cache(bucket_b);
+    assert_eq!(
+        client.list_files_from_forest(bucket_b).await.unwrap().len(),
+        2,
+        "bucket B must refresh after its own invalidate"
+    );
+}
+
 /// Acceptance #3 (bulk variant): `invalidate_all_forest_caches` drops
 /// every clean forest (so they refresh) and keeps every dirty one.
 #[tokio::test]
