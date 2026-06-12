@@ -73,17 +73,30 @@ pub async fn auth_middleware(
             // Extract JWT from either Bearer token or AWS Sig V4 format
             let token = extract_token_from_header(header, request.headers())?;
 
-            let secret = state.config.jwt_secret.as_ref()
-                .ok_or_else(|| ApiError::s3(S3ErrorCode::InternalError, "JWT secret not configured"))?;
+            // FM-4 (Phase 2.5): portable wallet identity. Self-certifying —
+            // no master-local secret involved, so the SAME token works on
+            // every federated master. Additive: only the `fula-eip712.`
+            // prefix routes here, and only behind the flag; the legacy JWT
+            // path below is untouched.
+            if state.config.eip712_auth_enabled
+                && token.starts_with(crate::auth_eip712::TOKEN_PREFIX)
+            {
+                let session = crate::auth_eip712::verify_eip712_token(&token)?;
+                crate::revocation::ensure_not_revoked(state.revocation.as_deref(), &token)?;
+                session
+            } else {
+                let secret = state.config.jwt_secret.as_ref()
+                    .ok_or_else(|| ApiError::s3(S3ErrorCode::InternalError, "JWT secret not configured"))?;
 
-            let claims = validate_token(&token, secret)?;
-            // Audit F3: honor a manually-revoked key. No-op unless the revocation
-            // deny-list is enabled (env switch + pins DB). Deny-list + fail-open,
-            // so a currently-valid token is never rejected. `token` is the raw
-            // JWT — the issuer hashes the same string into `api_keys.key_hash`.
-            crate::revocation::ensure_not_revoked(state.revocation.as_deref(), &token)?;
-            // Pass the raw JWT token to the session for forwarding to pinning service
-            claims_to_session(claims, token)
+                let claims = validate_token(&token, secret)?;
+                // Audit F3: honor a manually-revoked key. No-op unless the revocation
+                // deny-list is enabled (env switch + pins DB). Deny-list + fail-open,
+                // so a currently-valid token is never rejected. `token` is the raw
+                // JWT — the issuer hashes the same string into `api_keys.key_hash`.
+                crate::revocation::ensure_not_revoked(state.revocation.as_deref(), &token)?;
+                // Pass the raw JWT token to the session for forwarding to pinning service
+                claims_to_session(claims, token)
+            }
         }
         None => {
             return Err(ApiError::s3(

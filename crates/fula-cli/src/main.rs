@@ -104,6 +104,12 @@ struct Args {
     /// each other's writes. Default OFF.
     #[arg(long, env = "FULA_BUCKET_ROOT_CAS")]
     bucket_root_cas: bool,
+
+    /// FM-4 (Phase 2.5): accept EIP-712 wallet-signature bearers
+    /// (fula-eip712. prefix) — portable identity across federated masters.
+    /// Default OFF.
+    #[arg(long, env = "FULA_EIP712_AUTH")]
+    eip712_auth: bool,
 }
 
 #[tokio::main]
@@ -177,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
         local_retain_backfill: if args.no_local_retain_backfill { Some(false) } else { None },
         remote_cid_put_enabled: args.remote_cid_put,
         bucket_root_cas_enabled: args.bucket_root_cas,
+        eip712_auth_enabled: args.eip712_auth,
         ..Default::default()
     };
 

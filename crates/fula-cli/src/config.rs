@@ -71,6 +71,12 @@ pub struct GatewayConfig {
     /// lost updates. Needs the pins-DB (POSTGRES_* env). Default OFF.
     #[serde(default)]
     pub bucket_root_cas_enabled: bool,
+    /// FM-4 (Phase 2.5): accept self-certifying EIP-712 wallet-signature
+    /// bearers (`fula-eip712.` prefix) — one identity on every federated
+    /// master with no shared secret. Additive; legacy JWT auth untouched.
+    /// Default OFF.
+    #[serde(default)]
+    pub eip712_auth_enabled: bool,
     /// Storage API URL for balance/quota checking before uploads
     pub storage_api_url: Option<String>,
     /// Admin JWT secret for admin API authentication (separate from user JWT)
@@ -213,6 +219,7 @@ impl Default for GatewayConfig {
             registry_cid_path: Some("/var/lib/fula-gateway/registry.cid".to_string()),
             remote_cid_put_enabled: false,
             bucket_root_cas_enabled: false,
+            eip712_auth_enabled: false,
             storage_api_url: None,
             admin_jwt_secret: None,
             admin_api_enabled: false,

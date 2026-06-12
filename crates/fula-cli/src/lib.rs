@@ -33,6 +33,7 @@
 //! ```
 
 pub mod auth;
+pub mod auth_eip712;
 pub mod config;
 pub mod entries_store;
 pub mod error;

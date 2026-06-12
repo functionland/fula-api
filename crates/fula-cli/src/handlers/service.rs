@@ -55,5 +55,7 @@ pub async fn healthz() -> impl IntoResponse {
 pub async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "remoteCidPut": state.config.remote_cid_put_enabled,
+        // FM-4: clients/operators can discover wallet-auth support the same way.
+        "eip712Auth": state.config.eip712_auth_enabled,
     }))
 }
