@@ -9,6 +9,11 @@ on:
       - 'crates/fula-client/**'
       - 'crates/fula-crypto/**'
       - 'packages/fula_client/**'
+      # Workspace-root integration tests (#38: test-rust runs
+      # `--workspace --all-targets`, but a PR touching only tests/
+      # previously triggered NO CI at all — root-test changes merged
+      # unvalidated).
+      - 'tests/**'
       - 'flutter_rust_bridge.yaml'
       - '.github/workflows/flutter-ci.yml'
   pull_request:
@@ -18,6 +23,8 @@ on:
       - 'crates/fula-client/**'
       - 'crates/fula-crypto/**'
       - 'packages/fula_client/**'
+      # See push.paths note (#38).
+      - 'tests/**'
       - 'flutter_rust_bridge.yaml'
       - '.github/workflows/flutter-ci.yml'
   workflow_dispatch:
