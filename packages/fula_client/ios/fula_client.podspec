@@ -6,7 +6,7 @@
 
 Pod::Spec.new do |s|
   s.name             = 'fula_client'
-  s.version          = '0.6.7'
+  s.version          = '0.6.8'
   s.summary          = 'Flutter SDK for Fula decentralized storage'
   s.description      = <<-DESC
     A Flutter plugin providing client-side encryption, metadata privacy,
