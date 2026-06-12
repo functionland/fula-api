@@ -353,11 +353,23 @@ async fn test_v7_list_directory_paginated_round_trips() {
     let client = make_client(&base, encryption);
     client.create_bucket(bucket).await.expect("create bucket");
 
-    // 64 files under /big/ — enough to span multiple v7 shards.
+    // 64 files spread across 8 SUBDIRECTORIES of /big/ (8 files each).
+    //
+    // Issue #38: shard routing is DIR-LOCAL — `shard_for_path_v6` hashes the
+    // parent directory — so the previous single-directory seed put all 64
+    // files in ONE salt-random shard. The ≥2-page assertion below then
+    // depended on an artifact: page 2 was an EMPTY tail drain of the shards
+    // after the hot one, and whenever the salt routed /big to the LAST
+    // shard (P = 1/16 per run) the cursor exhausted immediately and the
+    // test failed with "got 1 page". Eight subdirectories route to eight
+    // independent salt-random shards, so the seeded set genuinely spans ≥2
+    // of the 16 initial shards unless all eight collide on one
+    // (P = 16⁻⁷ ≈ 4e-9) — and the pagination assertions below test real
+    // multi-shard paging, not the tail artifact.
     let total = 64usize;
     let mut expected: std::collections::HashSet<String> = std::collections::HashSet::new();
     for i in 0..total {
-        let key = format!("/big/entry-{:03}.bin", i);
+        let key = format!("/big/d{}/entry-{:03}.bin", i % 8, i);
         client.put_object_flat(bucket, &key, format!("v{}", i).into_bytes(), None)
             .await.expect("seed");
         expected.insert(key);
@@ -370,16 +382,22 @@ async fn test_v7_list_directory_paginated_round_trips() {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut cursor: Option<String> = None;
     let mut page_count = 0usize;
+    let mut nonempty_pages = 0usize;
     loop {
         let listing = client
             .list_directory_paginated(bucket, Some("/big"), cursor.as_deref(), Some(8))
             .await
             .expect("paginated page");
         page_count += 1;
+        let mut page_files = 0usize;
         for files in listing.directories.values() {
             for f in files {
                 seen.insert(f.original_key.clone());
+                page_files += 1;
             }
+        }
+        if page_files > 0 {
+            nonempty_pages += 1;
         }
         if listing.is_truncated {
             assert!(
@@ -397,12 +415,21 @@ async fn test_v7_list_directory_paginated_round_trips() {
         // Safety guard — paging must terminate; bail if runaway.
         assert!(page_count < 1024, "pagination did not converge");
     }
-    // Structural assumption: 64 files + max_keys=8 spans ≥2 v7 shards under the
-    // default shard count and BLAKE3 key distribution. If the shard config or
-    // hash distribution shifts enough to land all 64 in one shard, bump `total`
-    // rather than deleting this assertion — it guards the "pagination actually
-    // paginated" invariant that the test is supposed to prove.
+    // Structural invariant (issue #38): with 8 subdirectories on independent
+    // salt-random shards and max_keys=8 ≤ every populated shard's match
+    // count, each populated shard ends a page — so the walk must produce ≥2
+    // pages AND ≥2 NON-EMPTY pages. The non-empty assertion is the one that
+    // proves real multi-shard pagination (a single-shard walk can still
+    // emit 2 pages via the empty tail-drain artifact); it also keeps this
+    // test correct if `list_recursive_page` ever learns to skip trailing
+    // empty shards (the follow-up noted on #38).
     assert!(page_count >= 2, "expected >=2 pages for {} entries with max_keys=8, got {}", total, page_count);
+    assert!(
+        nonempty_pages >= 2,
+        "expected >=2 NON-EMPTY pages (real multi-shard paging) for {} entries \
+         across 8 subdirectories with max_keys=8, got {} non-empty of {} total",
+        total, nonempty_pages, page_count
+    );
     assert_eq!(seen, expected, "pagination lost or duplicated entries");
 
     // Sanity: the unpaginated API returns the whole set in one shot, matching
