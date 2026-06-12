@@ -195,6 +195,18 @@ pub struct Config {
     /// targeted regressions or backward-compat tests).
     pub walkable_v8_writer_enabled: bool,
 
+    /// Phase 2 (decentralized ingress) — optional fula-ingest endpoints.
+    /// When non-empty AND `walkable_v8_writer_enabled` AND the master
+    /// advertises `remoteCidPut` via GET /fula/capabilities (probed once per
+    /// chunked upload), chunk ciphertext BYTES are streamed to the first
+    /// ingest endpoint (`PUT /v0/block?cid=<precomputed>` — the node verifies
+    /// the CID before storing) and the master receives only an empty-body
+    /// mapping PUT (`x-amz-meta-fula-remote-cid` + true size). ANY failure on
+    /// that route falls back transparently to the legacy full-bytes PUT.
+    /// Empty (default) = behavior byte-identical to before. Native-only
+    /// (ignored on wasm32).
+    pub ingest_endpoints: Vec<String>,
+
     /// Phase 19 — optional health-status callback. When set, the SDK
     /// invokes this closure on every Up↔Down transition of the
     /// master health gate (`MasterHealthEvent::Online` /
@@ -330,6 +342,8 @@ impl Default for Config {
             // flipping master-side gates until SDK adoption reaches the
             // % they're comfortable with for the pre-v0.6 reader cost.
             walkable_v8_writer_enabled: true,
+            // Phase 2 — no ingest nodes by default (legacy byte path).
+            ingest_endpoints: Vec::new(),
             // Phase 19 — no callback by default (silent gate).
             health_callback: None,
             // E2E plan Phase 4 — Mode B/C signed-entry writer disabled
@@ -355,6 +369,13 @@ impl Config {
     /// Set the access token
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.access_token = Some(token.into());
+        self
+    }
+
+    /// Phase 2: route chunk bytes through fula-ingest node(s) when the master
+    /// supports remote-cid mapping PUTs. Empty = legacy behavior.
+    pub fn with_ingest_endpoints(mut self, endpoints: Vec<String>) -> Self {
+        self.ingest_endpoints = endpoints;
         self
     }
 

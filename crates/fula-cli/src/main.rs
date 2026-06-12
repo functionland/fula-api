@@ -92,6 +92,12 @@ struct Args {
     /// the local-retain backlog (the ongoing per-upload protection still runs).
     #[arg(long, env = "FULA_NO_LOCAL_RETAIN_BACKFILL")]
     no_local_retain_backfill: bool,
+
+    /// Phase 2 (decentralized ingress): accept empty-body chunk PUTs carrying
+    /// x-amz-meta-fula-remote-cid (bytes pre-stored on a fula-ingest node).
+    /// Advertised to clients via GET /fula/capabilities. Default OFF.
+    #[arg(long, env = "FULA_REMOTE_CID_PUT")]
+    remote_cid_put: bool,
 }
 
 #[tokio::main]
@@ -163,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
         cluster_peering_enabled: if args.no_cluster_peering { Some(false) } else { None },
         local_retain_enabled: if args.no_local_retain { Some(false) } else { None },
         local_retain_backfill: if args.no_local_retain_backfill { Some(false) } else { None },
+        remote_cid_put_enabled: args.remote_cid_put,
         ..Default::default()
     };
 

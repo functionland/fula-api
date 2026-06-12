@@ -58,6 +58,14 @@ pub struct GatewayConfig {
     pub cors_origins: Vec<String>,
     /// Path to store bucket registry CID for persistence
     pub registry_cid_path: Option<String>,
+    /// Phase 2 (decentralized ingress): accept empty-body chunk PUTs carrying
+    /// `x-amz-meta-fula-remote-cid` — the chunk's verified bytes were already
+    /// streamed to a fula-ingest node; this master records only the
+    /// key→cid mapping (after confirming block presence via the blockstore).
+    /// Advertised to clients via GET /fula/capabilities so old/flag-off
+    /// masters are never sent the protocol. Default OFF.
+    #[serde(default)]
+    pub remote_cid_put_enabled: bool,
     /// Storage API URL for balance/quota checking before uploads
     pub storage_api_url: Option<String>,
     /// Admin JWT secret for admin API authentication (separate from user JWT)
@@ -198,6 +206,7 @@ impl Default for GatewayConfig {
             cors_enabled: true,
             cors_origins: vec!["*".to_string()],
             registry_cid_path: Some("/var/lib/fula-gateway/registry.cid".to_string()),
+            remote_cid_put_enabled: false,
             storage_api_url: None,
             admin_jwt_secret: None,
             admin_api_enabled: false,
