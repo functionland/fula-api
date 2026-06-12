@@ -57,6 +57,40 @@ Future<bool> hasPendingChanges({
   bucket: bucket,
 );
 
+/// Invalidate the cached forest for `bucket` (issue #36).
+///
+/// The encrypted client caches each bucket's forest for the client
+/// lifetime, so a long-lived session never observes another device's
+/// uploads — `list_from_forest` / `get_flat` keep resolving against the
+/// session-stale index. Calling this drops the cached forest so the next
+/// forest operation reloads it from storage and sees cross-device writes.
+///
+/// **Dirty-safe**: a forest with pending (unsaved) local changes is NOT
+/// evicted — call [`flush_forest`] first to persist, then invalidate.
+/// Use [`has_pending_changes`] to inspect. This mirrors the underlying
+/// `EncryptedClient::invalidate_forest_cache` contract.
+///
+/// Typical app wiring: call on pull-to-refresh, tab-resume, reconnect,
+/// or any cache-revalidation path, then re-run `list_from_forest`.
+Future<void> invalidateForestCache({
+  required EncryptedClientHandle client,
+  required String bucket,
+}) => RustLib.instance.api.crateApiForestInvalidateForestCache(
+  client: client,
+  bucket: bucket,
+);
+
+/// Invalidate every cached bucket forest on this client (issue #36).
+///
+/// Bulk variant of [`invalidate_forest_cache`]: all clean forests are
+/// dropped; forests with pending (unsaved) changes are kept, matching
+/// the per-bucket dirty-safe contract.
+Future<void> invalidateAllForestCaches({
+  required EncryptedClientHandle client,
+}) => RustLib.instance.api.crateApiForestInvalidateAllForestCaches(
+  client: client,
+);
+
 /// Upload a file with immediate forest save
 ///
 /// This is the recommended method for most use cases.

@@ -9012,13 +9012,17 @@ impl EncryptedClient {
     /// Forces the next `load_forest` call to reload from storage.
     /// Dirty (unsaved) entries are NOT evicted — call `flush_forest()` first
     /// to persist changes before invalidating.
+    ///
+    /// The dirty check and the removal are ATOMIC (`DashMap::remove_if`
+    /// holds the shard lock across both). The previous get-then-remove
+    /// shape had a TOCTOU window where a concurrent deferred put could
+    /// dirty the entry between the check and the eviction, silently
+    /// dropping the pending index entry — reachable now that issue #36
+    /// exposes this call to arbitrary app refresh paths running
+    /// concurrently with uploads.
     pub fn invalidate_forest_cache(&self, bucket: &str) {
-        let is_dirty = self.forest_cache.get(bucket)
-            .map(|entry| entry.is_dirty())
-            .unwrap_or(false);
-        if !is_dirty {
-            self.forest_cache.remove(bucket);
-        }
+        self.forest_cache
+            .remove_if(bucket, |_, entry| !entry.is_dirty());
     }
 
     /// Invalidate all cached forests

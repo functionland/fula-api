@@ -63,6 +63,36 @@ pub async fn has_pending_changes(client: &EncryptedClientHandle, bucket: String)
     guard.has_pending_forest_changes(&bucket).await
 }
 
+/// Invalidate the cached forest for `bucket` (issue #36).
+///
+/// The encrypted client caches each bucket's forest for the client
+/// lifetime, so a long-lived session never observes another device's
+/// uploads — `list_from_forest` / `get_flat` keep resolving against the
+/// session-stale index. Calling this drops the cached forest so the next
+/// forest operation reloads it from storage and sees cross-device writes.
+///
+/// **Dirty-safe**: a forest with pending (unsaved) local changes is NOT
+/// evicted — call [`flush_forest`] first to persist, then invalidate.
+/// Use [`has_pending_changes`] to inspect. This mirrors the underlying
+/// `EncryptedClient::invalidate_forest_cache` contract.
+///
+/// Typical app wiring: call on pull-to-refresh, tab-resume, reconnect,
+/// or any cache-revalidation path, then re-run `list_from_forest`.
+pub async fn invalidate_forest_cache(client: &EncryptedClientHandle, bucket: String) {
+    let guard = client.inner.read().await;
+    guard.invalidate_forest_cache(&bucket);
+}
+
+/// Invalidate every cached bucket forest on this client (issue #36).
+///
+/// Bulk variant of [`invalidate_forest_cache`]: all clean forests are
+/// dropped; forests with pending (unsaved) changes are kept, matching
+/// the per-bucket dirty-safe contract.
+pub async fn invalidate_all_forest_caches(client: &EncryptedClientHandle) {
+    let guard = client.inner.read().await;
+    guard.invalidate_all_forest_caches();
+}
+
 // ============================================================================
 // Flat Namespace Operations
 // ============================================================================
