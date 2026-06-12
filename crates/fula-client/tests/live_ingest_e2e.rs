@@ -30,6 +30,11 @@ fn env_or_skip(key: &str) -> Option<String> {
 
 fn client(s3: &str, jwt: &str, ingest: Option<&str>, v8: bool) -> EncryptedClient {
     let mut config = Config::new(s3).with_token(jwt);
+    // The contended e2e box serializes 16 parallel chunk commits through the
+    // per-bucket write lock (each including a registry persist+pin); under
+    // load the queue tail exceeds the 30s default. Real deployments commit in
+    // ~100ms — this is test-box headroom, not a product setting.
+    config.timeout = std::time::Duration::from_secs(600);
     config.walkable_v8_writer_enabled = v8;
     if let Some(i) = ingest {
         config.ingest_endpoints = vec![i.to_string()];
