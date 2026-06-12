@@ -5391,4 +5391,266 @@ mod tests {
             extracted.directories.keys().collect::<Vec<_>>()
         );
     }
+
+    // =====================================================================
+    // Issue #34 — per-upload cost grows with bucket size (forest write
+    // amplification). These are CURRENT-BEHAVIOUR pins: they pass on the
+    // buggy code and quantify the bug; invert them when #34 is fixed.
+    //
+    // Mechanism (see also `node::round_trip_tests::
+    // issue_34_store_reputs_entire_unchanged_in_memory_tree` for the
+    // node-layer pin): `Node::set_value` marks every node on a mutated
+    // path `ChildPtr::InMemory`; `Node::store(&self)` re-PUTs every
+    // InMemory node but can never downgrade them to `Stored`
+    // (`ChildPtr::Stored` is only constructed by the load path,
+    // `Pointer::from_wire`). In a long-lived session the InMemory set
+    // grows monotonically, so EVERY flush re-uploads the whole
+    // ever-touched subtree. All files in one directory route to ONE
+    // shard (dir-local routing), so for the FxFiles bulk-upload pattern
+    // (N × `put_object_flat` = N × (upsert + flush) into one dir) the
+    // per-flush cost grows with N and the total is O(N²).
+    // =====================================================================
+
+    /// PUT-call + PUT-byte counting backend, local to the #34 tests
+    /// (`CountingBlobBackend` counts ops but not payload bytes, and byte
+    /// growth is half the #34 story).
+    struct Issue34CountingBackend {
+        inner: InMemoryBackend,
+        puts: std::sync::atomic::AtomicU64,
+        put_bytes: std::sync::atomic::AtomicU64,
+    }
+
+    impl Issue34CountingBackend {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryBackend::new(),
+                puts: std::sync::atomic::AtomicU64::new(0),
+                put_bytes: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        /// `(total PUT calls, total PUT payload bytes)` so far.
+        fn snapshot(&self) -> (u64, u64) {
+            use std::sync::atomic::Ordering::Relaxed;
+            (self.puts.load(Relaxed), self.put_bytes.load(Relaxed))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::wnfs_hamt::v7_store::BlobBackend for Issue34CountingBackend {
+        async fn get(&self, path: &str) -> Result<Vec<u8>> {
+            self.inner.get(path).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            bytes: Vec<u8>,
+        ) -> Result<crate::wnfs_hamt::v7_store::BlobPutResult> {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.puts.fetch_add(1, Relaxed);
+            self.put_bytes.fetch_add(bytes.len() as u64, Relaxed);
+            self.inner.put(path, bytes).await
+        }
+    }
+
+    /// Entry weighted like production: `put_object_flat` stashes the
+    /// `x-fula-encryption` JSON (wrapped DEK + nonce + encrypted private
+    /// metadata, ~0.9 KB) into `user_metadata` before the upsert
+    /// (`fula-client/src/encryption.rs`), so each forest entry carries
+    /// ~1 KB. Per-node payloads — and therefore the re-upload bytes this
+    /// test measures — scale with that weight; using it keeps the numbers
+    /// representative of the FxFiles repro rather than artificially small.
+    fn issue34_entry(path: &str) -> ForestFileEntry {
+        let mut e = file_entry(path, 4096);
+        e.user_metadata.insert(
+            "x-fula-encryption".to_string(),
+            "x".repeat(900),
+        );
+        e
+    }
+
+    /// Issue #34, pin 1: the marginal flush cost of `upsert + flush_dirty`
+    /// (= what every `put_object_flat` call does) grows with the number of
+    /// objects already in the bucket — in PUT calls AND in PUT bytes.
+    ///
+    /// This is the SDK-side reproduction of the FxFiles measurement
+    /// (cumulative avg 1.04 s/file at n=25 → 3.8 s/file at n=125): each
+    /// backend PUT here is a real sequential network round trip in
+    /// production (`S3BlobBackend` → master), so per-flush PUT growth is
+    /// per-upload latency growth.
+    #[tokio::test]
+    async fn issue_34_per_flush_put_cost_grows_with_bucket_size() {
+        const N: usize = 150;
+        // Pin the shard salt so the hot-shard index is stable run-to-run.
+        // (The HAMT shape itself is salt-independent — node hashing is
+        // `H::hash(key)` over fixed path strings — so the counts below are
+        // deterministic either way; the pinned salt also stabilizes which
+        // shard the directory routes to.)
+        const FIXED_SALT: [u8; 32] = [0x34; 32];
+
+        let backend = Arc::new(Issue34CountingBackend::new());
+        let mut manifest = crate::private_forest::ShardManifestV7::new(16);
+        manifest.root.shard_salt = FIXED_SALT.to_vec();
+        let mut forest =
+            ShardedHamtPrivateForest::from_manifest(manifest, "documents-v8", test_dek());
+
+        let mut puts_per_flush = Vec::with_capacity(N);
+        let mut bytes_per_flush = Vec::with_capacity(N);
+        for i in 0..N {
+            forest
+                .upsert_file(
+                    issue34_entry(&format!("/e2e/perf/file-{:03}.bin", i)),
+                    &backend,
+                )
+                .await
+                .unwrap();
+            let (p0, b0) = backend.snapshot();
+            forest.flush_dirty(&backend).await.unwrap();
+            let (p1, b1) = backend.snapshot();
+            puts_per_flush.push(p1 - p0);
+            bytes_per_flush.push(b1 - b0);
+        }
+
+        let (total_puts, total_bytes) = backend.snapshot();
+        eprintln!(
+            "\n[#34] one directory, one hot shard, flush after every upsert \
+             (the `put_object_flat` pattern):"
+        );
+        eprintln!("  upload # | HAMT-node PUTs in that flush | bytes in that flush");
+        for &n in &[1usize, 10, 25, 50, 75, 100, 125, 150] {
+            eprintln!(
+                "  {:>8} | {:>28} | {:>19}",
+                n,
+                puts_per_flush[n - 1],
+                bytes_per_flush[n - 1]
+            );
+        }
+        eprintln!(
+            "  TOTAL for {} files of 4 KB: {} node PUTs, {:.1} MB uploaded \
+             (index alone, object bodies excluded)",
+            N,
+            total_puts,
+            total_bytes as f64 / 1.0e6
+        );
+
+        // (1) Marginal PUT-call count grows several-fold: flushes 5-14
+        // (ancestor-chain warmup excluded) vs the last 10 flushes. On the
+        // current code this ratio is ~10×; assert a conservative ≥3× so
+        // minor tree-shape changes don't flake the pin.
+        let early_puts: u64 = puts_per_flush[4..14].iter().sum();
+        let late_puts: u64 = puts_per_flush[N - 10..].iter().sum();
+        assert!(
+            late_puts >= 3 * early_puts,
+            "issue #34 pin: expected per-flush PUT count to grow ≥3× as the \
+             bucket fills (early flushes 5-14: {} PUTs total; last 10 \
+             flushes: {} PUTs total). If late ≈ early ≈ O(path depth), the \
+             write amplification is FIXED — invert this test into a \
+             flat-marginal-cost regression guard.",
+            early_puts,
+            late_puts
+        );
+
+        // (2) Marginal PUT bytes grow at least as fast (every ever-touched
+        // node is re-serialized + re-encrypted + re-PUT on every flush, so
+        // per-flush bytes are O(bucket size)).
+        let early_bytes: u64 = bytes_per_flush[4..14].iter().sum();
+        let late_bytes: u64 = bytes_per_flush[N - 10..].iter().sum();
+        assert!(
+            late_bytes >= 5 * early_bytes,
+            "issue #34 pin: expected per-flush PUT bytes to grow ≥5× as the \
+             bucket fills (early flushes 5-14: {} B; last 10 flushes: {} B).",
+            early_bytes,
+            late_bytes
+        );
+    }
+
+    /// Issue #34, pin 2: the amplification is SESSION-ACCUMULATED state,
+    /// not an inherent cost of the tree size.
+    ///
+    /// Proof by contrast, same bucket / same salt / same persisted data:
+    ///   - the 150-upload session's marginal flush re-PUTs the whole
+    ///     ever-touched hot-shard tree (~17 nodes: root + every level-1
+    ///     child, all stuck `InMemory`);
+    ///   - a FRESH forest built from the same manifest (= what an app
+    ///     restart or a new device produces; every pointer loads as
+    ///     `Stored`) doing ONE upsert + flush re-PUTs only the touched
+    ///     root→leaf path (~3 nodes).
+    ///
+    /// An incremental flush would make the long-lived session behave like
+    /// the fresh one. This contrast is the direct falsification of "the
+    /// index is just big, the cost is unavoidable".
+    #[tokio::test]
+    async fn issue_34_fresh_session_flush_is_incremental_long_session_is_not() {
+        const N: usize = 150;
+        const FIXED_SALT: [u8; 32] = [0x34; 32];
+
+        let backend = Arc::new(Issue34CountingBackend::new());
+        let mut manifest = crate::private_forest::ShardManifestV7::new(16);
+        manifest.root.shard_salt = FIXED_SALT.to_vec();
+        let mut forest =
+            ShardedHamtPrivateForest::from_manifest(manifest, "documents-v8", test_dek());
+
+        // The long-lived session: N × (upsert + flush), like FxFiles.
+        for i in 0..N {
+            forest
+                .upsert_file(
+                    issue34_entry(&format!("/e2e/perf/file-{:03}.bin", i)),
+                    &backend,
+                )
+                .await
+                .unwrap();
+            forest.flush_dirty(&backend).await.unwrap();
+        }
+
+        // Marginal cost of upload #151 in the long-lived session.
+        forest
+            .upsert_file(issue34_entry("/e2e/perf/file-150.bin"), &backend)
+            .await
+            .unwrap();
+        let (p0, _) = backend.snapshot();
+        let manifest_after = forest.flush_dirty(&backend).await.unwrap().clone();
+        let (p1, _) = backend.snapshot();
+        let long_session_puts = p1 - p0;
+
+        // Fresh session over the SAME persisted state: from_manifest is the
+        // production load path, so every shard-root pointer deserializes as
+        // `Stored`/`StoredV2` and only the genuinely mutated path goes
+        // `InMemory` on the next write.
+        let mut fresh = ShardedHamtPrivateForest::from_manifest(
+            manifest_after,
+            "documents-v8",
+            test_dek(),
+        );
+        fresh
+            .upsert_file(issue34_entry("/e2e/perf/file-151.bin"), &backend)
+            .await
+            .unwrap();
+        let (q0, _) = backend.snapshot();
+        fresh.flush_dirty(&backend).await.unwrap();
+        let (q1, _) = backend.snapshot();
+        let fresh_session_puts = q1 - q0;
+
+        eprintln!(
+            "\n[#34] marginal flush after 150 uploads — long-lived session: \
+             {} node PUTs; fresh session (same data, loaded from manifest): \
+             {} node PUTs",
+            long_session_puts, fresh_session_puts
+        );
+
+        assert!(
+            fresh_session_puts >= 1,
+            "fresh session must persist at least the touched path"
+        );
+        assert!(
+            long_session_puts >= 3 * fresh_session_puts,
+            "issue #34 pin: the long-lived session's marginal flush re-PUT \
+             {} nodes while a fresh session over the same data re-PUT only \
+             {} — the difference is exactly the never-downgraded InMemory \
+             set. If the ratio collapsed to ~1, the write amplification is \
+             FIXED — invert this test into a regression guard.",
+            long_session_puts,
+            fresh_session_puts
+        );
+    }
 }
