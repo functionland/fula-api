@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueNom,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.11.1";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 2120515634;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1846171626;
 
 // Section: executor
 
@@ -3127,6 +3127,111 @@ fn wire__crate__api__client__head_object_impl(
                             api_key,
                         )
                         .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__forest__invalidate_all_forest_caches_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    client: impl CstDecode<
+        RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EncryptedClientHandle>,
+        >,
+    >,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "invalidate_all_forest_caches",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_client = client.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, ()>(
+                    (move || async move {
+                        let mut api_client_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_client,
+                                    0,
+                                    false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_client_guard =
+                                        Some(api_client.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_client_guard = api_client_guard.unwrap();
+                        let output_ok = Result::<_, ()>::Ok({
+                            crate::api::forest::invalidate_all_forest_caches(&*api_client_guard)
+                                .await;
+                        })?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__forest__invalidate_forest_cache_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    client: impl CstDecode<
+        RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EncryptedClientHandle>,
+        >,
+    >,
+    bucket: impl CstDecode<String>,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "invalidate_forest_cache",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_client = client.cst_decode();
+            let api_bucket = bucket.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, ()>(
+                    (move || async move {
+                        let mut api_client_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_client,
+                                    0,
+                                    false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_client_guard =
+                                        Some(api_client.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_client_guard = api_client_guard.unwrap();
+                        let output_ok = Result::<_, ()>::Ok({
+                            crate::api::forest::invalidate_forest_cache(
+                                &*api_client_guard,
+                                api_bucket,
+                            )
+                            .await;
+                        })?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -9777,6 +9882,23 @@ mod io {
     }
 
     #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__forest__invalidate_all_forest_caches(
+        port_: i64,
+        client: usize,
+    ) {
+        wire__crate__api__forest__invalidate_all_forest_caches_impl(port_, client)
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__forest__invalidate_forest_cache(
+        port_: i64,
+        client: usize,
+        bucket: *mut wire_cst_list_prim_u_8_strict,
+    ) {
+        wire__crate__api__forest__invalidate_forest_cache_impl(port_, client, bucket)
+    }
+
+    #[unsafe(no_mangle)]
     pub extern "C" fn frbgen_fula_client_wire__crate__api__encrypted__is_flat_namespace(
         port_: i64,
         client: usize,
@@ -12741,6 +12863,23 @@ mod web {
         key: String,
     ) {
         wire__crate__api__client__head_object_impl(port_, client, bucket, key)
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__forest__invalidate_all_forest_caches(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+    ) {
+        wire__crate__api__forest__invalidate_all_forest_caches_impl(port_, client)
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__forest__invalidate_forest_cache(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        bucket: String,
+    ) {
+        wire__crate__api__forest__invalidate_forest_cache_impl(port_, client, bucket)
     }
 
     #[wasm_bindgen]

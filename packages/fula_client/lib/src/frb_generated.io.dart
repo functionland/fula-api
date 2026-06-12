@@ -3997,6 +3997,52 @@ class RustLibWire implements BaseWire {
             )
           >();
 
+  void wire__crate__api__forest__invalidate_all_forest_caches(
+    int port_,
+    int client,
+  ) {
+    return _wire__crate__api__forest__invalidate_all_forest_caches(
+      port_,
+      client,
+    );
+  }
+
+  late final _wire__crate__api__forest__invalidate_all_forest_cachesPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64, ffi.UintPtr)>>(
+        'frbgen_fula_client_wire__crate__api__forest__invalidate_all_forest_caches',
+      );
+  late final _wire__crate__api__forest__invalidate_all_forest_caches =
+      _wire__crate__api__forest__invalidate_all_forest_cachesPtr
+          .asFunction<void Function(int, int)>();
+
+  void wire__crate__api__forest__invalidate_forest_cache(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> bucket,
+  ) {
+    return _wire__crate__api__forest__invalidate_forest_cache(
+      port_,
+      client,
+      bucket,
+    );
+  }
+
+  late final _wire__crate__api__forest__invalidate_forest_cachePtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >('frbgen_fula_client_wire__crate__api__forest__invalidate_forest_cache');
+  late final _wire__crate__api__forest__invalidate_forest_cache =
+      _wire__crate__api__forest__invalidate_forest_cachePtr
+          .asFunction<
+            void Function(int, int, ffi.Pointer<wire_cst_list_prim_u_8_strict>)
+          >();
+
   void wire__crate__api__encrypted__is_flat_namespace(int port_, int client) {
     return _wire__crate__api__encrypted__is_flat_namespace(port_, client);
   }

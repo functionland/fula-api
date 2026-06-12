@@ -2486,6 +2486,24 @@ class RustLibWire implements BaseWire {
     key,
   );
 
+  void wire__crate__api__forest__invalidate_all_forest_caches(
+    NativePortType port_,
+    int client,
+  ) => wasmModule.wire__crate__api__forest__invalidate_all_forest_caches(
+    port_,
+    client,
+  );
+
+  void wire__crate__api__forest__invalidate_forest_cache(
+    NativePortType port_,
+    int client,
+    String bucket,
+  ) => wasmModule.wire__crate__api__forest__invalidate_forest_cache(
+    port_,
+    client,
+    bucket,
+  );
+
   void wire__crate__api__encrypted__is_flat_namespace(
     NativePortType port_,
     int client,
@@ -3459,6 +3477,17 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     int client,
     String bucket,
     String key,
+  );
+
+  external void wire__crate__api__forest__invalidate_all_forest_caches(
+    NativePortType port_,
+    int client,
+  );
+
+  external void wire__crate__api__forest__invalidate_forest_cache(
+    NativePortType port_,
+    int client,
+    String bucket,
   );
 
   external void wire__crate__api__encrypted__is_flat_namespace(

@@ -73,7 +73,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => 2120515634;
+  int get rustContentHash => 1846171626;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -421,6 +421,15 @@ abstract class RustLibApi extends BaseApi {
     required FulaClientHandle client,
     required String bucket,
     required String key,
+  });
+
+  Future<void> crateApiForestInvalidateAllForestCaches({
+    required EncryptedClientHandle client,
+  });
+
+  Future<void> crateApiForestInvalidateForestCache({
+    required EncryptedClientHandle client,
+    required String bucket,
   });
 
   Future<bool> crateApiEncryptedIsFlatNamespace({
@@ -3152,6 +3161,75 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     debugName: "head_object",
     argNames: ["client", "bucket", "key"],
   );
+
+  @override
+  Future<void> crateApiForestInvalidateAllForestCaches({
+    required EncryptedClientHandle client,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          return wire.wire__crate__api__forest__invalidate_all_forest_caches(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiForestInvalidateAllForestCachesConstMeta,
+        argValues: [client],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestInvalidateAllForestCachesConstMeta =>
+      const TaskConstMeta(
+        debugName: "invalidate_all_forest_caches",
+        argNames: ["client"],
+      );
+
+  @override
+  Future<void> crateApiForestInvalidateForestCache({
+    required EncryptedClientHandle client,
+    required String bucket,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          return wire.wire__crate__api__forest__invalidate_forest_cache(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiForestInvalidateForestCacheConstMeta,
+        argValues: [client, bucket],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestInvalidateForestCacheConstMeta =>
+      const TaskConstMeta(
+        debugName: "invalidate_forest_cache",
+        argNames: ["client", "bucket"],
+      );
 
   @override
   Future<bool> crateApiEncryptedIsFlatNamespace({
