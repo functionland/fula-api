@@ -27,9 +27,11 @@ pub mod crdt;
 pub mod error;
 pub mod metadata;
 pub mod prolly;
+pub mod root_pointer;
 
 pub use bucket::{Bucket, BucketConfig, BucketManager, BucketRegistry};
 pub use error::{CoreError, Result};
+pub use root_pointer::{CasOutcome, RootPointerStore};
 pub use metadata::{ObjectMetadata, EncryptionMetadata, StorageClass};
 pub use prolly::{ProllyTree, ProllyNode, ProllyConfig};
 

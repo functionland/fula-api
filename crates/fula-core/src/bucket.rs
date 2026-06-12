@@ -47,6 +47,12 @@ pub struct Bucket<S: BlockStore> {
     metadata_cache: Option<Arc<DashMap<String, BucketMetadata>>>,
     /// Key used in the metadata cache (may differ from metadata.name for user-scoped buckets)
     cache_key: Option<String>,
+    /// FM-1 (Phase 2.5): shared multi-master root arbiter. `None` (default)
+    /// = single-master behavior, byte-identical to before. Set via
+    /// [`set_root_pointer_store`](Self::set_root_pointer_store) when the
+    /// operator enables the flag; `flush()` then CASes the shared pointer
+    /// before publishing the new root.
+    root_store: Option<Arc<dyn crate::root_pointer::RootPointerStore>>,
 }
 
 impl<S: BlockStore> Bucket<S> {
@@ -74,6 +80,7 @@ impl<S: BlockStore> Bucket<S> {
             config,
             metadata_cache: None,
             cache_key: None,
+            root_store: None,
         })
     }
 
@@ -91,6 +98,7 @@ impl<S: BlockStore> Bucket<S> {
             config,
             metadata_cache,
             cache_key: None,
+            root_store: None,
         })
     }
 
@@ -110,7 +118,18 @@ impl<S: BlockStore> Bucket<S> {
             config,
             metadata_cache,
             cache_key: Some(cache_key),
+            root_store: None,
         })
+    }
+
+    /// FM-1: attach the shared multi-master root arbiter (see
+    /// [`crate::root_pointer`]). Called by `BucketManager` right after
+    /// opening when the operator enabled bucket-root CAS.
+    pub fn set_root_pointer_store(
+        &mut self,
+        store: Arc<dyn crate::root_pointer::RootPointerStore>,
+    ) {
+        self.root_store = Some(store);
     }
 
     /// Get bucket name
@@ -262,7 +281,37 @@ impl<S: BlockStore> Bucket<S> {
 
     /// Flush changes and return the new root CID
     pub async fn flush(&mut self) -> Result<Cid> {
+        // FM-1: capture the root this bucket was OPENED at — the value the
+        // shared CAS must still hold for this flush to win the multi-master
+        // race.
+        let old_root = self.metadata.root_cid;
+
         let root_cid = self.index.flush().await?;
+
+        // FM-1 (Phase 2.5): with a shared arbiter attached, the new root is
+        // published to ALL masters atomically BEFORE this process's caches
+        // learn it. Losing the race means another master flushed this bucket
+        // after we opened it — surfacing as PreconditionFailed keeps the
+        // contract identical to conditional writes (retryable; SDKs already
+        // re-open + retry on 412). No-op when old == new (nothing changed).
+        if let Some(ref arbiter) = self.root_store {
+            if old_root != root_cid {
+                use crate::root_pointer::CasOutcome;
+                match arbiter
+                    .cas_root(&self.metadata.owner_id, &self.metadata.name, &old_root, &root_cid)
+                    .await?
+                {
+                    CasOutcome::Won => {}
+                    CasOutcome::Conflict { current } => {
+                        return Err(CoreError::PreconditionFailed(format!(
+                            "bucket '{}' was modified by another master (shared root is {:?}, this flush built on {}) — reopen and retry",
+                            self.metadata.name, current, old_root
+                        )));
+                    }
+                }
+            }
+        }
+
         self.metadata.root_cid = root_cid;
 
         // Update the metadata cache if we have a reference to it
@@ -430,6 +479,12 @@ pub struct BucketManager<S: BlockStore + PinStore> {
     /// registry.cid file from concurrent overwrites and coalesces the
     /// IPLD write when many mutations fire at once.
     registry_persist_lock: Arc<tokio::sync::Mutex<()>>,
+    /// FM-1 (Phase 2.5): shared multi-master root arbiter, attached to every
+    /// bucket opened for writing. Unset (default) = single-master behavior.
+    /// `OnceLock` so it can be wired AFTER the manager is shared in an `Arc`
+    /// (the Postgres pool is constructed later in AppState init); reads are
+    /// lock-free.
+    root_pointer_store: std::sync::OnceLock<Arc<dyn crate::root_pointer::RootPointerStore>>,
 }
 
 impl<S: BlockStore + PinStore> BucketManager<S> {
@@ -444,6 +499,7 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
             dirty: std::sync::atomic::AtomicBool::new(false),
             bucket_write_locks: Arc::new(DashMap::new()),
             registry_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
+            root_pointer_store: std::sync::OnceLock::new(),
         }
     }
 
@@ -458,7 +514,21 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
             dirty: std::sync::atomic::AtomicBool::new(false),
             bucket_write_locks: Arc::new(DashMap::new()),
             registry_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
+            root_pointer_store: std::sync::OnceLock::new(),
         }
+    }
+
+    /// FM-1 (Phase 2.5): enable shared multi-master root arbitration. Every
+    /// bucket opened via [`open_bucket_for_user`](Self::open_bucket_for_user)
+    /// afterwards (a) opens at the SHARED root when another master has moved
+    /// it past this process's cache, and (b) CASes the shared pointer on
+    /// flush. Call once at startup when the operator flag is on (set-once;
+    /// later calls are ignored).
+    pub fn set_root_pointer_store(
+        &self,
+        store: Arc<dyn crate::root_pointer::RootPointerStore>,
+    ) {
+        let _ = self.root_pointer_store.set(store);
     }
 
     /// Rebuild the name_index from the current buckets DashMap
@@ -1135,21 +1205,51 @@ impl<S: BlockStore + PinStore> BucketManager<S> {
         let internal_key = Self::scoped_bucket_key(user_id, name);
         tracing::debug!(bucket_name = %name, internal_key = %internal_key, "Opening user-scoped bucket");
 
-        let metadata = self.buckets.get(&internal_key)
+        let mut metadata = self.buckets.get(&internal_key)
             .map(|r| r.clone())
             .ok_or_else(|| {
                 tracing::error!(bucket_name = %name, internal_key = %internal_key, "User-scoped bucket not found");
                 CoreError::BucketNotFound(name.to_string())
             })?;
 
+        // FM-1 (Phase 2.5): another master may have flushed this bucket past
+        // our in-process cache. Open at the SHARED root so this write builds
+        // on the latest state instead of forking from a stale one (a stale
+        // open would only lose the CAS at flush — correct but wasteful).
+        if let Some(arbiter) = self.root_pointer_store.get() {
+            match arbiter.get_root(user_id, name).await {
+                Ok(Some(shared_root)) if shared_root != metadata.root_cid => {
+                    tracing::debug!(
+                        bucket = %name,
+                        cached = %metadata.root_cid,
+                        shared = %shared_root,
+                        "opening at the shared root (another master moved it)"
+                    );
+                    metadata.root_cid = shared_root;
+                    // Keep the cache truthful for read paths too.
+                    self.buckets.insert(internal_key.clone(), metadata.clone());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // Arbiter unreachable: opening at the cached root is safe —
+                    // the flush-side CAS still arbitrates. Log and continue.
+                    tracing::warn!(error = %e, bucket = %name, "shared-root lookup failed; opening at cached root");
+                }
+            }
+        }
+
         // Use load_with_cache_key so flush() updates the correct entry
-        Bucket::load_with_cache_key(
+        let mut bucket = Bucket::load_with_cache_key(
             metadata,
             Arc::clone(&self.store),
             self.default_config.clone(),
             Some(Arc::clone(&self.buckets)),
             internal_key,
-        ).await
+        ).await?;
+        if let Some(arbiter) = self.root_pointer_store.get() {
+            bucket.set_root_pointer_store(Arc::clone(arbiter));
+        }
+        Ok(bucket)
     }
 
     /// Delete a bucket for a specific user

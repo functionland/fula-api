@@ -66,6 +66,11 @@ pub struct GatewayConfig {
     /// masters are never sent the protocol. Default OFF.
     #[serde(default)]
     pub remote_cid_put_enabled: bool,
+    /// FM-1 (Phase 2.5): arbitrate bucket-root flushes through the shared
+    /// Postgres so CONCURRENT federated masters can serve writes without
+    /// lost updates. Needs the pins-DB (POSTGRES_* env). Default OFF.
+    #[serde(default)]
+    pub bucket_root_cas_enabled: bool,
     /// Storage API URL for balance/quota checking before uploads
     pub storage_api_url: Option<String>,
     /// Admin JWT secret for admin API authentication (separate from user JWT)
@@ -207,6 +212,7 @@ impl Default for GatewayConfig {
             cors_origins: vec!["*".to_string()],
             registry_cid_path: Some("/var/lib/fula-gateway/registry.cid".to_string()),
             remote_cid_put_enabled: false,
+            bucket_root_cas_enabled: false,
             storage_api_url: None,
             admin_jwt_secret: None,
             admin_api_enabled: false,

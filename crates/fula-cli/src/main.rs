@@ -98,6 +98,12 @@ struct Args {
     /// Advertised to clients via GET /fula/capabilities. Default OFF.
     #[arg(long, env = "FULA_REMOTE_CID_PUT")]
     remote_cid_put: bool,
+
+    /// FM-1 (Phase 2.5): arbitrate bucket-root flushes through the shared
+    /// Postgres (POSTGRES_* env) so concurrent federated masters never lose
+    /// each other's writes. Default OFF.
+    #[arg(long, env = "FULA_BUCKET_ROOT_CAS")]
+    bucket_root_cas: bool,
 }
 
 #[tokio::main]
@@ -170,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
         local_retain_enabled: if args.no_local_retain { Some(false) } else { None },
         local_retain_backfill: if args.no_local_retain_backfill { Some(false) } else { None },
         remote_cid_put_enabled: args.remote_cid_put,
+        bucket_root_cas_enabled: args.bucket_root_cas,
         ..Default::default()
     };
 

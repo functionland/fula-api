@@ -49,6 +49,7 @@ pub mod pin_queue;
 pub mod pinning;
 pub mod recovery_fallback;
 pub mod revocation;
+pub mod root_store_pg;
 pub mod routes;
 pub mod server;
 pub mod state;
