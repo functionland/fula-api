@@ -123,11 +123,13 @@ async fn live_1gib_chunked_via_ingest() {
     let want = blake3::hash(&data);
 
     let started = std::time::Instant::now();
-    c.put_object_flat(bucket, key, data.clone(), Some("application/octet-stream"))
+    // MOVE the payload — holding payload + a clone is >2 GiB in this one
+    // process and OOM-kills the run on the 7.8 GB e2e box (run #4, SIGKILL).
+    // `want` already carries everything the verification needs.
+    c.put_object_flat(bucket, key, data, Some("application/octet-stream"))
         .await
         .expect("1 GiB chunked flat upload via ingest");
     eprintln!("1 GiB upload took {:?}", started.elapsed());
-    drop(data);
 
     let got = c.get_object_flat(bucket, key).await.expect("1 GiB download");
     assert_eq!(got.len(), GIB);
