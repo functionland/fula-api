@@ -958,6 +958,43 @@ pub async fn list_directory(
 }
 
 // ============================================================================
+// Forest Cache Management (issue #36)
+// ============================================================================
+
+/// Invalidate the cached forest index for a bucket.
+///
+/// The encrypted client caches each bucket's forest for the client
+/// lifetime, so a long-lived session (e.g. a browser tab left open) never
+/// observes another device's uploads — listings and downloads keep
+/// resolving against the session-stale index. Call this on your app's
+/// refresh / revalidation paths, then re-list: the next forest operation
+/// reloads from storage and sees cross-device writes.
+///
+/// **Dirty-safe**: a forest with pending (unsaved) local changes is NOT
+/// evicted — flush first, then invalidate. Mirrors the fula-flutter
+/// binding of the same name for cross-platform parity.
+///
+/// @param client - EncryptedClient handle
+/// @param bucket - Bucket name
+#[wasm_bindgen(js_name = invalidateForestCache)]
+pub async fn invalidate_forest_cache(client: &EncryptedClient, bucket: &str) {
+    let guard = client.inner.lock().await;
+    guard.invalidate_forest_cache(bucket);
+}
+
+/// Invalidate every cached bucket forest on this client.
+///
+/// Bulk variant of `invalidateForestCache`: all clean forests are
+/// dropped; forests with pending (unsaved) changes are kept.
+///
+/// @param client - EncryptedClient handle
+#[wasm_bindgen(js_name = invalidateAllForestCaches)]
+pub async fn invalidate_all_forest_caches(client: &EncryptedClient) {
+    let guard = client.inner.lock().await;
+    guard.invalidate_all_forest_caches();
+}
+
+// ============================================================================
 // Bucket Operations
 // ============================================================================
 

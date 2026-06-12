@@ -81,6 +81,10 @@ jobs:
           grep -q "createEncryptedClient" crates/fula-js/pkg/fula_js.d.ts
           grep -q "getDecrypted" crates/fula-js/pkg/fula_js.d.ts
           grep -q "deriveKey" crates/fula-js/pkg/fula_js.d.ts
+          # Issue #36 — forest-cache invalidation must stay exposed for
+          # npm parity with the fula-flutter bindings.
+          grep -q "invalidateForestCache" crates/fula-js/pkg/fula_js.d.ts
+          grep -q "invalidateAllForestCaches" crates/fula-js/pkg/fula_js.d.ts
           echo "All expected exports found!"
 
       # Layer 1: ban panic-on-wasm stdlib time APIs at compile time.
