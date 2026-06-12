@@ -57,14 +57,16 @@ async fn live_chunked_via_ingest_round_trip() {
     let c = client(&s3, &jwt, Some(&ingest), true);
     let bucket = "p2-live-ingest";
     let key = "/ingest/round-trip.bin";
-    let data = payload(1_500_000); // ~6 chunks at the 256 KiB default
+    // >768 KiB → put_object_flat dispatches into put_object_chunked_internal
+    // (the FxFiles photo/video path) where the ingest route lives.
+    let data = payload(1_500_000);
 
-    c.put_object_chunked(bucket, key, &data, None)
+    c.put_object_flat(bucket, key, data.clone(), Some("application/octet-stream"))
         .await
-        .expect("chunked upload via ingest route");
+        .expect("chunked flat upload via ingest route");
 
     let got = c
-        .get_object(bucket, key)
+        .get_object_flat(bucket, key)
         .await
         .expect("download after ingest-routed upload");
     assert_eq!(got.len(), data.len(), "length mismatch");
@@ -89,10 +91,10 @@ async fn live_chunked_v8_off_legacy_round_trip() {
     let key = "/legacy/round-trip.bin";
     let data = payload(1_200_000);
 
-    c.put_object_chunked(bucket, key, &data, None)
+    c.put_object_flat(bucket, key, data.clone(), Some("application/octet-stream"))
         .await
-        .expect("chunked upload, v8 off");
-    let got = c.get_object(bucket, key).await.expect("download");
+        .expect("chunked flat upload, v8 off");
+    let got = c.get_object_flat(bucket, key).await.expect("download");
     assert_eq!(blake3::hash(&got), blake3::hash(&data));
 }
 
@@ -121,13 +123,13 @@ async fn live_1gib_chunked_via_ingest() {
     let want = blake3::hash(&data);
 
     let started = std::time::Instant::now();
-    c.put_object_chunked(bucket, key, &data, None)
+    c.put_object_flat(bucket, key, data.clone(), Some("application/octet-stream"))
         .await
-        .expect("1 GiB chunked upload via ingest");
+        .expect("1 GiB chunked flat upload via ingest");
     eprintln!("1 GiB upload took {:?}", started.elapsed());
     drop(data);
 
-    let got = c.get_object(bucket, key).await.expect("1 GiB download");
+    let got = c.get_object_flat(bucket, key).await.expect("1 GiB download");
     assert_eq!(got.len(), GIB);
     assert_eq!(blake3::hash(&got), want, "1 GiB content mismatch");
 }
