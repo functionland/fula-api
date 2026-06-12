@@ -5717,6 +5717,103 @@ mod tests {
             long_session_puts,
             fresh_session_puts
         );
+
+        // Cross-session composition (two-client shape, sequential): the
+        // long-lived session wrote files 000-150, the second session
+        // (loaded from the first's manifest) wrote file-151. A THIRD cold
+        // session over the final manifest must see writes from BOTH
+        // sessions — proving sealed flushes from different sessions
+        // compose on shared storage with no loss.
+        let manifest_final = fresh.flush_dirty(&backend).await.unwrap().clone();
+        let mut third = ShardedHamtPrivateForest::from_manifest(
+            manifest_final,
+            "documents-v8",
+            test_dek(),
+        );
+        for path in [
+            "/e2e/perf/file-000.bin", // session 1, first write
+            "/e2e/perf/file-149.bin", // session 1, last bulk write
+            "/e2e/perf/file-150.bin", // session 1, marginal write
+            "/e2e/perf/file-151.bin", // session 2's write
+        ] {
+            assert!(
+                third.get_file(path, &backend).await.unwrap().is_some(),
+                "third session must read {} written across two prior sessions",
+                path
+            );
+        }
+        let listing = third.list_directory("/e2e/perf", &backend).await.unwrap();
+        assert_eq!(
+            listing.len(),
+            N + 2,
+            "third session must list all files from both prior sessions"
+        );
+    }
+
+    /// Issue #34 — aliasing guarantee: an in-flight reader holding the
+    /// shard-root `Arc` from BEFORE a flush is completely unaffected by the
+    /// sealing write-back (its view stays the pre-seal tree; the transient
+    /// placeholder used inside `store_sealing` is never observable).
+    /// `Arc::make_mut` clones any node whose refcount > 1, so the sealer
+    /// mutates a private copy — this test pins that copy-on-write contract
+    /// for the sealing path specifically.
+    #[tokio::test]
+    async fn issue_34_in_flight_reader_arc_unaffected_by_sealing() {
+        const N: usize = 30;
+        const FIXED_SALT: [u8; 32] = [0x34; 32];
+
+        let backend = Arc::new(Issue34CountingBackend::new());
+        let mut manifest = crate::private_forest::ShardManifestV7::new(16);
+        manifest.root.shard_salt = FIXED_SALT.to_vec();
+        let mut forest =
+            ShardedHamtPrivateForest::from_manifest(manifest, "documents-v8", test_dek());
+
+        for i in 0..N {
+            forest
+                .upsert_file(
+                    issue34_entry(&format!("/e2e/perf/file-{:03}.bin", i)),
+                    &backend,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Simulate an in-flight reader: grab the hot shard's root Arc the
+        // way resolve paths do, BEFORE the flush.
+        let idx = forest.shard_for_file("/e2e/perf/file-000.bin");
+        let pre_seal_root: Arc<ForestHamt> = {
+            let guard = forest.loaded_shards[idx].read().await;
+            match &*guard {
+                LoadedShard::Loaded(node) => Arc::clone(node),
+                other => panic!("hot shard must be Loaded, got {:?}", std::mem::discriminant(other)),
+            }
+        };
+
+        // Flush — seals the live tree (cloning shared nodes via make_mut).
+        forest.flush_dirty(&backend).await.unwrap();
+
+        // The reader's pre-seal view must still resolve every entry — no
+        // placeholder, no missing child, values intact.
+        let reader = forest.reader_store_for(idx, &backend);
+        for i in 0..N {
+            let key = file_key(&format!("/e2e/perf/file-{:03}.bin", i));
+            let got = pre_seal_root.get(&key, &reader).await.unwrap();
+            assert!(
+                got.is_some(),
+                "in-flight reader lost entry {} during sealing",
+                i
+            );
+        }
+
+        // And the post-seal live tree reads the same set.
+        for i in 0..N {
+            let path = format!("/e2e/perf/file-{:03}.bin", i);
+            assert!(
+                forest.get_file(&path, &backend).await.unwrap().is_some(),
+                "post-seal tree lost entry {}",
+                path
+            );
+        }
     }
 
     /// Issue #34 — deletion over a SEALED tree: `remove_file` resolves

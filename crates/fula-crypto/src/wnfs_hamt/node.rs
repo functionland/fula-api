@@ -1219,10 +1219,16 @@ mod round_trip_tests {
             "retry after a failed seal must converge on the same persisted \
              state as a never-failed run"
         );
-        assert!(
-            retry_puts <= control_puts,
-            "retry must not re-PUT children that sealed before the failure \
-             (retry: {}, clean run: {})",
+        // Exactly the two children whose PUTs succeeded before the injected
+        // failure (calls 1 and 2) keep their seal and are skipped on retry;
+        // everything else — including the child whose PUT failed (restored
+        // to InMemory) — is re-persisted. Deterministic: fixed keys → fixed
+        // tree shape → fixed walk order.
+        assert_eq!(
+            retry_puts,
+            control_puts - 2,
+            "retry must re-PUT everything EXCEPT the 2 children sealed \
+             before the injected failure (retry: {}, clean run: {})",
             retry_puts,
             control_puts
         );
