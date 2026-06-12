@@ -166,6 +166,126 @@ where
         store.put_node(bytes).await
     }
 
+    /// Issue #34 — like [`store`](Self::store), but with WRITE-BACK: every
+    /// `InMemory` child that persists successfully is downgraded in place
+    /// to `ChildPtr::Sealed { storage_key, cid, node }`, so the NEXT store
+    /// of this tree emits the recorded reference instead of re-uploading
+    /// the unchanged subtree.
+    ///
+    /// Why this exists: `store(&self)` cannot record that a child was
+    /// persisted, so in a long-lived session the `InMemory` set grows
+    /// monotonically (every mutation path stays "dirty" forever) and every
+    /// flush re-serializes, re-encrypts, and re-PUTs the whole ever-touched
+    /// tree — O(N²) total upload cost for N sequential single-file puts
+    /// (issue #34). With sealing, a flush PUTs exactly the nodes mutated
+    /// since the previous flush plus this root: O(depth) per flush.
+    ///
+    /// Persisted bytes are IDENTICAL to `store`'s: a sealed child re-emits
+    /// the same `PointerWire::Link`/`LinkV2` its original PUT produced
+    /// (same plaintext → same content-addressed storage_key), so readers —
+    /// including pre-#34 SDKs — cannot distinguish the two writers. Pinned
+    /// by `issue_34_sealing_and_legacy_store_produce_identical_roots`.
+    ///
+    /// Error handling: if a child's recursive store fails, that child is
+    /// restored to `InMemory` and the error propagates — the in-memory
+    /// tree stays fully intact and a retry re-persists exactly the
+    /// still-unsealed remainder. Children that already sealed earlier in
+    /// the walk keep their seal (their PUTs succeeded; the references are
+    /// durable and content-addressed).
+    ///
+    /// Takes `self: &mut Arc<Self>` (same copy-on-write receiver as
+    /// [`set`](Self::set)) because the seal mutates pointers in place;
+    /// recursion is hand-boxed like `set_value` since `async_recursion`
+    /// and arbitrary-self receivers don't mix.
+    pub fn store_sealing<'a>(
+        self: &'a mut Arc<Self>,
+        store: &'a (impl HamtNodeStore + ?Sized),
+    ) -> AsyncBoxFut<'a, Result<NodePutResult>>
+    where
+        K: 'a,
+        V: 'a,
+    {
+        Box::pin(async move {
+            let node = Arc::make_mut(self);
+            let mut wire_pointers = Vec::with_capacity(node.pointers.len());
+            for p in node.pointers.iter_mut() {
+                let wire = match p {
+                    Pointer::Values(pairs) => PointerWire::Values(
+                        pairs
+                            .iter()
+                            .map(|pr| (pr.key.clone(), pr.value.clone()))
+                            .collect(),
+                    ),
+                    Pointer::Link(ChildPtr::Stored(key)) => PointerWire::Link(*key),
+                    Pointer::Link(ChildPtr::StoredV2 { storage_key, cid }) => {
+                        PointerWire::LinkV2 {
+                            storage_key: *storage_key,
+                            cid: cid.clone(),
+                        }
+                    }
+                    // Already persisted by a prior sealing pass and not
+                    // mutated since (a mutation would have re-attached the
+                    // subtree as InMemory): emit the recorded reference,
+                    // zero I/O.
+                    Pointer::Link(ChildPtr::Sealed { storage_key, cid, .. }) => match cid {
+                        Some(cid) => PointerWire::LinkV2 {
+                            storage_key: *storage_key,
+                            cid: cid.clone(),
+                        },
+                        None => PointerWire::Link(*storage_key),
+                    },
+                    Pointer::Link(child @ ChildPtr::InMemory(_)) => {
+                        // Take the Arc out so the recursive seal can run
+                        // with refcount-preserving `&mut Arc` semantics
+                        // (a transient placeholder sits in the slot only
+                        // across this block — both exits below overwrite
+                        // it before anything else can observe the tree).
+                        let taken = std::mem::replace(
+                            child,
+                            ChildPtr::Stored([0u8; super::store::STORAGE_KEY_LEN]),
+                        );
+                        let ChildPtr::InMemory(mut child_arc) = taken else {
+                            unreachable!("match arm guarantees InMemory");
+                        };
+                        match Node::<K, V, H>::store_sealing(&mut child_arc, store).await {
+                            Ok(result) => {
+                                let wire = match result.cid {
+                                    Some(ref cid) => PointerWire::LinkV2 {
+                                        storage_key: result.storage_key,
+                                        cid: cid.clone(),
+                                    },
+                                    None => PointerWire::Link(result.storage_key),
+                                };
+                                *child = ChildPtr::Sealed {
+                                    storage_key: result.storage_key,
+                                    cid: result.cid,
+                                    node: child_arc,
+                                };
+                                wire
+                            }
+                            Err(e) => {
+                                // Restore the child so the in-memory tree
+                                // is never left pointing at the
+                                // placeholder; the caller can retry the
+                                // flush and re-persist what's left.
+                                *child = ChildPtr::InMemory(child_arc);
+                                return Err(e);
+                            }
+                        }
+                    }
+                };
+                wire_pointers.push(wire);
+            }
+            let wire = NodeWire {
+                bitmask: node.bitmask,
+                pointers: wire_pointers,
+            };
+            let bytes = postcard::to_allocvec(&wire)
+                .map_err(|e| CryptoError::Serialization(format!("encode hamt node: {e}")))?;
+            store.put_node(bytes).await
+        })
+    }
+
     //----------------------------------------------------------------------------------------------
     // Iteration
     //----------------------------------------------------------------------------------------------
@@ -855,62 +975,120 @@ mod round_trip_tests {
         );
     }
 
-    /// Issue #34 — root-cause pin at the node layer (CURRENT-BEHAVIOUR test:
-    /// it passes on the buggy code and documents the bug; invert it when
-    /// #34 is fixed).
-    ///
-    /// `set_value` replaces every node on a mutated root→leaf path with
-    /// `Pointer::Link(ChildPtr::InMemory(_))`. `store(&self)` recursively
-    /// persists every `InMemory` child — but, taking `&self`, it cannot
-    /// downgrade them back to `Stored` after the PUT succeeds, and nothing
-    /// else does (`ChildPtr::Stored` is only ever constructed by
-    /// `Pointer::from_wire`, i.e. the load path). Consequence: the
-    /// `InMemory` set of a long-lived tree only ever grows, and EVERY
-    /// `store()` re-serializes and re-PUTs the ENTIRE ever-touched subtree
-    /// — unchanged nodes included. That is the engine of the O(N²)
-    /// sequential-upload cost reported in issue #34 (each
-    /// `put_object_flat` = upsert + flush; each flush re-uploads the whole
-    /// accumulated tree).
-    ///
-    /// The pin: two consecutive `store()` calls with NO mutation in
-    /// between PUT the same number of nodes. An incremental design would
-    /// PUT ~0 on the second call (nothing changed; the tree is
-    /// content-addressed so the root key is provably identical).
-    #[tokio::test]
-    async fn issue_34_store_reputs_entire_unchanged_in_memory_tree() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    // =====================================================================
+    // Issue #34 — write-amplification regression guards.
+    //
+    // History: before the fix, `store(&self)` persisted every `InMemory`
+    // child but could never downgrade it, so the InMemory set grew
+    // monotonically and every flush re-PUT the ENTIRE ever-touched tree —
+    // O(N²) total upload cost for N sequential puts (pinned at commit
+    // 74ec299 / 2ed7fe0: two consecutive stores of an unchanged 64-entry
+    // tree each re-PUT all ~12 nodes). The fix is `store_sealing`, which
+    // write-backs persisted children as `ChildPtr::Sealed`. These tests
+    // are the inverted pins plus the integrity guarantees of the fix.
+    // =====================================================================
 
-        struct PutCountingStore {
-            inner: InMemoryStore,
-            puts: AtomicUsize,
-        }
-        #[async_trait::async_trait]
-        impl HamtNodeStore for PutCountingStore {
-            async fn get_node(&self, key: &StorageKey) -> Result<HamtNodeBytes> {
-                self.inner.get_node(key).await
-            }
-            async fn put_node(&self, bytes: HamtNodeBytes) -> Result<NodePutResult> {
-                self.puts.fetch_add(1, Ordering::Relaxed);
-                self.inner.put_node(bytes).await
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PutCountingStore {
+        inner: InMemoryStore,
+        puts: AtomicUsize,
+        /// When `Some(n)`, the n-th put_node call (1-based) fails once.
+        fail_on_put: std::sync::Mutex<Option<usize>>,
+    }
+
+    impl PutCountingStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryStore::new(),
+                puts: AtomicUsize::new(0),
+                fail_on_put: std::sync::Mutex::new(None),
             }
         }
 
-        let store = PutCountingStore {
-            inner: InMemoryStore::new(),
-            puts: AtomicUsize::new(0),
-        };
+        fn puts(&self) -> usize {
+            self.puts.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HamtNodeStore for PutCountingStore {
+        async fn get_node(&self, key: &StorageKey) -> Result<HamtNodeBytes> {
+            self.inner.get_node(key).await
+        }
+        async fn put_node(&self, bytes: HamtNodeBytes) -> Result<NodePutResult> {
+            let n = self.puts.fetch_add(1, Ordering::Relaxed) + 1;
+            let should_fail = {
+                let mut guard = self.fail_on_put.lock().unwrap();
+                if *guard == Some(n) {
+                    *guard = None; // fail exactly once
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_fail {
+                return Err(CryptoError::Hamt(format!(
+                    "injected put_node failure on call {}",
+                    n
+                )));
+            }
+            self.inner.put_node(bytes).await
+        }
+    }
+
+    /// Build the deterministic 64-entry test tree (fixed keys → fixed
+    /// BLAKE3-driven shape; most root slots split past
+    /// HAMT_VALUES_BUCKET_SIZE = 3, producing a multi-node tree).
+    async fn build_issue34_tree(store: &PutCountingStore) -> Arc<TestNode> {
         let mut root: Arc<TestNode> = Arc::new(TestNode::default());
-        // 64 fixed keys force most root slots past HAMT_VALUES_BUCKET_SIZE
-        // (= 3), splitting into Link children — a multi-node tree. Keys are
-        // constant strings, so the BLAKE3-driven shape (and therefore every
-        // count below) is fully deterministic.
         for i in 0u64..64 {
             let k = format!("issue34-key-{:04}", i).into_bytes();
-            root.set(k, i, &store).await.unwrap();
+            root.set(k, i, store).await.unwrap();
         }
+        root
+    }
 
-        let first_key = root.store(&store).await.unwrap().storage_key;
-        let first = store.puts.load(Ordering::Relaxed);
+    /// Assert every entry of the 64-entry test tree reads back correctly
+    /// through `node` (resolving Sealed/Stored children as needed), with
+    /// `overridden` taking precedence for mutated keys.
+    async fn assert_issue34_tree_complete(
+        node: &TestNode,
+        store: &PutCountingStore,
+        overridden: &[(u64, u64)],
+    ) {
+        for i in 0u64..64 {
+            let k = format!("issue34-key-{:04}", i).into_bytes();
+            let want = overridden
+                .iter()
+                .find(|(idx, _)| *idx == i)
+                .map(|(_, v)| *v)
+                .unwrap_or(i);
+            let got = node.get(&k, store).await.unwrap();
+            assert_eq!(
+                got,
+                Some(want),
+                "entry {} must survive sealing round-trips intact",
+                i
+            );
+        }
+    }
+
+    /// Issue #34 FIXED — `store_sealing` write-backs persisted children, so
+    /// re-storing an unchanged tree re-PUTs ONLY the root node (1 PUT, same
+    /// content address), not the whole tree. The legacy `store(&self)` also
+    /// benefits once the tree is sealed (its `to_wire` emits the recorded
+    /// references). A subsequent single-key mutation re-PUTs only the
+    /// touched path. This is the inverted form of the original pin
+    /// `issue_34_store_reputs_entire_unchanged_in_memory_tree`.
+    #[tokio::test]
+    async fn issue_34_fixed_store_sealing_skips_unchanged_subtrees() {
+        let store = PutCountingStore::new();
+        let mut root = build_issue34_tree(&store).await;
+
+        // First sealing store: persists the full tree once.
+        let first_key = root.store_sealing(&store).await.unwrap().storage_key;
+        let first = store.puts();
         assert!(
             first >= 5,
             "setup degenerate: 64 entries should split into several nodes, \
@@ -918,23 +1096,145 @@ mod round_trip_tests {
             first
         );
 
-        // NO mutation between the two stores.
-        let second_key = root.store(&store).await.unwrap().storage_key;
-        let second = store.puts.load(Ordering::Relaxed) - first;
-
+        // Second sealing store, NO mutation: children are Sealed, so only
+        // the root is re-PUT (content-addressed → identical key, and the
+        // PUT itself is idempotent on the backend).
+        let second_key = root.store_sealing(&store).await.unwrap().storage_key;
+        let second = store.puts() - first;
+        assert_eq!(first_key, second_key, "unchanged tree → same content address");
         assert_eq!(
-            first_key, second_key,
-            "tree unchanged → content address must be identical"
-        );
-        assert_eq!(
-            second, first,
-            "issue #34 write amplification: the second store() of a \
-             byte-identical tree re-PUT {} nodes (same as the first store's \
-             {}), because InMemory children are never downgraded to Stored \
-             after a successful persist. An incremental flush would re-PUT 0 \
-             nodes here. If this assertion starts failing with second ≈ 0, \
-             the bug is FIXED — invert the test into a regression guard.",
+            second, 1,
+            "issue #34 regression: re-storing an unchanged sealed tree must \
+             PUT only the root node, got {} PUTs (pre-fix behaviour was {} — \
+             the whole tree)",
             second, first
         );
+
+        // Legacy store(&self) on the sealed tree: also root-only now, and
+        // the same bytes → same key. (Pre-fix this was the amplifying path.)
+        let third_key = root.store(&store).await.unwrap().storage_key;
+        let third = store.puts() - first - second;
+        assert_eq!(first_key, third_key, "legacy store must emit identical bytes");
+        assert_eq!(
+            third, 1,
+            "legacy store() of a sealed tree must also be root-only, got {}",
+            third
+        );
+
+        // Mutate ONE key: only the touched path unseals; the next sealing
+        // store re-PUTs the path (root + its branch), not the tree.
+        let mutated = format!("issue34-key-{:04}", 7).into_bytes();
+        root.set(mutated, 7_000, &store).await.unwrap();
+        let before = store.puts();
+        let fourth_key = root.store_sealing(&store).await.unwrap().storage_key;
+        let fourth = store.puts() - before;
+        assert_ne!(first_key, fourth_key, "mutation must change the root address");
+        assert!(
+            (2..=4).contains(&fourth),
+            "single-key mutation must re-PUT only the touched path \
+             (root + 1-2 nodes), got {} PUTs",
+            fourth
+        );
+
+        // INTEGRITY — through the live (sealed) tree...
+        assert_issue34_tree_complete(&root, &store, &[(7, 7_000)]).await;
+        // ...and through a cold reload of the final root from the backend
+        // (proves the sealed flush persisted a complete, correct tree).
+        let reloaded: TestNode = TestNode::load(&fourth_key, &store).await.unwrap();
+        assert_issue34_tree_complete(&reloaded, &store, &[(7, 7_000)]).await;
+    }
+
+    /// Issue #34 — NO-CORRUPTION equivalence proof: `store_sealing`
+    /// persists byte-identical state to the legacy `store`. Same inserts →
+    /// same content-addressed root key (content addressing makes root-key
+    /// equality transitive over the whole tree: identical root bytes embed
+    /// identical child keys, which address identical child plaintexts).
+    /// Readers — including pre-fix SDKs — cannot distinguish the writers.
+    #[tokio::test]
+    async fn issue_34_sealing_and_legacy_store_produce_identical_roots() {
+        let store_legacy = PutCountingStore::new();
+        let root_legacy = build_issue34_tree(&store_legacy).await;
+        let key_legacy = root_legacy.store(&store_legacy).await.unwrap().storage_key;
+
+        let store_sealed = PutCountingStore::new();
+        let mut root_sealed = build_issue34_tree(&store_sealed).await;
+        let key_sealed = root_sealed
+            .store_sealing(&store_sealed)
+            .await
+            .unwrap()
+            .storage_key;
+
+        assert_eq!(
+            key_legacy, key_sealed,
+            "store_sealing must persist byte-identical state to store() — \
+             a divergence here means the fix changed the on-disk format and \
+             could corrupt interop with already-uploaded data"
+        );
+
+        // Both persisted trees round-trip completely from their backends.
+        let from_legacy: TestNode =
+            TestNode::load(&key_legacy, &store_legacy).await.unwrap();
+        assert_issue34_tree_complete(&from_legacy, &store_legacy, &[]).await;
+        let from_sealed: TestNode =
+            TestNode::load(&key_sealed, &store_sealed).await.unwrap();
+        assert_issue34_tree_complete(&from_sealed, &store_sealed, &[]).await;
+    }
+
+    /// Issue #34 — error-path integrity: if a node PUT fails mid-seal, the
+    /// in-memory tree must remain fully intact (no placeholder left in any
+    /// slot), already-sealed children keep their seal, and a retry must
+    /// succeed and produce the exact same root as a never-failed run.
+    #[tokio::test]
+    async fn issue_34_store_sealing_failure_leaves_tree_intact_and_retryable() {
+        // Control: the root key a clean run produces.
+        let control_store = PutCountingStore::new();
+        let mut control_root = build_issue34_tree(&control_store).await;
+        let control_key = control_root
+            .store_sealing(&control_store)
+            .await
+            .unwrap()
+            .storage_key;
+        let control_puts = control_store.puts();
+
+        // Failing run: inject a one-shot failure on the 3rd put_node.
+        let store = PutCountingStore::new();
+        let mut root = build_issue34_tree(&store).await;
+        *store.fail_on_put.lock().unwrap() = Some(3);
+        let err = root.store_sealing(&store).await;
+        assert!(err.is_err(), "injected failure must surface");
+
+        // The tree must still be completely readable in memory — the
+        // placeholder installed during sealing must never survive an
+        // error exit.
+        assert_issue34_tree_complete(&root, &store, &[]).await;
+
+        // Retry: succeeds, costs at most a clean run (children sealed
+        // before the failure are skipped), and lands on the identical
+        // content address.
+        let before_retry = store.puts();
+        let retry_key = root.store_sealing(&store).await.unwrap().storage_key;
+        let retry_puts = store.puts() - before_retry;
+        assert_eq!(
+            retry_key, control_key,
+            "retry after a failed seal must converge on the same persisted \
+             state as a never-failed run"
+        );
+        // Exactly the two children whose PUTs succeeded before the injected
+        // failure (calls 1 and 2) keep their seal and are skipped on retry;
+        // everything else — including the child whose PUT failed (restored
+        // to InMemory) — is re-persisted. Deterministic: fixed keys → fixed
+        // tree shape → fixed walk order.
+        assert_eq!(
+            retry_puts,
+            control_puts - 2,
+            "retry must re-PUT everything EXCEPT the 2 children sealed \
+             before the injected failure (retry: {}, clean run: {})",
+            retry_puts,
+            control_puts
+        );
+
+        // And the persisted tree is complete.
+        let reloaded: TestNode = TestNode::load(&retry_key, &store).await.unwrap();
+        assert_issue34_tree_complete(&reloaded, &store, &[]).await;
     }
 }

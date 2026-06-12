@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.8] - 2026-06-12
+
+### Fixed
+
+- **Forest write amplification on sequential uploads
+  ([#34](https://github.com/functionland/fula-api/issues/34)).** Every
+  `put_object_flat` (and any other per-file flush) re-uploaded the entire
+  ever-touched portion of the bucket's HAMT index instead of just the
+  changed path, because nodes persisted by a flush were never marked
+  clean in memory. Sequential bulk uploads into one directory therefore
+  cost O(N²) total index traffic (measured: 1,630 index PUTs / 12.2 MB
+  to store 150 × 4 KB files; per-upload latency grew 1.0 s → 3.8 s as the
+  bucket filled). Flushes now write back a `Sealed` pointer state after
+  each successful node PUT: a flush uploads only the shard root plus the
+  path(s) mutated since the previous flush, so per-upload cost is flat
+  regardless of bucket size (same workload now: 384 PUTs / 3.5 MB, ~3
+  node PUTs per upload at any bucket size). The persisted format is
+  byte-identical to previous releases — existing buckets are read and
+  written exactly as before, and older SDKs interoperate unchanged.
+  Applies to all platforms (Android, iOS, Windows, web/wasm, fula-js)
+  since the fix lives in the shared `fula-crypto` core.
+
 ## [0.6.7] - 2026-06-10
 
 ### Fixed
