@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.9] - 2026-06-12
+
+### Added
+
+- **`invalidateForestCache` / `invalidateAllForestCaches` bindings
+  ([#36](https://github.com/functionland/fula-api/issues/36)).** The
+  encrypted client caches each bucket's forest for the client lifetime,
+  so a long-lived session never observed another device's uploads —
+  listings and downloads kept resolving against the session-stale index.
+  The escape hatch (`EncryptedClient::invalidate_forest_cache`) existed
+  in the Rust core but was unreachable from Dart and JS. Both bindings
+  now expose it: call on refresh / tab-resume / reconnect / cache-
+  revalidation paths, then re-list — the next forest operation reloads
+  from storage and sees cross-device writes, with no client rebuild.
+  Dirty-safe per the existing core contract: a forest with pending
+  (unsaved) local changes is NOT evicted; flush first, then invalidate.
+  Exposed identically in `fula-flutter` (Dart: `invalidateForestCache`,
+  `invalidateAllForestCaches`) and `fula-js` (same names) for
+  cross-platform parity; CI now guards the npm `.d.ts` exports.
+
 ## [0.6.8] - 2026-06-12
 
 ### Fixed
