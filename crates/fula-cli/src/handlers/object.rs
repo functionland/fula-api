@@ -863,7 +863,18 @@ pub async fn get_object(
         response = response.header("Content-Type", ct);
     }
 
-    if let Some(ref cc) = metadata.cache_control {
+    if is_mutable_index_key(&key) {
+        // Forced for the fixed-key forest index objects, overriding any
+        // per-object metadata: browsers HEURISTICALLY cache responses
+        // that carry Last-Modified but no Cache-Control, so web (wasm)
+        // clients kept reading a stale forest root for minutes after
+        // another device's upload — native apps (no HTTP cache) were
+        // fine. `no-cache` (not no-store) forces revalidation on every
+        // use; the If-None-Match → 304 path above makes an unchanged
+        // index cost one conditional round trip, and the ETag is the
+        // exact CID so a same-second overwrite can't false-304.
+        response = response.header("Cache-Control", "private, no-cache");
+    } else if let Some(ref cc) = metadata.cache_control {
         response = response.header("Cache-Control", cc);
     }
 
@@ -1091,6 +1102,12 @@ pub async fn head_object(
 
     if let Some(ref ct) = metadata.content_type {
         response = response.header("Content-Type", ct);
+    }
+
+    if is_mutable_index_key(&key) {
+        // Same forced revalidation as the GET path — HEAD responses
+        // update the browser's cached entry metadata too.
+        response = response.header("Cache-Control", "private, no-cache");
     }
 
     // Add user metadata
@@ -1352,6 +1369,26 @@ pub(crate) fn match_if_match(header: &str, current: Option<&str>) -> bool {
         "match_if_match diag"
     );
     result
+}
+
+/// Mutable fula-internal index objects live at FIXED keys and are
+/// overwritten in place — the sharded forest index / dir-index
+/// (`__fula_forest_v7_index`, `__fula_forest_v7_dir_index`) and any
+/// legacy fixed-key forest blob. Their GET/HEAD responses must force
+/// `Cache-Control: private, no-cache`, or browsers heuristically cache
+/// them (Last-Modified present, no Cache-Control) and wasm clients read
+/// a stale forest root for minutes after another device's write.
+///
+/// Immutable-by-construction families stay normally cacheable: their
+/// key never carries different bytes (content-addressed nodes/pages,
+/// timestamped v1 backups).
+pub(crate) fn is_mutable_index_key(key: &str) -> bool {
+    if !key.starts_with("__fula_") {
+        return false;
+    }
+    !(key.starts_with("__fula_forest_v7_nodes/")
+        || key.starts_with("__fula_forest_v7_pages/")
+        || key.starts_with("__fula_forest_v1_backup/"))
 }
 
 /// RFC 7232 §3.2. True iff the If-None-Match precondition is satisfied.
@@ -1636,7 +1673,7 @@ mod phase_1_2_wire_tests {
 
 #[cfg(test)]
 mod conditional_tests {
-    use super::{match_if_match, match_if_none_match};
+    use super::{is_mutable_index_key, match_if_match, match_if_none_match};
 
     #[test]
     fn if_match_star_requires_existing() {
@@ -1679,6 +1716,25 @@ mod conditional_tests {
         // If-None-Match with no valid tags in list vs an existing etag:
         // parse_etag_list returns empty, so .any() is false, so !false = true.
         assert!(match_if_none_match("W/\"abc\"", Some("abc")));
+    }
+
+    #[test]
+    fn mutable_index_keys_force_no_cache() {
+        // Fixed-key, overwritten-in-place index objects → forced.
+        assert!(is_mutable_index_key("__fula_forest_v7_index"));
+        assert!(is_mutable_index_key("__fula_forest_v7_dir_index"));
+        assert!(is_mutable_index_key("__fula_forest_v1"));
+        // Unknown future __fula_* state defaults to forced (safe bias).
+        assert!(is_mutable_index_key("__fula_something_new"));
+        // Immutable families keep normal caching.
+        assert!(!is_mutable_index_key("__fula_forest_v7_nodes/abc123"));
+        assert!(!is_mutable_index_key("__fula_forest_v7_pages/0001"));
+        assert!(!is_mutable_index_key(
+            "__fula_forest_v1_backup/1700000000000"
+        ));
+        // User content is untouched.
+        assert!(!is_mutable_index_key("photos/cat.jpg"));
+        assert!(!is_mutable_index_key(".fula/tags/abcd.json"));
     }
 
     #[test]
