@@ -58,9 +58,11 @@ mod tests {
     use super::test_support::InMemoryRootStore;
     use super::*;
 
-    fn cid_of(b: &[u8]) -> Cid {
-        let h = blake3::hash(b);
-        let mh = cid::multihash::Multihash::<64>::wrap(0x1e, h.as_bytes()).unwrap();
+    /// Distinct (raw, blake3-coded) CIDs from a seed — no real hashing needed,
+    /// the tests only require uniqueness. Avoids a blake3 dep on fula-core.
+    fn cid_of(seed: u8) -> Cid {
+        let digest = [seed; 32];
+        let mh = cid::multihash::Multihash::<64>::wrap(0x1e, &digest).unwrap();
         Cid::new_v1(0x55, mh)
     }
 
@@ -70,7 +72,7 @@ mod tests {
     #[tokio::test]
     async fn second_master_building_on_a_stale_root_loses_the_cas() {
         let store = InMemoryRootStore::default();
-        let (a, b, c) = (cid_of(b"root-a"), cid_of(b"root-b"), cid_of(b"root-c"));
+        let (a, b, c) = (cid_of(1), cid_of(2), cid_of(3));
 
         assert_eq!(
             store.cas_root("owner", "bkt", &a, &b).await.unwrap(),
@@ -92,7 +94,7 @@ mod tests {
     #[tokio::test]
     async fn buckets_and_owners_are_isolated() {
         let store = InMemoryRootStore::default();
-        let (a, b) = (cid_of(b"a"), cid_of(b"b"));
+        let (a, b) = (cid_of(10), cid_of(11));
         store.cas_root("o1", "bkt", &a, &b).await.unwrap();
         assert_eq!(store.get_root("o2", "bkt").await.unwrap(), None);
         assert_eq!(store.get_root("o1", "other").await.unwrap(), None);
