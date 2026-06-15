@@ -46,3 +46,14 @@ pub async fn health_check() -> impl IntoResponse {
 pub async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
+
+/// GET /fula/capabilities — unauthenticated protocol-capability advertisement
+/// (Phase 2). Clients probe this ONCE per instance before using optional
+/// protocols. An old master 404s here, so a client never sends e.g. the
+/// empty-body remote-cid PUT to a build that would misstore it as a real
+/// zero-byte object.
+pub async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    axum::Json(serde_json::json!({
+        "remoteCidPut": state.config.remote_cid_put_enabled,
+    }))
+}

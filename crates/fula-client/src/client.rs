@@ -522,6 +522,24 @@ impl FulaClient {
         })
     }
 
+    /// Phase 2 (decentralized ingress): one-shot master capability probe.
+    /// Returns whether the master accepts empty-body remote-cid mapping PUTs
+    /// (GET /fula/capabilities → {"remoteCidPut": bool}). ANY failure — 404 on
+    /// an old build, network error, unparseable body — returns `false`, so
+    /// callers degrade to the legacy full-bytes path, never to a protocol the
+    /// master would misinterpret.
+    pub async fn supports_remote_cid_put(&self) -> bool {
+        match self.request("GET", "/fula/capabilities", None, None, None).await {
+            Ok(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("remoteCidPut").and_then(|b| b.as_bool()))
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     /// Put an object with metadata and optional If-Match / If-None-Match guards.
     ///
     /// Used by conditional-write paths (e.g. forest flush) to detect concurrent

@@ -129,8 +129,104 @@ pub async fn put_object(
         }
     }
 
-    // Store the data
-    let cid = state.block_store.put_block(&body).await?;
+    // Phase 2 (decentralized ingress): empty-body mapping PUT. The chunk's
+    // verified bytes were already streamed to a fula-ingest node; record only
+    // the key→cid mapping here. Triple-gated: server flag (advertised via
+    // /fula/capabilities, so well-behaved clients never send this to a
+    // flag-off master), the header, and an empty body. The declared CID must
+    // be raw(0x55)+blake3(0x1e) — the only addressing the ingest verifies —
+    // and the block must be PRESENT in the blockstore (bitswap pulls it from
+    // the ingest peer); absent ⇒ retryable 409 so the client falls back to a
+    // full-bytes PUT. Storing nothing here is the point: the CID is
+    // self-certifying, so reads stay tamper-evident end-to-end.
+    let remote_cid_hdr = headers
+        .get("x-amz-meta-fula-remote-cid")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let cid = if let Some(declared) = remote_cid_hdr {
+        if !state.config.remote_cid_put_enabled {
+            return Err(ApiError::s3(
+                S3ErrorCode::InvalidRequest,
+                "remote-cid PUT is not enabled on this master (probe /fula/capabilities)",
+            ));
+        }
+        if !body.is_empty() {
+            return Err(ApiError::s3(
+                S3ErrorCode::InvalidRequest,
+                "remote-cid PUT requires an empty body",
+            ));
+        }
+        let declared_cid = cid::Cid::try_from(declared.as_str()).map_err(|e| {
+            ApiError::s3(S3ErrorCode::InvalidRequest, format!("invalid remote cid: {e}"))
+        })?;
+        if declared_cid.codec() != 0x55 || declared_cid.hash().code() != 0x1e {
+            return Err(ApiError::s3(
+                S3ErrorCode::InvalidRequest,
+                "remote cid must be raw (0x55) + blake3 (0x1e) — the addressing fula-ingest verifies",
+            ));
+        }
+        // BOUNDED presence check: kubo's block lookup for an ABSENT cid is an
+        // unbounded network search (bitswap/DHT) — without a deadline this
+        // handler would hang for minutes per missing block. 5s is ample for a
+        // bitswap pull from the ingest peer (same box: instant; LAN/WAN peer:
+        // one round-trip); timeout ⇒ treat as absent ⇒ retryable 409, the
+        // client falls back to a full-bytes PUT.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.block_store.has_block(&declared_cid),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                return Err(ApiError::s3(
+                    S3ErrorCode::OperationAborted,
+                    "declared block not present/retrievable yet — retry or fall back to a full-bytes PUT",
+                ));
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, cid = %declared_cid, "remote-cid presence check failed");
+                return Err(ApiError::s3(
+                    S3ErrorCode::OperationAborted,
+                    "block presence check failed — retry or fall back to a full-bytes PUT",
+                ));
+            }
+            Err(_elapsed) => {
+                tracing::debug!(cid = %declared_cid, "remote-cid presence check timed out (treating as absent)");
+                return Err(ApiError::s3(
+                    S3ErrorCode::OperationAborted,
+                    "block presence check timed out — retry or fall back to a full-bytes PUT",
+                ));
+            }
+        }
+        tracing::debug!(bucket = %bucket_name, key = %key, cid = %declared_cid, "remote-cid PUT accepted (bytes via ingest)");
+        declared_cid
+    } else {
+        // Store the data
+        state.block_store.put_block(&body).await?
+    };
+    // Phase 2: a mapping PUT has an empty body — the chunk's TRUE size (as
+    // stored on the ingest node) arrives in x-amz-meta-fula-remote-size so
+    // billing/list/stat record the real byte count, never 0. Only honored on
+    // the remote-cid path; bounded by max_body_size like a real body.
+    let object_size: u64 = match (
+        headers.get("x-amz-meta-fula-remote-size").and_then(|v| v.to_str().ok()),
+        headers.get("x-amz-meta-fula-remote-cid").is_some(),
+    ) {
+        (Some(sz), true) => {
+            let parsed = sz.parse::<u64>().map_err(|_| {
+                ApiError::s3(S3ErrorCode::InvalidRequest, "invalid x-amz-meta-fula-remote-size")
+            })?;
+            if parsed == 0 || parsed > state.config.max_body_size as u64 {
+                return Err(ApiError::s3(
+                    S3ErrorCode::InvalidRequest,
+                    "x-amz-meta-fula-remote-size out of range",
+                ));
+            }
+            parsed
+        }
+        _ => body.len() as u64,
+    };
 
     // Use CID as ETag (content-addressed identifier)
     // This is S3-compliant: AWS docs state "The ETag may or may not be an MD5 digest"
@@ -165,7 +261,7 @@ pub async fn put_object(
     // COPY handler at line 694). Access control is unaffected — bucket-
     // level access is gated by `BucketMetadata.owner_id` which is
     // already correctly the hashed form.
-    let mut metadata = ObjectMetadata::new(cid, body.len() as u64, etag.clone())
+    let mut metadata = ObjectMetadata::new(cid, object_size, etag.clone())
         .with_owner(&session.hashed_user_id);
 
     if let Some(ct) = content_type {
@@ -863,7 +959,18 @@ pub async fn get_object(
         response = response.header("Content-Type", ct);
     }
 
-    if let Some(ref cc) = metadata.cache_control {
+    if is_mutable_index_key(&key) {
+        // Forced for the fixed-key forest index objects, overriding any
+        // per-object metadata: browsers HEURISTICALLY cache responses
+        // that carry Last-Modified but no Cache-Control, so web (wasm)
+        // clients kept reading a stale forest root for minutes after
+        // another device's upload — native apps (no HTTP cache) were
+        // fine. `no-cache` (not no-store) forces revalidation on every
+        // use; the If-None-Match → 304 path above makes an unchanged
+        // index cost one conditional round trip, and the ETag is the
+        // exact CID so a same-second overwrite can't false-304.
+        response = response.header("Cache-Control", "private, no-cache");
+    } else if let Some(ref cc) = metadata.cache_control {
         response = response.header("Cache-Control", cc);
     }
 
@@ -1091,6 +1198,12 @@ pub async fn head_object(
 
     if let Some(ref ct) = metadata.content_type {
         response = response.header("Content-Type", ct);
+    }
+
+    if is_mutable_index_key(&key) {
+        // Same forced revalidation as the GET path — HEAD responses
+        // update the browser's cached entry metadata too.
+        response = response.header("Cache-Control", "private, no-cache");
     }
 
     // Add user metadata
@@ -1354,6 +1467,26 @@ pub(crate) fn match_if_match(header: &str, current: Option<&str>) -> bool {
     result
 }
 
+/// Mutable fula-internal index objects live at FIXED keys and are
+/// overwritten in place — the sharded forest index / dir-index
+/// (`__fula_forest_v7_index`, `__fula_forest_v7_dir_index`) and any
+/// legacy fixed-key forest blob. Their GET/HEAD responses must force
+/// `Cache-Control: private, no-cache`, or browsers heuristically cache
+/// them (Last-Modified present, no Cache-Control) and wasm clients read
+/// a stale forest root for minutes after another device's write.
+///
+/// Immutable-by-construction families stay normally cacheable: their
+/// key never carries different bytes (content-addressed nodes/pages,
+/// timestamped v1 backups).
+pub(crate) fn is_mutable_index_key(key: &str) -> bool {
+    if !key.starts_with("__fula_") {
+        return false;
+    }
+    !(key.starts_with("__fula_forest_v7_nodes/")
+        || key.starts_with("__fula_forest_v7_pages/")
+        || key.starts_with("__fula_forest_v1_backup/"))
+}
+
 /// RFC 7232 §3.2. True iff the If-None-Match precondition is satisfied.
 pub(crate) fn match_if_none_match(header: &str, current: Option<&str>) -> bool {
     let h = header.trim();
@@ -1399,6 +1532,11 @@ pub(crate) const FULA_CONTROL_HEADERS: &[&str] = &[
     // as user_metadata on the object itself (would pollute every
     // forest-manifest object with a meaningless `=1` tag).
     "fula-forest-manifest",
+    // Phase 2 (decentralized ingress): remote-cid mapping PUT controls —
+    // consumed by the handler (declared CID + true byte size of the chunk
+    // stored on the ingest node); never persisted as object metadata.
+    "fula-remote-cid",
+    "fula-remote-size",
 ];
 
 /// Returns `true` if the given x-amz-meta key (already stripped of
@@ -1636,7 +1774,7 @@ mod phase_1_2_wire_tests {
 
 #[cfg(test)]
 mod conditional_tests {
-    use super::{match_if_match, match_if_none_match};
+    use super::{is_mutable_index_key, match_if_match, match_if_none_match};
 
     #[test]
     fn if_match_star_requires_existing() {
@@ -1679,6 +1817,25 @@ mod conditional_tests {
         // If-None-Match with no valid tags in list vs an existing etag:
         // parse_etag_list returns empty, so .any() is false, so !false = true.
         assert!(match_if_none_match("W/\"abc\"", Some("abc")));
+    }
+
+    #[test]
+    fn mutable_index_keys_force_no_cache() {
+        // Fixed-key, overwritten-in-place index objects → forced.
+        assert!(is_mutable_index_key("__fula_forest_v7_index"));
+        assert!(is_mutable_index_key("__fula_forest_v7_dir_index"));
+        assert!(is_mutable_index_key("__fula_forest_v1"));
+        // Unknown future __fula_* state defaults to forced (safe bias).
+        assert!(is_mutable_index_key("__fula_something_new"));
+        // Immutable families keep normal caching.
+        assert!(!is_mutable_index_key("__fula_forest_v7_nodes/abc123"));
+        assert!(!is_mutable_index_key("__fula_forest_v7_pages/0001"));
+        assert!(!is_mutable_index_key(
+            "__fula_forest_v1_backup/1700000000000"
+        ));
+        // User content is untouched.
+        assert!(!is_mutable_index_key("photos/cat.jpg"));
+        assert!(!is_mutable_index_key(".fula/tags/abcd.json"));
     }
 
     #[test]
