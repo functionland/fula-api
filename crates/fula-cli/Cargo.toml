@@ -90,6 +90,11 @@ reqwest = { workspace = true }
 # block-by-cid). Same workspace sqlx the project already pins; used ONLY when
 # FULA_PINS_DATABASE_URL is configured.
 sqlx = { workspace = true }
+# FM-4 (Phase 2.5): EIP-712 wallet-signature auth — secp256k1 signature
+# recovery (RustCrypto; pure Rust) + keccak256. Only exercised behind
+# FULA_EIP712_AUTH; chosen over ethers/alloy to keep the dependency minimal.
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
 
 [dev-dependencies]
 criterion = { workspace = true }

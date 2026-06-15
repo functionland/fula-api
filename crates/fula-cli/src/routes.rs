@@ -24,7 +24,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let cors = create_cors_layer(&state.config.cors_origins);
 
     // Public routes that must bypass auth (e.g., container health checks)
-    let public = Router::new().route("/healthz", get(handlers::healthz));
+    let public = Router::new()
+        .route("/healthz", get(handlers::healthz))
+        // Phase 2: capability probe (no auth — the answer is not sensitive and
+        // clients must be able to probe before any authenticated operation).
+        .route("/fula/capabilities", get(handlers::capabilities))
+        .with_state(state.clone());
 
     // Phase 3.2 internal endpoints. Bearer-token-protected at the
     // handler level (see handlers::internal::authenticate). They

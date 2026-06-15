@@ -320,6 +320,21 @@ impl AppState {
             }
         };
 
+        // FM-1 (Phase 2.5) — shared bucket-root CAS across federated masters.
+        // Requires BOTH the flag AND the shared Postgres (the same pool the
+        // recovery endpoints use). Flag on without a DB ⇒ loud warning +
+        // single-master behavior (never silently multi-master-unsafe).
+        if config.bucket_root_cas_enabled {
+            if let Some(ref pool) = pins_db {
+                bucket_manager.set_root_pointer_store(std::sync::Arc::new(
+                    crate::root_store_pg::PgRootStore::new(pool.clone()),
+                ));
+                info!("✓ Bucket-root CAS enabled (FM-1): shared Postgres arbitrates multi-master flushes");
+            } else {
+                warn!("FULA_BUCKET_ROOT_CAS is on but no Postgres is configured (POSTGRES_* / FULA_PINS_DATABASE_URL) — running WITHOUT shared root arbitration");
+            }
+        }
+
         // Audit F3 — JWT revocation deny-list. Allocated EMPTY here (= allow
         // all) only when the env switch is set AND a pins DB exists; the
         // background refresher (`revocation::spawn_if_enabled`, started in

@@ -129,8 +129,104 @@ pub async fn put_object(
         }
     }
 
-    // Store the data
-    let cid = state.block_store.put_block(&body).await?;
+    // Phase 2 (decentralized ingress): empty-body mapping PUT. The chunk's
+    // verified bytes were already streamed to a fula-ingest node; record only
+    // the key→cid mapping here. Triple-gated: server flag (advertised via
+    // /fula/capabilities, so well-behaved clients never send this to a
+    // flag-off master), the header, and an empty body. The declared CID must
+    // be raw(0x55)+blake3(0x1e) — the only addressing the ingest verifies —
+    // and the block must be PRESENT in the blockstore (bitswap pulls it from
+    // the ingest peer); absent ⇒ retryable 409 so the client falls back to a
+    // full-bytes PUT. Storing nothing here is the point: the CID is
+    // self-certifying, so reads stay tamper-evident end-to-end.
+    let remote_cid_hdr = headers
+        .get("x-amz-meta-fula-remote-cid")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let cid = if let Some(declared) = remote_cid_hdr {
+        if !state.config.remote_cid_put_enabled {
+            return Err(ApiError::s3(
+                S3ErrorCode::InvalidRequest,
+                "remote-cid PUT is not enabled on this master (probe /fula/capabilities)",
+            ));
+        }
+        if !body.is_empty() {
+            return Err(ApiError::s3(
+                S3ErrorCode::InvalidRequest,
+                "remote-cid PUT requires an empty body",
+            ));
+        }
+        let declared_cid = cid::Cid::try_from(declared.as_str()).map_err(|e| {
+            ApiError::s3(S3ErrorCode::InvalidRequest, format!("invalid remote cid: {e}"))
+        })?;
+        if declared_cid.codec() != 0x55 || declared_cid.hash().code() != 0x1e {
+            return Err(ApiError::s3(
+                S3ErrorCode::InvalidRequest,
+                "remote cid must be raw (0x55) + blake3 (0x1e) — the addressing fula-ingest verifies",
+            ));
+        }
+        // BOUNDED presence check: kubo's block lookup for an ABSENT cid is an
+        // unbounded network search (bitswap/DHT) — without a deadline this
+        // handler would hang for minutes per missing block. 5s is ample for a
+        // bitswap pull from the ingest peer (same box: instant; LAN/WAN peer:
+        // one round-trip); timeout ⇒ treat as absent ⇒ retryable 409, the
+        // client falls back to a full-bytes PUT.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.block_store.has_block(&declared_cid),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                return Err(ApiError::s3(
+                    S3ErrorCode::OperationAborted,
+                    "declared block not present/retrievable yet — retry or fall back to a full-bytes PUT",
+                ));
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, cid = %declared_cid, "remote-cid presence check failed");
+                return Err(ApiError::s3(
+                    S3ErrorCode::OperationAborted,
+                    "block presence check failed — retry or fall back to a full-bytes PUT",
+                ));
+            }
+            Err(_elapsed) => {
+                tracing::debug!(cid = %declared_cid, "remote-cid presence check timed out (treating as absent)");
+                return Err(ApiError::s3(
+                    S3ErrorCode::OperationAborted,
+                    "block presence check timed out — retry or fall back to a full-bytes PUT",
+                ));
+            }
+        }
+        tracing::debug!(bucket = %bucket_name, key = %key, cid = %declared_cid, "remote-cid PUT accepted (bytes via ingest)");
+        declared_cid
+    } else {
+        // Store the data
+        state.block_store.put_block(&body).await?
+    };
+    // Phase 2: a mapping PUT has an empty body — the chunk's TRUE size (as
+    // stored on the ingest node) arrives in x-amz-meta-fula-remote-size so
+    // billing/list/stat record the real byte count, never 0. Only honored on
+    // the remote-cid path; bounded by max_body_size like a real body.
+    let object_size: u64 = match (
+        headers.get("x-amz-meta-fula-remote-size").and_then(|v| v.to_str().ok()),
+        headers.get("x-amz-meta-fula-remote-cid").is_some(),
+    ) {
+        (Some(sz), true) => {
+            let parsed = sz.parse::<u64>().map_err(|_| {
+                ApiError::s3(S3ErrorCode::InvalidRequest, "invalid x-amz-meta-fula-remote-size")
+            })?;
+            if parsed == 0 || parsed > state.config.max_body_size as u64 {
+                return Err(ApiError::s3(
+                    S3ErrorCode::InvalidRequest,
+                    "x-amz-meta-fula-remote-size out of range",
+                ));
+            }
+            parsed
+        }
+        _ => body.len() as u64,
+    };
 
     // Use CID as ETag (content-addressed identifier)
     // This is S3-compliant: AWS docs state "The ETag may or may not be an MD5 digest"
@@ -165,7 +261,7 @@ pub async fn put_object(
     // COPY handler at line 694). Access control is unaffected — bucket-
     // level access is gated by `BucketMetadata.owner_id` which is
     // already correctly the hashed form.
-    let mut metadata = ObjectMetadata::new(cid, body.len() as u64, etag.clone())
+    let mut metadata = ObjectMetadata::new(cid, object_size, etag.clone())
         .with_owner(&session.hashed_user_id);
 
     if let Some(ct) = content_type {
@@ -1399,6 +1495,11 @@ pub(crate) const FULA_CONTROL_HEADERS: &[&str] = &[
     // as user_metadata on the object itself (would pollute every
     // forest-manifest object with a meaningless `=1` tag).
     "fula-forest-manifest",
+    // Phase 2 (decentralized ingress): remote-cid mapping PUT controls —
+    // consumed by the handler (declared CID + true byte size of the chunk
+    // stored on the ingest node); never persisted as object metadata.
+    "fula-remote-cid",
+    "fula-remote-size",
 ];
 
 /// Returns `true` if the given x-amz-meta key (already stripped of

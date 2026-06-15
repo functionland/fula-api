@@ -7083,6 +7083,31 @@ impl EncryptedClient {
         // (skip_serializing_if keeps it off the wire).
         let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
 
+        // Phase 2 (decentralized ingress): decide the byte route ONCE per
+        // upload. The ingest route activates only when (a) ingest endpoints
+        // are configured, (b) the walkable-v8 writer is on (we need the
+        // pre-computed chunk CID to declare), and (c) the master ADVERTISES
+        // remote-cid support via /fula/capabilities — an old or flag-off
+        // master is never sent the empty-body protocol it would misstore.
+        // (cfg-gated: native only; wasm32 keeps the legacy path.)
+        #[cfg(not(target_arch = "wasm32"))]
+        let ingest_ctx: Option<(reqwest::Client, String, Option<String>)> = {
+            let cfg = self.inner.config();
+            if cfg.ingest_endpoints.is_empty() || !walkable_v8 {
+                None
+            } else if self.inner.supports_remote_cid_put().await {
+                tracing::debug!(ingest = %cfg.ingest_endpoints[0], "ingest byte route enabled (master advertises remoteCidPut)");
+                Some((
+                    reqwest::Client::new(),
+                    cfg.ingest_endpoints[0].trim_end_matches('/').to_string(),
+                    cfg.access_token.clone(),
+                ))
+            } else {
+                tracing::debug!("master does not advertise remoteCidPut — ingest route disabled, using legacy byte path");
+                None
+            }
+        };
+
         // Upload chunks in parallel with bounded concurrency. Using
         // futures::stream::buffer_unordered rather than tokio::spawn so the
         // same code runs on wasm32 (where tokio has no multi-thread runtime).
@@ -7111,8 +7136,61 @@ impl EncryptedClient {
             let bucket = bucket.to_string();
             let pinning = pinning.clone();
             let chunk_key_ret = chunk_key.clone();
+            #[cfg(not(target_arch = "wasm32"))]
+            let ingest_ctx = ingest_ctx.clone();
 
             async move {
+                // Phase 2: ingest byte route. Bytes go to the fula-ingest node
+                // (which verifies BLAKE3(body) == declared CID before storing)
+                // and the master gets an empty-body mapping PUT carrying the
+                // declared CID + true size. ANY failure on this route falls
+                // through to the legacy full-bytes PUT below — degradation,
+                // never corruption (the master only accepts the mapping when
+                // its flag is on AND the block is present in its blockstore).
+                #[cfg(not(target_arch = "wasm32"))]
+                if let (Some((ingest_http, ingest_base, token)), Some(expected)) =
+                    (ingest_ctx.as_ref(), expected_chunk_cid)
+                {
+                    let url = format!("{}/v0/block?cid={}", ingest_base, expected);
+                    let mut rb = ingest_http.put(&url).body(chunk.ciphertext.clone());
+                    if let Some(t) = token {
+                        rb = rb.bearer_auth(t);
+                    }
+                    match rb.send().await {
+                        Ok(r) if r.status().is_success() => {
+                            let map_meta = ObjectMetadata::new()
+                                .with_content_type("application/octet-stream")
+                                .with_metadata("x-fula-chunk", "true")
+                                .with_metadata("x-fula-chunk-index", &chunk.index.to_string())
+                                .with_metadata("fula-remote-cid", &expected.to_string())
+                                .with_metadata("fula-remote-size", &chunk.ciphertext.len().to_string());
+                            let map_res = if let Some(ref pin) = pinning {
+                                client.put_object_with_metadata_and_pinning(
+                                    &bucket, &chunk_key, bytes::Bytes::new(), Some(map_meta),
+                                    &pin.endpoint, &pin.token,
+                                ).await
+                            } else {
+                                client.put_object_with_metadata(
+                                    &bucket, &chunk_key, bytes::Bytes::new(), Some(map_meta),
+                                ).await
+                            };
+                            match map_res {
+                                Ok(put_result) => {
+                                    let chunk_cid = crate::walkable_v8::verify_etag_against_expected_cid(
+                                        &put_result.etag, expected, &bucket, &chunk_key,
+                                    );
+                                    return Ok::<(String, u32, Option<cid::Cid>), ClientError>((
+                                        chunk_key_ret, chunk_index_for_collect, chunk_cid,
+                                    ));
+                                }
+                                Err(e) => tracing::debug!(error = %e, chunk = %chunk_key, "remote-cid mapping PUT failed — falling back to full-bytes PUT"),
+                            }
+                        }
+                        Ok(r) => tracing::debug!(status = %r.status(), chunk = %chunk_key, "ingest rejected block — falling back to full-bytes PUT"),
+                        Err(e) => tracing::debug!(error = %e, chunk = %chunk_key, "ingest unreachable — falling back to full-bytes PUT"),
+                    }
+                }
+
                 let put_result = if let Some(ref pin) = pinning {
                     client.put_object_with_metadata_and_pinning(
                         &bucket,
@@ -10519,6 +10597,28 @@ impl EncryptedClient {
         // master's etag-attested CID matches.
         let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
 
+        // Phase 2 (decentralized ingress): same probe-gated ingest route as
+        // `put_object_chunked_internal` — this public API duplicates that
+        // loop (E51 mirroring pattern), so it must mirror the route too or
+        // FxFiles-path uploads silently stay on the legacy byte path.
+        #[cfg(not(target_arch = "wasm32"))]
+        let ingest_ctx: Option<(reqwest::Client, String, Option<String>)> = {
+            let cfg = self.inner.config();
+            if cfg.ingest_endpoints.is_empty() || !walkable_v8 {
+                None
+            } else if self.inner.supports_remote_cid_put().await {
+                tracing::debug!(ingest = %cfg.ingest_endpoints[0], "ingest byte route enabled (master advertises remoteCidPut)");
+                Some((
+                    reqwest::Client::new(),
+                    cfg.ingest_endpoints[0].trim_end_matches('/').to_string(),
+                    cfg.access_token.clone(),
+                ))
+            } else {
+                tracing::debug!("master does not advertise remoteCidPut — ingest route disabled, using legacy byte path");
+                None
+            }
+        };
+
         // Upload chunks in parallel with bounded concurrency. Using
         // futures::stream::buffer_unordered rather than tokio::spawn so the
         // same code runs on wasm32 (where tokio has no multi-thread runtime).
@@ -10548,8 +10648,49 @@ impl EncryptedClient {
                 let client = self.inner.clone();
                 let bucket = bucket.to_string();
                 let chunk_key_ret = chunk_key.clone();
+                #[cfg(not(target_arch = "wasm32"))]
+                let ingest_ctx = ingest_ctx.clone();
 
                 async move {
+                    // Phase 2: ingest byte route (see put_object_chunked_internal
+                    // for the full rationale). ANY failure falls through to the
+                    // legacy full-bytes PUT below.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let (Some((ingest_http, ingest_base, token)), Some(expected)) =
+                        (ingest_ctx.as_ref(), expected_chunk_cid)
+                    {
+                        let url = format!("{}/v0/block?cid={}", ingest_base, expected);
+                        let mut rb = ingest_http.put(&url).body(chunk.ciphertext.clone());
+                        if let Some(t) = token {
+                            rb = rb.bearer_auth(t);
+                        }
+                        match rb.send().await {
+                            Ok(r) if r.status().is_success() => {
+                                let map_meta = ObjectMetadata::new()
+                                    .with_content_type("application/octet-stream")
+                                    .with_metadata("x-fula-chunk", "true")
+                                    .with_metadata("x-fula-chunk-index", &chunk.index.to_string())
+                                    .with_metadata("fula-remote-cid", &expected.to_string())
+                                    .with_metadata("fula-remote-size", &chunk.ciphertext.len().to_string());
+                                match client.put_object_with_metadata(
+                                    &bucket, &chunk_key, bytes::Bytes::new(), Some(map_meta),
+                                ).await {
+                                    Ok(put_result) => {
+                                        let chunk_cid = crate::walkable_v8::verify_etag_against_expected_cid(
+                                            &put_result.etag, expected, &bucket, &chunk_key,
+                                        );
+                                        return Ok::<(String, u32, Option<cid::Cid>), ClientError>((
+                                            chunk_key_ret, chunk_index_for_collect, chunk_cid,
+                                        ));
+                                    }
+                                    Err(e) => tracing::debug!(error = %e, chunk = %chunk_key, "remote-cid mapping PUT failed — falling back to full-bytes PUT"),
+                                }
+                            }
+                            Ok(r) => tracing::debug!(status = %r.status(), chunk = %chunk_key, "ingest rejected block — falling back to full-bytes PUT"),
+                            Err(e) => tracing::debug!(error = %e, chunk = %chunk_key, "ingest unreachable — falling back to full-bytes PUT"),
+                        }
+                    }
+
                     let put_result = client.put_object_with_metadata(
                         &bucket,
                         &chunk_key,
