@@ -415,42 +415,48 @@ pub async fn upload_large_file(
 /// an orphan upload) or `complete_upload` (separately handled — a completed
 /// upload replies `NoSuchUpload` on retry, which callers must treat as
 /// success-equivalent). (NEW-F3.)
-async fn retry_idempotent<F, Fut, T>(max_attempts: usize, mut op: F) -> Result<T>
+pub(crate) async fn retry_idempotent<F, Fut, T>(max_attempts: usize, mut op: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    // WASM target has no reliable sleep primitive available from this crate
-    // (no tokio reactor / gloo-timers dep), so a retry loop would hammer the
-    // server in a tight cycle — worse than no retry. Collapse to
-    // single-attempt on WASM; native callers get the backoff path.
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = max_attempts;
-        return op().await;
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let mut attempt = 0usize;
-        loop {
-            attempt += 1;
-            match op().await {
-                Ok(v) => return Ok(v),
-                Err(e) if attempt >= max_attempts || !is_transient(&e) => return Err(e),
-                Err(e) => {
-                    let backoff_ms = std::cmp::min(5_000u64, 100u64 * (1u64 << (attempt as u32 - 1)));
-                    tracing::debug!(
-                        attempt,
-                        max_attempts,
-                        backoff_ms,
-                        error = %e,
-                        "multipart: transient error, retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                }
+    // Unified retry for native AND wasm — the only per-target difference is the
+    // sleep primitive (see [`retry_backoff_sleep`]). wasm previously collapsed
+    // to a single attempt for lack of a sleep dep, which left the chunked
+    // content-upload path (`encryption.rs::put_object_chunked_internal`) with
+    // NO retry on the web: one sporadic chunk-PUT drop (ERR_CONNECTION_CLOSED /
+    // transient 5xx under the 16-wide concurrent burst) failed the whole large
+    // upload while small (1-chunk) files were fine (FxFiles #50). gloo-timers
+    // gives wasm a real backoff so the retry actually fires there.
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt >= max_attempts || !is_transient(&e) => return Err(e),
+            Err(e) => {
+                let backoff_ms = std::cmp::min(5_000u64, 100u64 * (1u64 << (attempt as u32 - 1)));
+                tracing::debug!(
+                    attempt,
+                    max_attempts,
+                    backoff_ms,
+                    error = %e,
+                    "retry_idempotent: transient error, retrying"
+                );
+                retry_backoff_sleep(backoff_ms).await;
             }
         }
     }
+}
+
+/// Backoff sleep for [`retry_idempotent`]. tokio on native; gloo-timers on
+/// wasm32 — the browser has no tokio reactor and the wasm build's tokio
+/// feature set excludes `tokio::time`.
+async fn retry_backoff_sleep(ms: u64) {
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+    #[cfg(target_arch = "wasm32")]
+    gloo_timers::future::TimeoutFuture::new(ms as u32).await;
 }
 
 /// Classify a ClientError as retry-safe. Network-level failures (connect,
@@ -458,11 +464,10 @@ where
 /// are transient; everything else (auth, 4xx policy errors, malformed response)
 /// is not.
 ///
-/// Native-only: `retry_idempotent` short-circuits to a single attempt on
-/// wasm32 (no sleep primitive), so the classifier has no caller there.
-/// Shared with `S3BlobBackend::{get, put}` in `encryption.rs` so the
-/// blob-backend retry loop matches the same transient set.
-#[cfg(not(target_arch = "wasm32"))]
+/// Used on BOTH targets now: `retry_idempotent` retries on wasm too (FxFiles
+/// #50), and it is shared with `S3BlobBackend::{get, put}` in `encryption.rs`
+/// so the blob-backend retry loop matches the same transient set. The body is
+/// wasm-aware — reqwest's `is_connect` is native-only (see the cfg inside).
 pub(crate) fn is_transient(err: &ClientError) -> bool {
     match err {
         ClientError::Http(e) => {

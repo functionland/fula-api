@@ -7113,23 +7113,48 @@ impl EncryptedClient {
             let chunk_key_ret = chunk_key.clone();
 
             async move {
-                let put_result = if let Some(ref pin) = pinning {
-                    client.put_object_with_metadata_and_pinning(
-                        &bucket,
-                        &chunk_key,
-                        chunk.ciphertext,
-                        Some(chunk_metadata),
-                        &pin.endpoint,
-                        &pin.token,
-                    ).await?
-                } else {
-                    client.put_object_with_metadata(
-                        &bucket,
-                        &chunk_key,
-                        chunk.ciphertext,
-                        Some(chunk_metadata),
-                    ).await?
-                };
+                // FxFiles #50: the content-chunk PUT had no retry on EITHER
+                // target — the native blob-backend retry only wraps forest
+                // nodes, not content chunks. One sporadic chunk-PUT drop
+                // (ERR_CONNECTION_CLOSED / transient 5xx under the 16-wide
+                // concurrent burst) thus failed the whole large upload (worst
+                // on the web, where the retry was wasm-gated). Retry each chunk
+                // PUT on transient errors — safe because the chunk key is
+                // content-addressed (idempotent). Per-attempt clones are cheap
+                // (Arc / Bytes / small structs).
+                let ciphertext = bytes::Bytes::from(chunk.ciphertext);
+                let put_result = crate::multipart::retry_idempotent(4, || {
+                    let client = client.clone();
+                    let bucket = bucket.clone();
+                    let chunk_key = chunk_key.clone();
+                    let pinning = pinning.clone();
+                    let chunk_metadata = chunk_metadata.clone();
+                    let body = ciphertext.clone();
+                    async move {
+                        if let Some(ref pin) = pinning {
+                            client
+                                .put_object_with_metadata_and_pinning(
+                                    &bucket,
+                                    &chunk_key,
+                                    body,
+                                    Some(chunk_metadata),
+                                    &pin.endpoint,
+                                    &pin.token,
+                                )
+                                .await
+                        } else {
+                            client
+                                .put_object_with_metadata(
+                                    &bucket,
+                                    &chunk_key,
+                                    body,
+                                    Some(chunk_metadata),
+                                )
+                                .await
+                        }
+                    }
+                })
+                .await?;
                 // W.9.4-A2: verify master's etag-attested CID against
                 // the pre-computed BLAKE3(ciphertext). Mismatch
                 // soft-fails to None — chunk PUT succeeded, only the
