@@ -1062,6 +1062,101 @@ where
         })?
 }
 
+/// True iff `v` is a COMPLETE encryption-metadata blob — either a non-chunked
+/// object (no `chunked` block) or a chunked object whose `chunked.chunk_nonces`
+/// array is present and non-empty. `chunk_nonces` are required to decrypt each
+/// chunk and are NOT derivable, so a chunked blob missing them is unusable; the
+/// reader must then source the full blob elsewhere (forest entry / index body).
+fn enc_metadata_is_complete(v: &serde_json::Value) -> bool {
+    match v.get("chunked") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(chunked) => chunked
+            .get("chunk_nonces")
+            .and_then(|n| n.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+    }
+}
+
+/// Resolve the COMPLETE `x-fula-encryption` metadata JSON for an object.
+///
+/// For large chunked files the per-chunk arrays (`chunk_nonces` = decrypt;
+/// `chunk_cids` = offline hints) no longer ride in the `x-fula-encryption`
+/// HTTP header (it would exceed the gateway's `large_client_header_buffers`
+/// limit and the PUT would 400). They always live in the index-object BODY and
+/// the forest entry. Precedence:
+///   1. the HTTP header, IF complete — legacy objects + small files whose
+///      header still carries the arrays (backward compatible);
+///   2. the forest entry's `user_metadata` — owner reads; always full and
+///      CID-stamped, and the source used when the master is down (offline);
+///   3. the index-object BODY — share recipients have no forest entry; also the
+///      offline-by-CID source.
+/// The body is parsed only when header+forest are incomplete; a single object's
+/// small header is always complete (no `chunked` block) → resolved at step 1,
+/// so its ciphertext body is never mis-parsed as JSON.
+fn resolve_enc_metadata(
+    header_json: Option<&str>,
+    forest_entry: Option<&ForestFileEntry>,
+    index_body: Option<&[u8]>,
+) -> Result<serde_json::Value> {
+    if let Some(h) = header_json {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(h) {
+            if enc_metadata_is_complete(&v) {
+                return Ok(v);
+            }
+        }
+    }
+    if let Some(e) = forest_entry {
+        if let Some(s) = e.user_metadata.get("x-fula-encryption") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                if enc_metadata_is_complete(&v) {
+                    return Ok(v);
+                }
+            }
+        }
+    }
+    if let Some(b) = index_body {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(b) {
+            if enc_metadata_is_complete(&v) {
+                return Ok(v);
+            }
+        }
+    }
+    Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+        "encryption metadata unavailable (incomplete in HTTP header, forest entry, and index body)"
+            .to_string(),
+    )))
+}
+
+/// Build the `x-fula-encryption` HTTP-header value from the full metadata JSON.
+///
+/// Returns it verbatim when it fits the gateway header budget; otherwise strips
+/// the large per-chunk arrays (`chunk_nonces`, `chunk_cids`) from the `chunked`
+/// block so the header stays small. The FULL JSON is ALWAYS written to the
+/// index body + forest entry regardless — readers recover the arrays from there
+/// via [`resolve_enc_metadata`]. Keying on the serialized length (not chunk
+/// count) keeps small files' headers intact, so un-updated readers that only
+/// know the header path keep working on small/legacy objects.
+fn header_safe_enc_metadata(full_json: &str) -> String {
+    // Margin below nginx's `large_client_header_buffers 4 32k`: the request also
+    // carries other headers + the value is a single header line, so 16 KB is a
+    // safe cap that still lets typical small chunked files keep their full header.
+    const HEADER_BUDGET: usize = 16 * 1024;
+    if full_json.len() <= HEADER_BUDGET {
+        return full_json.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(full_json) {
+        Ok(mut v) => {
+            if let Some(chunked) = v.get_mut("chunked").and_then(|c| c.as_object_mut()) {
+                chunked.remove("chunk_nonces");
+                chunked.remove("chunk_cids");
+            }
+            v.to_string()
+        }
+        Err(_) => full_json.to_string(),
+    }
+}
+
 impl EncryptedClient {
     /// Create a new encrypted client
     pub fn new(config: Config, encryption: EncryptionConfig) -> Result<Self> {
@@ -1338,14 +1433,29 @@ impl EncryptedClient {
     /// object, with automatic fallback to the forest entry's local copy
     /// when master is unreachable.
     ///
-    /// Behavior:
-    /// - Tries `head_object` against the configured master first. On
-    ///   success, returns the `x-fula-encryption` HTTP response header.
-    ///   This preserves "live S3 = source of truth" for online flows.
+    /// Behavior (online — `head_object` succeeds):
+    /// - Returns the `x-fula-encryption` HTTP header IF it is COMPLETE.
+    ///   Small / legacy objects (and any whose metadata fits the gateway
+    ///   header budget) resolve here with no extra work — "live S3 =
+    ///   source of truth".
+    /// - For LARGE chunked files the header is stripped of the per-chunk
+    ///   arrays (`header_safe_enc_metadata`), so a present-but-incomplete
+    ///   header (no `chunk_nonces`) is NOT returned directly. It falls
+    ///   through to (2) the forest entry's
+    ///   `user_metadata["x-fula-encryption"]` — written FULL at upload
+    ///   by the main + resumable chunked paths
+    ///   (`register_encrypted_chunked_upload_in_forest` / the stash at the
+    ///   end of `put_object_encrypted`) — then to (3) the index-object
+    ///   BODY (the manifest JSON; one small GET of the index object, NOT
+    ///   the file content, which lives in separate chunk keys). The body
+    ///   is the robust last resort for upload paths that don't populate
+    ///   the forest (e.g. the public `put_object_chunked`). This
+    ///   guarantees share / collab tokens built from the result carry the
+    ///   `chunk_nonces` the recipient needs to decrypt.
     /// - On a transport-layer failure (master unreachable / DNS /
-    ///   connect / timeout / health-gate-down), falls back to the
-    ///   forest entry's `user_metadata["x-fula-encryption"]`, populated
-    ///   at upload by `put_object_encrypted_*` (see `encryption.rs:5955-5968`).
+    ///   connect / timeout / health-gate-down), falls back to the forest
+    ///   entry's `user_metadata["x-fula-encryption"]` (the index body
+    ///   can't be fetched while master is down).
     /// - On any other error (404, AccessDenied, parse errors),
     ///   propagates as-is — those are real failure responses, not
     ///   master-down.
@@ -1367,16 +1477,77 @@ impl EncryptedClient {
         storage_key: &str,
     ) -> Result<String> {
         match self.inner.head_object(bucket, storage_key).await {
-            Ok(head) => head
-                .metadata
-                .get("x-fula-encryption")
-                .cloned()
-                .ok_or_else(|| {
-                    ClientError::Encryption(fula_crypto::CryptoError::Decryption(
-                        "Object is not encrypted or missing encryption metadata"
+            Ok(head) => {
+                // 1. HTTP header — source of truth for small / legacy objects
+                //    and any object whose metadata fits the gateway header
+                //    budget. For LARGE chunked files `header_safe_enc_metadata`
+                //    strips the per-chunk arrays (`chunk_nonces` / `chunk_cids`)
+                //    from this header, so a PRESENT header is not sufficient: it
+                //    must be COMPLETE (carry `chunk_nonces`). A share/collab
+                //    token built from a stripped header would omit the nonces
+                //    and the recipient could not decrypt. Small/legacy objects
+                //    resolve here with no extra work (no forest load, no GET).
+                let header = head.metadata.get("x-fula-encryption").cloned();
+                if let Some(ref h) = header {
+                    if serde_json::from_str::<serde_json::Value>(h)
+                        .map(|v| enc_metadata_is_complete(&v))
+                        .unwrap_or(false)
+                    {
+                        return Ok(h.clone());
+                    }
+                }
+                // 2. Forest entry — the owner (the actor creating a share) holds
+                //    it locally, and the main + resumable chunked-upload paths
+                //    write the FULL blob into `user_metadata`. Cheap: cached for
+                //    monolithic forests, at worst one HAMT shard read for v7.
+                self.ensure_forest_loaded(bucket).await?;
+                let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
+                if let Some(ref e) = forest_entry {
+                    if let Some(s) = e.user_metadata.get("x-fula-encryption") {
+                        if serde_json::from_str::<serde_json::Value>(s)
+                            .map(|v| enc_metadata_is_complete(&v))
+                            .unwrap_or(false)
+                        {
+                            return Ok(s.clone());
+                        }
+                    }
+                }
+                // 3. Index-object BODY — the manifest JSON (NOT the file: chunks
+                //    live under separate keys), always written FULL on upload.
+                //    Robust last resort for upload paths that don't populate the
+                //    forest `user_metadata` (e.g. the public `put_object_chunked`)
+                //    or when the forest cache was evicted. One small GET of the
+                //    index object, taken only when header + forest were both
+                //    incomplete (i.e. a large chunked file with no full forest
+                //    copy) — never on the small/legacy fast path above.
+                let body = self.inner.get_object(bucket, storage_key).await?;
+                if serde_json::from_slice::<serde_json::Value>(&body)
+                    .map(|v| enc_metadata_is_complete(&v))
+                    .unwrap_or(false)
+                {
+                    return String::from_utf8(body.to_vec()).map_err(|e| {
+                        ClientError::Encryption(fula_crypto::CryptoError::Decryption(format!(
+                            "index body is not valid UTF-8 JSON: {}",
+                            e
+                        )))
+                    });
+                }
+                // Nothing complete anywhere. A present-but-incomplete header
+                // means the object IS encrypted but its per-chunk nonces are
+                // unrecoverable here; surface that distinctly from "not
+                // encrypted" so callers can tell a genuine gap from a plaintext
+                // object.
+                match header {
+                    Some(_) => Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                        "encryption metadata incomplete in HTTP header, forest entry, and index \
+                         body (cannot build a share/collab token without per-chunk nonces)"
                             .to_string(),
-                    ))
-                }),
+                    ))),
+                    None => Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                        "Object is not encrypted or missing encryption metadata".to_string(),
+                    ))),
+                }
+            }
             Err(err) if Self::is_master_unreachable_error(&err) => {
                 // Master unreachable — fall back to the local forest entry.
                 self.ensure_forest_loaded(bucket).await?;
@@ -1696,19 +1867,17 @@ impl EncryptedClient {
         // a missing entry on BOTH sources means we have no way to
         // decrypt — surface a clear error rather than silently
         // returning ciphertext or refusing on the wrong axis.
-        let enc_metadata_str = get_meta("x-fula-encryption").ok_or_else(|| {
-            ClientError::Encryption(fula_crypto::CryptoError::Decryption(
-                "Missing encryption metadata (HTTP headers absent and forest entry has no \
-                 user_metadata; legacy upload that requires master to be online — re-upload \
-                 once via the new SDK to enable offline reads for this file)"
-                    .to_string(),
-            ))
-        })?;
-
-        let enc_metadata: serde_json::Value = serde_json::from_str(&enc_metadata_str)
-            .map_err(|e| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption(e.to_string())
-            ))?;
+        // Resolve the COMPLETE metadata: HTTP header (legacy/small) → forest
+        // entry (owner; full + CID-stamped; offline source) → index body. For
+        // large chunked files the header no longer carries the per-chunk
+        // arrays, so a present-but-stripped header must NOT short-circuit the
+        // forest fallback — `resolve_enc_metadata` checks completeness, unlike
+        // the old `get_meta` (which fell back only on full key-absence).
+        let enc_metadata = resolve_enc_metadata(
+            result.metadata.get("x-fula-encryption").map(|s| s.as_str()),
+            forest_entry.as_ref(),
+            Some(result.data.as_ref()),
+        )?;
 
         // Unwrap the DEK (common to both chunked and non-chunked)
         let wrapped_key: EncryptedData = serde_json::from_value(
@@ -2195,16 +2364,19 @@ impl EncryptedClient {
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        let enc_metadata_str = result.metadata
-            .get("x-fula-encryption")
-            .ok_or_else(|| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption("Missing encryption metadata".to_string())
-            ))?;
+        // H-1 / H-2: look up the forest entry once; shared by metadata
+        // resolution AND both decrypt branches.
+        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
 
-        let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
-            .map_err(|e| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption(e.to_string())
-            ))?;
+        // Resolve COMPLETE metadata: header (legacy/small) → forest (full +
+        // CID-stamped) → index body. A large chunked file's header keeps
+        // `wrapped_key` but drops `chunk_nonces`, so the chunked branch needs
+        // the full blob from forest/body.
+        let enc_metadata = resolve_enc_metadata(
+            result.metadata.get("x-fula-encryption").map(|s| s.as_str()),
+            forest_entry.as_ref(),
+            Some(result.data.as_ref()),
+        )?;
 
         let wrapped_key: EncryptedData = serde_json::from_value(
             enc_metadata["wrapped_key"].clone()
@@ -2215,9 +2387,6 @@ impl EncryptedClient {
         let decryptor = Decryptor::new(self.encryption.key_manager.keypair());
         let dek = decryptor.decrypt_dek(&wrapped_key)
             .map_err(ClientError::Encryption)?;
-
-        // H-1 / H-2: look up the forest entry once; shared by both branches.
-        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
 
         if is_chunked {
             self.get_object_chunked_to_writer(bucket, storage_key, &enc_metadata, &dek, writer, forest_entry.as_ref()).await
@@ -2325,16 +2494,19 @@ impl EncryptedClient {
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        let enc_metadata_str = result.metadata
-            .get("x-fula-encryption")
-            .ok_or_else(|| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption("Missing encryption metadata".to_string())
-            ))?;
+        // H-1 / H-2: look up the forest entry once; shared by metadata
+        // resolution AND both decrypt branches.
+        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
 
-        let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
-            .map_err(|e| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption(e.to_string())
-            ))?;
+        // Resolve COMPLETE metadata: header (legacy/small) → forest (full +
+        // CID-stamped) → index body. A large chunked file's header keeps
+        // `wrapped_key` but drops `chunk_nonces`, so the chunked branch needs
+        // the full blob from forest/body.
+        let enc_metadata = resolve_enc_metadata(
+            result.metadata.get("x-fula-encryption").map(|s| s.as_str()),
+            forest_entry.as_ref(),
+            Some(result.data.as_ref()),
+        )?;
 
         let wrapped_key: EncryptedData = serde_json::from_value(
             enc_metadata["wrapped_key"].clone()
@@ -2345,9 +2517,6 @@ impl EncryptedClient {
         let decryptor = Decryptor::new(self.encryption.key_manager.keypair());
         let dek = decryptor.decrypt_dek(&wrapped_key)
             .map_err(ClientError::Encryption)?;
-
-        // H-1 / H-2: look up the forest entry once; shared by both branches.
-        let forest_entry = self.forest_entry_lookup(bucket, storage_key).await?;
 
         if is_chunked {
             self.get_object_chunked_buffered_to_writer(bucket, storage_key, &enc_metadata, &dek, writer, forest_entry.as_ref()).await
@@ -7304,13 +7473,16 @@ impl EncryptedClient {
             "chunked": serde_json::to_value(&chunked_metadata).unwrap(),
         });
         
-        // The index object is small - just metadata, no file content
+        // Index object: the body is the FULL metadata JSON (incl. per-chunk
+        // arrays); the HEADER copy is shrunk via `header_safe_enc_metadata` so a
+        // large chunked file's metadata can't blow past the gateway's header
+        // limit. Readers recover the full blob from the body / forest entry.
         let index_body = enc_metadata.to_string();
         let metadata = ObjectMetadata::new()
             .with_content_type("application/json")
             .with_metadata("x-fula-encrypted", "true")
             .with_metadata("x-fula-chunked", "true")
-            .with_metadata("x-fula-encryption", &index_body);
+            .with_metadata("x-fula-encryption", &header_safe_enc_metadata(&index_body));
 
         // Walkable-v8 (W.9.3): pre-compute `BLAKE3(index_body)` so the
         // post-PUT self-verify can compare master's etag-attested CID
@@ -7326,22 +7498,38 @@ impl EncryptedClient {
         // Upload index object. If this fails after all chunks were successfully
         // uploaded, we must compensate by deleting the chunks — otherwise the
         // upload is non-atomic and leaks storage.
-        let index_result = if let Some(ref pinning) = self.pinning {
-            self.inner.put_object_with_metadata_and_pinning(
-                bucket,
-                storage_key,
-                Bytes::from(index_body.clone()),
-                Some(metadata),
-                &pinning.endpoint,
-                &pinning.token,
-            ).await
-        } else {
-            self.inner.put_object_with_metadata(
-                bucket,
-                storage_key,
-                Bytes::from(index_body.clone()),
-                Some(metadata),
-            ).await
+        // Retry the finalize PUT on transient errors — same treatment as the
+        // content chunks above. The index key is content-addressed (idempotent),
+        // so a single dropped finalize must NOT trigger the compensating delete
+        // of every chunk + a whole-upload restart. Per-attempt clones are cheap.
+        let index_result = {
+            let client = self.inner.clone();
+            let pinning = self.pinning.clone();
+            crate::multipart::retry_idempotent(4, || {
+                let client = client.clone();
+                let pinning = pinning.clone();
+                let body = Bytes::from(index_body.clone());
+                let metadata = metadata.clone();
+                async move {
+                    if let Some(ref pin) = pinning {
+                        client
+                            .put_object_with_metadata_and_pinning(
+                                bucket,
+                                storage_key,
+                                body,
+                                Some(metadata),
+                                &pin.endpoint,
+                                &pin.token,
+                            )
+                            .await
+                    } else {
+                        client
+                            .put_object_with_metadata(bucket, storage_key, body, Some(metadata))
+                            .await
+                    }
+                }
+            })
+            .await
         };
 
         let result = match index_result {
@@ -8003,7 +8191,8 @@ impl EncryptedClient {
             .with_content_type("application/json")
             .with_metadata("x-fula-encrypted", "true")
             .with_metadata("x-fula-chunked", "true")
-            .with_metadata("x-fula-encryption", &index_body);
+            // Header shrunk for large chunked files; full JSON stays in body + forest.
+            .with_metadata("x-fula-encryption", &header_safe_enc_metadata(&index_body));
 
         // Walkable-v8 (#82): pre-compute BLAKE3 of the index body so
         // we can verify against master's etag and stamp the CID into
@@ -8459,7 +8648,8 @@ impl EncryptedClient {
             .with_content_type("application/json")
             .with_metadata("x-fula-encrypted", "true")
             .with_metadata("x-fula-chunked", "true")
-            .with_metadata("x-fula-encryption", index_body);
+            // Header shrunk for large chunked files; full JSON stays in body + forest.
+            .with_metadata("x-fula-encryption", &header_safe_enc_metadata(index_body));
 
         // Walkable-v8 (#53 / #82): pre-compute BLAKE3 of the index
         // body BEFORE the PUT consumes it via Bytes::from. Skipped
@@ -10066,17 +10256,16 @@ impl EncryptedClient {
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        // Parse encryption metadata from S3 headers
-        let enc_metadata_str = result.metadata
-            .get("x-fula-encryption")
-            .ok_or_else(|| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption("Missing encryption metadata (not in share token or S3 headers)".to_string())
-            ))?;
-
-        let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
-            .map_err(|e| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption(e.to_string())
-            ))?;
+        // Share recipients have NO forest entry, so resolve from the HTTP
+        // header (legacy/small) → index BODY (large chunked files). The body's
+        // `chunk_nonces` are recovered here; decryption below uses the share's
+        // own DEK (not the body's wrapped_key), and `chunk_nonces` are never
+        // changed by key rotation — so the body is a safe source for shares.
+        let enc_metadata = resolve_enc_metadata(
+            result.metadata.get("x-fula-encryption").map(|s| s.as_str()),
+            None,
+            Some(result.data.as_ref()),
+        )?;
 
         if is_chunked {
             // CHUNKED DOWNLOAD: Download and decrypt each chunk using the share's DEK
@@ -10259,7 +10448,37 @@ impl EncryptedClient {
     ) -> Result<u32> {
         // Get the object with metadata
         let result = self.inner.get_object_with_metadata(bucket, storage_key).await?;
-        
+
+        // GUARD: key rotation of chunked (large) objects is not yet supported.
+        // For a chunked file the index metadata exceeds the gateway header
+        // budget, so `header_safe_enc_metadata` strips the per-chunk arrays from
+        // the `x-fula-encryption` header this function reads. Rewrapping here
+        // would operate on incomplete metadata AND mirror that stripped blob
+        // back into the forest entry (via `sync_forest_user_metadata_after_rewrap`),
+        // dropping the `chunk_nonces` the owner needs to decrypt. A correct
+        // chunked-rewrap path must resolve the FULL metadata (forest / index
+        // body), update only `wrapped_key`/`kek_version`, and re-write the header
+        // via `header_safe_enc_metadata` while keeping body + forest FULL —
+        // tracked as a follow-up. `rotate_bucket` collects this as a per-object
+        // failure (it does not abort the run); single-object rotation is
+        // unaffected. (Pre-0.6.13 this rewrap failed anyway — the re-PUT of the
+        // full oversized header was rejected by the gateway with HTTP 400.)
+        if result
+            .metadata
+            .get("x-fula-chunked")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+        {
+            return Err(ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                format!(
+                    "key rotation of chunked (large) object '{}' is not yet supported \
+                     (index metadata exceeds the gateway header budget); single-object \
+                     rotation is unaffected",
+                    storage_key
+                ),
+            )));
+        }
+
         let enc_metadata_str = result.metadata
             .get("x-fula-encryption")
             .ok_or_else(|| ClientError::Encryption(
@@ -10860,7 +11079,8 @@ impl EncryptedClient {
             .with_content_type("application/json")
             .with_metadata("x-fula-encrypted", "true")
             .with_metadata("x-fula-chunked", "true")
-            .with_metadata("x-fula-encryption", &index_body);
+            // Header shrunk for large chunked files; full JSON stays in body + forest.
+            .with_metadata("x-fula-encryption", &header_safe_enc_metadata(&index_body));
 
         // E51 / W.9.3: pre-compute `BLAKE3(index_body)` so the post-PUT
         // self-verify can compare master's etag-attested CID against a
@@ -11017,16 +11237,17 @@ impl EncryptedClient {
         }
 
         // Parse encryption metadata
-        let enc_metadata_str = index_result.metadata
-            .get("x-fula-encryption")
-            .ok_or_else(|| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption("Missing encryption metadata".to_string())
-            ))?;
+        // H-1 / H-2: look up forest entry for the owner-read path (used for
+        // content_hash verification AND metadata resolution below).
+        let forest_entry = self.forest_entry_lookup(bucket, &storage_key).await?;
 
-        let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
-            .map_err(|e| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption(e.to_string())
-            ))?;
+        // Resolve COMPLETE metadata: header (legacy/small) → forest (full +
+        // CID-stamped) → index body. Large chunked headers drop `chunk_nonces`.
+        let enc_metadata = resolve_enc_metadata(
+            index_result.metadata.get("x-fula-encryption").map(|s| s.as_str()),
+            forest_entry.as_ref(),
+            Some(index_result.data.as_ref()),
+        )?;
 
         // Unwrap DEK
         let wrapped_dek: EncryptedData = serde_json::from_value(enc_metadata["wrapped_key"].clone())
@@ -11036,11 +11257,6 @@ impl EncryptedClient {
 
         let decryptor = Decryptor::new(self.encryption.key_manager.keypair());
         let dek = decryptor.decrypt_dek(&wrapped_dek)?;
-
-        // H-1 / H-2: look up forest entry for the owner-read path so the
-        // chunked engine can verify content_hash and reject legacy-format
-        // blobs pinned to streaming-v2.
-        let forest_entry = self.forest_entry_lookup(bucket, &storage_key).await?;
 
         // Delegate to the windowed parallel download path shared with the main
         // get_object_decrypted flow. Handles streaming-v2 and legacy formats
@@ -11086,17 +11302,20 @@ impl EncryptedClient {
             return Ok(full.slice(start.min(full.len())..end.min(full.len())));
         }
         
-        // Parse encryption metadata
-        let enc_metadata_str = index_result.metadata
-            .get("x-fula-encryption")
-            .ok_or_else(|| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption("Missing encryption metadata".to_string())
-            ))?;
-        
-        let enc_metadata: serde_json::Value = serde_json::from_str(enc_metadata_str)
-            .map_err(|e| ClientError::Encryption(
-                fula_crypto::CryptoError::Decryption(e.to_string())
-            ))?;
+        // Resolve COMPLETE metadata: header (legacy/small) → in-hand index
+        // body. Unlike the full-download paths, the range path runs NO
+        // forest-backed integrity gate (no enforce_min_version /
+        // enforce_content_hash), and the index body is ALREADY fetched above —
+        // so we skip the forest lookup here. For a v7 sharded-HAMT forest that
+        // lookup can trigger an S3 shard read, an avoidable round-trip on every
+        // large-file range read (video seek / thumbnails). The body is written
+        // FULL at upload; if it were somehow incomplete, `resolve_enc_metadata`
+        // errors rather than mis-decrypting.
+        let enc_metadata = resolve_enc_metadata(
+            index_result.metadata.get("x-fula-encryption").map(|s| s.as_str()),
+            None,
+            Some(index_result.data.as_ref()),
+        )?;
         
         // Unwrap DEK
         let wrapped_dek: EncryptedData = serde_json::from_value(enc_metadata["wrapped_key"].clone())
@@ -11392,6 +11611,93 @@ impl RotationReport {
 #[allow(deprecated)] // F1: tests legitimately exercise random-keypair constructors; deprecation targets production callers only
 mod tests {
     use super::*;
+
+    /// A chunked enc-metadata JSON whose serialized form exceeds the 16 KB
+    /// header budget (the per-chunk arrays dominate), mirroring a large file.
+    fn big_chunked_meta() -> String {
+        let chunk_nonces: Vec<String> =
+            (0..220).map(|i| format!("chunk-nonce-padding-{:04}", i)).collect();
+        let chunk_cids: Vec<Vec<u8>> = (0..220)
+            .map(|_| (0u16..36).map(|x| (x % 251) as u8).collect())
+            .collect();
+        serde_json::json!({
+            "version": 4,
+            "algorithm": "AES-256-GCM",
+            "wrapped_key": {"alg": "HPKE-X25519", "ct": "d3JhcHBlZC1kZWstYmxvYg"},
+            "kek_version": 1,
+            "chunked": {
+                "format": "streaming-v2",
+                "num_chunks": 220,
+                "chunk_size": 262144,
+                "chunk_nonces": chunk_nonces,
+                "chunk_cids": chunk_cids,
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn header_safe_strips_only_per_chunk_arrays_when_oversized() {
+        let full = big_chunked_meta();
+        assert!(full.len() > 16 * 1024, "fixture must exceed the header budget");
+        let header = header_safe_enc_metadata(&full);
+        assert!(header.len() < full.len(), "oversized header must be stripped");
+        assert!(header.len() <= 16 * 1024, "stripped header must fit the budget");
+        let v: serde_json::Value = serde_json::from_str(&header).unwrap();
+        // Per-chunk arrays removed from the HEADER copy...
+        assert!(v["chunked"].get("chunk_nonces").is_none());
+        assert!(v["chunked"].get("chunk_cids").is_none());
+        // ...but scalars + wrapped_key (needed to unwrap the DEK) survive.
+        assert_eq!(v["chunked"]["num_chunks"], 220);
+        assert!(v.get("wrapped_key").is_some());
+        assert_eq!(v["version"], 4);
+    }
+
+    #[test]
+    fn header_safe_passes_small_metadata_verbatim() {
+        // Small files keep their full header (old-client read compatibility).
+        let small = serde_json::json!({
+            "version": 4, "wrapped_key": {"k": "v"},
+            "chunked": {"num_chunks": 2, "chunk_nonces": ["a", "b"]}
+        })
+        .to_string();
+        assert!(small.len() <= 16 * 1024);
+        assert_eq!(header_safe_enc_metadata(&small), small);
+    }
+
+    #[test]
+    fn enc_metadata_completeness_keys_on_chunk_nonces() {
+        assert!(enc_metadata_is_complete(&serde_json::json!({"wrapped_key": {}, "nonce": "x"})));
+        assert!(enc_metadata_is_complete(&serde_json::json!({"chunked": {"chunk_nonces": ["a"]}})));
+        assert!(!enc_metadata_is_complete(&serde_json::json!({"chunked": {"num_chunks": 3}})));
+        assert!(!enc_metadata_is_complete(&serde_json::json!({"chunked": {"chunk_nonces": []}})));
+    }
+
+    #[test]
+    fn resolve_enc_metadata_precedence_and_roundtrip() {
+        let full = big_chunked_meta();
+        let stripped = header_safe_enc_metadata(&full); // incomplete: no chunk_nonces
+        let full_v: serde_json::Value = serde_json::from_str(&full).unwrap();
+        let expect_nonces = full_v["chunked"]["chunk_nonces"].clone();
+
+        // 1. Complete header wins; body is ignored (and never mis-parsed).
+        let r = resolve_enc_metadata(Some(&full), None, Some(b"not-json-ciphertext")).unwrap();
+        assert_eq!(r["chunked"]["chunk_nonces"], expect_nonces);
+
+        // 2. Stripped header + no forest -> recover the FULL blob from the index
+        //    body (the share-recipient / offline-by-CID path). Round-trip: the
+        //    recovered chunk_nonces equal the original (decryption-correctness).
+        let r = resolve_enc_metadata(Some(&stripped), None, Some(full.as_bytes())).unwrap();
+        assert_eq!(r["chunked"]["chunk_nonces"], expect_nonces);
+        assert_eq!(r["chunked"]["chunk_nonces"].as_array().unwrap().len(), 220);
+
+        // 3. No usable source anywhere -> hard error (never returns incomplete).
+        assert!(resolve_enc_metadata(Some(&stripped), None, Some(stripped.as_bytes())).is_err());
+
+        // 4. Absent header (offline empty-metadata) + body present -> body.
+        let r = resolve_enc_metadata(None, None, Some(full.as_bytes())).unwrap();
+        assert_eq!(r["chunked"]["num_chunks"], 220);
+    }
 
     #[test]
     fn test_encryption_config() {
