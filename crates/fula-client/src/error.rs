@@ -320,6 +320,24 @@ impl ClientError {
     pub fn is_cache_error(&self) -> bool {
         matches!(self, Self::BlockTooLarge { .. } | Self::BlockCache(_))
     }
+
+    /// Check if this is an HTTP 410 Gone error.
+    ///
+    /// Distinct from not-found (404): a 410 means the object's metadata still
+    /// exists but its backing content is unretrievable — on this gateway,
+    /// that's a garbage-collected IPFS CID (a server-side content read like
+    /// `copy_object` fails, though `head_object` still returns the ETag).
+    ///
+    /// The v1→v7 forest migration uses this to treat a backup `copy_object`
+    /// that 410s as "the source content is already gone, so there is nothing
+    /// to back up" and proceed (rebuilding v7 from the in-memory forest),
+    /// rather than deferring as if it were a transient failure. The match is
+    /// deliberately NARROW — every other error (transient 5xx, throttling,
+    /// auth, precondition) must still be treated as a real failure.
+    pub fn is_gone(&self) -> bool {
+        matches!(self, Self::S3Error { code, .. }
+            if code == "Gone" || code == "HTTP410" || code == "410")
+    }
 }
 
 fn extract_xml_element(xml: &str, element: &str) -> Option<String> {
@@ -350,7 +368,7 @@ mod tests {
 </Error>"#;
 
         let error = ClientError::from_s3_xml(xml, 404);
-        
+
         match error {
             ClientError::S3Error { code, message, request_id } => {
                 assert_eq!(code, "NoSuchKey");
@@ -359,5 +377,37 @@ mod tests {
             }
             _ => panic!("Expected S3Error"),
         }
+    }
+
+    #[test]
+    fn is_gone_matches_only_410_gone() {
+        let s3 = |code: &str| ClientError::S3Error {
+            code: code.to_string(),
+            message: String::new(),
+            request_id: None,
+        };
+        // 410 Gone == the object's metadata exists but its backing content is
+        // unretrievable (gc-orphaned CID). The v1->v7 migration treats this as
+        // "no server-side content to back up", NOT a transient failure.
+        assert!(s3("Gone").is_gone());
+        assert!(s3("HTTP410").is_gone());
+        assert!(s3("410").is_gone());
+        assert!(ClientError::from_s3_xml("<Error><Code>Gone</Code></Error>", 410).is_gone());
+        // A 410 body with no <Code> falls back to "HTTP410".
+        assert!(ClientError::from_s3_xml("<Error></Error>", 410).is_gone());
+
+        // CRITICAL: must NOT match anything else — every other copy error must
+        // still defer/fail (a transient masquerading as "gc'd" is the one way
+        // the skip-the-backup fix turns dangerous).
+        assert!(!s3("NoSuchKey").is_gone());
+        assert!(!s3("NoSuchBucket").is_gone());
+        assert!(!s3("PreconditionFailed").is_gone());
+        assert!(!s3("HTTP412").is_gone());
+        assert!(!s3("InternalError").is_gone());
+        assert!(!s3("HTTP500").is_gone());
+        assert!(!s3("SlowDown").is_gone());
+        assert!(!ClientError::from_s3_xml("<Error><Code>InternalError</Code></Error>", 500).is_gone());
+        assert!(!ClientError::NotFound { bucket: "b".into(), key: "k".into() }.is_gone());
+        assert!(!ClientError::BucketNotFound("b".into()).is_gone());
     }
 }
