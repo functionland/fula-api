@@ -546,6 +546,180 @@ pub async fn get_file_size(_file_path: String) -> anyhow::Result<u64> {
 }
 
 // ============================================================================
+// Upload progress (polling) — real per-chunk percentage for FxFiles
+// ============================================================================
+//
+// The SDK reports cumulative byte progress via an `Arc<dyn Fn(u64,u64)>`
+// callback invoked as each content chunk's PUT completes (web + native).
+// Rather than a Dart `Stream` (FRB `StreamSink`), which has never been
+// exercised through this repo's external codegen/publish pipeline, progress
+// is surfaced with the SAME opaque-handle + polling pattern already proven
+// for `MasterHealthEvent` and `CancelHandle`: the app creates a
+// [`ProgressHandle`], passes it to a `_with_progress` upload, and reads the
+// latest value on a timer via [`poll_progress`] while the upload future is
+// pending. The handle's `Arc` lifecycle is the cleanup — no global registry,
+// no key collisions, no leak on early-return/panic.
+
+struct ProgressState {
+    /// Highest cumulative bytes reported so far (monotonic via `fetch_max`).
+    uploaded: std::sync::atomic::AtomicU64,
+    /// Total bytes of the upload (constant once the first chunk reports).
+    total: std::sync::atomic::AtomicU64,
+}
+
+/// Opaque handle to an upload's live progress. Cheap to clone (clones the
+/// inner `Arc`); the upload tasks and the poller observe the same counters.
+#[derive(Clone)]
+pub struct ProgressHandle {
+    inner: std::sync::Arc<ProgressState>,
+}
+
+/// Create a fresh progress handle (0 / 0). Pass it to a `_with_progress`
+/// upload function and read it via [`poll_progress`].
+pub async fn create_progress_handle() -> ProgressHandle {
+    ProgressHandle {
+        inner: std::sync::Arc::new(ProgressState {
+            uploaded: std::sync::atomic::AtomicU64::new(0),
+            total: std::sync::atomic::AtomicU64::new(0),
+        }),
+    }
+}
+
+/// Read the latest progress for an in-flight (or finished) upload. Safe to
+/// call any time, from any thread; returns 0% before the first chunk lands.
+///
+/// **100% caveat:** cumulative bytes reach `total` when the LAST content
+/// chunk's PUT returns — BEFORE the index PUT + forest-flush tail. UIs that
+/// show a determinate bar should cap at <100% until their own completion
+/// signal (the upload future resolving), mirroring the mobile clamp.
+pub async fn poll_progress(handle: &ProgressHandle) -> UploadProgress {
+    let uploaded = handle.inner.uploaded.load(std::sync::atomic::Ordering::Relaxed);
+    let total = handle.inner.total.load(std::sync::atomic::Ordering::Relaxed);
+    UploadProgress::new(uploaded, total, 0, 0)
+}
+
+/// Build the SDK progress callback that feeds a [`ProgressHandle`]. Private
+/// (not an FRB binding). `fetch_max` keeps the displayed value monotonic
+/// even though up to 16 concurrent chunk tasks report cumulative values in
+/// nondeterministic order; `total` is the same on every call.
+fn progress_cb(handle: &ProgressHandle) -> std::sync::Arc<dyn Fn(u64, u64) + Send + Sync> {
+    let p = handle.inner.clone();
+    std::sync::Arc::new(move |done, tot| {
+        // Store `total` first so a poll landing mid-callback never reads a
+        // nonzero `uploaded` against a still-zero `total` (transient 0% blip).
+        p.total.store(tot, std::sync::atomic::Ordering::Relaxed);
+        p.uploaded.fetch_max(done, std::sync::atomic::Ordering::Relaxed);
+    })
+}
+
+/// [`put_flat`] with live progress (web + native). Drive a percentage by
+/// polling [`poll_progress`] on the passed [`ProgressHandle`] while this
+/// future runs.
+pub async fn put_flat_with_progress(
+    client: &EncryptedClientHandle,
+    bucket: String,
+    path: String,
+    data: Vec<u8>,
+    content_type: Option<String>,
+    progress: &ProgressHandle,
+) -> anyhow::Result<PutResult> {
+    let cb = progress_cb(progress);
+    let guard = client.inner.write().await;
+    let result = guard
+        .put_object_flat_with_progress(&bucket, &path, Bytes::from(data), content_type.as_deref(), cb)
+        .await?;
+    Ok(result.into())
+}
+
+/// [`put_flat_resumable_from_path_cancellable`] with live progress (native).
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn put_flat_resumable_from_path_with_progress(
+    client: &EncryptedClientHandle,
+    bucket: String,
+    path: String,
+    file_path: String,
+    manifest_path: String,
+    content_type: Option<String>,
+    cancel: &CancelHandle,
+    progress: &ProgressHandle,
+) -> anyhow::Result<PutResult> {
+    let data = tokio::fs::read(&file_path)
+        .await
+        .with_context(|| format!("Failed to read file: {}", file_path))?;
+    let cb = progress_cb(progress);
+    let guard = client.inner.read().await;
+    let manifest = std::path::PathBuf::from(manifest_path);
+    let result = guard
+        .put_object_encrypted_resumable_with_cancel_and_progress(
+            &bucket,
+            &path,
+            Bytes::from(data),
+            content_type.as_deref(),
+            &manifest,
+            Some(cancel.inner.clone()),
+            Some(cb),
+        )
+        .await?;
+    Ok(result.into())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn put_flat_resumable_from_path_with_progress(
+    _client: &EncryptedClientHandle,
+    _bucket: String,
+    _path: String,
+    _file_path: String,
+    _manifest_path: String,
+    _content_type: Option<String>,
+    _cancel: &CancelHandle,
+    _progress: &ProgressHandle,
+) -> anyhow::Result<PutResult> {
+    anyhow::bail!(
+        "put_flat_resumable_from_path_with_progress is not supported on WASM; \
+         use put_flat_with_progress from WASM"
+    )
+}
+
+/// [`resume_flat_upload_from_path_cancellable`] with live progress (native).
+/// Progress continues from the chunks the interrupted attempt already
+/// uploaded (the SDK seeds the counter), so the bar resumes mid-way.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn resume_flat_upload_from_path_with_progress(
+    client: &EncryptedClientHandle,
+    manifest_path: String,
+    file_path: String,
+    cancel: &CancelHandle,
+    progress: &ProgressHandle,
+) -> anyhow::Result<PutResult> {
+    let data = tokio::fs::read(&file_path)
+        .await
+        .with_context(|| format!("Failed to read file: {}", file_path))?;
+    let cb = progress_cb(progress);
+    let guard = client.inner.read().await;
+    let manifest = std::path::PathBuf::from(manifest_path);
+    let result = guard
+        .resume_upload_with_cancel_and_progress(
+            &manifest,
+            &data,
+            Some(cancel.inner.clone()),
+            Some(cb),
+        )
+        .await?;
+    Ok(result.into())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn resume_flat_upload_from_path_with_progress(
+    _client: &EncryptedClientHandle,
+    _manifest_path: String,
+    _file_path: String,
+    _cancel: &CancelHandle,
+    _progress: &ProgressHandle,
+) -> anyhow::Result<PutResult> {
+    anyhow::bail!("resume_flat_upload_from_path_with_progress is not supported on WASM")
+}
+
+// ============================================================================
 // Subtree Operations (for Sharing)
 // ============================================================================
 
