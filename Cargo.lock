@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "fula-flutter"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "anyhow",
  "async-lock",
@@ -2003,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "fula-js"
-version = "0.6.12"
+version = "0.6.13"
 dependencies = [
  "base64 0.22.1",
  "bytes",
