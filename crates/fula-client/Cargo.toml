@@ -83,6 +83,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 uuid = { version = "1.11", features = ["v4", "serde", "js"] }
 # MultipartAbortGuard Drop impl spawns the abort future on wasm
 wasm-bindgen-futures = "0.4"
+# Backoff sleep for retry_idempotent on wasm — the browser has no tokio
+# reactor. `futures` feature exposes TimeoutFuture (a setTimeout-backed Future)
+# so the per-chunk upload retry (FxFiles #50) actually sleeps between attempts.
+gloo-timers = { version = "0.3", features = ["futures"] }
 # Walkable-v8 (W.9.2): `S3BlobBackend::put` parses master's PUT-response
 # ETag into a `Cid` on every target so the cross-platform CID-stamping
 # seam stays symmetric. cid 0.11 is wasm-compatible; default-features

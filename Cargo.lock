@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "fula-api"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "fula-blockstore"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "fula-cli"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1857,7 +1857,7 @@ dependencies = [
 
 [[package]]
 name = "fula-client"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1871,6 +1871,7 @@ dependencies = [
  "fs2",
  "fula-crypto",
  "futures",
+ "gloo-timers",
  "hex",
  "mime_guess",
  "parking_lot",
@@ -1899,7 +1900,7 @@ dependencies = [
 
 [[package]]
 name = "fula-core"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1934,7 +1935,7 @@ dependencies = [
 
 [[package]]
 name = "fula-crypto"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "aes-gcm",
  "anyhow",
