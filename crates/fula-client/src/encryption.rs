@@ -6207,11 +6207,33 @@ impl EncryptedClient {
             V1_BACKUP_PREFIX,
             chrono::Utc::now().timestamp_millis(),
         );
-        if let Err(e) = self.inner.copy_object(bucket, &index_key, bucket, &backup_key).await {
-            release_best_effort(lock_token.clone()).await;
-            return Ok(MigrationOutcome::DeferredTransientError {
-                reason: format!("v1 backup COPY failed: {}", e),
-            });
+        match self.inner.copy_object(bucket, &index_key, bucket, &backup_key).await {
+            Ok(_) => {}
+            // The v1 index object's backing content was garbage-collected
+            // (gc-orphaned CID → 410 Gone): a server-side COPY can't read it,
+            // so there is no v1 content to back up and the restore point can't
+            // exist regardless. Skip the backup and proceed — v7 is rebuilt
+            // faithfully from the in-memory `v1_forest` (monolithic =
+            // whole-or-nothing, so no entry is dropped), and with auto-gc off
+            // the fresh v7 nodes won't be collected. The backup only matters if
+            // a FUTURE v7 manifest becomes unreadable, and `try_v1_backup_fallback`
+            // already returns None gracefully when no backup exists.
+            Err(e) if e.is_gone() => {
+                tracing::warn!(
+                    %bucket,
+                    %backup_key,
+                    error = %e,
+                    "v1 backup COPY hit 410 Gone (source content gc'd); skipping backup, proceeding with migration"
+                );
+            }
+            // Every OTHER copy error (transient 5xx, throttling, auth, network)
+            // is a real failure — defer so a retry can make the restore point.
+            Err(e) => {
+                release_best_effort(lock_token.clone()).await;
+                return Ok(MigrationOutcome::DeferredTransientError {
+                    reason: format!("v1 backup COPY failed: {}", e),
+                });
+            }
         }
 
         // ── Step 5: Build the v7 forest in memory ──────────────────────────
