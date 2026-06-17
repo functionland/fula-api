@@ -6665,7 +6665,32 @@ impl EncryptedClient {
         let lock = self.bucket_write_lock(bucket);
         let _guard = lock.lock().await;
         let result = self
-            .put_object_flat_deferred_locked(bucket, key, data, content_type)
+            .put_object_flat_deferred_locked(bucket, key, data, content_type, None)
+            .await?;
+        self.flush_forest_locked(bucket).await?;
+        Ok(result)
+    }
+
+    /// Like [`put_object_flat`], but reports cumulative upload progress
+    /// (`bytes_uploaded`, `total_bytes`) via `progress` as each content chunk's
+    /// PUT completes — the real per-chunk progress FxFiles uses to drive an
+    /// upload percentage on web + native (the SDK previously only exposed a
+    /// completion event, leaving apps with a time-based estimate). The callback
+    /// is `Send + Sync` so it can be invoked from the concurrent chunk-upload
+    /// tasks on both native (multi-thread) and wasm. Non-chunked (small) files
+    /// emit a single 100% event on completion via the caller.
+    pub async fn put_object_flat_with_progress(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        content_type: Option<&str>,
+        progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+    ) -> Result<PutObjectResult> {
+        let lock = self.bucket_write_lock(bucket);
+        let _guard = lock.lock().await;
+        let result = self
+            .put_object_flat_deferred_locked(bucket, key, data, content_type, Some(progress))
             .await?;
         self.flush_forest_locked(bucket).await?;
         Ok(result)
@@ -6701,7 +6726,7 @@ impl EncryptedClient {
     ) -> Result<PutObjectResult> {
         let lock = self.bucket_write_lock(bucket);
         let _guard = lock.lock().await;
-        self.put_object_flat_deferred_locked(bucket, key, data, content_type)
+        self.put_object_flat_deferred_locked(bucket, key, data, content_type, None)
             .await
     }
 
@@ -6718,6 +6743,7 @@ impl EncryptedClient {
         key: &str,
         data: impl Into<Bytes>,
         content_type: Option<&str>,
+        progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
     ) -> Result<PutObjectResult> {
         let data = data.into();
         let original_size = data.len() as u64;
@@ -6819,6 +6845,7 @@ impl EncryptedClient {
                 &wrapped_dek,
                 &encrypted_meta,
                 kek_version,
+                progress,
             ).await?
         } else {
             // SINGLE OBJECT: File is small enough for one block
@@ -7058,6 +7085,7 @@ impl EncryptedClient {
         wrapped_dek: &EncryptedData,
         encrypted_meta: &EncryptedPrivateMetadata,
         kek_version: u32,
+        progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
     ) -> Result<(PutObjectResult, String, Option<cid::Cid>)> {
         // Create chunked encoder with AAD binding chunks to storage key
         let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
@@ -7088,6 +7116,12 @@ impl EncryptedClient {
         // same code runs on wasm32 (where tokio has no multi-thread runtime).
         use futures::StreamExt;
         let pinning = self.pinning.clone();
+        // Real progress (FxFiles): cumulative bytes reported per completed
+        // chunk. Count-proportional to total so it lands exactly on
+        // `total_bytes` at the final chunk, regardless of completion order.
+        let total_bytes = data.len() as u64;
+        let num_chunks = (chunked_metadata.num_chunks as u64).max(1);
+        let uploaded_chunks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let futs = all_chunks.into_iter().map(|chunk| {
             let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk.index);
             let chunk_metadata = ObjectMetadata::new()
@@ -7111,6 +7145,8 @@ impl EncryptedClient {
             let bucket = bucket.to_string();
             let pinning = pinning.clone();
             let chunk_key_ret = chunk_key.clone();
+            let progress_cb = progress.clone();
+            let uploaded_chunks = uploaded_chunks.clone();
 
             async move {
                 // FxFiles #50: the content-chunk PUT had no retry on EITHER
@@ -7155,6 +7191,18 @@ impl EncryptedClient {
                     }
                 })
                 .await?;
+                // Real upload progress (FxFiles): emit cumulative bytes once
+                // this chunk's PUT (with retry) has succeeded. Count-
+                // proportional to the file size so the final chunk lands on
+                // exactly `total_bytes` (chunk plaintext sizes vary; the count
+                // is monotonic and exact at completion). Invoked from the
+                // concurrent upload tasks, hence the Send+Sync callback.
+                if let Some(ref cb) = progress_cb {
+                    let done = uploaded_chunks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    cb(done.saturating_mul(total_bytes) / num_chunks, total_bytes);
+                }
                 // W.9.4-A2: verify master's etag-attested CID against
                 // the pre-computed BLAKE3(ciphertext). Mismatch
                 // soft-fails to None — chunk PUT succeeded, only the
