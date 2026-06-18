@@ -7650,8 +7650,8 @@ impl EncryptedClient {
         chunk_index: u32,
         plaintext: &[u8],
         dek: &fula_crypto::keys::DekKey,
-        walkable_v8: bool,
     ) -> Result<(String, Option<cid::Cid>)> {
+        let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
         // Re-encrypt with the committed nonce. Identical to the native resume
         // path's per-chunk encrypt (see ~8520): same AAD prefix, same nonce
         // source, same AEAD. Reusing a nonce here is safe because it only ever

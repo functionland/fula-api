@@ -1986,6 +1986,7 @@ dependencies = [
  "async-lock",
  "bytes",
  "chrono",
+ "cid 0.11.1",
  "flutter_rust_bridge",
  "fula-client",
  "fula-crypto",

@@ -38,6 +38,8 @@ bytes = { workspace = true }
 
 # Thread safety
 parking_lot = { workspace = true }
+# Streaming-upload handle stores per-chunk CID hints (Vec<Option<cid::Cid>>).
+cid = { workspace = true }
 
 # Platform-specific dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

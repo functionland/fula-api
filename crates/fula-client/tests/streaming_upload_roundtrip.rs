@@ -148,7 +148,6 @@ async fn streaming_upload_roundtrip_byte_exact() {
                 i as u32,
                 &data[start..end],
                 &dek,
-                true,
             )
             .await
             .expect("streaming_put_chunk");
