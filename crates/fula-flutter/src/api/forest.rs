@@ -631,6 +631,37 @@ pub async fn put_flat_with_progress(
     Ok(result.into())
 }
 
+/// [`put_flat_with_progress`] with cooperative cancellation (web + native).
+/// Non-resumable: triggering `cancel` aborts the in-flight upload (chunks
+/// already in flight finish, later chunks short-circuit, uploaded chunks are
+/// cleaned up) and the call returns a `Cancelled` error. A cancelled upload
+/// restarts from scratch — wasm resumable support lands separately. This is
+/// web's cancel path (the native resumable+manifest cancel is the
+/// `*_from_path` family, which is native-only).
+pub async fn put_flat_with_progress_cancellable(
+    client: &EncryptedClientHandle,
+    bucket: String,
+    path: String,
+    data: Vec<u8>,
+    content_type: Option<String>,
+    progress: &ProgressHandle,
+    cancel: &CancelHandle,
+) -> anyhow::Result<PutResult> {
+    let cb = progress_cb(progress);
+    let guard = client.inner.write().await;
+    let result = guard
+        .put_object_flat_with_progress_cancellable(
+            &bucket,
+            &path,
+            Bytes::from(data),
+            content_type.as_deref(),
+            cb,
+            cancel.inner.clone(),
+        )
+        .await?;
+    Ok(result.into())
+}
+
 /// [`put_flat_resumable_from_path_cancellable`] with live progress (native).
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn put_flat_resumable_from_path_with_progress(

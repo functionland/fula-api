@@ -6856,7 +6856,7 @@ impl EncryptedClient {
         let lock = self.bucket_write_lock(bucket);
         let _guard = lock.lock().await;
         let result = self
-            .put_object_flat_deferred_locked(bucket, key, data, content_type, None)
+            .put_object_flat_deferred_locked(bucket, key, data, content_type, None, None)
             .await?;
         self.flush_forest_locked(bucket).await?;
         Ok(result)
@@ -6881,7 +6881,40 @@ impl EncryptedClient {
         let lock = self.bucket_write_lock(bucket);
         let _guard = lock.lock().await;
         let result = self
-            .put_object_flat_deferred_locked(bucket, key, data, content_type, Some(progress))
+            .put_object_flat_deferred_locked(bucket, key, data, content_type, Some(progress), None)
+            .await?;
+        self.flush_forest_locked(bucket).await?;
+        Ok(result)
+    }
+
+    /// [`put_object_flat_with_progress`] with cooperative cancellation, for
+    /// web (and native) callers that need to abort an in-flight large upload.
+    /// `cancel` is checked between chunk PUTs: chunks already in flight
+    /// (≤ MAX_CONCURRENT_CHUNK_UPLOADS) finish, later chunks short-circuit, the
+    /// uploaded chunks are deleted, and the call returns
+    /// `ClientError::Cancelled`. NON-resumable: a cancelled upload restarts from
+    /// scratch (wasm resumable support lands separately). Mirrors the native
+    /// resumable path's `Arc<AtomicBool>` cancel semantics.
+    pub async fn put_object_flat_with_progress_cancellable(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        content_type: Option<&str>,
+        progress: Arc<dyn Fn(u64, u64) + Send + Sync>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<PutObjectResult> {
+        let lock = self.bucket_write_lock(bucket);
+        let _guard = lock.lock().await;
+        let result = self
+            .put_object_flat_deferred_locked(
+                bucket,
+                key,
+                data,
+                content_type,
+                Some(progress),
+                Some(cancel),
+            )
             .await?;
         self.flush_forest_locked(bucket).await?;
         Ok(result)
@@ -6917,7 +6950,7 @@ impl EncryptedClient {
     ) -> Result<PutObjectResult> {
         let lock = self.bucket_write_lock(bucket);
         let _guard = lock.lock().await;
-        self.put_object_flat_deferred_locked(bucket, key, data, content_type, None)
+        self.put_object_flat_deferred_locked(bucket, key, data, content_type, None, None)
             .await
     }
 
@@ -6935,6 +6968,7 @@ impl EncryptedClient {
         data: impl Into<Bytes>,
         content_type: Option<&str>,
         progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
+        cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<PutObjectResult> {
         let data = data.into();
         let original_size = data.len() as u64;
@@ -7037,6 +7071,7 @@ impl EncryptedClient {
                 &encrypted_meta,
                 kek_version,
                 progress,
+                cancel,
             ).await?
         } else {
             // SINGLE OBJECT: File is small enough for one block
@@ -7277,6 +7312,10 @@ impl EncryptedClient {
         encrypted_meta: &EncryptedPrivateMetadata,
         kek_version: u32,
         progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
+        // Cooperative cancel (web + native). `Some` = the chunk loop checks it
+        // between PUTs; `None` = uncancellable (existing callers). Mirrors the
+        // native resumable path's `Arc<AtomicBool>` flag.
+        cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(PutObjectResult, String, Option<cid::Cid>)> {
         // Create chunked encoder with AAD binding chunks to storage key
         let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
@@ -7338,8 +7377,19 @@ impl EncryptedClient {
             let chunk_key_ret = chunk_key.clone();
             let progress_cb = progress.clone();
             let uploaded_chunks = uploaded_chunks.clone();
+            let cancel = cancel.clone();
 
             async move {
+                // Cooperative cancel (mirrors the native resumable path): a
+                // chunk that hasn't started yet short-circuits when the flag is
+                // set; chunks already in flight (≤ MAX_CONCURRENT_CHUNK_UPLOADS)
+                // run to completion, and the post-loop compensating-delete
+                // cleans up everything that did upload.
+                if let Some(ref c) = cancel {
+                    if c.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(ClientError::Cancelled);
+                    }
+                }
                 // FxFiles #50: the content-chunk PUT had no retry on EITHER
                 // target — the native blob-backend retry only wraps forest
                 // nodes, not content chunks. One sporadic chunk-PUT drop
@@ -7448,6 +7498,18 @@ impl EncryptedClient {
                 let _ = self.inner.delete_object(bucket, key).await;
             }
             return Err(err);
+        }
+
+        // Cancelled after the chunks uploaded but before the index PUT: the
+        // chunks are unreferenced (no index object points at them yet), so
+        // delete them and abort — same cleanup as the failure path above.
+        if let Some(ref c) = cancel {
+            if c.load(std::sync::atomic::Ordering::Relaxed) {
+                for key in &uploaded_keys {
+                    let _ = self.inner.delete_object(bucket, key).await;
+                }
+                return Err(ClientError::Cancelled);
+            }
         }
 
         // W.9.4-A2: stamp the per-chunk CID Vec into the metadata

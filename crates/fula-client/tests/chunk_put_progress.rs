@@ -85,3 +85,50 @@ async fn chunked_put_reports_cumulative_progress() {
     let max_done = evs.iter().map(|(d, _)| *d).max().unwrap();
     assert_eq!(max_done, total, "progress must reach 100% (max cumulative == total)");
 }
+
+/// 0.6.14 wasm upload-cancel: a pre-set cancel flag must abort the chunked
+/// upload with `ClientError::Cancelled` — every chunk short-circuits at the
+/// closure-start check before its PUT (mirrors the native resumable cancel).
+#[tokio::test]
+async fn chunked_put_cancellable_aborts_when_flag_preset() {
+    use std::sync::atomic::AtomicBool;
+
+    let server = MockServer::start().await;
+    Mock::given(method("PUT")).respond_with(EtagResponder).mount(&server).await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let mut config = Config::new(&server.uri()).with_token("test-jwt");
+    config.walkable_v8_writer_enabled = true;
+    let secret = SecretKey::generate();
+    let client = EncryptedClient::new(config, EncryptionConfig::from_secret_key(secret))
+        .expect("EncryptedClient::new");
+
+    // Multi-chunk file (2 MiB > 768 KB threshold).
+    let data = vec![0xABu8; 2 * 1024 * 1024];
+    // Pre-cancelled: the flag is already set before the upload starts.
+    let cancel = Arc::new(AtomicBool::new(true));
+    let progress: Arc<dyn Fn(u64, u64) + Send + Sync> = Arc::new(|_, _| {});
+
+    let result = client
+        .put_object_flat_with_progress_cancellable(
+            "videos-v8",
+            "/cancelled.bin",
+            Bytes::from(data),
+            Some("application/octet-stream"),
+            progress,
+            cancel,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(fula_client::ClientError::Cancelled)),
+        "a pre-set cancel flag must abort the chunked upload with Cancelled",
+    );
+}
