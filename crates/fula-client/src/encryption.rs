@@ -7627,6 +7627,107 @@ impl EncryptedClient {
         Ok((result, index_body, index_cid))
     }
 
+    /// Streaming upload, pass 2 — encrypt ONE chunk from its PRE-COMMITTED
+    /// nonce and PUT it.
+    ///
+    /// The plaintext is supplied by the caller (pushed from Dart, sliced from a
+    /// browser Blob) instead of sliced from a whole-file buffer, so peak memory
+    /// stays bounded regardless of file size. The chunk is encrypted with the
+    /// nonce committed during pass 1 (NEVER regenerated); because AES-GCM is
+    /// deterministic for a fixed (key, nonce, plaintext, AAD), the ciphertext —
+    /// hence its content-addressed key and CID — is identical to what pass 1
+    /// would have produced, so the PUT is idempotent and safe to retry or to
+    /// repeat on resume. The AAD binds the ciphertext to (storage_key,
+    /// chunk_index): the anti-mixup guarantee. This mirrors the native resume
+    /// re-encrypt (`resume_upload_with_cancel_and_progress`) and the chunk-PUT
+    /// closure in `put_object_chunked_internal` (transient retry, pinning,
+    /// post-PUT CID self-verify), but for a single pushed chunk.
+    async fn streaming_put_chunk(
+        &self,
+        bucket: &str,
+        storage_key: &str,
+        chunked_meta: &ChunkedFileMetadata,
+        chunk_index: u32,
+        plaintext: &[u8],
+        dek: &fula_crypto::keys::DekKey,
+        walkable_v8: bool,
+    ) -> Result<(String, Option<cid::Cid>)> {
+        // Re-encrypt with the committed nonce. Identical to the native resume
+        // path's per-chunk encrypt (see ~8520): same AAD prefix, same nonce
+        // source, same AEAD. Reusing a nonce here is safe because it only ever
+        // encrypts this exact (dek, plaintext, AAD) triple.
+        let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
+        let nonce = chunked_meta
+            .get_chunk_nonce(chunk_index)
+            .map_err(ClientError::Encryption)?;
+        let aead = Aead::new_default(dek);
+        let aad = format!("{}:{}", aad_prefix, chunk_index).into_bytes();
+        let ciphertext = Bytes::from(
+            aead.encrypt_with_aad(&nonce, plaintext, &aad)
+                .map_err(ClientError::Encryption)?,
+        );
+
+        let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, chunk_index);
+        let chunk_metadata = ObjectMetadata::new()
+            .with_content_type("application/octet-stream")
+            .with_metadata("x-fula-chunk", "true")
+            .with_metadata("x-fula-chunk-index", &chunk_index.to_string());
+
+        // Pre-compute the expected CID before `ciphertext` moves into the PUT.
+        let expected_chunk_cid = if walkable_v8 {
+            Some(crate::walkable_v8::local_blake3_raw_cid(&ciphertext))
+        } else {
+            None
+        };
+
+        // Per-chunk PUT with transient retry (FxFiles #50). The chunk key is
+        // content-addressed, so retrying — or re-PUTting the same chunk on a
+        // resume — is idempotent.
+        let pinning = self.pinning.clone();
+        let inner = self.inner.clone();
+        let put_result = crate::multipart::retry_idempotent(4, || {
+            let client = inner.clone();
+            let bucket = bucket.to_string();
+            let chunk_key = chunk_key.clone();
+            let pinning = pinning.clone();
+            let chunk_metadata = chunk_metadata.clone();
+            let body = ciphertext.clone();
+            async move {
+                if let Some(ref pin) = pinning {
+                    client
+                        .put_object_with_metadata_and_pinning(
+                            &bucket,
+                            &chunk_key,
+                            body,
+                            Some(chunk_metadata),
+                            &pin.endpoint,
+                            &pin.token,
+                        )
+                        .await
+                } else {
+                    client
+                        .put_object_with_metadata(&bucket, &chunk_key, body, Some(chunk_metadata))
+                        .await
+                }
+            }
+        })
+        .await?;
+
+        // Post-PUT CID self-verify (walkable-v8): confirms the stored bytes
+        // match what we encrypted. None when the flag is off or verify fails.
+        let chunk_cid = match (walkable_v8, expected_chunk_cid) {
+            (true, Some(expected)) => crate::walkable_v8::verify_etag_against_expected_cid(
+                &put_result.etag,
+                expected,
+                bucket,
+                &chunk_key,
+            ),
+            _ => None,
+        };
+
+        Ok((chunk_key, chunk_cid))
+    }
+
     /// Upload an object with resumable chunked encoding.
     ///
     /// Like `put_object_encrypted_with_type`, but writes a manifest file at
