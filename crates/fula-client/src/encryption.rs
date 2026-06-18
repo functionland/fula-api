@@ -7642,7 +7642,7 @@ impl EncryptedClient {
     /// re-encrypt (`resume_upload_with_cancel_and_progress`) and the chunk-PUT
     /// closure in `put_object_chunked_internal` (transient retry, pinning,
     /// post-PUT CID self-verify), but for a single pushed chunk.
-    async fn streaming_put_chunk(
+    pub async fn streaming_put_chunk(
         &self,
         bucket: &str,
         storage_key: &str,
@@ -7726,6 +7726,344 @@ impl EncryptedClient {
         };
 
         Ok((chunk_key, chunk_cid))
+    }
+
+    /// Streaming upload, prelude — the one-time setup before any chunks are
+    /// pushed: ensure the forest is loaded, generate the per-file DEK, derive
+    /// the flat storage key (monolithic inline; v7 reads `shard_salt` behind
+    /// the forest RwLock without holding the DashMap guard), HPKE-wrap the DEK,
+    /// and read the KEK version. Mirrors the head of
+    /// `put_object_flat_deferred_locked` (~6976-7043). The remaining metadata
+    /// (`private_meta` / `encrypted_meta`) is built at finalize, once pass 1 has
+    /// computed the total size + content hash from the pushed plaintext.
+    ///
+    /// Read-only w.r.t. live write state (the forest load is idempotent), and
+    /// deliberately a separate path so the non-streaming uploader is untouched.
+    /// Returns `(storage_key, dek, wrapped_dek, kek_version)`.
+    pub async fn streaming_begin(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(String, fula_crypto::keys::DekKey, EncryptedData, u32)> {
+        self.ensure_forest_loaded(bucket).await?;
+        let dek = self.encryption.key_manager.generate_dek();
+
+        enum KeyPath {
+            Ready(String),
+            V7(Arc<tokio::sync::RwLock<ShardedHamtPrivateForest>>),
+        }
+        let path = {
+            let cache_entry = self.forest_cache.get(bucket).ok_or_else(|| {
+                ClientError::Encryption(fula_crypto::CryptoError::Encryption(
+                    "forest not loaded".to_string(),
+                ))
+            })?;
+            match cache_entry.value() {
+                ForestCacheEntry::Monolithic { forest, .. } => {
+                    KeyPath::Ready(forest.generate_key(key, &dek))
+                }
+                ForestCacheEntry::ShardedHamt { forest, .. } => KeyPath::V7(forest.clone()),
+            }
+        };
+        let storage_key = match path {
+            KeyPath::Ready(sk) => sk,
+            KeyPath::V7(forest_arc) => {
+                let salt = {
+                    let guard = forest_arc.read().await;
+                    guard.manifest().shard_salt().to_vec()
+                };
+                generate_flat_key(key, &dek, &salt)
+            }
+        };
+
+        let encryptor = Encryptor::new(self.encryption.public_key());
+        let wrapped_dek = encryptor
+            .encrypt_dek(&dek)
+            .map_err(ClientError::Encryption)?;
+        let kek_version = self.encryption.key_manager.version();
+
+        Ok((storage_key, dek, wrapped_dek, kek_version))
+    }
+
+    /// Streaming upload, end of pass 1 — finalize the plan-mode encoder and
+    /// build the per-file metadata now that the total size + content hash are
+    /// known from the pushed plaintext. Returns the committed
+    /// `ChunkedFileMetadata` (nonces + BAO root), the `PrivateMetadata`, and its
+    /// AEAD-encrypted form. The caller keeps these for pass 2 + `streaming_finish`
+    /// (and, in P3, derives the persisted resume manifest from them). `encoder`
+    /// MUST be the plan-only encoder built with AAD prefix
+    /// `fula:v4:chunk:{storage_key}` and the same `dek` from `streaming_begin`.
+    pub fn streaming_finalize_plan(
+        &self,
+        encoder: ChunkedEncoder,
+        dek: &fula_crypto::keys::DekKey,
+        storage_key: &str,
+        key: &str,
+        content_type: Option<&str>,
+    ) -> Result<(ChunkedFileMetadata, PrivateMetadata, EncryptedPrivateMetadata)> {
+        // Content hash + size must be read BEFORE finalize() consumes the encoder.
+        let content_hash = encoder.content_hash_hex();
+        let total_size = encoder.bytes_processed();
+        let (_final_chunk, chunked_metadata, _outboard) =
+            encoder.finalize().map_err(ClientError::Encryption)?;
+
+        let private_meta = PrivateMetadata::new(key, total_size)
+            .with_content_type(content_type.unwrap_or("application/octet-stream"))
+            .with_content_hash(content_hash);
+        let meta_aad = EncryptedPrivateMetadata::aad_v2(storage_key);
+        let encrypted_meta = EncryptedPrivateMetadata::encrypt_v2(&private_meta, dek, &meta_aad)
+            .map_err(ClientError::Encryption)?;
+
+        Ok((chunked_metadata, private_meta, encrypted_meta))
+    }
+
+    /// Streaming upload, finalize ("commit") — write the index/metadata object,
+    /// register the file in the encrypted forest, and flush to master. After
+    /// this the file is listable; before it, the uploaded chunks are
+    /// unreferenced (an abandoned/cancelled upload leaves them collectable — see
+    /// the plan's orphan lifecycle). Mirrors the index-write tail of
+    /// `put_object_chunked_internal` (~7515-7627) + the wasm-proven forest
+    /// registration of `put_object_flat_deferred_locked` (~7154-7286). The
+    /// per-bucket write lock + post-register `flush_forest` give durability in
+    /// place of the native-only WAL.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn streaming_finish(
+        &self,
+        bucket: &str,
+        key: &str,
+        storage_key: &str,
+        wrapped_dek: &EncryptedData,
+        encrypted_meta: &EncryptedPrivateMetadata,
+        kek_version: u32,
+        private_meta: &PrivateMetadata,
+        mut chunked_metadata: ChunkedFileMetadata,
+        chunk_cids: Vec<Option<cid::Cid>>,
+    ) -> Result<PutObjectResult> {
+        let walkable_v8 = self.inner.config().walkable_v8_writer_enabled;
+
+        // W.9.4-A2: stamp per-chunk CID hints. Only when at least one is Some,
+        // so the wire stays byte-identical to v0.5 output when the flag is off.
+        if walkable_v8 && chunk_cids.iter().any(|c| c.is_some()) {
+            chunked_metadata.populate_chunk_cids(chunk_cids);
+        }
+
+        // Index body = the FULL metadata JSON; the header copy is shrunk via
+        // `header_safe_enc_metadata` so a large chunked file's metadata can't
+        // blow the gateway header limit (0.6.13).
+        let enc_metadata = serde_json::json!({
+            "version": 4,
+            "algorithm": "AES-256-GCM",
+            "wrapped_key": serde_json::to_value(wrapped_dek).unwrap(),
+            "kek_version": kek_version,
+            "metadata_privacy": true,
+            "obfuscation_mode": "flat",
+            "private_metadata": encrypted_meta.to_json().map_err(ClientError::Encryption)?,
+            "chunked": serde_json::to_value(&chunked_metadata).unwrap(),
+        });
+        let index_body = enc_metadata.to_string();
+        let metadata = ObjectMetadata::new()
+            .with_content_type("application/json")
+            .with_metadata("x-fula-encrypted", "true")
+            .with_metadata("x-fula-chunked", "true")
+            .with_metadata("x-fula-encryption", &header_safe_enc_metadata(&index_body));
+
+        let expected_index_cid = if walkable_v8 {
+            Some(crate::walkable_v8::local_blake3_raw_cid(index_body.as_bytes()))
+        } else {
+            None
+        };
+
+        // Index PUT with transient retry (idempotent, content-addressed).
+        let pinning = self.pinning.clone();
+        let inner = self.inner.clone();
+        let index_result = crate::multipart::retry_idempotent(4, || {
+            let client = inner.clone();
+            let pinning = pinning.clone();
+            let body = Bytes::from(index_body.clone());
+            let metadata = metadata.clone();
+            let bucket = bucket.to_string();
+            let storage_key = storage_key.to_string();
+            async move {
+                if let Some(ref pin) = pinning {
+                    client
+                        .put_object_with_metadata_and_pinning(
+                            &bucket,
+                            &storage_key,
+                            body,
+                            Some(metadata),
+                            &pin.endpoint,
+                            &pin.token,
+                        )
+                        .await
+                } else {
+                    client
+                        .put_object_with_metadata(&bucket, &storage_key, body, Some(metadata))
+                        .await
+                }
+            }
+        })
+        .await?;
+
+        let index_cid = match (walkable_v8, expected_index_cid) {
+            (true, Some(expected)) => crate::walkable_v8::verify_etag_against_expected_cid(
+                &index_result.etag,
+                expected,
+                bucket,
+                storage_key,
+            ),
+            _ => None,
+        };
+
+        // Commit to the forest under the per-bucket write lock (mirrors the
+        // non-streaming path), then flush so a fresh client load sees the file.
+        let lock = self.bucket_write_lock(bucket);
+        let _guard = lock.lock().await;
+        self.ensure_forest_loaded(bucket).await?;
+        self.register_streaming_upload_in_forest(
+            bucket,
+            key,
+            storage_key,
+            index_cid,
+            &index_body,
+            private_meta,
+        )
+        .await?;
+        self.flush_forest_locked(bucket).await?;
+
+        Ok(index_result)
+    }
+
+    /// Forest registration for a streaming chunked upload. Mirrors the
+    /// wasm-proven upsert in `put_object_flat_deferred_locked` (~7154-7286):
+    /// build the encrypted `ForestFileEntry`, stamp the index CID + metadata,
+    /// upsert into the v7 (sharded-HAMT) or monolithic forest, append to the
+    /// WAL on native (auto-skipped on wasm), and best-effort clean up the
+    /// previous upload's orphaned objects. Caller MUST hold the per-bucket
+    /// write lock and have `ensure_forest_loaded`.
+    async fn register_streaming_upload_in_forest(
+        &self,
+        bucket: &str,
+        key: &str,
+        storage_key: &str,
+        index_cid: Option<cid::Cid>,
+        index_metadata_json: &str,
+        private_meta: &PrivateMetadata,
+    ) -> Result<()> {
+        let mut forest_entry =
+            ForestFileEntry::from_metadata(private_meta, storage_key.to_string());
+        forest_entry.mark_encrypted();
+        forest_entry.storage_cid = index_cid;
+        forest_entry
+            .user_metadata
+            .insert("x-fula-encrypted".to_string(), "true".to_string());
+        forest_entry
+            .user_metadata
+            .insert("x-fula-encryption".to_string(), index_metadata_json.to_string());
+        forest_entry
+            .user_metadata
+            .insert("x-fula-chunked".to_string(), "true".to_string());
+
+        let now = chrono::Utc::now().timestamp();
+        #[cfg(not(target_arch = "wasm32"))]
+        let wal_entry_clone = forest_entry.clone();
+
+        let is_v7 = self.is_forest_sharded_hamt(bucket);
+        let old_storage_key: Option<String> = if is_v7 {
+            let forest_arc = {
+                let cache_entry = self.forest_cache.get(bucket).ok_or_else(|| {
+                    ClientError::Encryption(fula_crypto::CryptoError::Decryption(format!(
+                        "forest cache missing for bucket {} during streaming-upload registration",
+                        bucket,
+                    )))
+                })?;
+                match cache_entry.value() {
+                    ForestCacheEntry::ShardedHamt { forest, .. } => forest.clone(),
+                    _ => unreachable!("is_forest_sharded_hamt guard above"),
+                }
+            };
+            let backend: Arc<S3BlobBackend> =
+                Arc::new(S3BlobBackend::new(self.inner.clone(), bucket.to_string()));
+            let old = {
+                let mut guard = forest_arc.write().await;
+                let prior = guard
+                    .get_file(key, &backend)
+                    .await
+                    .map_err(ClientError::Encryption)?;
+                debug_assert!(
+                    forest_entry.encrypted,
+                    "v7 upsert invariant violated: streaming entry for {} has encrypted=false",
+                    forest_entry.path
+                );
+                guard
+                    .upsert_file(forest_entry, &backend)
+                    .await
+                    .map_err(ClientError::Encryption)?;
+                prior.map(|e| e.storage_key)
+            };
+            if let Some(mut cache_entry) = self.forest_cache.get_mut(bucket) {
+                if let ForestCacheEntry::ShardedHamt { loaded_at, .. } = cache_entry.value_mut() {
+                    *loaded_at = now;
+                }
+            }
+            old
+        } else {
+            let (mut forest, prior_etag, prior_seq) = {
+                let cache_entry = self.forest_cache.get(bucket).ok_or_else(|| {
+                    ClientError::Encryption(fula_crypto::CryptoError::Decryption(format!(
+                        "forest cache missing for bucket {} during streaming-upload registration",
+                        bucket,
+                    )))
+                })?;
+                match cache_entry.value() {
+                    ForestCacheEntry::Monolithic {
+                        forest,
+                        index_etag,
+                        last_sequence,
+                        ..
+                    } => (forest.clone(), index_etag.clone(), *last_sequence),
+                    ForestCacheEntry::ShardedHamt { .. } => unreachable!("is_v7 handled above"),
+                }
+            };
+            let old = forest.get_storage_key(key).map(|s| s.to_string());
+            forest.upsert_file(forest_entry);
+            self.forest_cache.insert(
+                bucket.to_string(),
+                ForestCacheEntry::Monolithic {
+                    forest,
+                    loaded_at: now,
+                    dirty: true,
+                    index_etag: prior_etag,
+                    last_sequence: prior_seq,
+                },
+            );
+            old
+        };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let wal_mac = wal::derive_mac_key(&self.encryption.key_manager, bucket);
+            if let Err(e) = wal::append(
+                bucket,
+                &wal_mac,
+                WalEntry::Insert {
+                    key: key.to_string(),
+                    entry: wal_entry_clone,
+                },
+            ) {
+                tracing::warn!(%bucket, error = %e, "WAL append failed (streaming-upload register); continuing");
+            }
+        }
+
+        // Best-effort cleanup of the orphaned previous upload (per-upload random
+        // DEKs make a shared key astronomically unlikely; the guard is cheap).
+        if let Some(old_key) = old_storage_key {
+            if old_key != storage_key {
+                let num_chunks = self.get_chunked_num_chunks(bucket, &old_key).await;
+                self.cleanup_orphaned_storage(bucket, &old_key, num_chunks).await;
+            }
+        }
+
+        Ok(())
     }
 
     /// Upload an object with resumable chunked encoding.
