@@ -5,7 +5,7 @@ description = "Flutter bindings for Fula decentralized storage - works on Androi
 # to parse `*.workspace = true` keys in its own manifest scan. Keep
 # these in sync with `[workspace.package]` in the root Cargo.toml.
 # (Same workaround as crates/fula-js.)
-version = "0.6.14"
+version = "0.6.15"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/functionland/fula-api"
