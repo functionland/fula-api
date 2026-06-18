@@ -662,6 +662,293 @@ pub async fn put_flat_with_progress_cancellable(
     Ok(result.into())
 }
 
+// ============================================================================
+// Streaming upload (web OOM fix) — PUSH model.
+// docs/web-streaming-resumable-upload-plan.md (P2). Dart slices the file from a
+// Blob and drives the two passes; this never holds the whole file. Pass 1 feeds
+// a plan-only encoder (commit nonces + integrity root, no ciphertext); pass 2
+// re-encrypts each chunk from its committed nonce and PUTs it; finish writes the
+// index + registers the forest. Uses the proven `put_flat`/handle rails — no
+// Rust→Dart callback (FRB on wasm surfaces push via handles, not callbacks).
+// ============================================================================
+
+/// Returned by `streaming_upload_finalize_plan` so Dart knows how to slice
+/// pass 2 (chunk `i` = file bytes `[i*chunk_size .. min((i+1)*chunk_size, len)]`).
+pub struct StreamingPlanInfo {
+    pub num_chunks: u32,
+    pub chunk_size: u32,
+}
+
+enum StreamingPhase {
+    Planning {
+        encoder: fula_crypto::chunked::ChunkedEncoder,
+        content_type: Option<String>,
+    },
+    Uploading {
+        chunked_metadata: std::sync::Arc<fula_crypto::chunked::ChunkedFileMetadata>,
+        private_meta: fula_crypto::private_metadata::PrivateMetadata,
+        encrypted_meta: fula_crypto::private_metadata::EncryptedPrivateMetadata,
+        chunk_cids: Vec<Option<cid::Cid>>,
+    },
+    Done,
+}
+
+struct StreamingUploadInner {
+    client: EncryptedClientHandle,
+    bucket: String,
+    key: String,
+    storage_key: String,
+    dek: fula_crypto::keys::DekKey,
+    wrapped_dek: fula_crypto::hpke::EncryptedData,
+    kek_version: u32,
+    phase: StreamingPhase,
+}
+
+/// Opaque handle to an in-progress streaming upload. The `std::sync::Mutex` is
+/// only ever held for brief synchronous critical sections (never across an
+/// `.await`), so concurrent `streaming_upload_chunk` calls for distinct indices
+/// run their PUTs in parallel.
+pub struct StreamingUploadHandle {
+    inner: std::sync::Arc<std::sync::Mutex<StreamingUploadInner>>,
+}
+
+/// Begin a streaming upload: run the prelude (DEK, storage_key, wrapped DEK,
+/// KEK version) and create the plan-only encoder. Drive the returned handle via
+/// `streaming_upload_plan_chunk` (×N, in order) → `streaming_upload_finalize_plan`
+/// → `streaming_upload_chunk` (×N) → `streaming_upload_finish`.
+pub async fn streaming_upload_begin(
+    client: &EncryptedClientHandle,
+    bucket: String,
+    key: String,
+    content_type: Option<String>,
+) -> anyhow::Result<StreamingUploadHandle> {
+    let (storage_key, dek, wrapped_dek, kek_version) = {
+        let guard = client.inner.read().await;
+        guard.streaming_begin(&bucket, &key).await?
+    };
+    let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
+    let encoder =
+        fula_crypto::chunked::ChunkedEncoder::with_aad(dek.clone(), aad_prefix.into_bytes())
+            .into_plan_only();
+    Ok(StreamingUploadHandle {
+        inner: std::sync::Arc::new(std::sync::Mutex::new(StreamingUploadInner {
+            client: client.clone(),
+            bucket,
+            key,
+            storage_key,
+            dek,
+            wrapped_dek,
+            kek_version,
+            phase: StreamingPhase::Planning {
+                encoder,
+                content_type,
+            },
+        })),
+    })
+}
+
+/// Pass 1 — feed one plaintext slice (pushed from Dart) into the plan-only
+/// encoder. MUST be called sequentially in file order (BAO is order-sensitive).
+pub async fn streaming_upload_plan_chunk(
+    handle: &StreamingUploadHandle,
+    bytes: Vec<u8>,
+) -> anyhow::Result<()> {
+    let mut g = handle.inner.lock().unwrap();
+    match &mut g.phase {
+        StreamingPhase::Planning { encoder, .. } => {
+            encoder
+                .update(&bytes)
+                .map_err(|e| anyhow::anyhow!("streaming plan chunk failed: {e}"))?;
+            Ok(())
+        }
+        _ => anyhow::bail!("streaming_upload_plan_chunk: not in planning phase"),
+    }
+}
+
+/// End of pass 1 — finalize the plan, commit per-file metadata, and return the
+/// chunk count + chunk size so Dart can slice pass 2.
+pub async fn streaming_upload_finalize_plan(
+    handle: &StreamingUploadHandle,
+) -> anyhow::Result<StreamingPlanInfo> {
+    // Region 1: take the encoder out (sync, no await held).
+    let (encoder, content_type, dek, storage_key, key, client) = {
+        let mut g = handle.inner.lock().unwrap();
+        let (encoder, content_type) =
+            match std::mem::replace(&mut g.phase, StreamingPhase::Done) {
+                StreamingPhase::Planning {
+                    encoder,
+                    content_type,
+                } => (encoder, content_type),
+                other => {
+                    g.phase = other;
+                    anyhow::bail!("streaming_upload_finalize_plan: not in planning phase");
+                }
+            };
+        (
+            encoder,
+            content_type,
+            g.dek.clone(),
+            g.storage_key.clone(),
+            g.key.clone(),
+            g.client.clone(),
+        )
+    };
+    // streaming_finalize_plan is synchronous; the client read guard is only for
+    // method access. No handle lock held here.
+    let (chunked_metadata, private_meta, encrypted_meta) = {
+        let guard = client.inner.read().await;
+        guard.streaming_finalize_plan(
+            encoder,
+            &dek,
+            &storage_key,
+            &key,
+            content_type.as_deref(),
+        )?
+    };
+    let num_chunks = chunked_metadata.num_chunks;
+    let chunk_size = chunked_metadata.chunk_size;
+    // Region 2: install the uploading phase.
+    {
+        let mut g = handle.inner.lock().unwrap();
+        g.phase = StreamingPhase::Uploading {
+            chunked_metadata: std::sync::Arc::new(chunked_metadata),
+            private_meta,
+            encrypted_meta,
+            chunk_cids: vec![None; num_chunks as usize],
+        };
+    }
+    Ok(StreamingPlanInfo {
+        num_chunks,
+        chunk_size,
+    })
+}
+
+/// Pass 2 — encrypt + upload one chunk (pushed from Dart) using its committed
+/// nonce. Safe to call concurrently for distinct indices (Dart bounds the
+/// concurrency) and idempotent, so safe to retry.
+pub async fn streaming_upload_chunk(
+    handle: &StreamingUploadHandle,
+    chunk_index: u32,
+    bytes: Vec<u8>,
+) -> anyhow::Result<()> {
+    let (client, bucket, storage_key, dek, chunked_metadata) = {
+        let g = handle.inner.lock().unwrap();
+        match &g.phase {
+            StreamingPhase::Uploading {
+                chunked_metadata, ..
+            } => (
+                g.client.clone(),
+                g.bucket.clone(),
+                g.storage_key.clone(),
+                g.dek.clone(),
+                chunked_metadata.clone(),
+            ),
+            _ => anyhow::bail!("streaming_upload_chunk: not in uploading phase"),
+        }
+    };
+    let (_chunk_key, cid) = {
+        let guard = client.inner.read().await;
+        guard
+            .streaming_put_chunk(
+                &bucket,
+                &storage_key,
+                &chunked_metadata,
+                chunk_index,
+                &bytes,
+                &dek,
+            )
+            .await?
+    };
+    {
+        let mut g = handle.inner.lock().unwrap();
+        if let StreamingPhase::Uploading { chunk_cids, .. } = &mut g.phase {
+            if let Some(slot) = chunk_cids.get_mut(chunk_index as usize) {
+                *slot = cid;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Finalize ("commit") — write the index object, register the file in the
+/// encrypted forest, and flush. After this the file is listable; before it the
+/// uploaded chunks are unreferenced.
+pub async fn streaming_upload_finish(
+    handle: &StreamingUploadHandle,
+) -> anyhow::Result<PutResult> {
+    #[allow(clippy::type_complexity)]
+    let (
+        client,
+        bucket,
+        key,
+        storage_key,
+        wrapped_dek,
+        encrypted_meta,
+        kek_version,
+        private_meta,
+        chunked_metadata,
+        chunk_cids,
+    ): (
+        EncryptedClientHandle,
+        String,
+        String,
+        String,
+        fula_crypto::hpke::EncryptedData,
+        fula_crypto::private_metadata::EncryptedPrivateMetadata,
+        u32,
+        fula_crypto::private_metadata::PrivateMetadata,
+        std::sync::Arc<fula_crypto::chunked::ChunkedFileMetadata>,
+        Vec<Option<cid::Cid>>,
+    ) = {
+        let mut g = handle.inner.lock().unwrap();
+        let inner = &mut *g;
+        match std::mem::replace(&mut inner.phase, StreamingPhase::Done) {
+            StreamingPhase::Uploading {
+                chunked_metadata,
+                private_meta,
+                encrypted_meta,
+                chunk_cids,
+            } => (
+                inner.client.clone(),
+                inner.bucket.clone(),
+                inner.key.clone(),
+                inner.storage_key.clone(),
+                inner.wrapped_dek.clone(),
+                encrypted_meta,
+                inner.kek_version,
+                private_meta,
+                chunked_metadata,
+                chunk_cids,
+            ),
+            other => {
+                inner.phase = other;
+                anyhow::bail!("streaming_upload_finish: not in uploading phase");
+            }
+        }
+    };
+    // Sole owner now that the phase moved out (any racing upload_chunk Arc clone
+    // is transient); clone as a fallback if one is still in flight.
+    let chunked_metadata = std::sync::Arc::try_unwrap(chunked_metadata)
+        .unwrap_or_else(|arc| (*arc).clone());
+    let result = {
+        let guard = client.inner.read().await;
+        guard
+            .streaming_finish(
+                &bucket,
+                &key,
+                &storage_key,
+                &wrapped_dek,
+                &encrypted_meta,
+                kek_version,
+                &private_meta,
+                chunked_metadata,
+                chunk_cids,
+            )
+            .await?
+    };
+    Ok(result.into())
+}
+
 /// [`put_flat_resumable_from_path_cancellable`] with live progress (native).
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn put_flat_resumable_from_path_with_progress(

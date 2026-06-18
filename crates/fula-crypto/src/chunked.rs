@@ -239,6 +239,15 @@ pub struct ChunkedEncoder {
     current_chunk: Vec<u8>,
     bytes_processed: u64,
     aad_prefix: Option<Vec<u8>>,
+    /// Plan-only mode (streaming pass 1): still generate the per-chunk nonce and
+    /// feed the plaintext to the BAO + content hashers and advance the chunk
+    /// count, but skip the AEAD encrypt and retain NO ciphertext. The committed
+    /// integrity root + nonce list stay valid for pass 2, which re-encrypts each
+    /// chunk from its stored nonce (deterministic AEAD => identical ciphertext).
+    /// Default false (normal encode). The chunking/BAO/nonce code is shared with
+    /// the encrypting path verbatim, so plan-mode and full-encode produce the
+    /// SAME root, content hash and chunk count for the same input.
+    plan_only: bool,
 }
 
 /// An encrypted chunk ready for upload
@@ -270,6 +279,7 @@ impl ChunkedEncoder {
             current_chunk: Vec::with_capacity(chunk_size),
             bytes_processed: 0,
             aad_prefix: None,
+            plan_only: false,
         }
     }
 
@@ -290,6 +300,15 @@ impl ChunkedEncoder {
             aad_prefix: Some(aad_prefix.into()),
             ..Self::with_chunk_size(dek, chunk_size)
         }
+    }
+
+    /// Switch this encoder into plan-only mode (no AEAD; see the `plan_only`
+    /// field). Chainable: `ChunkedEncoder::with_aad(dek, prefix).into_plan_only()`.
+    /// Pass 1 of the streaming/resumable upload uses this to commit the nonce
+    /// list + integrity root without holding ciphertext.
+    pub fn into_plan_only(mut self) -> Self {
+        self.plan_only = true;
+        self
     }
 
     /// Feed data into the encoder
@@ -365,18 +384,26 @@ impl ChunkedEncoder {
         // Generate a unique nonce for this chunk
         let nonce = Nonce::generate();
 
-        // Encrypt the chunk, with AAD if prefix is set
-        let aead = Aead::new_default(&self.dek);
-        let ciphertext = if let Some(ref prefix) = self.aad_prefix {
-            let aad = format!("{}:{}", String::from_utf8_lossy(prefix), chunk_index).into_bytes();
-            aead.encrypt_with_aad(&nonce, &self.current_chunk, &aad)?
+        // Encrypt the chunk (with AAD if a prefix is set) — UNLESS plan-only,
+        // where pass 1 commits the nonce + integrity root without retaining
+        // ciphertext and pass 2 re-encrypts from the stored nonce. The nonce is
+        // still generated above so the committed nonce list is complete.
+        let ciphertext = if self.plan_only {
+            Bytes::new()
         } else {
-            aead.encrypt(&nonce, &self.current_chunk)?
+            let aead = Aead::new_default(&self.dek);
+            let ct = if let Some(ref prefix) = self.aad_prefix {
+                let aad = format!("{}:{}", String::from_utf8_lossy(prefix), chunk_index).into_bytes();
+                aead.encrypt_with_aad(&nonce, &self.current_chunk, &aad)?
+            } else {
+                aead.encrypt(&nonce, &self.current_chunk)?
+            };
+            Bytes::from(ct)
         };
-        
+
         let chunk = EncryptedChunk {
             index: chunk_index,
-            ciphertext: Bytes::from(ciphertext),
+            ciphertext,
             nonce: nonce.clone(),
         };
         
@@ -880,6 +907,93 @@ mod tests {
         assert!(
             decoder.chunks.is_empty(),
             "D5: decrypt_chunk_streaming must not accumulate into self.chunks"
+        );
+    }
+
+    /// Plan-only mode (streaming pass 1) must produce the SAME integrity root,
+    /// content hash and chunk count as a full encode of the same input — they
+    /// are all plaintext-derived, so encryption can't change them. (Per-chunk
+    /// nonces are random and therefore differ between the two encoders; that is
+    /// expected and harmless.) This is what lets pass 1 commit the manifest
+    /// without ciphertext and have pass 2's re-encrypt match the committed root.
+    #[test]
+    fn test_plan_mode_matches_full_encode() {
+        let dek = DekKey::generate();
+        let cs = MIN_CHUNK_SIZE;
+        let original = b"plan vs full parity ".repeat(5000); // multi-chunk + partial tail
+        let prefix: &[u8] = b"fula:v4:chunk:teststore/key";
+
+        let mut full = ChunkedEncoder::with_aad_and_chunk_size(dek.clone(), prefix, cs);
+        full.update(&original).unwrap();
+        let full_ch = full.content_hash_hex();
+        let (_fc, full_meta, _fob) = full.finalize().unwrap();
+
+        let mut plan =
+            ChunkedEncoder::with_aad_and_chunk_size(dek.clone(), prefix, cs).into_plan_only();
+        let ready = plan.update(&original).unwrap();
+        assert!(
+            ready.iter().all(|c| c.ciphertext.is_empty()),
+            "plan-only mode must not retain ciphertext"
+        );
+        let plan_ch = plan.content_hash_hex();
+        let (final_chunk, plan_meta, _pob) = plan.finalize().unwrap();
+        assert!(
+            final_chunk.as_ref().map_or(true, |c| c.ciphertext.is_empty()),
+            "plan-only final chunk must not retain ciphertext"
+        );
+
+        assert_eq!(full_meta.root_hash, plan_meta.root_hash, "BAO root must match");
+        assert_eq!(full_ch, plan_ch, "content hash must match");
+        assert_eq!(
+            full_meta.num_chunks, plan_meta.num_chunks,
+            "chunk count must match"
+        );
+        assert!(full_meta.num_chunks > 1, "test needs a multi-chunk input");
+        assert_eq!(
+            plan_meta.chunk_nonces.len(),
+            plan_meta.num_chunks as usize,
+            "plan-only must commit one nonce per chunk"
+        );
+    }
+
+    /// Load-bearing correctness test for the whole streaming scheme: pass 1
+    /// (plan-only) commits the nonces + metadata WITHOUT ciphertext, then pass 2
+    /// re-encrypts each chunk from its STORED nonce (deterministic AEAD), and the
+    /// committed metadata decrypts the result back to the exact original. Proves
+    /// commit-then-re-encrypt round-trips — the foundation of resume safety.
+    #[test]
+    fn test_plan_mode_nonces_reencrypt_and_decrypt_roundtrip() {
+        let dek = DekKey::generate();
+        let cs = MIN_CHUNK_SIZE;
+        let original = b"pass1 commits nonces; pass2 re-encrypts then decode. ".repeat(3000);
+        let prefix: &[u8] = b"fula:v4:chunk:teststore/key";
+
+        // PASS 1 — plan-only: commit nonces + metadata, retain no ciphertext.
+        let mut planner =
+            ChunkedEncoder::with_aad_and_chunk_size(dek.clone(), prefix, cs).into_plan_only();
+        planner.update(&original).unwrap();
+        let (_final, metadata, _ob) = planner.finalize().unwrap();
+        let num_chunks = metadata.num_chunks as usize;
+        assert!(num_chunks > 1);
+
+        // PASS 2 (simulated): re-encrypt each chunk from its stored nonce + the
+        // same AAD the encoder uses, exactly as the streaming uploader will.
+        let mut decoder = ChunkedDecoder::with_aad(dek.clone(), metadata.clone(), prefix);
+        for i in 0..num_chunks {
+            let start = i * cs;
+            let end = ((i + 1) * cs).min(original.len());
+            let pt = &original[start..end];
+            let nonce = metadata.get_chunk_nonce(i as u32).unwrap();
+            let aead = Aead::new_default(&dek);
+            let aad = format!("{}:{}", String::from_utf8_lossy(prefix), i).into_bytes();
+            let ct = aead.encrypt_with_aad(&nonce, pt, &aad).unwrap();
+            decoder.decrypt_chunk(i as u32, &ct).unwrap();
+        }
+        let recovered = decoder.finalize().unwrap();
+        assert_eq!(
+            recovered.as_ref(),
+            original.as_slice(),
+            "commit-then-re-encrypt-from-stored-nonce must round-trip byte-exact"
         );
     }
 
