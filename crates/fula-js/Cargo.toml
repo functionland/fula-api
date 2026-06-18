@@ -4,7 +4,7 @@ description = "JavaScript/TypeScript SDK for Fula decentralized storage - WASM b
 # Hard-coded (not workspace-inherited) because wasm-pack <= 0.13 fails
 # to parse `*.workspace = true` keys in its own manifest scan. Keep
 # these in sync with `[workspace.package]` in the root Cargo.toml.
-version = "0.6.15"
+version = "0.6.16"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/functionland/fula-api"
