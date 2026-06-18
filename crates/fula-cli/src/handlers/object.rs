@@ -863,9 +863,21 @@ pub async fn get_object(
         response = response.header("Content-Type", ct);
     }
 
-    if let Some(ref cc) = metadata.cache_control {
-        response = response.header("Cache-Control", cc);
-    }
+    // Default GET responses to `no-cache` so a browser HTTP cache (the web app
+    // runs on `fetch`, which obeys it; native reqwest has no such cache) ALWAYS
+    // revalidates via the ETag instead of serving a heuristically-cached copy.
+    // This is what fixes the web app showing a STALE folder/bucket listing after
+    // an upload: the forest index lives at an encrypted key the gateway can't
+    // single out, but `no-cache` makes the browser re-check EVERY object —
+    //   - the index: its content (hence ETag) changes on each write, so the
+    //     conditional GET misses and returns 200 with the FRESH index;
+    //   - unchanged file content: ETag matches, so the conditional GET returns
+    //     304 (handled at the If-None-Match block above) and the browser serves
+    //     the cached body with NO re-download.
+    // Net: listings stay fresh while downloads stay cached. A stored per-object
+    // cache_control still wins (e.g. an explicit `immutable` hint set on write).
+    let cache_control = metadata.cache_control.as_deref().unwrap_or("no-cache");
+    response = response.header("Cache-Control", cache_control);
 
     if let Some(ref cd) = metadata.content_disposition {
         response = response.header("Content-Disposition", cd);
