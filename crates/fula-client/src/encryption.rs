@@ -642,7 +642,6 @@ impl BlobBackend for S3BlobBackend {
 /// Written to a local file before uploading chunks. On failure, the manifest
 /// records which chunks were successfully uploaded so the upload can resume
 /// without re-uploading completed chunks.
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct UploadManifest {
     /// Bucket name
@@ -660,7 +659,6 @@ pub struct UploadManifest {
     pub index_metadata_json: String,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ManifestChunk {
     pub index: u32,
@@ -668,9 +666,9 @@ pub struct ManifestChunk {
     pub uploaded: bool,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl UploadManifest {
-    /// Read a manifest from a file
+    /// Read a manifest from a file (native resumable upload path).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(path: &std::path::Path) -> std::result::Result<Self, ClientError> {
         let data = std::fs::read_to_string(path)
             .map_err(ClientError::Io)?;
@@ -681,7 +679,8 @@ impl UploadManifest {
         })
     }
 
-    /// Write the manifest to a file
+    /// Write the manifest to a file (native resumable upload path).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn save(&self, path: &std::path::Path) -> std::result::Result<(), ClientError> {
         let data = serde_json::to_string_pretty(self).map_err(|e| {
             ClientError::Encryption(fula_crypto::CryptoError::Decryption(
@@ -689,6 +688,27 @@ impl UploadManifest {
             ))
         })?;
         std::fs::write(path, data).map_err(ClientError::Io)
+    }
+
+    /// Serialize the manifest to bytes for caller-side persistence. On web the
+    /// caller stores these in IndexedDB (no filesystem); on native it's the
+    /// same JSON `save`/`load` writes. Available on all targets.
+    pub fn to_bytes(&self) -> std::result::Result<Vec<u8>, ClientError> {
+        serde_json::to_vec(self).map_err(|e| {
+            ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                format!("Failed to serialize manifest: {}", e),
+            ))
+        })
+    }
+
+    /// Deserialize a manifest from bytes (the web resume path passes the bytes
+    /// it persisted in IndexedDB). Available on all targets.
+    pub fn from_bytes(bytes: &[u8]) -> std::result::Result<Self, ClientError> {
+        serde_json::from_slice(bytes).map_err(|e| {
+            ClientError::Encryption(fula_crypto::CryptoError::Decryption(
+                format!("Invalid upload manifest: {}", e),
+            ))
+        })
     }
 
     /// Count how many chunks still need uploading
