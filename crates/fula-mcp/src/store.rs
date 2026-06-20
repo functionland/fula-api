@@ -418,6 +418,11 @@ fn recover_dek_and_share_inputs(
 /// # Errors
 /// - [`StoreError::Capability`] if the bundle lacks the `ai/` write grant or the
 ///   key is non-canonical (raised with NO I/O performed).
+/// - [`StoreError::RateLimited`] if this session is over its local per-AI write
+///   rate limit (raised with NO I/O, right after the scope check).
+/// - [`StoreError::QuotaExceeded`] if the pre-flight quota check reports the user
+///   is over quota (raised with no encryption/upload), OR if the gateway rejects
+///   the real PUT for being over quota (`AccountProblem`).
 /// - [`StoreError::Client`] if a storage call fails.
 /// - [`StoreError::ObjectNotFound`] if the upload's `storage_key` cannot be
 ///   resolved from the forest afterward.
