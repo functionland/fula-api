@@ -202,6 +202,11 @@ pub struct CapabilityBundle {
     mcp_keypair: KekKeyPair,
     /// The owner's X25519 public key (recipient of AI -> owner shares).
     owner_public: PublicKey,
+    /// The owner's FxFiles `userId` (the `sha256(publicKey)[..16]` value), if the
+    /// session injector supplied one. OPTIONAL: it is informational — used by P8
+    /// to stamp the `userId` field of the AI's tag-metadata document for format
+    /// fidelity. Not a secret and not load-bearing for any authority check.
+    user_id: Option<String>,
     /// The positive scoped grants this session holds.
     grants: Vec<Capability>,
 }
@@ -221,6 +226,11 @@ struct CapabilityBundleJson {
     mcp_secret_b64: String,
     /// Base64 of the 32-byte owner X25519 public key.
     owner_public_b64: String,
+    /// Optional FxFiles `userId` (`sha256(publicKey)[..16]`). Informational; used
+    /// by P8 to stamp the tag-metadata document's `userId` field. Absent in older
+    /// bundles (P3/P5/P6/P7) — those still parse.
+    #[serde(default)]
+    user_id: Option<String>,
     /// Optional client timeout (seconds). Defaults to [`DEFAULT_TIMEOUT_SECS`].
     #[serde(default)]
     timeout_secs: Option<u64>,
@@ -331,6 +341,7 @@ impl CapabilityBundle {
             workspace_secret,
             mcp_keypair,
             owner_public,
+            user_id: parsed.user_id.take().filter(|s| !s.is_empty()),
             grants: std::mem::take(&mut parsed.grants),
         };
 
@@ -377,6 +388,13 @@ impl CapabilityBundle {
     /// The owner's X25519 public key (recipient of `AI -> owner` shares).
     pub fn owner_public_key(&self) -> &PublicKey {
         &self.owner_public
+    }
+
+    /// The owner's FxFiles `userId` (`sha256(publicKey)[..16]`), if the session
+    /// injector supplied one. Informational — used by P8 to stamp the tag
+    /// document's `userId` field for format fidelity; never used for authority.
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
     }
 
     /// The positive scoped grants this session holds.
@@ -796,6 +814,7 @@ mod tests {
             workspace_secret: SecretKey::from_bytes(&ws).unwrap(),
             mcp_keypair: KekKeyPair::from_secret_key(SecretKey::from_bytes(&mcp).unwrap()),
             owner_public,
+            user_id: None,
             grants,
         }
     }
@@ -944,6 +963,29 @@ mod tests {
         // The owner public key must round-trip.
         let expected_owner_pub = SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key();
         assert_eq!(b.owner_public_key().as_bytes(), expected_owner_pub.as_bytes());
+        // The sample bundle carries no user_id → None (back-compat with older
+        // P3/P5/P6/P7 bundles).
+        assert_eq!(b.user_id(), None);
+    }
+
+    #[test]
+    fn bundle_parses_optional_user_id() {
+        // A bundle WITH a user_id surfaces it; an empty string is treated as None.
+        let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        let mcp = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
+        let owner = base64::engine::general_purpose::STANDARD
+            .encode(SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key().as_bytes());
+        let with = format!(
+            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "user_id": "deadbeef01234567" }}"#
+        );
+        assert_eq!(
+            CapabilityBundle::from_json(&with).unwrap().user_id(),
+            Some("deadbeef01234567")
+        );
+        let empty = format!(
+            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "user_id": "" }}"#
+        );
+        assert_eq!(CapabilityBundle::from_json(&empty).unwrap().user_id(), None);
     }
 
     #[test]

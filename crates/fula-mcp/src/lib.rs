@@ -56,6 +56,15 @@ pub mod read;
 /// [`list::list_files`] and [`list::search`].
 pub mod list;
 
+/// The AI's TAG operations: `tag_file` + `list_tags` (P8). Writes the AI's tags
+/// into its OWN workspace as a [`TagCloudMetadata`](tags::TagCloudMetadata)
+/// document whose JSON byte-shape is identical to FxFiles' native tag format, so
+/// FxFiles can adopt them with a straight additive-by-id merge. The document is
+/// NOT the user's master-key-encrypted `tag-metadata-v8` doc — it lives under the
+/// `ai/` scope in the workspace bucket (encrypted with the workspace secret). See
+/// [`tags::tag_file`] and [`tags::list_tags`].
+pub mod tags;
+
 /// Re-exports of the underlying crypto + client types this crate builds on.
 ///
 /// Phase 1 deliberately reuses these verbatim instead of wrapping them — the
