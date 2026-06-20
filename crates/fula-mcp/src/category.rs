@@ -14,7 +14,12 @@
 
 /// Mirror of FxFiles' `ShelfCategory` (`lib/core/models/shelf_item.dart`),
 /// same variants in the same order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes to its lowercase [`name`](Self::name) (e.g. `"image"`) via
+/// `rename_all = "snake_case"`, so an MCP tool result (P9) carries the same
+/// category token the `ai/<category>/` key segment uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Category {
     Link,
     Note,
@@ -41,6 +46,30 @@ impl Category {
             Category::File => "file",
             Category::Other => "other",
         }
+    }
+
+    /// The exact inverse of [`Self::name`]: map a lowercase category segment back
+    /// to its [`Category`], or `None` if the segment is not a known category name.
+    ///
+    /// Used by the P7 enumeration layer to recover a file's category from the
+    /// `ai/<category>/…` key segment that [`crate::store::build_workspace_key`]
+    /// wrote — a faithful round-trip of what the store path encoded, rather than
+    /// re-deriving from the (possibly absent) content-type. Matching is
+    /// case-sensitive because `name()` only ever emits lowercase and the key
+    /// segment is produced verbatim from it.
+    pub fn from_name(name: &str) -> Option<Category> {
+        Some(match name {
+            "link" => Category::Link,
+            "note" => Category::Note,
+            "screenshot" => Category::Screenshot,
+            "image" => Category::Image,
+            "video" => Category::Video,
+            "audio" => Category::Audio,
+            "document" => Category::Document,
+            "file" => Category::File,
+            "other" => Category::Other,
+            _ => return None,
+        })
     }
 }
 
@@ -278,5 +307,48 @@ mod tests {
         assert!(!is_single_url("ftp://a.b")); // wrong scheme
         assert!(!is_single_url("a https://x")); // leading token
         assert!(!is_single_url("not a url"));
+    }
+
+    #[test]
+    fn from_name_is_exact_inverse_of_name() {
+        // Every category round-trips name() -> from_name(); unknown names are None;
+        // matching is case-sensitive (name() only ever emits lowercase).
+        for cat in [
+            Category::Link,
+            Category::Note,
+            Category::Screenshot,
+            Category::Image,
+            Category::Video,
+            Category::Audio,
+            Category::Document,
+            Category::File,
+            Category::Other,
+        ] {
+            assert_eq!(Category::from_name(cat.name()), Some(cat));
+        }
+        assert_eq!(Category::from_name("inbox"), None);
+        assert_eq!(Category::from_name("Image"), None);
+        assert_eq!(Category::from_name(""), None);
+    }
+
+    #[test]
+    fn serialize_matches_name() {
+        // The serde tag (snake_case) MUST equal name() for every variant, so an
+        // MCP tool result carries the same category token the key segment uses.
+        // A future rename of a variant that desyncs the two would fail here.
+        for cat in [
+            Category::Link,
+            Category::Note,
+            Category::Screenshot,
+            Category::Image,
+            Category::Video,
+            Category::Audio,
+            Category::Document,
+            Category::File,
+            Category::Other,
+        ] {
+            let json = serde_json::to_string(&cat).unwrap();
+            assert_eq!(json, format!("\"{}\"", cat.name()), "serde tag must equal name()");
+        }
     }
 }
