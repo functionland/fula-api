@@ -379,12 +379,12 @@ impl FulaMcpServer {
             }
             Err(e) => {
                 use crate::read::ReadError;
-                let (outcome, detail) = match &e {
-                    ReadError::Capability(_) => (Outcome::AccessDenied, e.to_string()),
-                    ReadError::NotFound(_) => (Outcome::NotFound, e.to_string()),
-                    ReadError::Client(_) => (Outcome::Internal, e.to_string()),
+                let (outcome, kind) = match &e {
+                    ReadError::Capability(_) => (Outcome::AccessDenied, "capability"),
+                    ReadError::NotFound(_) => (Outcome::NotFound, "not_found"),
+                    ReadError::Client(_) => (Outcome::Internal, "client"),
                 };
-                Ok(tool_error("fula_read_file", Some(&args.key), "ai", outcome, started, &detail))
+                Ok(tool_error("fula_read_file", Some(&args.key), "ai", outcome, started, kind))
             }
         }
     }
@@ -487,6 +487,12 @@ impl FulaMcpServer {
     /// The store happy-path + tag-on-store, split out so the public tool method
     /// stays a thin parse-and-dispatch. Returns a [`CallToolResult`] (success or
     /// a mapped tool error) — never an `Err`, since by here the args are valid.
+    ///
+    /// The argument list mirrors `store_file`'s own surface (content + the five
+    /// classify/key inputs) plus the in-call `tags` and the audit `started`
+    /// instant; splitting them into a struct would just move the same fields, so
+    /// we allow the lint (as `capability::mint_owner_share` already does).
+    #[allow(clippy::too_many_arguments)]
     async fn store_impl(
         &self,
         content: Bytes,
@@ -502,12 +508,15 @@ impl FulaMcpServer {
             Ok(o) => o,
             Err(e) => {
                 use crate::store::StoreError;
-                let (oc, detail) = match &e {
-                    StoreError::Capability(_) => (Outcome::AccessDenied, e.to_string()),
-                    StoreError::ObjectNotFound(_) => (Outcome::NotFound, e.to_string()),
-                    _ => (Outcome::Internal, e.to_string()),
+                let (oc, kind) = match &e {
+                    StoreError::Capability(_) => (Outcome::AccessDenied, "capability"),
+                    StoreError::ObjectNotFound(_) => (Outcome::NotFound, "not_found"),
+                    StoreError::Client(_) => (Outcome::Internal, "client"),
+                    StoreError::DekRecovery(_) => (Outcome::Internal, "dek_recovery"),
+                    StoreError::Share(_) => (Outcome::Internal, "share"),
+                    StoreError::MetadataShape(_) => (Outcome::Internal, "metadata_shape"),
                 };
-                return tool_error("fula_store_file", Some(name), "ai", oc, started, &detail);
+                return tool_error("fula_store_file", Some(name), "ai", oc, started, kind);
             }
         };
 
@@ -528,10 +537,10 @@ impl FulaMcpServer {
                     created_tags = t.created_tags;
                     added_associations = t.added_associations;
                 }
-                Err(e) => {
-                    // Stored OK; only tagging failed. Audit it (the detail — which
-                    // may carry transport text — goes to stderr only, never to the
-                    // model), and report the store success with tags_failed set.
+                Err(_e) => {
+                    // Stored OK; only tagging failed. Audit it with a BOUNDED label
+                    // (never the error Display, to keep the "no secret in logs"
+                    // invariant), and report the store success with tags_failed set.
                     tags_failed = true;
                     audit(
                         "fula_store_file",
@@ -539,7 +548,7 @@ impl FulaMcpServer {
                         "ai",
                         Outcome::Ok,
                         started,
-                        Some(&format!("stored ok but tagging failed: {e}")),
+                        Some("stored_ok_tagging_failed"),
                     );
                 }
             }
@@ -595,27 +604,32 @@ fn json_ok<T: Serialize>(value: &T) -> CallToolResult {
 }
 
 /// Build an MCP **tool error** ([`CallToolResult`] with `is_error = true`) for a
-/// failure `outcome`, emit the audit event (with the sensitive `detail` going to
-/// stderr only), and return the model-visible result carrying ONLY the fixed
-/// generic message for that category.
+/// failure `outcome`, emit the audit event, and return the model-visible result
+/// carrying ONLY the fixed generic message for that category.
 ///
-/// This is the single funnel that guarantees no secret leaks to the model: the
-/// `detail` (which may embed transport/JWT text from a `Client` error's Display)
-/// is passed to [`audit`] for the operator's stderr log, but the
-/// [`CallToolResult`] the model receives contains only [`Outcome::client_message`].
+/// `error_kind` is a BOUNDED, static label (e.g. `"client"`, `"corrupt_document"`)
+/// chosen from the source error's *variant* — never its `Display`. This is the
+/// crux of the crate's "no secret in logs" invariant (`capability.rs`): because
+/// the audit detail is a fixed label rather than `e.to_string()`, no transport /
+/// JWT / DEK substring from a `Client`-style error's Display can EVER reach the
+/// audit stream OR the model. The model-visible text is the equally-generic
+/// [`Outcome::client_message`]. (We deliberately trade per-error log granularity
+/// for a leak-proof-by-construction audit; the `key` + `scope` + `duration_ms` +
+/// `outcome` + `error_kind` still localize a failure to the failing op + object.)
 fn tool_error(
     action: &str,
     key: Option<&str>,
     scope: &str,
     outcome: Outcome,
     started: Instant,
-    detail: &str,
+    error_kind: &'static str,
 ) -> CallToolResult {
-    audit(action, key, scope, outcome, started, Some(detail));
+    audit(action, key, scope, outcome, started, Some(error_kind));
     CallToolResult::error(vec![Content::text(outcome.client_message())])
 }
 
 /// Map a [`crate::list::ListError`] onto a tool error (list/search share it).
+/// Yields a BOUNDED `error_kind` label from the variant, never the Display.
 fn map_list_error(
     action: &str,
     key: Option<&str>,
@@ -623,18 +637,17 @@ fn map_list_error(
     started: Instant,
 ) -> CallToolResult {
     use crate::list::ListError;
-    let (outcome, detail) = match &err {
-        ListError::Capability(_) => (Outcome::AccessDenied, err.to_string()),
-        ListError::Client(_) => (Outcome::Internal, err.to_string()),
+    let (outcome, kind) = match &err {
+        ListError::Capability(_) => (Outcome::AccessDenied, "capability"),
+        ListError::Client(_) => (Outcome::Internal, "client"),
     };
-    tool_error(action, key, "ai", outcome, started, &detail)
+    tool_error(action, key, "ai", outcome, started, kind)
 }
 
 /// Map a [`crate::tags::TagError`] onto a tool error (tag_file / list_tags share
-/// it). `NoTags` is a caller mistake → access-denied-adjacent? No: it is a
-/// malformed-request-shaped *misuse*, but since it is reached only after arg
-/// parse (an empty `tags` array deserializes fine), we surface it as an internal
-/// tool error with a clear message rather than a protocol error.
+/// it). Yields a BOUNDED `error_kind` label from the variant, never the Display.
+/// `NoTags` is reached only after arg parse (an empty `tags` array deserializes
+/// fine), so it is surfaced as an internal tool error rather than a protocol one.
 fn map_tag_error(
     action: &str,
     key: Option<&str>,
@@ -642,13 +655,16 @@ fn map_tag_error(
     started: Instant,
 ) -> CallToolResult {
     use crate::tags::TagError;
-    let (outcome, detail) = match &err {
-        TagError::Capability(_) => (Outcome::AccessDenied, err.to_string()),
+    let (outcome, kind) = match &err {
+        TagError::Capability(_) => (Outcome::AccessDenied, "capability"),
         // CorruptDocument / Client / Serialize / NoTags are all "internal" from the
         // model's perspective (it cannot fix them by retrying with a different key).
-        _ => (Outcome::Internal, err.to_string()),
+        TagError::CorruptDocument { .. } => (Outcome::Internal, "corrupt_document"),
+        TagError::Client(_) => (Outcome::Internal, "client"),
+        TagError::Serialize(_) => (Outcome::Internal, "serialize"),
+        TagError::NoTags => (Outcome::Internal, "no_tags"),
     };
-    tool_error(action, key, "ai", outcome, started, &detail)
+    tool_error(action, key, "ai", outcome, started, kind)
 }
 
 /// Parse an optional `category_override` / `category` string into a [`Category`].
@@ -663,13 +679,19 @@ fn parse_category_override(s: Option<&str>) -> Result<Option<Category>, ()> {
 
 /// Emit ONE structured audit event for a tool call.
 ///
-/// Logs `action`, `key`, `scope`, `outcome`, `duration_ms`, and — on failure —
-/// a `detail` (the underlying error's Display, which is allowed HERE because this
-/// goes to the operator's own stderr, NOT to the model). It NEVER logs the file
-/// content, the workspace/MCP secret, the JWT, or any DEK / share token: none of
-/// those are passed in. `key` is the logical object key (e.g.
-/// `ai/image/<uuid>-photo.png`) — a workspace path the operator already controls,
-/// not a secret.
+/// Logs `action`, `key`, `scope`, `outcome`, `duration_ms`, and an optional
+/// `detail`. **`detail` is always a BOUNDED static label** (an error-kind such as
+/// `"client"` / `"corrupt_document"`, or the `"stored_ok_tagging_failed"`
+/// marker) — NEVER an error `Display`. This is what upholds the crate's "no secret
+/// in logs" invariant (`capability.rs`) *by construction*: there is no code path
+/// by which a transport / JWT / DEK substring can enter the audit stream, because
+/// the only strings passed in are compile-time constants. It also NEVER logs the
+/// file content, the workspace/MCP secret, the JWT, or any DEK / share token —
+/// none of those are passed in. `key` is the logical object key (e.g.
+/// `ai/image/<uuid>-photo.png`) — a workspace path the local operator (who is the
+/// data owner in this local-stdio model) already controls, not a secret. (A
+/// future *hosted/multi-tenant* deployment, where operator ≠ owner, should hash
+/// the key with an injected audit secret; noted as a follow-up.)
 ///
 /// The durable, user-side audit document is a deliberate follow-up (a P-future
 /// "workspace audit doc"): this tracing-to-stderr seam is where that writer would
@@ -681,7 +703,7 @@ fn audit(
     scope: &str,
     outcome: Outcome,
     started: Instant,
-    detail: Option<&str>,
+    detail: Option<&'static str>,
 ) {
     let duration_ms = started.elapsed().as_millis() as u64;
     match outcome {
@@ -691,6 +713,9 @@ fn audit(
             scope,
             outcome = outcome.label(),
             duration_ms,
+            // Present only for the partial "stored ok but tagging failed" case;
+            // a bounded label, never an error Display.
+            detail = detail.unwrap_or(""),
             "fula-mcp tool call"
         ),
         _ => tracing::warn!(
@@ -699,7 +724,8 @@ fn audit(
             scope,
             outcome = outcome.label(),
             duration_ms,
-            // The detail is operator-only (stderr); it never reaches the model.
+            // A bounded error-kind label; operator-only (stderr) and never the
+            // model, but it is leak-proof regardless since it is a constant.
             detail = detail.unwrap_or(""),
             "fula-mcp tool call failed"
         ),
@@ -953,6 +979,89 @@ mod tests {
             // No format placeholders, no obviously-sensitive markers.
             assert!(!m.contains('{') && !m.contains("jwt") && !m.contains("secret"));
         }
+    }
+
+    // ── the AUDIT stream is also leak-proof (not just the model-visible text) ──
+    //
+    // The crate invariant is "no secret in logs". Because `audit`'s `detail` is
+    // typed `Option<&'static str>` and every call site passes a compile-time
+    // constant, a runtime secret cannot enter the audit stream BY CONSTRUCTION.
+    // This test makes that concrete: it captures the actual `tracing` events a
+    // failing tool call emits and asserts the rendered output contains NONE of
+    // the planted secret material AND that the `detail` is a known bounded label.
+
+    use std::sync::{Arc, Mutex};
+
+    /// A minimal `tracing` layer that records every event's rendered fields into a
+    /// shared string buffer, so a test can inspect exactly what would be logged.
+    #[derive(Clone, Default)]
+    struct CaptureLayer {
+        buf: Arc<Mutex<String>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visitor<'a>(&'a mut String);
+            impl tracing::field::Visit for Visitor<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={:?}", field.name(), value);
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={}", field.name(), value);
+                }
+            }
+            let mut guard = self.buf.lock().unwrap();
+            event.record(&mut Visitor(&mut guard));
+            guard.push('\n');
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_stream_never_contains_a_secret_and_uses_bounded_detail() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = CaptureLayer::default();
+        let buf = capture.buf.clone();
+
+        // Install the capturing subscriber for the duration of this test only.
+        let subscriber = tracing_subscriber::registry().with(capture);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Drive a failing path that goes through `tool_error` → `audit`.
+        let srv = server_rw();
+        let _ = srv
+            .fula_read_file(Parameters(ReadFileArgs { key: "photos/x.jpg".to_string() }))
+            .await
+            .unwrap();
+
+        let logged = buf.lock().unwrap().clone();
+        // The audit event must have been emitted.
+        assert!(logged.contains("fula-mcp tool call failed"), "no audit event captured: {logged:?}");
+        // It must carry a BOUNDED detail label — here, the capability denial kind.
+        assert!(logged.contains("detail=capability"), "expected bounded detail label: {logged:?}");
+        // And it must NOT contain any planted secret from the bundle.
+        let jwt = "super-secret-jwt-DO-NOT-LEAK";
+        let ws_b64 = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        let mcp_b64 = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
+        assert!(!logged.contains(jwt), "AUDIT LEAKED THE JWT: {logged}");
+        assert!(!logged.contains(&ws_b64), "audit leaked the workspace secret: {logged}");
+        assert!(!logged.contains(&mcp_b64), "audit leaked the MCP secret: {logged}");
+        // The key IS logged (allowed by spec / local-operator model); confirm it
+        // is the requested logical key, not a secret.
+        assert!(logged.contains("key=photos/x.jpg"), "audit should log the requested key: {logged}");
     }
 
     // ── server Debug is redacting ─────────────────────────────────────────────

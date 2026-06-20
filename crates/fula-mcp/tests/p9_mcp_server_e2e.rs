@@ -197,11 +197,22 @@ async fn e2e_tool_layer_store_then_read_round_trips() {
         if stored.tags_failed {
             return Err("tags_failed was set on the store result (tagging should have succeeded)".to_string());
         }
-        // Both tags are brand new in a fresh bucket → 2 created, 2 associations.
-        if stored.created_tags.len() != 2 || stored.added_associations != 2 {
+        // This run wrote a UNIQUE file key, so its (tag, file) associations are
+        // always new → 2 added regardless of whether a prior run left the tag
+        // NAMES behind. We assert on `added_associations` (rerun-safe) and only
+        // bound `created_tags` (0 on a rerun where the tag doc persisted, 2 on a
+        // truly fresh bucket — the e2e leaves the bucket behind by design, so a
+        // second run legitimately creates 0 new tag names).
+        if stored.added_associations != 2 {
             return Err(format!(
-                "unexpected tag bookkeeping: created={:?} added={}",
-                stored.created_tags, stored.added_associations
+                "expected 2 new (tag,file) associations for the unique file, got {} (created={:?})",
+                stored.added_associations, stored.created_tags
+            ));
+        }
+        if stored.created_tags.len() > 2 {
+            return Err(format!(
+                "created_tags should be at most the 2 requested, got {:?}",
+                stored.created_tags
             ));
         }
 
