@@ -111,6 +111,14 @@ enum Outcome {
     AccessDenied,
     /// The target object did not exist. Maps to the MCP "not found" tool error.
     NotFound,
+    /// The user is over their storage quota / out of credits (P10). Maps to the
+    /// MCP "quota exceeded" tool error — an ACTIONABLE signal (add credits),
+    /// distinct from a generic internal failure the model cannot fix.
+    QuotaExceeded,
+    /// A write was rate-limited (P10) — the session's local write bucket or the
+    /// gateway's per-user limiter. Maps to the MCP "rate limited" tool error — an
+    /// ACTIONABLE signal (slow down and retry).
+    RateLimited,
     /// Any other failure (client / network / crypto / serialize / shape). Maps to
     /// the MCP "internal error" tool error.
     Internal,
@@ -123,6 +131,8 @@ impl Outcome {
             Outcome::Ok => "ok",
             Outcome::AccessDenied => "access_denied",
             Outcome::NotFound => "not_found",
+            Outcome::QuotaExceeded => "quota_exceeded",
+            Outcome::RateLimited => "rate_limited",
             Outcome::Internal => "internal_error",
         }
     }
@@ -138,6 +148,15 @@ impl Outcome {
                 "access denied: the requested key is outside this session's granted scope"
             }
             Outcome::NotFound => "not found: no such object in the AI workspace",
+            // ACTIONABLE, generic, secret-free (like the others): tells the model
+            // exactly what to do without leaking balances or any transport detail.
+            Outcome::QuotaExceeded => {
+                "quota exceeded: the user is over their storage quota or out of credits; \
+                 add FULA credits and retry"
+            }
+            Outcome::RateLimited => {
+                "rate limited: too many writes in a short period; slow down and retry shortly"
+            }
             Outcome::Internal => "internal error: the storage operation could not be completed",
         }
     }
@@ -511,6 +530,8 @@ impl FulaMcpServer {
                 let (oc, kind) = match &e {
                     StoreError::Capability(_) => (Outcome::AccessDenied, "capability"),
                     StoreError::ObjectNotFound(_) => (Outcome::NotFound, "not_found"),
+                    StoreError::QuotaExceeded => (Outcome::QuotaExceeded, "quota_exceeded"),
+                    StoreError::RateLimited => (Outcome::RateLimited, "rate_limited"),
                     StoreError::Client(_) => (Outcome::Internal, "client"),
                     StoreError::DekRecovery(_) => (Outcome::Internal, "dek_recovery"),
                     StoreError::Share(_) => (Outcome::Internal, "share"),
@@ -928,6 +949,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_file_rate_limited_maps_to_rate_limited_tool_error() {
+        // P10: drain the session's write bucket, then a store must surface the
+        // MCP "rate limited" tool error (is_error) with the fixed actionable
+        // message — and do so WITHOUT any network call (the gate is pre-I/O; the
+        // endpoint is unreachable, so a network fall-through would say "internal"
+        // instead). This exercises the full server → store_file → Outcome mapping.
+        let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        let mcp = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
+        let owner = base64::engine::general_purpose::STANDARD
+            .encode(SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key().as_bytes());
+        let json = format!(
+            r#"{{ "endpoint": "https://offline.invalid", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "write_burst": 1, "write_refill_per_sec": 0.0001, "grants": [{{ "scope": "ai/", "permissions": {{ "can_read": true, "can_write": true, "can_delete": false }} }}] }}"#
+        );
+        let cap = CapabilityBundle::from_json(&json).unwrap();
+        assert!(cap.try_consume_write_token(), "drain the single token");
+        let srv = FulaMcpServer::new(cap);
+        let args = StoreFileArgs {
+            content: base64::engine::general_purpose::STANDARD.encode(b"hello"),
+            name: "x.txt".to_string(),
+            mime: Some("text/plain".to_string()),
+            text: None,
+            category_override: None,
+            tags: None,
+        };
+        let res = srv.fula_store_file(Parameters(args)).await.unwrap();
+        assert_eq!(res.is_error, Some(true), "must be a tool error");
+        let txt = text_of(&res);
+        assert!(txt.contains("rate limited"), "got: {txt}");
+    }
+
+    #[tokio::test]
     async fn list_tags_no_read_grant_maps_to_access_denied() {
         // A bundle whose only grant is on a DIFFERENT scope → list_tags (needs ai/
         // read) denies pre-I/O.
@@ -973,7 +1025,13 @@ mod tests {
         // The fixed per-category messages must be static, generic strings — they
         // are the ONLY text the model sees on failure, so they must never be a
         // template that could interpolate a secret.
-        for oc in [Outcome::AccessDenied, Outcome::NotFound, Outcome::Internal] {
+        for oc in [
+            Outcome::AccessDenied,
+            Outcome::NotFound,
+            Outcome::QuotaExceeded,
+            Outcome::RateLimited,
+            Outcome::Internal,
+        ] {
             let m = oc.client_message();
             assert!(!m.is_empty());
             // No format placeholders, no obviously-sensitive markers.

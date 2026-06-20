@@ -79,6 +79,11 @@ use serde::Deserialize;
 use thiserror::Error;
 use zeroize::Zeroize;
 
+use crate::quota::{
+    check_quota, QuotaDecision, TokenBucket, DEFAULT_WRITE_BURST, DEFAULT_WRITE_REFILL_PER_SEC,
+    ENV_WRITE_BURST, ENV_WRITE_REFILL_PER_SEC,
+};
+
 /// The default S3 client request timeout when the bundle does not specify one.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
@@ -88,6 +93,50 @@ pub const ENV_CAPABILITY: &str = "FULA_MCP_CAPABILITY";
 /// Environment variable that, if set, overrides the bundle's `jwt` field. Lets an
 /// operator inject the short-lived token out-of-band from the rest of the bundle.
 pub const ENV_JWT_OVERRIDE: &str = "FULA_MCP_JWT";
+
+/// Environment variable that, if set, overrides the bundle's `storage_api_url`
+/// (the credit/quota host the P10 pre-check calls). Mirrors [`ENV_JWT_OVERRIDE`]
+/// so an operator can inject the credit host out-of-band.
+pub const ENV_STORAGE_API_URL: &str = "FULA_MCP_STORAGE_API_URL";
+
+/// Validate the operator-supplied `storage_api_url` for the quota pre-check.
+///
+/// The pre-check sends the session's bearer JWT to THIS host, which is distinct
+/// from the S3 `endpoint` (e.g. `https://cloud.fx.land` vs `https://s3.cloud.fx.land`).
+/// To avoid leaking a bearer token to an unintended origin we require the URL to
+/// be `https://` — with the sole exception of an explicit `http://localhost` /
+/// `http://127.0.0.1` for local/dev deployments (the gateway's own install
+/// defaults the credit host to `http://127.0.0.1:3001`). Any other scheme (or an
+/// `http://` non-loopback host) is rejected at parse time.
+///
+/// NOTE on threat model: the bundle is OPERATOR-injected, and in the local-stdio
+/// model the operator IS the data owner, so a mis-set URL only ever leaks the
+/// operator's own JWT to a host the operator chose. Same-origin/allowlist
+/// enforcement against the gateway endpoint is a deliberate follow-up for a
+/// hosted/multi-tenant deployment (operator ≠ owner) — the same way this crate
+/// already defers multi-tenant audit-key hashing (`server.rs`). This cheap
+/// HTTPS-or-loopback guard is the proportionate check for the current model.
+///
+/// # Errors
+/// [`CapabilityError::InvalidStorageApiUrl`] if the URL is not HTTPS and not an
+/// explicit loopback `http://` URL.
+fn validate_storage_api_url(url: &str) -> Result<(), CapabilityError> {
+    let lower = url.trim().to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(());
+    }
+    // Allow plaintext HTTP ONLY for loopback (local/dev credit service).
+    if lower.starts_with("http://localhost")
+        || lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://[::1]")
+    {
+        return Ok(());
+    }
+    Err(CapabilityError::InvalidStorageApiUrl {
+        reason: "must be https:// (or http:// only for localhost/127.0.0.1) to avoid \
+                 sending the session JWT to an unintended origin",
+    })
+}
 
 /// The access a caller needs for a given key. Maps onto [`SharePermissions`].
 ///
@@ -160,6 +209,15 @@ pub enum CapabilityError {
     /// Minting or accepting a share token failed.
     #[error("share operation failed: {0}")]
     Share(String),
+
+    /// The optional `storage_api_url` (the P10 quota host the bundle's JWT is
+    /// sent to) failed validation — it must be HTTPS (or an explicit loopback
+    /// `http://`) so a bearer token is never leaked to an unintended origin.
+    #[error("invalid storage_api_url: {reason}")]
+    InvalidStorageApiUrl {
+        /// Why the URL was rejected.
+        reason: &'static str,
+    },
 }
 
 /// One positive, scoped authority the session holds.
@@ -207,8 +265,19 @@ pub struct CapabilityBundle {
     /// to stamp the `userId` field of the AI's tag-metadata document for format
     /// fidelity. Not a secret and not load-bearing for any authority check.
     user_id: Option<String>,
+    /// The credit/quota host the P10 pre-check calls
+    /// (`GET {storage_api_url}/api/v1/storage`), if configured. `None` → the
+    /// quota pre-check is OFF (fail-open `NotConfigured`), exactly like the
+    /// gateway's `storage_api_url = None` behavior. Validated HTTPS-or-loopback at
+    /// parse time (see [`validate_storage_api_url`]).
+    storage_api_url: Option<String>,
     /// The positive scoped grants this session holds.
     grants: Vec<Capability>,
+    /// Per-session WRITE rate limiter (P10). A token bucket constructed ONCE here
+    /// (so it actually limits across calls) and shared by every write op via
+    /// [`Self::try_consume_write_token`]. Interior mutability lives inside the
+    /// bucket (a `Mutex`), so the bundle itself stays shareable behind an `Arc`.
+    write_bucket: TokenBucket,
 }
 
 /// On-the-wire JSON shape of the bundle. Deserialized, consumed, and dropped at
@@ -234,6 +303,20 @@ struct CapabilityBundleJson {
     /// Optional client timeout (seconds). Defaults to [`DEFAULT_TIMEOUT_SECS`].
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// Optional credit/quota host for the P10 pre-check
+    /// (`GET {storage_api_url}/api/v1/storage`). Absent → quota checking OFF
+    /// (fail-open). Validated HTTPS-or-loopback. Older bundles omit it (still
+    /// parse).
+    #[serde(default)]
+    storage_api_url: Option<String>,
+    /// Optional override for the P10 write-rate-limit burst (token-bucket
+    /// capacity). Defaults to [`DEFAULT_WRITE_BURST`].
+    #[serde(default)]
+    write_burst: Option<u32>,
+    /// Optional override for the P10 write-rate-limit refill (tokens/sec).
+    /// Defaults to [`DEFAULT_WRITE_REFILL_PER_SEC`].
+    #[serde(default)]
+    write_refill_per_sec: Option<f64>,
     /// The positive scoped grants.
     #[serde(default)]
     grants: Vec<Capability>,
@@ -334,6 +417,27 @@ impl CapabilityBundle {
         let timeout =
             Duration::from_secs(parsed.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).max(1));
 
+        // Validate the optional credit/quota host (the JWT is sent here in the
+        // P10 pre-check). Reject a non-HTTPS, non-loopback URL at parse time so a
+        // bearer token can never be leaked to an unintended origin. An empty
+        // string is treated as "not configured" (quota check off).
+        let storage_api_url = match parsed.storage_api_url.take().filter(|s| !s.is_empty()) {
+            Some(u) => {
+                validate_storage_api_url(&u)?;
+                Some(u)
+            }
+            None => None,
+        };
+
+        // Build the per-session WRITE rate limiter ONCE (so it limits across
+        // calls). Defaults are generous; the bundle may override both knobs.
+        let write_bucket = TokenBucket::new(
+            parsed.write_burst.unwrap_or(DEFAULT_WRITE_BURST),
+            parsed
+                .write_refill_per_sec
+                .unwrap_or(DEFAULT_WRITE_REFILL_PER_SEC),
+        );
+
         let bundle = CapabilityBundle {
             endpoint: std::mem::take(&mut parsed.endpoint),
             jwt: std::mem::take(&mut parsed.jwt),
@@ -342,7 +446,9 @@ impl CapabilityBundle {
             mcp_keypair,
             owner_public,
             user_id: parsed.user_id.take().filter(|s| !s.is_empty()),
+            storage_api_url,
             grants: std::mem::take(&mut parsed.grants),
+            write_bucket,
         };
 
         // Best-effort wipe of the base64 secret strings in the parsed struct
@@ -355,13 +461,19 @@ impl CapabilityBundle {
 
     /// Construct a bundle from environment variables.
     ///
-    /// Reads the JSON blob from [`ENV_CAPABILITY`]. If [`ENV_JWT_OVERRIDE`] is
-    /// set and non-empty, it replaces the bundle's `jwt` (so the short-lived
-    /// token can be injected separately from the rest of the bundle).
+    /// Reads the JSON blob from [`ENV_CAPABILITY`]. Then applies out-of-band
+    /// overrides, each only when set and non-empty:
+    /// - [`ENV_JWT_OVERRIDE`] replaces `jwt` (so the short-lived token can be
+    ///   injected separately from the rest of the bundle).
+    /// - [`ENV_STORAGE_API_URL`] replaces the credit/quota host (validated
+    ///   HTTPS-or-loopback, like the in-bundle field).
+    /// - [`ENV_WRITE_BURST`] / [`ENV_WRITE_REFILL_PER_SEC`] override the P10
+    ///   write rate-limit (the bucket is rebuilt with the new knobs).
     ///
     /// # Errors
     /// [`CapabilityError::MissingEnv`] if [`ENV_CAPABILITY`] is unset, plus any
-    /// parse error from [`CapabilityBundle::from_json`].
+    /// parse error from [`CapabilityBundle::from_json`] (including
+    /// [`CapabilityError::InvalidStorageApiUrl`] for a bad env URL).
     pub fn from_env() -> Result<Self, CapabilityError> {
         let json =
             std::env::var(ENV_CAPABILITY).map_err(|_| CapabilityError::MissingEnv(ENV_CAPABILITY))?;
@@ -370,6 +482,24 @@ impl CapabilityBundle {
             if !jwt.is_empty() {
                 bundle.jwt = jwt;
             }
+        }
+        if let Ok(url) = std::env::var(ENV_STORAGE_API_URL) {
+            if !url.is_empty() {
+                validate_storage_api_url(&url)?;
+                bundle.storage_api_url = Some(url);
+            }
+        }
+        // Rate-limit env overrides: rebuild the bucket only if either is set, so
+        // the common case keeps the bucket built in `from_parsed` untouched.
+        let env_burst = std::env::var(ENV_WRITE_BURST).ok().and_then(|s| s.parse::<u32>().ok());
+        let env_refill = std::env::var(ENV_WRITE_REFILL_PER_SEC)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok());
+        if env_burst.is_some() || env_refill.is_some() {
+            bundle.write_bucket = TokenBucket::new(
+                env_burst.unwrap_or_else(|| bundle.write_bucket.capacity()),
+                env_refill.unwrap_or(DEFAULT_WRITE_REFILL_PER_SEC),
+            );
         }
         Ok(bundle)
     }
@@ -400,6 +530,36 @@ impl CapabilityBundle {
     /// The positive scoped grants this session holds.
     pub fn grants(&self) -> &[Capability] {
         &self.grants
+    }
+
+    /// The configured credit/quota host for the P10 pre-check, if any. `None`
+    /// means quota checking is OFF for this session (the pre-check fails open).
+    pub fn storage_api_url(&self) -> Option<&str> {
+        self.storage_api_url.as_deref()
+    }
+
+    /// Run the P10 fail-fast quota pre-check for this session, reusing the
+    /// session's scoped JWT against the configured credit host. Returns a 3-state
+    /// [`QuotaDecision`]; only [`QuotaDecision::Denied`] should block a write —
+    /// every other outcome (including every fail-open case) proceeds, because the
+    /// gateway re-enforces quota on the real PUT. If no `storage_api_url` is
+    /// configured this is a no-network `SkippedFailOpen(NotConfigured)`.
+    ///
+    /// The JWT / URL are read from the bundle's private fields here so callers
+    /// never need to handle the token themselves.
+    pub async fn check_quota(&self) -> QuotaDecision {
+        check_quota(self.storage_api_url.as_deref(), Some(self.jwt.as_str())).await
+    }
+
+    /// Try to take one WRITE token from the per-session rate limiter. Returns
+    /// `true` if the write may proceed, `false` if the session is over its local
+    /// write-rate limit (→ the caller should surface a `RateLimited` error).
+    ///
+    /// Fully synchronous (the bucket's `Mutex` critical section is tiny and never
+    /// held across an `.await`); call it AFTER the scope/authority check so an
+    /// unauthorized attempt cannot drain the budget.
+    pub fn try_consume_write_token(&self) -> bool {
+        self.write_bucket.try_consume()
     }
 
     /// Build the AI-workspace [`EncryptedClient`] from the workspace secret +
@@ -815,7 +975,11 @@ mod tests {
             mcp_keypair: KekKeyPair::from_secret_key(SecretKey::from_bytes(&mcp).unwrap()),
             owner_public,
             user_id: None,
+            storage_api_url: None,
             grants,
+            // A generous default bucket; the capability tests here never exercise
+            // the rate limiter (that lives in `quota.rs` + `store.rs` tests).
+            write_bucket: TokenBucket::new(DEFAULT_WRITE_BURST, DEFAULT_WRITE_REFILL_PER_SEC),
         }
     }
 
@@ -986,6 +1150,95 @@ mod tests {
             r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "user_id": "" }}"#
         );
         assert_eq!(CapabilityBundle::from_json(&empty).unwrap().user_id(), None);
+    }
+
+    #[test]
+    fn bundle_parses_and_validates_storage_api_url() {
+        // P10: an HTTPS storage_api_url is accepted and surfaced; absent → None.
+        let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        let mcp = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
+        let owner = base64::engine::general_purpose::STANDARD
+            .encode(SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key().as_bytes());
+        let with = format!(
+            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "storage_api_url": "https://cloud.fx.land" }}"#
+        );
+        let b = CapabilityBundle::from_json(&with).unwrap();
+        assert_eq!(b.storage_api_url(), Some("https://cloud.fx.land"));
+
+        // Loopback http:// is allowed (local/dev credit service).
+        let local = format!(
+            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "storage_api_url": "http://127.0.0.1:3001" }}"#
+        );
+        assert_eq!(
+            CapabilityBundle::from_json(&local).unwrap().storage_api_url(),
+            Some("http://127.0.0.1:3001")
+        );
+
+        // A plaintext http:// to a non-loopback host is REJECTED (would leak the
+        // bearer JWT to an unintended origin in cleartext).
+        let insecure = format!(
+            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "storage_api_url": "http://cloud.fx.land" }}"#
+        );
+        assert!(matches!(
+            CapabilityBundle::from_json(&insecure).unwrap_err(),
+            CapabilityError::InvalidStorageApiUrl { .. }
+        ));
+
+        // A non-http scheme is rejected too.
+        let ftp = format!(
+            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "storage_api_url": "ftp://evil.example" }}"#
+        );
+        assert!(matches!(
+            CapabilityBundle::from_json(&ftp).unwrap_err(),
+            CapabilityError::InvalidStorageApiUrl { .. }
+        ));
+
+        // No field → quota checking off (None).
+        let without = format!(
+            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}" }}"#
+        );
+        assert_eq!(
+            CapabilityBundle::from_json(&without).unwrap().storage_api_url(),
+            None
+        );
+    }
+
+    #[test]
+    fn validate_storage_api_url_accepts_https_and_loopback_rejects_others() {
+        assert!(validate_storage_api_url("https://cloud.fx.land").is_ok());
+        assert!(validate_storage_api_url("HTTPS://Cloud.FX.Land").is_ok()); // case-insensitive
+        assert!(validate_storage_api_url("http://localhost:3001").is_ok());
+        assert!(validate_storage_api_url("http://127.0.0.1").is_ok());
+        assert!(validate_storage_api_url("http://[::1]:3001").is_ok());
+        assert!(validate_storage_api_url("http://example.com").is_err());
+        assert!(validate_storage_api_url("ftp://x").is_err());
+        assert!(validate_storage_api_url("not a url").is_err());
+    }
+
+    #[test]
+    fn write_token_bucket_limits_per_session() {
+        // P10: a bundle with burst=2 admits exactly two write tokens, then denies.
+        // (The bundle owns ONE bucket, so this proves per-session limiting.)
+        let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        let mcp = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
+        let owner = base64::engine::general_purpose::STANDARD
+            .encode(SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key().as_bytes());
+        let json = format!(
+            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "write_burst": 2, "write_refill_per_sec": 0.0001 }}"#
+        );
+        let b = CapabilityBundle::from_json(&json).unwrap();
+        assert!(b.try_consume_write_token(), "1st write token");
+        assert!(b.try_consume_write_token(), "2nd write token");
+        assert!(!b.try_consume_write_token(), "3rd write over burst → denied");
+    }
+
+    #[tokio::test]
+    async fn check_quota_unconfigured_is_failopen_no_network() {
+        // A bundle with no storage_api_url → the pre-check is a no-network
+        // fail-open (NotConfigured), so it NEVER blocks a write on its own.
+        let b = bundle_with_grants(vec![]);
+        let decision = b.check_quota().await;
+        assert!(decision.allows(), "unconfigured quota check must fail open");
     }
 
     #[test]

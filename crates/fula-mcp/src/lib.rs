@@ -65,6 +65,14 @@ pub mod list;
 /// [`tags::tag_file`] and [`tags::list_tags`].
 pub mod tags;
 
+/// Fail-fast credit/quota pre-check + a per-session WRITE rate limiter (P10).
+/// The quota check calls the SAME credit endpoint the gateway uses and FAILS
+/// OPEN on any error (the gateway re-enforces quota on the real PUT, so a check
+/// outage degrades to "the PUT may fail later," not "all writes blocked"); the
+/// token-bucket limiter throttles a runaway AI's writes per session. Both run
+/// after the scope check, before the heavy encrypt+upload. See [`quota`].
+pub mod quota;
+
 /// The stdio MCP server that exposes the six P5–P8 ops as Model Context Protocol
 /// tools (P9). Loads the [`capability::CapabilityBundle`] from the environment
 /// once at startup (in memory only) and runs over stdio via the `rmcp` SDK. See
