@@ -163,6 +163,10 @@ async fn e2e_tag_file_overwrite_and_adoption_read() {
 
     let client = cap.workspace_client().expect("workspace client");
     let _ = client.create_bucket(WORKSPACE_BUCKET).await; // best-effort; may already exist
+    // The tag doc is a FIXED key (not uuid-keyed like P5/6/7), so an aborted prior
+    // run could leave a polluted document that fails this run's count assertions.
+    // Defensively delete it at START so the run is idempotent across invocations.
+    let _ = client.delete_object_flat(WORKSPACE_BUCKET, TAG_METADATA_KEY).await;
 
     // Confirm the published location helper agrees with the constant.
     assert_eq!(tag_metadata_location(), (WORKSPACE_BUCKET, TAG_METADATA_KEY));
@@ -311,7 +315,9 @@ async fn e2e_tag_file_overwrite_and_adoption_read() {
     run.unwrap_or_else(|e| panic!("P8 tags e2e failed: {e}"));
     eprintln!(
         "P8 tags e2e OK: AI tagged two files (overwrite path), list_tags returned the union, and a \
-         second same-secret client adopted the TagCloudMetadata doc — both files' associations \
-         present, shared tag fileCount=2, Dart camelCase shape + explicit nulls verified."
+         second same-secret client read+serde-parsed the TagCloudMetadata doc — both files' \
+         associations present, shared tag fileCount=2, camelCase keys + explicit nulls present in \
+         the raw JSON. (This is an SDK same-secret round-trip + golden-by-inspection against the \
+         Dart toJson; the Dart fromJson itself is not executed — no Flutter harness in this repo.)"
     );
 }
