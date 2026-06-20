@@ -21,12 +21,18 @@ thiserror = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 
+# Capability-bundle (de)serialization + key material handling (P3).
+#  - serde/serde_json: parse the injected capability-bundle JSON.
+#  - base64: decode the 32-byte secret/key fields carried in the bundle.
+#  - zeroize: wipe intermediate decoded secret bytes after constructing the keys.
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+zeroize = "1.8"
+
 [dev-dependencies]
 # Test-only helpers: RNG for random payloads, uuid for isolated e2e keys,
-# hex for derived-key debug output, serde_json for ShareToken/envelope
-# transmit round-trips (P2 shared-scope-write proof).
+# hex for derived-key debug output. (serde_json/base64 are now in [dependencies].)
 rand = { workspace = true }
 uuid = { workspace = true }
 hex = { workspace = true }
-serde_json = { workspace = true }
-base64 = { workspace = true }

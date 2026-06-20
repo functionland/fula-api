@@ -32,6 +32,8 @@
 
 use thiserror::Error;
 
+pub mod capability;
+
 /// Re-exports of the underlying crypto + client types this crate builds on.
 ///
 /// Phase 1 deliberately reuses these verbatim instead of wrapping them — the
