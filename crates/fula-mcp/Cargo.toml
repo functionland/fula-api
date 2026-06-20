@@ -23,7 +23,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 # Test-only helpers: RNG for random payloads, uuid for isolated e2e keys,
-# hex for derived-key debug output.
+# hex for derived-key debug output, serde_json for ShareToken/envelope
+# transmit round-trips (P2 shared-scope-write proof).
 rand = { workspace = true }
 uuid = { workspace = true }
 hex = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
