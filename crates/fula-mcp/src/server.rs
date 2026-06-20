@@ -1036,9 +1036,17 @@ mod tests {
         let capture = CaptureLayer::default();
         let buf = capture.buf.clone();
 
-        // Install the capturing subscriber for the duration of this test only.
+        // Install the capture as the PROCESS-GLOBAL subscriber (once). A
+        // thread-local `set_default` races other parallel tests: their guard
+        // drops transiently reset the process-wide `tracing` max-level, which can
+        // filter out our `warn!` audit event before this layer ever sees it
+        // (the test then passes ONLY under `--test-threads=1`). No other test in
+        // this binary installs a global subscriber, so a single global install is
+        // safe and keeps the level permissive across all threads. The capture
+        // buffer is this test's own Arc<Mutex>; the assertions key on this test's
+        // planted strings, so any other test's events sharing the buffer are inert.
         let subscriber = tracing_subscriber::registry().with(capture);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _ = tracing::subscriber::set_global_default(subscriber);
 
         // Drive a failing path that goes through `tool_error` → `audit`.
         let srv = server_rw();
