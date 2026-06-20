@@ -8,6 +8,7 @@ members = [
     "crates/fula-client",
     "crates/fula-flutter",
     "crates/fula-js",
+    "crates/fula-mcp",
 ]
 
 # Root package for examples

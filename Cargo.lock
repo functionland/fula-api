@@ -2024,6 +2024,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fula-mcp"
+version = "0.6.16"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "fula-client",
+ "fula-crypto",
+ "hex",
+ "rand 0.8.5",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
