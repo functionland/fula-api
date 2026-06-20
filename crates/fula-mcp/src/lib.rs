@@ -65,6 +65,12 @@ pub mod list;
 /// [`tags::tag_file`] and [`tags::list_tags`].
 pub mod tags;
 
+/// The stdio MCP server that exposes the six P5–P8 ops as Model Context Protocol
+/// tools (P9). Loads the [`capability::CapabilityBundle`] from the environment
+/// once at startup (in memory only) and runs over stdio via the `rmcp` SDK. See
+/// [`server::run`] (env-driven entrypoint) and [`server::FulaMcpServer`].
+pub mod server;
+
 /// Re-exports of the underlying crypto + client types this crate builds on.
 ///
 /// Phase 1 deliberately reuses these verbatim instead of wrapping them — the
