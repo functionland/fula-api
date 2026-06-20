@@ -1,0 +1,29 @@
+[package]
+name = "fula-mcp"
+description = "MCP server for Fula decentralized storage (Phase 1: crypto + client round-trip spike; no MCP protocol yet)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Reuse the existing crypto + client crates — do NOT reimplement crypto.
+fula-crypto = { path = "../fula-crypto" }
+fula-client = { path = "../fula-client" }
+
+# Async runtime + error handling for the library surface.
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Test-only helpers: RNG for random payloads, uuid for isolated e2e keys,
+# hex for derived-key debug output.
+rand = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
