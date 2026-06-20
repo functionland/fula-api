@@ -49,6 +49,13 @@ pub mod store;
 /// anything else before any network I/O. See [`read::read_file`].
 pub mod read;
 
+/// The AI's scoped ENUMERATION operations: `list_files` + `search` (P7).
+/// Enumerates ONLY the AI's own `ai/` workspace forest — confined by the P3
+/// segment-boundary geometry so the user's real buckets can never leak — with
+/// optional category / sub-prefix narrowing and filename search. See
+/// [`list::list_files`] and [`list::search`].
+pub mod list;
+
 /// Re-exports of the underlying crypto + client types this crate builds on.
 ///
 /// Phase 1 deliberately reuses these verbatim instead of wrapping them — the
