@@ -7,10 +7,16 @@
 //!
 //! This crate is greenfield. Phase 1's only job is to **prove** that the
 //! existing [`fula_crypto`] and [`fula_client`] crates can be reused to do a
-//! full **encrypt → chunked-upload → download → decrypt** round-trip that is
-//! format-compatible with how the FxFiles app stores files. There is no MCP
-//! transport, no tool dispatch, and no server loop in this phase — only this
-//! thin library plus the round-trip tests under `tests/`.
+//! full **encrypt → chunked-upload → download → decrypt** round-trip, writing
+//! to the gateway in the same on-the-wire format the FxFiles app uses and
+//! reading it back byte-identically with the app-derived Mode A secret. There
+//! is no MCP transport, no tool dispatch, and no server loop in this phase —
+//! only this thin library plus the round-trip tests under `tests/`.
+//!
+//! Scope note: the tests here are *same-client* round-trips (this code both
+//! writes and reads). They validate the reuse and the live-gateway format path;
+//! they do not re-assert cross-compatibility with the Flutter client, which the
+//! workspace already covers in `tests/cross_platform_encryption_test.rs`.
 //!
 //! What lives here so far:
 //! - [`derive_mode_a_secret`]: the Mode A (OAuth-derived) key-derivation

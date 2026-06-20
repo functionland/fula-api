@@ -52,6 +52,28 @@ fn chunked_roundtrip(plaintext: &[u8]) -> (Vec<u8>, u32) {
         plaintext.len() as u64,
         "metadata.total_size must equal the original length"
     );
+    // Stronger than a count check: the chunk indices must be EXACTLY the
+    // contiguous sequence 0..num_chunks (no gap, no duplicate). This guards
+    // against a (hypothetical) double-count that happens to sum to the right
+    // length but misaligns indices with the metadata nonce table.
+    assert_eq!(
+        chunks.iter().map(|c| c.index).collect::<Vec<_>>(),
+        (0..metadata.num_chunks).collect::<Vec<_>>(),
+        "chunk indices must be exactly 0..num_chunks"
+    );
+    // Confirm encryption actually happened (not a passthrough regression):
+    // for any non-trivial input, the first chunk's ciphertext must not be a
+    // byte-prefix-equal copy of the plaintext. AEAD also appends a 16-byte tag,
+    // so even a same-length comparison would differ — but check content too.
+    if !plaintext.is_empty() {
+        let first_ct = chunks[0].ciphertext.as_ref();
+        let plen = plaintext.len().min(first_ct.len());
+        assert_ne!(
+            &first_ct[..plen],
+            &plaintext[..plen],
+            "ciphertext must differ from plaintext (encryption must occur)"
+        );
+    }
 
     // --- Decode side --------------------------------------------------------
     // Feed every chunk by its own index; the decoder looks up the matching

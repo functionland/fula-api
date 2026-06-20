@@ -1,9 +1,18 @@
 //! Phase 1 — GATED end-to-end round-trip against a real Fula gateway.
 //!
-//! This is the test that proves the FULL client format compatibility:
+//! This proves the `fula-client` encrypted upload/download path round-trips
+//! through the LIVE gateway using the app-derived Mode A secret:
 //! `EncryptedClient::put_object_flat` (HPKE DEK-wrap + storage-key obfuscation +
 //! chunked content encryption + forest index write) followed by
-//! `get_object_flat` (forest lookup + decrypt) must return byte-identical data.
+//! `get_object_flat` (forest lookup + decrypt) returns byte-identical data.
+//!
+//! Scope honesty: this is a SAME-CLIENT round-trip (this Rust code writes and
+//! reads). It exercises the full server-side format and the app-compatible Mode
+//! A key derivation, but it does NOT by itself prove cross-compatibility with
+//! the FxFiles Flutter client — that would need a Flutter-produced object
+//! decrypted here (or vice versa), or a Flutter golden fixture. The repo's
+//! `tests/cross_platform_encryption_test.rs` / `tests/exact_flow_test.rs` cover
+//! that cross-platform vector; this spike intentionally does not duplicate it.
 //!
 //! It is doubly gated so a plain `cargo test` stays green OFFLINE:
 //!   1. `#[ignore]` — excluded from a normal run; needs `-- --ignored`.
