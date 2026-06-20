@@ -401,57 +401,85 @@ pub async fn store_file(
         .await
         .map_err(|e| StoreError::Client(format!("put_object_flat: {e}")))?;
 
-    // 5a. Resolve the obfuscated storage_key for the object we just wrote, by
-    //     looking it up in our OWN forest listing by logical key.
-    let listed = client
-        .list_files_from_forest(WORKSPACE_BUCKET)
-        .await
-        .map_err(|e| StoreError::Client(format!("list_files_from_forest: {e}")))?;
-    // Require EXACTLY ONE entry for our logical key (per external review): the
-    // per-file uuid makes our key unique, so 0 matches means the write didn't
-    // land (or the forest is inconsistent) and ≥2 means an ambiguous collision —
-    // both are refusals rather than "pick the first/newest and hope".
-    let mut matches = listed.iter().filter(|f| f.original_key == key);
-    let storage_key = match (matches.next(), matches.next()) {
-        (Some(f), None) => f.storage_key.clone(),
-        (None, _) => return Err(StoreError::ObjectNotFound(key.clone())),
-        (Some(_), Some(_)) => {
-            return Err(StoreError::ObjectNotFound(format!(
-                "{key} (ambiguous: multiple forest entries for one key)"
-            )));
+    // From here the object EXISTS in the workspace. Run the resolve→recover→mint
+    // steps in an inner block that returns Result, so that if ANY of them fails
+    // we best-effort delete the just-written object before propagating the error
+    // (per external review). The orphan would otherwise be undeletable dead data
+    // in the AI's own bucket (a fresh-uuid retry never reuses it). The cleanup is
+    // best-effort: a delete failure is logged, not surfaced (the original error
+    // is what the caller needs to see).
+    let built: Result<StoreOutcome, StoreError> = async {
+        // 5a. Resolve the obfuscated storage_key for the object we just wrote, by
+        //     looking it up in our OWN forest listing by logical key.
+        let listed = client
+            .list_files_from_forest(WORKSPACE_BUCKET)
+            .await
+            .map_err(|e| StoreError::Client(format!("list_files_from_forest: {e}")))?;
+        // Require EXACTLY ONE entry for our logical key (per external review): the
+        // per-file uuid makes our key unique, so 0 matches means the write didn't
+        // land (or the forest is inconsistent) and ≥2 means an ambiguous collision
+        // — both are refusals rather than "pick the first/newest and hope".
+        let mut matches = listed.iter().filter(|f| f.original_key == key);
+        let storage_key = match (matches.next(), matches.next()) {
+            (Some(f), None) => f.storage_key.clone(),
+            (None, _) => return Err(StoreError::ObjectNotFound(key.clone())),
+            (Some(_), Some(_)) => {
+                return Err(StoreError::ObjectNotFound(format!(
+                    "{key} (ambiguous: multiple forest entries for one key)"
+                )));
+            }
+        };
+
+        // 5b. Fetch the COMPLETE encryption metadata (with_fallback guarantees the
+        //     per-chunk nonces are present for chunked files) and recover the DEK +
+        //     nonce / chunked inputs.
+        let enc_meta_json = client
+            .get_object_encryption_metadata_with_fallback(WORKSPACE_BUCKET, &storage_key)
+            .await
+            .map_err(|e| {
+                StoreError::Client(format!("get_object_encryption_metadata_with_fallback: {e}"))
+            })?;
+        let (dek, nonce, chunked) =
+            recover_dek_and_share_inputs(&enc_meta_json, client.encryption_config())?;
+
+        // 6. Mint the owner-read share token. path_scope = storage_key (the FxFiles
+        //    convention the read path resolves by). No expiry: the owner may need
+        //    to read AI-authored files indefinitely; a time-boxed token would
+        //    silently lock the owner out of their own data. (A future phase can add
+        //    a caller-chosen expiry if a use-case wants ephemeral shares.)
+        //
+        //    The token carries read-write permissions (P3 `mint_owner_share`
+        //    hardcodes this, "as in P2"): inert in practice — the token is
+        //    HPKE-wrapped to the owner's key (opaque to anyone else) and the SDK
+        //    has no share-aware WRITE path that consumes it. Tightening it to
+        //    read-only is a noted P3 follow-up, not a P5 change.
+        let owner_share = cap
+            .mint_owner_share(&dek, &storage_key, nonce.as_deref(), chunked.as_deref(), None)
+            .map_err(|e| StoreError::Share(e.to_string()))?;
+
+        Ok(StoreOutcome {
+            key: key.clone(),
+            bucket: WORKSPACE_BUCKET.to_string(),
+            storage_key,
+            etag: put.etag,
+            category,
+            native_bucket: native_category_bucket(category).map(|s| s.to_string()),
+            owner_share,
+        })
+    }
+    .await;
+
+    if built.is_err() {
+        // Best-effort orphan cleanup; do NOT mask the original error.
+        if let Err(del) = client.delete_object_flat(WORKSPACE_BUCKET, &key).await {
+            tracing::warn!(
+                "store_file: failed to clean up orphaned object {WORKSPACE_BUCKET}/{key} after a \
+                 post-upload error: {del}"
+            );
         }
-    };
+    }
 
-    // 5b. Fetch the COMPLETE encryption metadata (with_fallback guarantees the
-    //     per-chunk nonces are present for chunked files) and recover the DEK +
-    //     nonce / chunked inputs.
-    let enc_meta_json = client
-        .get_object_encryption_metadata_with_fallback(WORKSPACE_BUCKET, &storage_key)
-        .await
-        .map_err(|e| {
-            StoreError::Client(format!("get_object_encryption_metadata_with_fallback: {e}"))
-        })?;
-    let (dek, nonce, chunked) =
-        recover_dek_and_share_inputs(&enc_meta_json, client.encryption_config())?;
-
-    // 6. Mint the owner-read share token. path_scope = storage_key (the FxFiles
-    //    convention the read path resolves by). No expiry: the owner may need to
-    //    read AI-authored files indefinitely; a time-boxed token would silently
-    //    lock the owner out of their own data. (A future phase can add a
-    //    caller-chosen expiry if a use-case wants ephemeral shares.)
-    let owner_share = cap
-        .mint_owner_share(&dek, &storage_key, nonce.as_deref(), chunked.as_deref(), None)
-        .map_err(|e| StoreError::Share(e.to_string()))?;
-
-    Ok(StoreOutcome {
-        key,
-        bucket: WORKSPACE_BUCKET.to_string(),
-        storage_key,
-        etag: put.etag,
-        category,
-        native_bucket: native_category_bucket(category).map(|s| s.to_string()),
-        owner_share,
-    })
+    built
 }
 
 #[cfg(test)]
