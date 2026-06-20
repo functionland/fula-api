@@ -34,6 +34,10 @@ use thiserror::Error;
 
 pub mod capability;
 
+/// File categorization + native-bucket routing, a faithful port of FxFiles'
+/// `ShelfClassifier` + the content-bucket map (P4).
+pub mod category;
+
 /// Re-exports of the underlying crypto + client types this crate builds on.
 ///
 /// Phase 1 deliberately reuses these verbatim instead of wrapping them — the
