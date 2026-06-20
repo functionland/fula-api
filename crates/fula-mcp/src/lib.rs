@@ -43,6 +43,12 @@ pub mod category;
 /// token for it. See [`store::store_file`].
 pub mod store;
 
+/// The AI's scoped, decrypting READ operation: `read_file` (P6). The home of the
+/// default-deny read guarantee — reads ONLY the AI's own workspace files (`ai/`
+/// scope) or files the owner explicitly granted via a share token, rejecting
+/// anything else before any network I/O. See [`read::read_file`].
+pub mod read;
+
 /// Re-exports of the underlying crypto + client types this crate builds on.
 ///
 /// Phase 1 deliberately reuses these verbatim instead of wrapping them — the
