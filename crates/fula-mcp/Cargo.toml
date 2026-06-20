@@ -20,6 +20,9 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
+# stderr structured logging for the binary's audit events (stdout is the JSON-RPC
+# MCP channel, so all logs go to stderr). Used by `src/bin/fula-mcp.rs`.
+tracing-subscriber = { workspace = true }
 
 # Capability-bundle (de)serialization + key material handling (P3).
 #  - serde/serde_json: parse the injected capability-bundle JSON.
@@ -37,6 +40,21 @@ mime_guess = "2"
 # Per-file unique key segment (`ai/<category>/<uuid>-<name>`) in store_file (P5).
 # Used in library code (not just tests), so it lives in [dependencies].
 uuid = { workspace = true }
+
+# ── MCP protocol layer (P9: stdio server) ────────────────────────────────────
+# The official Model Context Protocol Rust SDK (modelcontextprotocol/rust-sdk).
+#  - server:       the ServerHandler + tool-router machinery.
+#  - macros:       the #[tool_router] / #[tool] / #[tool_handler] attribute macros.
+#  - transport-io: the server-side stdio transport (`rmcp::transport::stdio()`).
+# We deliberately do NOT enable client / http / auth / prompts / tasks: this
+# crate is a stdio tool server only, so a minimal feature set keeps the
+# dependency + attack surface small.
+rmcp = { version = "1.7", default-features = false, features = ["server", "macros", "transport-io"] }
+# JSON-schema derive for the tool argument structs. rmcp re-exports a compatible
+# `schemars` when its `schemars` feature is on, but we depend on it directly so
+# `#[derive(schemars::JsonSchema)]` is in scope for our arg types; the version
+# must match what rmcp's `Parameters<T>` bound expects.
+schemars = "1"
 
 [dev-dependencies]
 # Test-only helpers: RNG for random payloads, hex for derived-key debug output.
