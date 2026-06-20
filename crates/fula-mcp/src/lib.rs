@@ -38,6 +38,11 @@ pub mod capability;
 /// `ShelfClassifier` + the content-bucket map (P4).
 pub mod category;
 
+/// The AI's scoped, encrypted WRITE operation: `store_file` (P5). Writes a file
+/// into the AI's own encrypted workspace and mints an owner-readable share
+/// token for it. See [`store::store_file`].
+pub mod store;
+
 /// Re-exports of the underlying crypto + client types this crate builds on.
 ///
 /// Phase 1 deliberately reuses these verbatim instead of wrapping them — the

@@ -34,9 +34,12 @@ zeroize = "1.8"
 # package's lookupMimeType. The de-facto Rust equivalent.
 mime_guess = "2"
 
-[dev-dependencies]
-# Test-only helpers: RNG for random payloads, uuid for isolated e2e keys,
-# hex for derived-key debug output. (serde_json/base64 are now in [dependencies].)
-rand = { workspace = true }
+# Per-file unique key segment (`ai/<category>/<uuid>-<name>`) in store_file (P5).
+# Used in library code (not just tests), so it lives in [dependencies].
 uuid = { workspace = true }
+
+[dev-dependencies]
+# Test-only helpers: RNG for random payloads, hex for derived-key debug output.
+# (serde_json/base64/uuid are now in [dependencies].)
+rand = { workspace = true }
 hex = { workspace = true }
