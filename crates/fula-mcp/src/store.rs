@@ -65,13 +65,52 @@
 //! gateway-side scoping for the bucket; `assert_in_scope` owns the key.
 
 use bytes::Bytes;
-use fula_client::EncryptionConfig;
+use fula_client::{ClientError, EncryptionConfig};
 use fula_crypto::{DekKey, Decryptor, EncryptedData, ShareToken};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::capability::{CapabilityBundle, CapabilityError, Permission};
 use crate::category::{classify, native_category_bucket, Category};
+use crate::quota::QuotaDecision;
+
+/// The S3 error code the gateway returns when a write is rejected for being over
+/// quota / out of credits (see `fula-cli/src/handlers/object.rs`,
+/// `S3ErrorCode::AccountProblem`). Matched STRUCTURALLY on
+/// [`ClientError::S3Error::code`] — not by substring on a Display string — so the
+/// gateway's own quota rejection maps cleanly to [`StoreError::QuotaExceeded`].
+const S3_CODE_QUOTA: &str = "AccountProblem";
+
+/// The S3 error code the gateway returns when the per-user rate limiter trips
+/// (see `fula-cli/src/middleware.rs`, `S3ErrorCode::SlowDown`). Mapped to
+/// [`StoreError::RateLimited`].
+const S3_CODE_RATE: &str = "SlowDown";
+
+/// Classify a failed `put_object_flat` error.
+///
+/// The gateway enforces quota AND rate limits on the real PUT (the MCP's
+/// pre-checks are only a fail-fast courtesy). When it rejects a write it returns
+/// a structured [`ClientError::S3Error`] carrying the S3 `code`. We match that
+/// typed code BEFORE flattening the error into a string, so:
+/// - `AccountProblem` → [`StoreError::QuotaExceeded`] (the user is over quota —
+///   the same clean signal the pre-check would have produced, but caught at the
+///   real PUT, e.g. when the pre-check failed open or was skipped), and
+/// - `SlowDown` → [`StoreError::RateLimited`] (the gateway's per-user limiter).
+///
+/// Every other error (including non-S3 transport/crypto failures) flattens to the
+/// generic [`StoreError::Client`], exactly as before — we never widen the
+/// quota/rate mapping to an unknown code.
+fn classify_put_error(err: ClientError) -> StoreError {
+    if let ClientError::S3Error { code, .. } = &err {
+        if code == S3_CODE_QUOTA {
+            return StoreError::QuotaExceeded;
+        }
+        if code == S3_CODE_RATE {
+            return StoreError::RateLimited;
+        }
+    }
+    StoreError::Client(format!("put_object_flat: {err}"))
+}
 
 /// The single bucket the AI writes all of its workspace files into.
 ///
@@ -184,6 +223,22 @@ pub enum StoreError {
     /// interpret unambiguously, rather than guessing.
     #[error("unexpected object metadata shape: {0}")]
     MetadataShape(String),
+
+    /// The user is over their storage quota / out of credits, so the write was
+    /// NOT performed. Raised by the fail-fast pre-check (before any
+    /// encryption/upload) when the credit service reports `canUpload == false`,
+    /// OR mapped from the gateway's own `AccountProblem` rejection of the real
+    /// PUT (see [`classify_put_error`]). Either way it is a clean, actionable
+    /// "add credits" signal — distinct from a generic internal failure.
+    #[error("storage quota exceeded: the user is over quota or out of credits")]
+    QuotaExceeded,
+
+    /// The write was rejected by a rate limiter — either this session's local
+    /// per-AI write bucket (the fail-fast pre-check, before any I/O) or the
+    /// gateway's per-user limiter (mapped from its `SlowDown` rejection; see
+    /// [`classify_put_error`]). The model should slow its write rate and retry.
+    #[error("rate limited: too many writes; slow down and retry")]
+    RateLimited,
 }
 
 /// Sanitize one caller-supplied filename into a single safe key segment.
@@ -363,6 +418,11 @@ fn recover_dek_and_share_inputs(
 /// # Errors
 /// - [`StoreError::Capability`] if the bundle lacks the `ai/` write grant or the
 ///   key is non-canonical (raised with NO I/O performed).
+/// - [`StoreError::RateLimited`] if this session is over its local per-AI write
+///   rate limit (raised with NO I/O, right after the scope check).
+/// - [`StoreError::QuotaExceeded`] if the pre-flight quota check reports the user
+///   is over quota (raised with no encryption/upload), OR if the gateway rejects
+///   the real PUT for being over quota (`AccountProblem`).
 /// - [`StoreError::Client`] if a storage call fails.
 /// - [`StoreError::ObjectNotFound`] if the upload's `storage_key` cannot be
 ///   resolved from the forest afterward.
@@ -388,18 +448,43 @@ pub async fn store_file(
     //    relies on. `?` converts CapabilityError -> StoreError::Capability.
     cap.assert_in_scope(&key, WORKSPACE_KEY_PREFIX, Permission::Write)?;
 
+    // 3a. RATE LIMIT (P10), AFTER authority so an unauthorized/out-of-scope
+    //     attempt cannot drain the session's write budget (a local DoS against
+    //     legitimate writes). One token per write; over-limit fails fast with NO
+    //     I/O. This is the MCP's courtesy guard against a runaway AI; the gateway
+    //     also enforces a per-user limit (mapped from `SlowDown` below).
+    if !cap.try_consume_write_token() {
+        return Err(StoreError::RateLimited);
+    }
+
+    // 3b. QUOTA PRE-CHECK (P10), still BEFORE the expensive encrypt+upload, so we
+    //     do not burn CPU + bandwidth on a write the gateway will reject. This
+    //     calls the SAME credit endpoint the gateway uses, with the session JWT.
+    //     It FAILS OPEN on any error (unreachable / timeout / non-2xx / bad body
+    //     / unconfigured): the gateway re-enforces quota on the real PUT, so a
+    //     check outage degrades to "the PUT may fail later," not "all writes
+    //     blocked." ONLY an explicit over-quota verdict blocks here. (See the
+    //     `quota` module docs for the full fail-open rationale.)
+    if let QuotaDecision::Denied = cap.check_quota().await {
+        return Err(StoreError::QuotaExceeded);
+    }
+
     // Build the workspace client ONCE and reuse it for the put + the metadata
     // fetch + the unwrap, so the SAME keypair that wrote the wrapped DEK is the
     // one that unwraps it.
     let client = cap.workspace_client()?;
 
     // 4. Upload (HPKE DEK-wrap + storage-key obfuscation + chunked content
-    //    encryption + forest-index write — the real SDK path).
+    //    encryption + forest-index write — the real SDK path). A gateway quota /
+    //    rate rejection of the PUT is mapped to the SAME clean `QuotaExceeded` /
+    //    `RateLimited` signal as the pre-checks (via `classify_put_error`), so
+    //    the model gets one actionable error whether the pre-check or the real
+    //    PUT caught it (e.g. when the pre-check failed open or was skipped).
     let content_type = mime.filter(|m| !m.is_empty());
     let put = client
         .put_object_flat(WORKSPACE_BUCKET, &key, content, content_type)
         .await
-        .map_err(|e| StoreError::Client(format!("put_object_flat: {e}")))?;
+        .map_err(classify_put_error)?;
 
     // From here the object EXISTS in the workspace. Run the resolve→recover→mint
     // steps in an inner block that returns Result, so that if ANY of them fails
@@ -953,5 +1038,124 @@ mod tests {
             .unwrap();
         let stranger = KekKeyPair::generate();
         assert!(ShareRecipient::new(&stranger).accept_share(&token).is_err());
+    }
+
+    // ── P10: gateway put-error classification (pure, offline) ──────────────────
+    //
+    // A gateway quota / rate rejection of the real PUT arrives as a structured
+    // `ClientError::S3Error { code, .. }`. classify_put_error must map the two
+    // known codes to the clean QuotaExceeded / RateLimited signals and leave
+    // everything else as the generic Client error (never widening the mapping).
+
+    #[test]
+    fn classify_put_error_maps_account_problem_to_quota_exceeded() {
+        let e = ClientError::S3Error {
+            code: "AccountProblem".to_string(),
+            message: "Insufficient credits. Please add FULA credits to continue.".to_string(),
+            request_id: None,
+        };
+        assert!(matches!(classify_put_error(e), StoreError::QuotaExceeded));
+    }
+
+    #[test]
+    fn classify_put_error_maps_slow_down_to_rate_limited() {
+        let e = ClientError::S3Error {
+            code: "SlowDown".to_string(),
+            message: "Please reduce your request rate".to_string(),
+            request_id: None,
+        };
+        assert!(matches!(classify_put_error(e), StoreError::RateLimited));
+    }
+
+    #[test]
+    fn classify_put_error_leaves_other_s3_codes_as_client() {
+        // An unrelated S3 code (e.g. AccessDenied, InternalError) must NOT be
+        // miscategorized as quota/rate — it flattens to the generic Client error.
+        for code in ["AccessDenied", "InternalError", "NoSuchBucket"] {
+            let e = ClientError::S3Error {
+                code: code.to_string(),
+                message: "x".to_string(),
+                request_id: None,
+            };
+            assert!(
+                matches!(classify_put_error(e), StoreError::Client(_)),
+                "code {code} must stay a generic Client error"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_put_error_leaves_non_s3_errors_as_client() {
+        // A transport-level error (not S3Error) is always the generic Client error.
+        let e = ClientError::UploadFailed("connection reset".to_string());
+        let mapped = classify_put_error(e);
+        assert!(matches!(mapped, StoreError::Client(_)));
+        // And the Display preserves context (the "put_object_flat:" prefix).
+        assert!(format!("{mapped}").contains("put_object_flat"));
+    }
+
+    // ── P10: the local write rate-limit gate fires BEFORE any network I/O ──────
+
+    /// A bundle whose write bucket has a tiny capacity, so the test can drain it
+    /// and prove `store_file` rejects the next write WITHOUT touching the network.
+    /// `endpoint` is unreachable, so if the gate did NOT fire the call would fail
+    /// with `Client` (a network error) instead of `RateLimited` — the assertion
+    /// therefore distinguishes "gate fired" from "fell through to the put".
+    fn bundle_json_with_burst(burst: u32) -> String {
+        let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        let mcp = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
+        let owner = base64::engine::general_purpose::STANDARD
+            .encode(SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key().as_bytes());
+        format!(
+            r#"{{ "endpoint": "https://gw.invalid", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "write_burst": {burst}, "write_refill_per_sec": 0.0001, "grants": [{{ "scope": "ai/", "permissions": {{ "can_read": true, "can_write": true, "can_delete": false }} }}] }}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn store_file_rate_limited_before_any_io_when_bucket_drained() {
+        // burst=1: the first token is consumable; we drain it directly, then the
+        // store must return RateLimited with NO network call (the gate is checked
+        // right after assert_in_scope, before the client/put). The refill rate is
+        // ~0 so no token comes back during the test.
+        let cap = Bundle::from_json(&bundle_json_with_burst(1)).unwrap();
+        // Drain the single token.
+        assert!(cap.try_consume_write_token(), "first token available");
+        // Now store_file should short-circuit on the rate limit, NOT attempt the
+        // (unreachable) put.
+        let res = store_file(
+            &cap,
+            Bytes::from_static(b"hello"),
+            "x.txt",
+            Some("text/plain"),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(StoreError::RateLimited)),
+            "expected RateLimited (gate fires pre-I/O), got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_file_rate_limit_does_not_fire_while_tokens_remain() {
+        // Sanity: with tokens available the rate gate is NOT the failure mode.
+        // The write still fails (endpoint is unreachable), but it must fail with a
+        // Client error (it got past the gate to the put), never RateLimited. This
+        // proves the gate isn't a blanket block — it only trips when drained.
+        let cap = Bundle::from_json(&bundle_json_with_burst(5)).unwrap();
+        let res = store_file(
+            &cap,
+            Bytes::from_static(b"hello"),
+            "x.txt",
+            Some("text/plain"),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(StoreError::Client(_))),
+            "expected a Client (network) error past the gate, got {res:?}"
+        );
     }
 }

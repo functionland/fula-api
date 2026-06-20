@@ -56,6 +56,12 @@ rmcp = { version = "1.7", default-features = false, features = ["server", "macro
 # must match what rmcp's `Parameters<T>` bound expects.
 schemars = "1"
 
+# HTTP client for the P10 quota pre-check (`GET {storage_api_url}/api/v1/storage`),
+# calling the SAME credit endpoint the gateway uses. Inherited from the workspace
+# (default-features off + rustls-tls + json) so we match the workspace TLS stack
+# rather than pulling a second one — same as `fula-cli`.
+reqwest = { workspace = true }
+
 [dev-dependencies]
 # Test-only helpers: RNG for random payloads, hex for derived-key debug output.
 # (serde_json/base64/uuid are now in [dependencies].)
