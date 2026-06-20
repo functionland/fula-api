@@ -228,7 +228,10 @@ pub struct ListTagsArgs {}
 /// location) and `owner_share` (a [`ShareToken`](fula_crypto::ShareToken)
 /// wrapping the content DEK) — both are crypto-adjacent and never leave the
 /// server.
-#[derive(Debug, Serialize, JsonSchema)]
+///
+/// Derives `Deserialize` too so the gated e2e (which reads the tool result back)
+/// can parse it; production only ever serializes it.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct StoreFileResult {
     /// The canonical logical key the file was stored under.
     pub key: String,
@@ -257,14 +260,14 @@ pub struct StoreFileResult {
 }
 
 /// `fula_read_file` result: the decrypted bytes, base64-encoded.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ReadFileResult {
     /// The file's plaintext bytes, base64-encoded (standard alphabet).
     pub content_base64: String,
 }
 
 /// `fula_tag_file` result.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct TagFileResult {
     /// Names of tags newly created by this call.
     pub created_tags: Vec<String>,

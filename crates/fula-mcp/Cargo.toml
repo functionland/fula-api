@@ -61,3 +61,12 @@ schemars = "1"
 # (serde_json/base64/uuid are now in [dependencies].)
 rand = { workspace = true }
 hex = { workspace = true }
+# The transport smoke test (tests/p9_mcp_transport_smoke.rs) drives an in-process
+# rmcp CLIENT against our server over a `tokio::io::duplex` pipe to exercise the
+# real `initialize` + `tools/list` handshake. The production binary does NOT
+# enable the client feature (it is a server only); we add it here, test-only, so
+# the smoke test can speak the protocol without spawning a subprocess.
+rmcp = { version = "1.7", default-features = false, features = ["server", "client", "macros", "transport-io"] }
+# `tokio::io::duplex` lives behind the `io-util` feature; the workspace tokio
+# already enables "full", so this is just an explicit note. (No extra dep.)
+tokio = { workspace = true }
