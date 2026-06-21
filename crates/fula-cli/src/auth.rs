@@ -819,6 +819,43 @@ mod tests {
     }
 
     #[test]
+    fn mcp_capability_gate_derives_from_perms() {
+        // The CAPABILITY gate (can_read/can_write) — which every handler runs
+        // BEFORE assert_mcp_scope — must derive from the MCP perms, since an MCP
+        // token carries no storage `scope`. This is the regression for the
+        // empty-scope defect (without it, can_read/can_write are false and every
+        // MCP op is rejected before the scope check).
+        let secret = "test-secret";
+
+        // Full perms: can_read AND can_write.
+        let full = session_from_claims(
+            &mcp_claims("u", "fula-ai-workspace", "ai/", &["read", "write", "list"]),
+            secret,
+        );
+        assert!(full.can_read() && full.can_write());
+
+        // Read-only: can_read, NOT can_write.
+        let ro = session_from_claims(&mcp_claims("u", "fula-ai-workspace", "ai/", &["read"]), secret);
+        assert!(ro.can_read());
+        assert!(!ro.can_write());
+
+        // List-only: can_read TRUE (so it passes the can_read gate that
+        // list_objects runs) but NOT can_write — and assert(Read) on an actual
+        // object GET still denies it (assert is the authoritative fence).
+        let list_only = session_from_claims(&mcp_claims("u", "fula-ai-workspace", "ai/", &["list"]), secret);
+        assert!(list_only.can_read(), "list perm grants coarse read capability");
+        assert!(!list_only.can_write());
+        assert!(list_only.assert_mcp_scope("fula-ai-workspace", None, McpAction::List).is_ok());
+        assert!(
+            list_only.assert_mcp_scope("fula-ai-workspace", Some("ai/x"), McpAction::Read).is_err(),
+            "list-only must still be denied an actual object GET by assert"
+        );
+
+        // An MCP session is never admin (empty storage scope).
+        assert!(!full.is_admin());
+    }
+
+    #[test]
     fn normal_storage_token_is_unaffected_by_mcp_enforcement() {
         // REGRESSION: a normal storage token (no token_use, no mcp) gets
         // mcp_scope == None, so every assert_mcp_scope is a no-op Ok — it can

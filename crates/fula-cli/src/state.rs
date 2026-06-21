@@ -623,13 +623,28 @@ impl UserSession {
         self.scopes.iter().any(|s| s == scope || s == "*")
     }
 
-    /// Check if user can read
+    /// Check if user can read.
+    ///
+    /// P12: a scoped MCP token carries NO storage `scope` (its perms live in the
+    /// `mcp` claim), so for an MCP session capability is derived from the MCP
+    /// perms instead — otherwise the per-handler `can_read` gate would reject
+    /// every MCP op before `assert_mcp_scope` runs. Coarse by design;
+    /// `assert_mcp_scope` is still the authoritative per-op fence. Non-MCP
+    /// sessions (`mcp_scope == None`) use the existing storage-scope logic
+    /// unchanged (byte-identical).
     pub fn can_read(&self) -> bool {
+        if let Some(scope) = &self.mcp_scope {
+            return scope.has_read_capability();
+        }
         self.has_scope("storage:read") || self.has_scope("storage:*")
     }
 
-    /// Check if user can write
+    /// Check if user can write. See [`Self::can_read`] for the P12 MCP-aware
+    /// capability derivation; non-MCP sessions are unchanged.
     pub fn can_write(&self) -> bool {
+        if let Some(scope) = &self.mcp_scope {
+            return scope.has_write_capability();
+        }
         self.has_scope("storage:write") || self.has_scope("storage:*")
     }
 

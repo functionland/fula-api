@@ -167,6 +167,26 @@ impl McpScope {
         self.perms.contains(&perm)
     }
 
+    /// Coarse READ capability for the capability gate (`UserSession::can_read`).
+    /// An MCP token mints NO storage `scope`, so the per-handler `can_read`
+    /// gate (which tests `storage:read`) would otherwise reject every MCP op
+    /// BEFORE [`Self::assert`] runs. Capability is derived from perms instead:
+    /// `read` OR `list` ⇒ can_read, because the list handlers gate on
+    /// `can_read` and then narrow via `assert(List)`. This is intentionally
+    /// COARSE — [`Self::assert`] remains the authoritative per-op fence, so a
+    /// list-only token passing `can_read` is still denied an actual object GET.
+    pub fn has_read_capability(&self) -> bool {
+        self.has_perm(McpPerm::Read) || self.has_perm(McpPerm::List)
+    }
+
+    /// Coarse WRITE capability for the capability gate
+    /// (`UserSession::can_write`): the `write` perm. As with
+    /// [`Self::has_read_capability`], [`Self::assert`] is still the
+    /// authoritative per-op fence.
+    pub fn has_write_capability(&self) -> bool {
+        self.has_perm(McpPerm::Write)
+    }
+
     /// Is `key` within the scoped prefix? Because the prefix is `ai/` (ends in
     /// `/`), a plain `starts_with` already enforces the segment boundary:
     /// `ai/foo` is in-scope, `aimage/foo` is NOT (it does not start with
