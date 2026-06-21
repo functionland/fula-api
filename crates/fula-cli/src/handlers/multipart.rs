@@ -1,6 +1,7 @@
 //! Multipart upload handlers
 
 use crate::{AppState, ApiError, S3ErrorCode};
+use crate::mcp_scope::McpAction;
 use crate::pinning::{check_can_upload, pin_for_user};
 use crate::state::UserSession;
 use crate::multipart::UploadPart;
@@ -37,6 +38,9 @@ pub async fn create_multipart_upload(
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
+    // P12: scoped MCP tokens may only start a multipart upload within their
+    // bucket + `ai/` prefix (closes the multipart write-escape past put_object).
+    session.assert_mcp_scope(&bucket, Some(&key), McpAction::Write)?;
 
     // Verify bucket exists for this user
     if !state.bucket_manager.bucket_exists_for_user(&session.hashed_user_id, &bucket) {
@@ -107,6 +111,9 @@ pub async fn upload_part(
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
+    // P12: scoped MCP tokens may only upload parts within their bucket + `ai/`
+    // prefix.
+    session.assert_mcp_scope(&bucket, Some(&key), McpAction::Write)?;
 
     let upload_id = params.upload_id
         .ok_or_else(|| ApiError::s3(S3ErrorCode::InvalidArgument, "Missing uploadId"))?;
@@ -170,6 +177,9 @@ pub async fn complete_multipart_upload(
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
+    // P12: scoped MCP tokens may only complete a multipart upload within their
+    // bucket + `ai/` prefix.
+    session.assert_mcp_scope(&bucket, Some(&key), McpAction::Write)?;
 
     // Check balance BEFORE completing the upload (if remote pinning is configured)
     let can_upload = check_can_upload(
@@ -415,6 +425,9 @@ pub async fn abort_multipart_upload(
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
+    // P12: scoped MCP tokens may only abort a multipart upload within their
+    // bucket + `ai/` prefix.
+    session.assert_mcp_scope(&bucket, Some(&key), McpAction::Write)?;
 
     let upload_id = params.upload_id
         .ok_or_else(|| ApiError::s3(S3ErrorCode::InvalidArgument, "Missing uploadId"))?;
@@ -441,6 +454,9 @@ pub async fn list_parts(
     if !session.can_read() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Read access required"));
     }
+    // P12: scoped MCP tokens may only list parts within their bucket + `ai/`
+    // prefix.
+    session.assert_mcp_scope(&bucket, Some(&key), McpAction::Read)?;
 
     let upload_id = params.upload_id
         .ok_or_else(|| ApiError::s3(S3ErrorCode::InvalidArgument, "Missing uploadId"))?;
@@ -473,6 +489,9 @@ pub async fn list_multipart_uploads(
     if !session.can_read() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Read access required"));
     }
+    // P12: scoped MCP tokens may only list multipart uploads of their own
+    // scoped bucket (list perm; bucket-level op).
+    session.assert_mcp_scope(&bucket, None, McpAction::List)?;
 
     let uploads = state.multipart_manager.list_uploads(&bucket);
 

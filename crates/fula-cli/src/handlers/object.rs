@@ -2,6 +2,7 @@
 
 use crate::pinning::{check_can_upload, pin_for_user, unpin_for_user};
 use crate::{AppState, ApiError, S3ErrorCode};
+use crate::mcp_scope::McpAction;
 use crate::state::UserSession;
 use crate::xml;
 use axum::{
@@ -29,6 +30,9 @@ pub async fn put_object(
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
+    // P12: scoped MCP tokens may only PUT within their bucket + `ai/` prefix.
+    // No-op for normal storage tokens (mcp_scope == None).
+    session.assert_mcp_scope(&bucket_name, Some(&key), McpAction::Write)?;
 
     // Check balance BEFORE storing data (if remote pinning is configured)
     let can_upload = check_can_upload(
@@ -697,6 +701,8 @@ pub async fn get_object(
     if !session.can_read() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Read access required"));
     }
+    // P12: scoped MCP tokens may only GET within their bucket + `ai/` prefix.
+    session.assert_mcp_scope(&bucket_name, Some(&key), McpAction::Read)?;
 
     // User-scoped bucket access
     let bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
@@ -1084,6 +1090,8 @@ pub async fn head_object(
     if !session.can_read() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Read access required"));
     }
+    // P12: scoped MCP tokens may only HEAD within their bucket + `ai/` prefix.
+    session.assert_mcp_scope(&bucket_name, Some(&key), McpAction::Read)?;
 
     // User-scoped bucket access
     let bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
@@ -1123,6 +1131,8 @@ pub async fn delete_object(
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
+    // P12: scoped MCP tokens may only DELETE within their bucket + `ai/` prefix.
+    session.assert_mcp_scope(&bucket_name, Some(&key), McpAction::Write)?;
 
     // Serialize same-bucket index mutations (see `put_object` for rationale).
     let _bucket_guard = state
@@ -1273,6 +1283,10 @@ pub async fn copy_object(
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
+    // P12: scoped MCP tokens may only write the DESTINATION within their bucket
+    // + `ai/` prefix. The SOURCE (a separate bucket/key) is checked as a READ
+    // below — copy_object straddles two objects, so both ends are fenced.
+    session.assert_mcp_scope(&dest_bucket, Some(&dest_key), McpAction::Write)?;
 
     let copy_source = headers
         .get("x-amz-copy-source")
@@ -1284,6 +1298,9 @@ pub async fn copy_object(
     let (source_bucket, source_key) = source_path
         .split_once('/')
         .ok_or_else(|| ApiError::s3(S3ErrorCode::InvalidArgument, "Invalid copy source format"))?;
+    // P12: the copy SOURCE must also be in-scope (read). Prevents an MCP token
+    // from exfiltrating an out-of-scope/other-bucket object into its workspace.
+    session.assert_mcp_scope(source_bucket, Some(source_key), McpAction::Read)?;
 
     // Get source object (user-scoped). Read-only, so no write lock needed here.
     let source_bucket_handle = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, source_bucket).await?;
