@@ -82,8 +82,25 @@ pub async fn auth_middleware(
             // so a currently-valid token is never rejected. `token` is the raw
             // JWT — the issuer hashes the same string into `api_keys.key_hash`.
             crate::revocation::ensure_not_revoked(state.revocation.as_deref(), &token)?;
+            // P12: MCP jti revocation deny-list. Mirrors the F3 key deny-list
+            // but keyed on the MCP token's `jti`. No-op unless the MCP
+            // revocation source is enabled; fail-CLOSED is applied per-action in
+            // the handlers (a write under an enabled-but-unreachable source is
+            // denied), while the plain membership deny (a known-revoked jti)
+            // applies to every verb here.
+            crate::mcp_revocation::ensure_jti_not_revoked(
+                state.mcp_revocation.as_deref(),
+                claims.jti.as_deref(),
+            )?;
+            // P12: derive the scoped-MCP fence (fail-closed). For a normal
+            // storage token this is `None` and changes nothing; for an MCP
+            // token it REQUIRES a valid `mcp` claim or the token is refused.
+            // Computed before `claims` is moved into `claims_to_session`.
+            let mcp_scope = crate::auth::mcp_scope_from_claims(&claims)?;
             // Pass the raw JWT token to the session for forwarding to pinning service
-            claims_to_session(claims, token)
+            let mut session = claims_to_session(claims, token);
+            session.mcp_scope = mcp_scope;
+            session
         }
         None => {
             return Err(ApiError::s3(

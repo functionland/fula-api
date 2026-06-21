@@ -159,6 +159,50 @@ pub fn claims_to_session(claims: Claims, jwt_token: String) -> UserSession {
     UserSession::new(claims.sub, claims.name, scopes, expires_at, jwt_token)
 }
 
+/// P12 — derive the optional scoped-MCP fence from a token's claims, fail-closed.
+///
+/// Returns:
+/// - `Ok(None)` for a normal storage token (no `token_use`, no `mcp`) — the
+///   common path; the resulting session enforces nothing new.
+/// - `Ok(Some(scope))` for a well-formed scoped MCP token
+///   (`token_use == "mcp_s3"` AND a valid `mcp` claim).
+/// - `Err(AccessDenied)` (token REFUSED) if the token looks like an MCP token
+///   but is malformed — i.e. `token_use == "mcp_s3"` with an absent/invalid
+///   `mcp` claim, OR (token-confusion hardening) an `mcp` claim present WITHOUT
+///   `token_use == "mcp_s3"`. A malformed MCP token must never fall through to
+///   broad storage access (fail-closed); an ambiguous mixed token is rejected
+///   rather than silently treated as an unconstrained storage token.
+///
+/// Borrows `&claims` so the caller can still move `claims` into
+/// `claims_to_session` afterwards.
+pub fn mcp_scope_from_claims(
+    claims: &Claims,
+) -> Result<Option<crate::mcp_scope::McpScope>, ApiError> {
+    let is_mcp = claims.token_use.as_deref() == Some("mcp_s3");
+
+    if is_mcp {
+        // Flagged as an MCP token: REQUIRE a valid mcp claim, else refuse.
+        let claim = claims.mcp.as_ref().ok_or_else(|| {
+            tracing::warn!("MCP token (token_use=mcp_s3) missing the `mcp` claim; refusing token");
+            ApiError::s3(S3ErrorCode::AccessDenied, "malformed MCP token")
+        })?;
+        let scope = crate::mcp_scope::McpScope::from_claim(claim).map_err(|e| {
+            tracing::warn!(reason = %e, "MCP token `mcp` claim invalid; refusing token");
+            ApiError::s3(S3ErrorCode::AccessDenied, "malformed MCP token")
+        })?;
+        Ok(Some(scope))
+    } else if claims.mcp.is_some() {
+        // Token-confusion hardening (codex): an `mcp` claim WITHOUT the
+        // `token_use` discriminator is ambiguous. Reject rather than treat it as
+        // an unconstrained storage token.
+        tracing::warn!("token carries an `mcp` claim without token_use=mcp_s3; refusing ambiguous token");
+        Err(ApiError::s3(S3ErrorCode::AccessDenied, "ambiguous token"))
+    } else {
+        // Normal storage token — no MCP fence.
+        Ok(None)
+    }
+}
+
 /// Extract bearer token from Authorization header
 pub fn extract_bearer_token(auth_header: &str) -> Option<&str> {
     auth_header

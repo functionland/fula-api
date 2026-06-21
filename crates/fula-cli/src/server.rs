@@ -112,6 +112,12 @@ pub async fn run_server(config: GatewayConfig) -> anyhow::Result<()> {
     // currently-valid token is never rejected, and a DB outage never locks out.
     crate::revocation::spawn_if_enabled(&state);
 
+    // P12 — MCP `jti` revocation deny-list refresher. No-op unless
+    // FULA_MCP_REVOCATION_ENABLED + endpoint are set (default OFF — live
+    // polling deferred to the test-server deploy). Keyed on jti; the plain
+    // membership deny runs in auth_middleware.
+    crate::mcp_revocation::spawn_if_enabled(&state);
+
     // Create router
     let app = routes::create_router(state);
 
@@ -220,6 +226,10 @@ pub async fn run_server_with_shutdown(
     // disabled (default) / no pins DB. Deny-list + fail-open: never rejects a
     // currently-valid token; a DB outage never locks anyone out.
     crate::revocation::spawn_if_enabled(&state);
+
+    // P12 — MCP `jti` revocation deny-list refresher (see run_server). No-op
+    // unless FULA_MCP_REVOCATION_ENABLED + endpoint are set (default OFF).
+    crate::mcp_revocation::spawn_if_enabled(&state);
 
     let app = routes::create_router(state);
 
