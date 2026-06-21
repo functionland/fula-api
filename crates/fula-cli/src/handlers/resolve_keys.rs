@@ -70,6 +70,14 @@ pub async fn resolve_bucket_keys(
     if !session.can_read() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Read access required"));
     }
+    // P12 defense-in-depth: a scoped MCP token has NO business resolving
+    // storage_key→CID (it would hand back CIDs for any of the user's buckets,
+    // feeding the block-by-cid byte read and bypassing the bucket/prefix fence).
+    // The middleware allowlist already blocks MCP from /api/v1/*; this is a
+    // second, local fail-closed in case the route wiring ever changes.
+    if session.mcp_scope.is_some() {
+        return Err(ApiError::s3(S3ErrorCode::AccessDenied, "not available to MCP tokens"));
+    }
     if req.keys.is_empty() {
         return Ok((
             StatusCode::OK,

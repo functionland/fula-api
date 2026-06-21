@@ -1,6 +1,7 @@
 //! Batch operation handlers (DeleteObjects)
 
 use crate::{AppState, ApiError, S3ErrorCode};
+use crate::mcp_scope::McpAction;
 use crate::state::UserSession;
 use crate::xml;
 use axum::{
@@ -21,6 +22,10 @@ pub async fn delete_objects(
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
+    // P12: scoped MCP tokens may only bulk-delete in their own scoped bucket
+    // (write perm; bucket-level). Each individual key is additionally fenced to
+    // the `ai/` prefix inside the loop below.
+    session.assert_mcp_scope(&bucket_name, None, McpAction::Write)?;
 
     // Serialize same-bucket index mutations (see `put_object` for rationale).
     let _bucket_guard = state
@@ -47,6 +52,17 @@ pub async fn delete_objects(
     let mut errors: Vec<(String, &str, &str)> = Vec::new();
 
     for key in keys {
+        // P12: per-key MCP fence. An out-of-prefix (or wrong-bucket) key is
+        // reported as a per-key AccessDenied error rather than failing the whole
+        // batch (S3 batch-delete semantics) — and is never actually deleted.
+        // No-op for normal storage tokens (mcp_scope == None).
+        if session
+            .assert_mcp_scope(&bucket_name, Some(&key), McpAction::Write)
+            .is_err()
+        {
+            errors.push((key, "AccessDenied", "out of MCP scope"));
+            continue;
+        }
         match bucket.delete_object(&key).await {
             Ok(Some(_)) => {
                 deleted.push(key);

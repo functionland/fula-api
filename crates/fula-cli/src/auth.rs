@@ -32,6 +32,48 @@ pub struct Claims {
     pub scope: String,
     /// Name
     pub name: Option<String>,
+    /// JWT ID (P12). Present on scoped MCP tokens (`token_use == "mcp_s3"`);
+    /// the revocation key. `serde(default)` so legacy storage tokens (which
+    /// carry no `jti`) deserialize unchanged.
+    #[serde(default)]
+    pub jti: Option<String>,
+    /// Token-kind discriminator (P12). A token is a scoped MCP token iff this
+    /// equals `Some("mcp_s3")`. `serde(default)` ⇒ legacy storage tokens (no
+    /// `token_use`) deserialize as `None` and behave byte-identically.
+    #[serde(default)]
+    pub token_use: Option<String>,
+    /// Scoped MCP authorization claim (P12). Present only on MCP tokens; see
+    /// [`crate::mcp_scope`]. `serde(default)` ⇒ absent on storage tokens.
+    #[serde(default)]
+    pub mcp: Option<McpScopeClaim>,
+}
+
+/// The `mcp` claim on a scoped MCP-S3 JWT (P12). Mirrors the issuer's contract
+/// in `pinning-webui/server/mcpTokens.ts` (`McpScopeClaim`). The gateway only
+/// parses + enforces these in production; `Serialize` is derived solely so
+/// tests can mint MCP tokens via the existing `create_test_token` helper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpScopeClaim {
+    /// MAJOR schema version. v1 is the only version this gateway accepts; an
+    /// unknown major version is rejected (fail-closed) in [`crate::mcp_scope`].
+    pub v: u32,
+    /// Scope entries. v1 carries exactly one.
+    #[serde(default)]
+    pub scopes: Vec<McpScopeEntry>,
+}
+
+/// One scope entry inside [`McpScopeClaim`] (P12). The bucket + prefix the
+/// token may touch and the permissions granted on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpScopeEntry {
+    /// The single bucket this token is scoped to (e.g. `fula-ai-workspace`).
+    pub bucket: String,
+    /// The key-namespace prefix the token may touch (the constant `ai/`).
+    pub prefix: String,
+    /// Granted permission strings (subset of `read`/`write`/`list`). Unknown
+    /// strings are IGNORED by the parser (forward-compat) — never a grant.
+    #[serde(default)]
+    pub perms: Vec<String>,
 }
 
 /// JWT validation configuration
@@ -115,6 +157,50 @@ pub fn claims_to_session(claims: Claims, jwt_token: String) -> UserSession {
 
     // Security audit fix A3: Use UserSession::new() to auto-hash user ID
     UserSession::new(claims.sub, claims.name, scopes, expires_at, jwt_token)
+}
+
+/// P12 — derive the optional scoped-MCP fence from a token's claims, fail-closed.
+///
+/// Returns:
+/// - `Ok(None)` for a normal storage token (no `token_use`, no `mcp`) — the
+///   common path; the resulting session enforces nothing new.
+/// - `Ok(Some(scope))` for a well-formed scoped MCP token
+///   (`token_use == "mcp_s3"` AND a valid `mcp` claim).
+/// - `Err(AccessDenied)` (token REFUSED) if the token looks like an MCP token
+///   but is malformed — i.e. `token_use == "mcp_s3"` with an absent/invalid
+///   `mcp` claim, OR (token-confusion hardening) an `mcp` claim present WITHOUT
+///   `token_use == "mcp_s3"`. A malformed MCP token must never fall through to
+///   broad storage access (fail-closed); an ambiguous mixed token is rejected
+///   rather than silently treated as an unconstrained storage token.
+///
+/// Borrows `&claims` so the caller can still move `claims` into
+/// `claims_to_session` afterwards.
+pub fn mcp_scope_from_claims(
+    claims: &Claims,
+) -> Result<Option<crate::mcp_scope::McpScope>, ApiError> {
+    let is_mcp = claims.token_use.as_deref() == Some("mcp_s3");
+
+    if is_mcp {
+        // Flagged as an MCP token: REQUIRE a valid mcp claim, else refuse.
+        let claim = claims.mcp.as_ref().ok_or_else(|| {
+            tracing::warn!("MCP token (token_use=mcp_s3) missing the `mcp` claim; refusing token");
+            ApiError::s3(S3ErrorCode::AccessDenied, "malformed MCP token")
+        })?;
+        let scope = crate::mcp_scope::McpScope::from_claim(claim).map_err(|e| {
+            tracing::warn!(reason = %e, "MCP token `mcp` claim invalid; refusing token");
+            ApiError::s3(S3ErrorCode::AccessDenied, "malformed MCP token")
+        })?;
+        Ok(Some(scope))
+    } else if claims.mcp.is_some() {
+        // Token-confusion hardening (codex): an `mcp` claim WITHOUT the
+        // `token_use` discriminator is ambiguous. Reject rather than treat it as
+        // an unconstrained storage token.
+        tracing::warn!("token carries an `mcp` claim without token_use=mcp_s3; refusing ambiguous token");
+        Err(ApiError::s3(S3ErrorCode::AccessDenied, "ambiguous token"))
+    } else {
+        // Normal storage token — no MCP fence.
+        Ok(None)
+    }
 }
 
 /// Extract bearer token from Authorization header
@@ -441,6 +527,9 @@ mod tests {
             aud: None,
             scope: "storage:read storage:write".to_string(),
             name: Some("Test User".to_string()),
+            jti: None,
+            token_use: None,
+            mcp: None,
         };
 
         let token = create_test_token(&claims, secret);
@@ -460,6 +549,9 @@ mod tests {
             aud: None,
             scope: String::new(),
             name: None,
+            jti: None,
+            token_use: None,
+            mcp: None,
         };
 
         let token = create_test_token(&claims, secret);
@@ -479,6 +571,9 @@ mod tests {
             aud: None,
             scope: "storage:read storage:write".to_string(),
             name: Some("Test User".to_string()),
+            jti: None,
+            token_use: None,
+            mcp: None,
         };
 
         let session = claims_to_session(claims, "test-jwt-token".to_string());
@@ -608,5 +703,230 @@ mod tests {
         // Not Bearer or AWS Sig V4
         assert!(extract_token_from_header("Basic xyz", &headers).is_err());
         assert!(extract_token_from_header("Custom auth", &headers).is_err());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // P12 — SCOPED MCP TOKEN: end-to-end parse → validate → fail-closed → enforce
+    // ═══════════════════════════════════════════════════════════════════════════════
+    //
+    // These exercise the SAME chain the auth middleware runs — mint an MCP JWT,
+    // `validate_token` it, derive the scope via `mcp_scope_from_claims`, build the
+    // session, then `assert_mcp_scope` each scenario — so they cover the wiring,
+    // not just the `mcp_scope` unit logic. The handlers each call exactly this
+    // `assert_mcp_scope`, so a green here means the enforcement the handlers rely
+    // on is sound.
+
+    use crate::mcp_scope::McpAction;
+
+    /// Mint an MCP JWT (token_use + mcp claim) the way the issuer does, via the
+    /// existing test-token helper. `perms`/`bucket` are configurable so each
+    /// test can shape the scope.
+    fn mcp_claims(sub: &str, bucket: &str, prefix: &str, perms: &[&str]) -> Claims {
+        Claims {
+            sub: sub.to_string(),
+            exp: Some((Utc::now() + Duration::hours(1)).timestamp()),
+            iat: Some(Utc::now().timestamp()),
+            // iss/aud left None here: P12's `validate_token` only enforces them
+            // when a JwtValidationConfig configures an expected value (it doesn't
+            // by default), and jsonwebtoken v9 rejects a token that CARRIES an
+            // `aud` claim when no expected audience is set. The MCP discriminator
+            // is `token_use` + `mcp`, independent of iss/aud — so omitting them
+            // keeps this an honest validate→derive→enforce round-trip. (iss/aud
+            // enforcement is explicitly out of P12 scope; see the report.)
+            iss: None,
+            aud: None,
+            scope: String::new(), // MCP tokens carry NO storage scope
+            name: None,
+            jti: Some("test-jti-123".to_string()),
+            token_use: Some("mcp_s3".to_string()),
+            mcp: Some(McpScopeClaim {
+                v: 1,
+                scopes: vec![McpScopeEntry {
+                    bucket: bucket.to_string(),
+                    prefix: prefix.to_string(),
+                    perms: perms.iter().map(|s| s.to_string()).collect(),
+                }],
+            }),
+        }
+    }
+
+    /// Run the full middleware chain (validate → derive scope → build session)
+    /// for a freshly-minted token and return the resulting session.
+    fn session_from_claims(claims: &Claims, secret: &str) -> UserSession {
+        let token = create_test_token(claims, secret);
+        let validated = validate_token(&token, secret).expect("token validates");
+        let scope = mcp_scope_from_claims(&validated).expect("scope derives");
+        let mut session = claims_to_session(validated, token);
+        session.mcp_scope = scope;
+        session
+    }
+
+    #[test]
+    fn mcp_token_in_scope_ops_pass() {
+        let secret = "test-secret";
+        let claims = mcp_claims("user-sub", "fula-ai-workspace", "ai/", &["read", "write", "list"]);
+        let session = session_from_claims(&claims, secret);
+
+        // The session is recognized as MCP-scoped.
+        assert!(session.mcp_scope.is_some(), "MCP token must carry a scope");
+
+        // In-scope object read/write + bucket list/create all pass.
+        assert!(session.assert_mcp_scope("fula-ai-workspace", Some("ai/notes/x.txt"), McpAction::Read).is_ok());
+        assert!(session.assert_mcp_scope("fula-ai-workspace", Some("ai/notes/x.txt"), McpAction::Write).is_ok());
+        assert!(session.assert_mcp_scope("fula-ai-workspace", None, McpAction::List).is_ok());
+        assert!(session.assert_mcp_scope("fula-ai-workspace", None, McpAction::Write).is_ok());
+    }
+
+    #[test]
+    fn mcp_token_other_bucket_is_access_denied() {
+        let secret = "test-secret";
+        let claims = mcp_claims("user-sub", "fula-ai-workspace", "ai/", &["read", "write", "list"]);
+        let session = session_from_claims(&claims, secret);
+
+        let err = session
+            .assert_mcp_scope("victim-bucket", Some("ai/x"), McpAction::Read)
+            .expect_err("other bucket must be denied");
+        // Surfaces as an opaque S3 AccessDenied (403).
+        assert!(matches!(err.error_code(), S3ErrorCode::AccessDenied));
+    }
+
+    #[test]
+    fn mcp_token_aimage_boundary_key_is_access_denied() {
+        // The segment-boundary regression: `aimage/...` must NOT be inside `ai/`.
+        let secret = "test-secret";
+        let claims = mcp_claims("user-sub", "fula-ai-workspace", "ai/", &["read", "write", "list"]);
+        let session = session_from_claims(&claims, secret);
+
+        assert!(session
+            .assert_mcp_scope("fula-ai-workspace", Some("aimage/secret.txt"), McpAction::Read)
+            .is_err());
+        assert!(session
+            .assert_mcp_scope("fula-ai-workspace", Some("other/key"), McpAction::Write)
+            .is_err());
+    }
+
+    #[test]
+    fn mcp_token_missing_perm_is_access_denied() {
+        // A read-only MCP token may read but not write, even in-scope.
+        let secret = "test-secret";
+        let claims = mcp_claims("user-sub", "fula-ai-workspace", "ai/", &["read"]);
+        let session = session_from_claims(&claims, secret);
+
+        assert!(session.assert_mcp_scope("fula-ai-workspace", Some("ai/x"), McpAction::Read).is_ok());
+        assert!(session.assert_mcp_scope("fula-ai-workspace", Some("ai/x"), McpAction::Write).is_err());
+        // ...and cannot list (no list perm).
+        assert!(session.assert_mcp_scope("fula-ai-workspace", None, McpAction::List).is_err());
+    }
+
+    #[test]
+    fn mcp_capability_gate_derives_from_perms() {
+        // The CAPABILITY gate (can_read/can_write) — which every handler runs
+        // BEFORE assert_mcp_scope — must derive from the MCP perms, since an MCP
+        // token carries no storage `scope`. This is the regression for the
+        // empty-scope defect (without it, can_read/can_write are false and every
+        // MCP op is rejected before the scope check).
+        let secret = "test-secret";
+
+        // Full perms: can_read AND can_write.
+        let full = session_from_claims(
+            &mcp_claims("u", "fula-ai-workspace", "ai/", &["read", "write", "list"]),
+            secret,
+        );
+        assert!(full.can_read() && full.can_write());
+
+        // Read-only: can_read, NOT can_write.
+        let ro = session_from_claims(&mcp_claims("u", "fula-ai-workspace", "ai/", &["read"]), secret);
+        assert!(ro.can_read());
+        assert!(!ro.can_write());
+
+        // List-only: can_read TRUE (so it passes the can_read gate that
+        // list_objects runs) but NOT can_write — and assert(Read) on an actual
+        // object GET still denies it (assert is the authoritative fence).
+        let list_only = session_from_claims(&mcp_claims("u", "fula-ai-workspace", "ai/", &["list"]), secret);
+        assert!(list_only.can_read(), "list perm grants coarse read capability");
+        assert!(!list_only.can_write());
+        assert!(list_only.assert_mcp_scope("fula-ai-workspace", None, McpAction::List).is_ok());
+        assert!(
+            list_only.assert_mcp_scope("fula-ai-workspace", Some("ai/x"), McpAction::Read).is_err(),
+            "list-only must still be denied an actual object GET by assert"
+        );
+
+        // An MCP session is never admin (empty storage scope).
+        assert!(!full.is_admin());
+    }
+
+    #[test]
+    fn normal_storage_token_is_unaffected_by_mcp_enforcement() {
+        // REGRESSION: a normal storage token (no token_use, no mcp) gets
+        // mcp_scope == None, so every assert_mcp_scope is a no-op Ok — it can
+        // touch any bucket/key/action exactly as before P12.
+        let secret = "test-secret";
+        let claims = Claims {
+            sub: "storage-user".to_string(),
+            exp: None,
+            iat: None,
+            iss: None,
+            aud: None,
+            scope: "storage:read storage:write".to_string(),
+            name: None,
+            jti: None,
+            token_use: None,
+            mcp: None,
+        };
+        let session = session_from_claims(&claims, secret);
+
+        assert!(session.mcp_scope.is_none(), "storage token must NOT be MCP-scoped");
+        assert!(session.can_read() && session.can_write());
+        // Any bucket / any key / any action — all pass (no MCP fence).
+        assert!(session.assert_mcp_scope("any-bucket", Some("anything/at/all"), McpAction::Write).is_ok());
+        assert!(session.assert_mcp_scope("another", None, McpAction::List).is_ok());
+        assert!(session.assert_mcp_scope("aimage-bucket", Some("aimage/x"), McpAction::Read).is_ok());
+    }
+
+    #[test]
+    fn mcp_flagged_token_without_mcp_claim_is_refused() {
+        // FAIL-CLOSED: token_use=mcp_s3 but NO mcp claim ⇒ the whole token is
+        // refused at mcp_scope_from_claims (must NOT fall through to broad access).
+        let secret = "test-secret";
+        let mut claims = mcp_claims("user-sub", "fula-ai-workspace", "ai/", &["read"]);
+        claims.mcp = None; // strip the scope claim but keep token_use
+        let token = create_test_token(&claims, secret);
+        let validated = validate_token(&token, secret).unwrap();
+        assert!(
+            mcp_scope_from_claims(&validated).is_err(),
+            "an MCP-flagged token with no mcp claim must be refused"
+        );
+    }
+
+    #[test]
+    fn mcp_token_with_unsupported_version_is_refused() {
+        // FAIL-CLOSED: mcp.v != 1 ⇒ token refused (never treated as unconstrained).
+        let secret = "test-secret";
+        let mut claims = mcp_claims("user-sub", "fula-ai-workspace", "ai/", &["read"]);
+        if let Some(ref mut m) = claims.mcp {
+            m.v = 2;
+        }
+        let token = create_test_token(&claims, secret);
+        let validated = validate_token(&token, secret).unwrap();
+        assert!(
+            mcp_scope_from_claims(&validated).is_err(),
+            "mcp.v=2 must be refused by the v1 gateway"
+        );
+    }
+
+    #[test]
+    fn ambiguous_mcp_claim_without_token_use_is_refused() {
+        // TOKEN-CONFUSION HARDENING: an mcp claim present WITHOUT
+        // token_use=mcp_s3 is ambiguous ⇒ refused (not silently treated as a
+        // storage token).
+        let secret = "test-secret";
+        let mut claims = mcp_claims("user-sub", "fula-ai-workspace", "ai/", &["read"]);
+        claims.token_use = None; // mcp present, but no discriminator
+        let token = create_test_token(&claims, secret);
+        let validated = validate_token(&token, secret).unwrap();
+        assert!(
+            mcp_scope_from_claims(&validated).is_err(),
+            "an mcp claim without token_use=mcp_s3 must be refused as ambiguous"
+        );
     }
 }

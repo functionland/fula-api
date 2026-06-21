@@ -41,6 +41,8 @@ pub mod index_pin_backfill;
 pub mod index_pin_set;
 pub mod local_retain;
 pub mod local_retain_queue;
+pub mod mcp_revocation;
+pub mod mcp_scope;
 pub mod middleware;
 pub mod multipart;
 pub mod peering;

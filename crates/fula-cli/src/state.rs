@@ -85,6 +85,15 @@ pub struct AppState {
     /// present. Deny-list + fail-open: a valid/legacy/unknown token is never
     /// rejected, and a DB outage never locks anyone out.
     pub revocation: Option<Arc<crate::revocation::RevocationState>>,
+    /// P12 — MCP-token `jti` revocation deny-list. `Some` when
+    /// `FULA_MCP_REVOCATION_ENABLED` is set AND an endpoint is configured;
+    /// `None` (default) → `mcp_revocation::ensure_jti_not_revoked` is a no-op.
+    /// A background refresher (`mcp_revocation::spawn_if_enabled`, deferred to
+    /// the test-server deploy) mirrors revoked jtis into it; `auth_middleware`
+    /// rejects a token whose `jti` is present. Sibling of [`Self::revocation`]
+    /// but keyed on jti, with a fail-CLOSED-on-write policy for the
+    /// enabled-but-unreachable case (per-action wiring deferred).
+    pub mcp_revocation: Option<Arc<crate::mcp_revocation::McpRevocationState>>,
 }
 
 impl AppState {
@@ -331,6 +340,17 @@ impl AppState {
             None
         };
 
+        // P12 — MCP jti revocation deny-list. Allocated EMPTY (= allow all)
+        // only when the env switch is set AND an endpoint is configured; the
+        // background refresher (deferred) performs the first load. Default OFF
+        // → `None` → no-op, byte-identical auth.
+        let mcp_revocation = if crate::mcp_revocation::enabled() {
+            info!("✓ MCP revocation deny-list enabled (FULA_MCP_REVOCATION_ENABLED); honoring jti revocation, loads on first refresh");
+            Some(Arc::new(crate::mcp_revocation::McpRevocationState::empty()))
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             block_store,
@@ -344,6 +364,7 @@ impl AppState {
             index_pin_set,
             pins_db,
             revocation,
+            mcp_revocation,
         })
     }
 
@@ -564,6 +585,15 @@ pub struct UserSession {
     pub expires_at: chrono::DateTime<chrono::Utc>,
     /// Raw JWT token for forwarding to pinning service
     pub jwt_token: String,
+    /// Scoped MCP authorization (P12). `Some` ONLY for a validated scoped MCP
+    /// token (`token_use == "mcp_s3"`); the middleware fail-closes the token if
+    /// it is MCP-flagged but the claim is missing/malformed, so a `Some` here is
+    /// always a parsed, enforce-ready scope. `None` for every normal storage
+    /// token (and dev/admin sessions) ⇒ [`Self::assert_mcp_scope`] is a no-op
+    /// and behavior is byte-identical to pre-P12. Set by `auth_middleware`
+    /// AFTER `claims_to_session`; defaults to `None` in [`Self::new`] so all
+    /// other constructors stay untouched.
+    pub mcp_scope: Option<crate::mcp_scope::McpScope>,
 }
 
 impl UserSession {
@@ -577,6 +607,9 @@ impl UserSession {
             scopes,
             expires_at,
             jwt_token,
+            // P12: non-MCP by default. `auth_middleware` overwrites this with a
+            // validated scope for MCP tokens; everything else stays `None`.
+            mcp_scope: None,
         }
     }
 
@@ -590,13 +623,28 @@ impl UserSession {
         self.scopes.iter().any(|s| s == scope || s == "*")
     }
 
-    /// Check if user can read
+    /// Check if user can read.
+    ///
+    /// P12: a scoped MCP token carries NO storage `scope` (its perms live in the
+    /// `mcp` claim), so for an MCP session capability is derived from the MCP
+    /// perms instead — otherwise the per-handler `can_read` gate would reject
+    /// every MCP op before `assert_mcp_scope` runs. Coarse by design;
+    /// `assert_mcp_scope` is still the authoritative per-op fence. Non-MCP
+    /// sessions (`mcp_scope == None`) use the existing storage-scope logic
+    /// unchanged (byte-identical).
     pub fn can_read(&self) -> bool {
+        if let Some(scope) = &self.mcp_scope {
+            return scope.has_read_capability();
+        }
         self.has_scope("storage:read") || self.has_scope("storage:*")
     }
 
-    /// Check if user can write
+    /// Check if user can write. See [`Self::can_read`] for the P12 MCP-aware
+    /// capability derivation; non-MCP sessions are unchanged.
     pub fn can_write(&self) -> bool {
+        if let Some(scope) = &self.mcp_scope {
+            return scope.has_write_capability();
+        }
         self.has_scope("storage:write") || self.has_scope("storage:*")
     }
 
@@ -609,6 +657,39 @@ impl UserSession {
     /// Security audit fix A3: Uses hashed user ID for comparison
     pub fn can_access_bucket(&self, bucket_owner_id: &str) -> bool {
         self.hashed_user_id == bucket_owner_id || self.is_admin()
+    }
+
+    /// P12 — enforce the scoped MCP fence for this request.
+    ///
+    /// For a normal storage token (`mcp_scope == None`) this is a no-op and
+    /// returns `Ok(())`, so existing behavior is byte-identical. For a scoped
+    /// MCP token it delegates to [`crate::mcp_scope::McpScope::assert`]: the
+    /// request `bucket` must match the token's scope, an object `key`
+    /// (`Some`) must be within the `ai/` prefix, and the `action`'s permission
+    /// must be granted. Any violation maps to an opaque `AccessDenied` — the
+    /// specific rule that tripped is logged (debug) but never leaked.
+    ///
+    /// Call this in every object/bucket handler right after the existing
+    /// `can_read`/`can_write` gate. Bucket-level ops pass `key = None`.
+    pub fn assert_mcp_scope(
+        &self,
+        bucket: &str,
+        key: Option<&str>,
+        action: crate::mcp_scope::McpAction,
+    ) -> Result<(), crate::ApiError> {
+        match &self.mcp_scope {
+            None => Ok(()),
+            Some(scope) => scope.assert(bucket, key, action).map_err(|e| {
+                tracing::debug!(
+                    bucket = %bucket,
+                    has_key = key.is_some(),
+                    ?action,
+                    reason = %e,
+                    "MCP scope check denied request"
+                );
+                crate::ApiError::s3(crate::S3ErrorCode::AccessDenied, "out of MCP scope")
+            }),
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 //! Bucket operation handlers
 
 use crate::{AppState, ApiError, S3ErrorCode};
+use crate::mcp_scope::McpAction;
 use crate::state::UserSession;
 use crate::xml;
 use axum::{
@@ -21,6 +22,8 @@ pub async fn create_bucket(
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
+    // P12: a scoped MCP token may only create its own scoped bucket (write perm).
+    session.assert_mcp_scope(&bucket, None, McpAction::Write)?;
 
     // Security audit fix A3: Use hashed user ID for privacy
     let owner = Owner::new(&session.hashed_user_id)
@@ -49,6 +52,8 @@ pub async fn delete_bucket(
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
+    // P12: a scoped MCP token may only delete its own scoped bucket (write perm).
+    session.assert_mcp_scope(&bucket, None, McpAction::Write)?;
 
     // User-scoped bucket deletion (user can only delete their own buckets)
     state.bucket_manager.delete_bucket_for_user(&session.hashed_user_id, &bucket).await?;
@@ -62,6 +67,11 @@ pub async fn head_bucket(
     Extension(session): Extension<UserSession>,
     Path(bucket): Path<String>,
 ) -> Result<Response, ApiError> {
+    // P12: a scoped MCP token may only HEAD its own scoped bucket (read perm).
+    // (head_bucket has no can_read gate today; this adds the MCP fence only —
+    // storage tokens with mcp_scope == None are unaffected.)
+    session.assert_mcp_scope(&bucket, None, McpAction::Read)?;
+
     // User-scoped bucket check (user can only see their own buckets)
     if !state.bucket_manager.bucket_exists_for_user(&session.hashed_user_id, &bucket) {
         return Err(ApiError::s3(S3ErrorCode::NoSuchBucket, "Bucket not found"));
@@ -97,6 +107,10 @@ pub async fn list_objects(
     if !session.can_read() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Read access required"));
     }
+    // P12: a scoped MCP token may only LIST its own scoped bucket (list perm).
+    // Bucket-level op (key=None); listing is confined to the bucket — the
+    // results inside are already prefixed `ai/...` for a real MCP workspace.
+    session.assert_mcp_scope(&bucket_name, None, McpAction::List)?;
 
     // User-scoped bucket access (user can only access their own buckets)
     let bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;

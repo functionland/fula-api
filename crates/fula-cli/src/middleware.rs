@@ -14,7 +14,7 @@ use crate::state::{UserSession, AdminSession};
 use chrono::{DateTime, Utc};
 use axum::{
     body::Body,
-    extract::State,
+    extract::{MatchedPath, State},
     http::Request,
     middleware::Next,
     response::Response,
@@ -40,6 +40,26 @@ pub fn create_rate_limiter(requests_per_second: u32, burst: u32) -> Arc<KeyedRat
     let burst = NonZeroU32::new(burst.max(requests_per_second).max(1)).unwrap();
     let quota = Quota::per_second(rps).allow_burst(burst);
     Arc::new(RateLimiter::keyed(quota))
+}
+
+/// P12 — is this matched route PATTERN one a scoped MCP token may use?
+///
+/// Allowed = the S3 object/bucket DATA routes only (the ones whose handlers run
+/// `assert_mcp_scope`):
+/// - `/{bucket}` and `/{bucket}/` — CreateBucket / DeleteBucket / HeadBucket /
+///   ListObjects / batch-delete (POST),
+/// - `/{bucket}/{*key}` — Put/Get/Head/Delete object + multipart + tagging.
+///
+/// Everything else (`/` ListBuckets, `/locks/*`, `/api/v1/*`, and any FUTURE
+/// authenticated route) is denied — fail-CLOSED, including when `matched` is
+/// `None` (a request that somehow reached auth with no matched route pattern).
+/// Keyed on the route PATTERN (axum [`MatchedPath`]) so new routes are denied
+/// by default rather than silently allowed.
+pub(crate) fn mcp_route_allowed(matched: Option<&str>) -> bool {
+    matches!(
+        matched,
+        Some("/{bucket}") | Some("/{bucket}/") | Some("/{bucket}/{*key}")
+    )
 }
 
 /// Authentication middleware
@@ -82,8 +102,25 @@ pub async fn auth_middleware(
             // so a currently-valid token is never rejected. `token` is the raw
             // JWT — the issuer hashes the same string into `api_keys.key_hash`.
             crate::revocation::ensure_not_revoked(state.revocation.as_deref(), &token)?;
+            // P12: MCP jti revocation deny-list. Mirrors the F3 key deny-list
+            // but keyed on the MCP token's `jti`. No-op unless the MCP
+            // revocation source is enabled; fail-CLOSED is applied per-action in
+            // the handlers (a write under an enabled-but-unreachable source is
+            // denied), while the plain membership deny (a known-revoked jti)
+            // applies to every verb here.
+            crate::mcp_revocation::ensure_jti_not_revoked(
+                state.mcp_revocation.as_deref(),
+                claims.jti.as_deref(),
+            )?;
+            // P12: derive the scoped-MCP fence (fail-closed). For a normal
+            // storage token this is `None` and changes nothing; for an MCP
+            // token it REQUIRES a valid `mcp` claim or the token is refused.
+            // Computed before `claims` is moved into `claims_to_session`.
+            let mcp_scope = crate::auth::mcp_scope_from_claims(&claims)?;
             // Pass the raw JWT token to the session for forwarding to pinning service
-            claims_to_session(claims, token)
+            let mut session = claims_to_session(claims, token);
+            session.mcp_scope = mcp_scope;
+            session
         }
         None => {
             return Err(ApiError::s3(
@@ -96,6 +133,31 @@ pub async fn auth_middleware(
     // Check session expiration
     if session.is_expired() {
         return Err(ApiError::s3(S3ErrorCode::InvalidToken, "Token has expired"));
+    }
+
+    // P12 — DEFENSE-IN-DEPTH choke point. A scoped MCP token may ONLY hit the
+    // S3 object/bucket DATA routes (where the per-handler `assert_mcp_scope`
+    // enforces bucket+prefix+perms). Every other authenticated route
+    // (ListBuckets `/`, `/locks/*`, the `/api/v1/*` recovery + index endpoints)
+    // has no scope-aware fence and an MCP token has no legitimate use for it, so
+    // it is denied here — a single place that fail-CLOSES for FUTURE routes too
+    // (keyed on the matched route PATTERN, not the raw URI). Non-MCP storage
+    // tokens are unaffected. The per-handler asserts remain as belt-and-braces.
+    if session.mcp_scope.is_some() {
+        let matched = request
+            .extensions()
+            .get::<MatchedPath>()
+            .map(|m| m.as_str().to_string());
+        if !mcp_route_allowed(matched.as_deref()) {
+            tracing::warn!(
+                route = matched.as_deref().unwrap_or("<unmatched>"),
+                "MCP token denied on a non-data route (P12 allowlist)"
+            );
+            return Err(ApiError::s3(
+                S3ErrorCode::AccessDenied,
+                "MCP tokens are restricted to S3 object operations on the scoped bucket",
+            ));
+        }
     }
 
     // Store session in request extensions
@@ -290,6 +352,196 @@ mod tests {
         let limiter = create_rate_limiter(1000, 10);
         for _ in 0..1000 {
             assert!(limiter.check_key(&"u".to_string()).is_ok());
+        }
+    }
+
+    // ── P12 MCP route-allowlist (pure function) ─────────────────────────────
+    #[test]
+    fn mcp_route_allowlist_allows_only_data_routes() {
+        // The three S3 data-route patterns are allowed.
+        assert!(mcp_route_allowed(Some("/{bucket}")));
+        assert!(mcp_route_allowed(Some("/{bucket}/")));
+        assert!(mcp_route_allowed(Some("/{bucket}/{*key}")));
+    }
+
+    #[test]
+    fn mcp_route_allowlist_denies_everything_else_failclosed() {
+        // ListBuckets, locks, api_v1 recovery/index, health — all denied.
+        assert!(!mcp_route_allowed(Some("/")));
+        assert!(!mcp_route_allowed(Some("/locks/{bucket}")));
+        assert!(!mcp_route_allowed(Some("/locks/{bucket}/heartbeat")));
+        assert!(!mcp_route_allowed(Some("/api/v1/blocks/{cid}")));
+        assert!(!mcp_route_allowed(Some("/api/v1/buckets/{bucket}/resolve-keys")));
+        assert!(!mcp_route_allowed(Some("/api/v1/buckets/list")));
+        assert!(!mcp_route_allowed(Some("/api/v1/users-index/entry")));
+        // Fail-CLOSED: a request with no matched route pattern is denied.
+        assert!(!mcp_route_allowed(None));
+        // An unknown/future route is denied by default.
+        assert!(!mcp_route_allowed(Some("/some/future/route")));
+    }
+
+    // ── P12 MCP allowlist (real auth_middleware + MatchedPath, end-to-end) ───
+    //
+    // Proves the choke point actually works against axum's router: that
+    // `MatchedPath` reaches `auth_middleware` and the pattern strings match, so
+    // a real MCP token is ALLOWED on `/{bucket}` + `/{bucket}/{*key}` and DENIED
+    // (403) on `/`, `/locks/{bucket}`, `/api/v1/blocks/{cid}` — while a normal
+    // storage token passes the allowlist on every route.
+    mod allowlist_integration {
+        use super::*;
+        use crate::auth::{Claims, McpScopeClaim, McpScopeEntry};
+        use crate::state::AppState;
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use axum::routing::{get, put};
+        use axum::Router;
+        use chrono::{Duration as ChronoDuration, Utc};
+        use fula_blockstore::MemoryBlockStore;
+        use fula_core::BucketManager;
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        use tower::ServiceExt;
+
+        const SECRET: &str = "allowlist-test-secret";
+
+        async fn test_state() -> Arc<AppState> {
+            use fula_blockstore::FlexibleBlockStore;
+            let block_store = Arc::new(FlexibleBlockStore::Memory(MemoryBlockStore::new()));
+            let bucket_manager = Arc::new(BucketManager::new(Arc::clone(&block_store)));
+            let mut config = crate::config::GatewayConfig::default();
+            config.auth_enabled = true;
+            config.jwt_secret = Some(SECRET.to_string());
+            config.use_memory_store = true;
+            Arc::new(AppState {
+                config,
+                block_store,
+                bucket_manager,
+                multipart_manager: Arc::new(crate::multipart::MultipartManager::new(60)),
+                lock_store: crate::handlers::locks::LockStore::new(),
+                users_index_publisher: None,
+                pin_queue: None,
+                entries_store: None,
+                local_retain: None,
+                index_pin_set: None,
+                pins_db: None,
+                revocation: None,
+                mcp_revocation: None,
+            })
+        }
+
+        /// A trivial OK handler — the test only cares whether the request
+        /// reaches it (allowlist passed) or is rejected by the middleware (403).
+        async fn ok_handler() -> StatusCode {
+            StatusCode::OK
+        }
+
+        /// Router mirroring the real route PATTERNS, behind the real
+        /// `auth_middleware`. Both allowed (data) and denied (aux) patterns.
+        fn router(state: Arc<AppState>) -> Router {
+            Router::new()
+                // Allowed (data) routes
+                .route("/{bucket}", put(ok_handler))
+                .route("/{bucket}/{*key}", get(ok_handler))
+                // Denied (aux / recovery) routes
+                .route("/", get(ok_handler))
+                .route("/locks/{bucket}", axum::routing::post(ok_handler))
+                .route("/api/v1/blocks/{cid}", get(ok_handler))
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    auth_middleware,
+                ))
+                .with_state(state)
+        }
+
+        fn mint(claims: &Claims) -> String {
+            encode(&Header::default(), claims, &EncodingKey::from_secret(SECRET.as_bytes())).unwrap()
+        }
+
+        fn mcp_token() -> String {
+            let claims = Claims {
+                sub: "user-sub".to_string(),
+                exp: Some((Utc::now() + ChronoDuration::hours(1)).timestamp()),
+                iat: Some(Utc::now().timestamp()),
+                iss: None,
+                aud: None,
+                scope: String::new(),
+                name: None,
+                jti: Some("jti-1".to_string()),
+                token_use: Some("mcp_s3".to_string()),
+                mcp: Some(McpScopeClaim {
+                    v: 1,
+                    scopes: vec![McpScopeEntry {
+                        bucket: "fula-ai-workspace".to_string(),
+                        prefix: "ai/".to_string(),
+                        perms: vec!["read".into(), "write".into(), "list".into()],
+                    }],
+                }),
+            };
+            mint(&claims)
+        }
+
+        fn storage_token() -> String {
+            let claims = Claims {
+                sub: "storage-user".to_string(),
+                exp: None,
+                iat: None,
+                iss: None,
+                aud: None,
+                scope: "storage:read storage:write".to_string(),
+                name: None,
+                jti: None,
+                token_use: None,
+                mcp: None,
+            };
+            mint(&claims)
+        }
+
+        async fn status_for(state: Arc<AppState>, method: Method, uri: &str, token: &str) -> StatusCode {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            router(state).oneshot(req).await.unwrap().status()
+        }
+
+        #[tokio::test]
+        async fn mcp_token_allowed_on_data_routes() {
+            let state = test_state().await;
+            // PUT /{bucket} and GET /{bucket}/{*key} are data routes → reach the
+            // OK handler (NOT 403 from the allowlist).
+            let s1 = status_for(Arc::clone(&state), Method::PUT, "/fula-ai-workspace", &mcp_token()).await;
+            assert_eq!(s1, StatusCode::OK, "MCP token must be allowed on /{{bucket}}");
+            let s2 = status_for(Arc::clone(&state), Method::GET, "/fula-ai-workspace/ai/x.txt", &mcp_token()).await;
+            assert_eq!(s2, StatusCode::OK, "MCP token must be allowed on /{{bucket}}/{{*key}}");
+        }
+
+        #[tokio::test]
+        async fn mcp_token_denied_on_aux_and_recovery_routes() {
+            let state = test_state().await;
+            // ListBuckets, locks, api_v1 block-read → 403 from the allowlist.
+            let root = status_for(Arc::clone(&state), Method::GET, "/", &mcp_token()).await;
+            assert_eq!(root, StatusCode::FORBIDDEN, "MCP token must be denied on / (ListBuckets)");
+            let locks = status_for(Arc::clone(&state), Method::POST, "/locks/some-bucket", &mcp_token()).await;
+            assert_eq!(locks, StatusCode::FORBIDDEN, "MCP token must be denied on /locks/*");
+            let blocks = status_for(Arc::clone(&state), Method::GET, "/api/v1/blocks/somecid", &mcp_token()).await;
+            assert_eq!(blocks, StatusCode::FORBIDDEN, "MCP token must be denied on /api/v1/blocks/{{cid}} (out-of-scope byte read)");
+        }
+
+        #[tokio::test]
+        async fn storage_token_passes_allowlist_on_every_route() {
+            // REGRESSION: a normal storage token is NOT subject to the MCP
+            // allowlist — it reaches the handler on aux routes too (byte-identical).
+            let state = test_state().await;
+            for (m, uri) in [
+                (Method::GET, "/"),
+                (Method::POST, "/locks/some-bucket"),
+                (Method::GET, "/api/v1/blocks/somecid"),
+                (Method::PUT, "/fula-ai-workspace"),
+            ] {
+                let s = status_for(Arc::clone(&state), m.clone(), uri, &storage_token()).await;
+                assert_eq!(s, StatusCode::OK, "storage token must pass the allowlist on {uri}");
+            }
         }
     }
 }

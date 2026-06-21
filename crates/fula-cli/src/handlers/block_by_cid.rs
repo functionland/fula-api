@@ -34,6 +34,14 @@ pub async fn get_block_by_cid(
     if !session.can_read() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Read access required"));
     }
+    // P12 defense-in-depth: this fetches raw block bytes gated only on the CID
+    // being pinned ANYWHERE on the platform (not ownership), so a scoped MCP
+    // token here would read arbitrary out-of-scope bytes. The middleware
+    // allowlist already blocks MCP from /api/v1/*; this is a second, local
+    // fail-closed in case the route wiring ever changes.
+    if session.mcp_scope.is_some() {
+        return Err(ApiError::s3(S3ErrorCode::AccessDenied, "not available to MCP tokens"));
+    }
 
     let cid = Cid::from_str(&cid_str)
         .map_err(|e| ApiError::s3(S3ErrorCode::InvalidArgument, format!("invalid CID: {e}")))?;

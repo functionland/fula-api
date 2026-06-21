@@ -1,6 +1,7 @@
 //! Object tagging handlers
 
 use crate::{AppState, ApiError, S3ErrorCode};
+use crate::mcp_scope::McpAction;
 use crate::state::UserSession;
 use axum::{
     extract::{Extension, Path, State},
@@ -19,10 +20,12 @@ pub async fn get_object_tagging(
     if !session.can_read() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Read access required"));
     }
+    // P12: scoped MCP tokens may only read tags within their bucket + `ai/` prefix.
+    session.assert_mcp_scope(&bucket_name, Some(&key), McpAction::Read)?;
 
     // User-scoped bucket access
     let bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
-    
+
     let metadata = bucket.get_object(&key).await?
         .ok_or_else(|| ApiError::s3_with_resource(
             S3ErrorCode::NoSuchKey,
@@ -68,6 +71,8 @@ pub async fn put_object_tagging(
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
+    // P12: scoped MCP tokens may only write tags within their bucket + `ai/` prefix.
+    session.assert_mcp_scope(&bucket_name, Some(&key), McpAction::Write)?;
 
     // Serialize same-bucket index mutations (see `put_object` for rationale).
     let _bucket_guard = state
@@ -108,6 +113,8 @@ pub async fn delete_object_tagging(
     if !session.can_write() {
         return Err(ApiError::s3(S3ErrorCode::AccessDenied, "Write access required"));
     }
+    // P12: scoped MCP tokens may only delete tags within their bucket + `ai/` prefix.
+    session.assert_mcp_scope(&bucket_name, Some(&key), McpAction::Write)?;
 
     // Serialize same-bucket index mutations (see `put_object` for rationale).
     let _bucket_guard = state
