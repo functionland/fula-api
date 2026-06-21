@@ -32,6 +32,47 @@ pub struct Claims {
     pub scope: String,
     /// Name
     pub name: Option<String>,
+    /// JWT ID (P12). Present on scoped MCP tokens (`token_use == "mcp_s3"`);
+    /// the revocation key. `serde(default)` so legacy storage tokens (which
+    /// carry no `jti`) deserialize unchanged.
+    #[serde(default)]
+    pub jti: Option<String>,
+    /// Token-kind discriminator (P12). A token is a scoped MCP token iff this
+    /// equals `Some("mcp_s3")`. `serde(default)` ⇒ legacy storage tokens (no
+    /// `token_use`) deserialize as `None` and behave byte-identically.
+    #[serde(default)]
+    pub token_use: Option<String>,
+    /// Scoped MCP authorization claim (P12). Present only on MCP tokens; see
+    /// [`crate::mcp_scope`]. `serde(default)` ⇒ absent on storage tokens.
+    #[serde(default)]
+    pub mcp: Option<McpScopeClaim>,
+}
+
+/// The `mcp` claim on a scoped MCP-S3 JWT (P12). Mirrors the issuer's contract
+/// in `pinning-webui/server/mcpTokens.ts` (`McpScopeClaim`). `Deserialize`-only:
+/// the gateway never mints these, it only parses + enforces them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpScopeClaim {
+    /// MAJOR schema version. v1 is the only version this gateway accepts; an
+    /// unknown major version is rejected (fail-closed) in [`crate::mcp_scope`].
+    pub v: u32,
+    /// Scope entries. v1 carries exactly one.
+    #[serde(default)]
+    pub scopes: Vec<McpScopeEntry>,
+}
+
+/// One scope entry inside [`McpScopeClaim`] (P12). The bucket + prefix the
+/// token may touch and the permissions granted on it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpScopeEntry {
+    /// The single bucket this token is scoped to (e.g. `fula-ai-workspace`).
+    pub bucket: String,
+    /// The key-namespace prefix the token may touch (the constant `ai/`).
+    pub prefix: String,
+    /// Granted permission strings (subset of `read`/`write`/`list`). Unknown
+    /// strings are IGNORED by the parser (forward-compat) — never a grant.
+    #[serde(default)]
+    pub perms: Vec<String>,
 }
 
 /// JWT validation configuration
@@ -441,6 +482,9 @@ mod tests {
             aud: None,
             scope: "storage:read storage:write".to_string(),
             name: Some("Test User".to_string()),
+            jti: None,
+            token_use: None,
+            mcp: None,
         };
 
         let token = create_test_token(&claims, secret);
@@ -460,6 +504,9 @@ mod tests {
             aud: None,
             scope: String::new(),
             name: None,
+            jti: None,
+            token_use: None,
+            mcp: None,
         };
 
         let token = create_test_token(&claims, secret);
@@ -479,6 +526,9 @@ mod tests {
             aud: None,
             scope: "storage:read storage:write".to_string(),
             name: Some("Test User".to_string()),
+            jti: None,
+            token_use: None,
+            mcp: None,
         };
 
         let session = claims_to_session(claims, "test-jwt-token".to_string());
