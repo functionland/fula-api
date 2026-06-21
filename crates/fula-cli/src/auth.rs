@@ -49,9 +49,10 @@ pub struct Claims {
 }
 
 /// The `mcp` claim on a scoped MCP-S3 JWT (P12). Mirrors the issuer's contract
-/// in `pinning-webui/server/mcpTokens.ts` (`McpScopeClaim`). `Deserialize`-only:
-/// the gateway never mints these, it only parses + enforces them.
-#[derive(Debug, Clone, Deserialize)]
+/// in `pinning-webui/server/mcpTokens.ts` (`McpScopeClaim`). The gateway only
+/// parses + enforces these in production; `Serialize` is derived solely so
+/// tests can mint MCP tokens via the existing `create_test_token` helper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpScopeClaim {
     /// MAJOR schema version. v1 is the only version this gateway accepts; an
     /// unknown major version is rejected (fail-closed) in [`crate::mcp_scope`].
@@ -63,7 +64,7 @@ pub struct McpScopeClaim {
 
 /// One scope entry inside [`McpScopeClaim`] (P12). The bucket + prefix the
 /// token may touch and the permissions granted on it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpScopeEntry {
     /// The single bucket this token is scoped to (e.g. `fula-ai-workspace`).
     pub bucket: String,
