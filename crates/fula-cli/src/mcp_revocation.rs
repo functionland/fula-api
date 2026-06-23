@@ -46,10 +46,16 @@ use tracing::{debug, info, warn};
 use crate::state::AppState;
 use crate::{ApiError, S3ErrorCode};
 
-/// Observability counters.
+/// Observability counters (jti deny-list).
 pub static MCP_REVOCATION_DENIED_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static MCP_REVOCATION_REFRESH_OK: AtomicU64 = AtomicU64::new(0);
 pub static MCP_REVOCATION_REFRESH_FAIL: AtomicU64 = AtomicU64::new(0);
+
+/// Observability counters (L1b connection deny-list — sibling of the jti
+/// counters above, keyed on the connection pubkey instead of the jti).
+pub static MCP_CONNECTION_REVOCATION_DENIED_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static MCP_CONNECTION_REVOCATION_REFRESH_OK: AtomicU64 = AtomicU64::new(0);
+pub static MCP_CONNECTION_REVOCATION_REFRESH_FAIL: AtomicU64 = AtomicU64::new(0);
 
 /// `true` when the env master switch is set (`1`/`true`). The feature is only
 /// actually live when this AND an endpoint are both present (see [`enabled`]).
@@ -291,6 +297,249 @@ pub fn spawn_if_enabled(state: &Arc<AppState>) {
     info!("✓ MCP revocation deny-list refresher started (honors jti revocation)");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// L1b — CONNECTION-LEVEL revocation deny-list (sibling of the jti deny-list)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// A connection-bound MCP token carries a `cnf.mcp_pub_b64` claim (the MCP
+// connection's X25519 public key, base64). pinning-webui can revoke a whole
+// CONNECTION (independent of any individual token's jti) by publishing its
+// pubkey on a "revoked connections" feed. This block mirrors the jti seam
+// above EXACTLY — same swap-on-tick in-memory `HashSet<String>`, same trait
+// seam for tests, same FAIL-OPEN refresh (keep the previous set on error) —
+// but is keyed on the connection pubkey and parses `{ revoked_pubkeys: [...] }`.
+//
+// Fail policy: PLAIN MEMBERSHIP only (a known-revoked pubkey is denied for
+// every verb) and FAIL-OPEN on a source outage (an unreachable endpoint keeps
+// the previous set; it never wipes revocations and never locks connections
+// out). This deliberately does NOT carry the jti seam's deferred
+// `revocation_decision`/`SourceHealth` asymmetric-write scaffolding — that was
+// never wired into the middleware and L1b's contract is plain fail-open.
+//
+// Default OFF: gated on `FULA_MCP_CONNECTION_REVOCATION_ENABLED` +
+// `FULA_MCP_CONNECTION_REVOCATION_ENDPOINT`. When off, the AppState field is
+// `None` and [`ensure_connection_not_revoked`] is a no-op — auth is
+// byte-identical to pre-L1b.
+
+/// `true` when the connection-revocation master switch is set (`1`/`true`).
+/// Live only when this AND an endpoint are both present (see [`connection_enabled`]).
+pub fn connection_env_enabled() -> bool {
+    std::env::var("FULA_MCP_CONNECTION_REVOCATION_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// The configured connection-revocation endpoint
+/// (`FULA_MCP_CONNECTION_REVOCATION_ENDPOINT`), if any.
+pub fn connection_endpoint() -> Option<String> {
+    std::env::var("FULA_MCP_CONNECTION_REVOCATION_ENDPOINT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Is the connection deny-list live? Requires the env switch AND an endpoint.
+/// When `false`, [`ensure_connection_not_revoked`] is a no-op.
+pub fn connection_enabled() -> bool {
+    connection_env_enabled() && connection_endpoint().is_some()
+}
+
+/// In-memory revoked-connection-pubkey set, swapped wholesale by the background
+/// refresher. Same swap-on-tick idiom as [`McpRevocationState`].
+pub struct McpConnectionRevocationState {
+    set: parking_lot::RwLock<Arc<HashSet<String>>>,
+}
+
+impl Default for McpConnectionRevocationState {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl McpConnectionRevocationState {
+    /// An empty deny-list = allow every connection (the safe startup state).
+    pub fn empty() -> Self {
+        Self {
+            set: parking_lot::RwLock::new(Arc::new(HashSet::new())),
+        }
+    }
+
+    /// Replace the deny-list with a freshly-loaded set.
+    pub fn swap(&self, new: HashSet<String>) {
+        *self.set.write() = Arc::new(new);
+    }
+
+    /// Is this connection pubkey explicitly revoked? Compared verbatim — the
+    /// issuer normalizes the pubkey on both mint and verify, so the token's
+    /// `cnf.mcp_pub_b64` and the feed's entries are already canonical.
+    pub fn is_revoked(&self, pubkey: &str) -> bool {
+        let snapshot = { self.set.read().clone() };
+        snapshot.contains(pubkey)
+    }
+
+    /// Current deny-list size (monitoring).
+    pub fn len(&self) -> usize {
+        self.set.read().len()
+    }
+
+    /// Companion to `len` for clippy; empty = allow-all.
+    pub fn is_empty(&self) -> bool {
+        self.set.read().is_empty()
+    }
+}
+
+/// Plain membership deny — reject a token whose connection pubkey is on the
+/// deny-list. `None` state (feature off) → always `Ok`. `None` pubkey (token
+/// has no `cnf` — every storage token and unbound MCP token) → `Ok`. This is
+/// the non-MCP-token invariant: a token without a connection binding can never
+/// be on the connection deny-list, so it is never denied here regardless of how
+/// large the revoked set is. Decoupled from `AppState` so it is directly
+/// unit-testable. Mirrors [`ensure_jti_not_revoked`].
+pub fn ensure_connection_not_revoked(
+    revocation: Option<&McpConnectionRevocationState>,
+    pubkey: Option<&str>,
+) -> Result<(), ApiError> {
+    match (revocation, pubkey) {
+        (Some(rev), Some(pubkey)) if rev.is_revoked(pubkey) => {
+            MCP_CONNECTION_REVOCATION_DENIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            Err(ApiError::s3(
+                S3ErrorCode::InvalidToken,
+                "Connection has been revoked",
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Where the revoked-connection-pubkey set comes from. `Err` ⇒ keep the
+/// previous set (never wipe on a transient failure). The trait seam lets tests
+/// inject an in-memory source with no HTTP. Mirrors [`McpRevocationSource`].
+#[async_trait::async_trait]
+pub trait McpConnectionRevocationSource: Send + Sync {
+    async fn revoked_pubkeys(&self) -> anyhow::Result<HashSet<String>>;
+}
+
+/// Shape of the revoked-connections feed's JSON body. Tolerant: only the
+/// `revoked_pubkeys` array is read; any other fields are ignored.
+#[derive(Debug, serde::Deserialize)]
+struct RevokedPubkeysBody {
+    #[serde(default)]
+    revoked_pubkeys: Vec<String>,
+}
+
+/// Production source: an HTTP `GET {endpoint}` returning the revoked-connection
+/// pubkey list. Mirrors [`HttpMcpRevocationSource`] but additionally sends an
+/// `Authorization: Bearer {FULA_MCP_REVOCATION_INTERNAL_TOKEN}` header when that
+/// (jti-family) internal token is configured, so the feed can be auth-gated.
+pub struct HttpConnectionRevocationSource {
+    endpoint: String,
+    internal_token: Option<String>,
+    client: reqwest::Client,
+}
+
+impl HttpConnectionRevocationSource {
+    pub fn new(endpoint: String) -> Self {
+        let internal_token = std::env::var("FULA_MCP_REVOCATION_INTERNAL_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        Self {
+            endpoint,
+            internal_token,
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl McpConnectionRevocationSource for HttpConnectionRevocationSource {
+    async fn revoked_pubkeys(&self) -> anyhow::Result<HashSet<String>> {
+        let mut req = self
+            .client
+            .get(&self.endpoint)
+            .timeout(Duration::from_secs(5));
+        if let Some(token) = &self.internal_token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "mcp connection revocation endpoint returned {}",
+                resp.status()
+            );
+        }
+        let body: RevokedPubkeysBody = resp.json().await?;
+        Ok(body
+            .revoked_pubkeys
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect())
+    }
+}
+
+/// One refresh: swap on success, keep the previous set on error (fail-open).
+async fn refresh_connections_once(
+    src: &dyn McpConnectionRevocationSource,
+    state: &McpConnectionRevocationState,
+) {
+    match src.revoked_pubkeys().await {
+        Ok(set) => {
+            let n = set.len();
+            state.swap(set);
+            MCP_CONNECTION_REVOCATION_REFRESH_OK.fetch_add(1, Ordering::Relaxed);
+            debug!(revoked = n, "mcp connection revocation deny-list refreshed");
+        }
+        Err(e) => {
+            MCP_CONNECTION_REVOCATION_REFRESH_FAIL.fetch_add(1, Ordering::Relaxed);
+            warn!(error = %e, "mcp connection revocation deny-list refresh failed; keeping previous set");
+        }
+    }
+}
+
+/// Background loop: reload the connection deny-list every `interval`.
+pub async fn run_connection_refresh_loop(
+    src: Arc<dyn McpConnectionRevocationSource>,
+    state: Arc<McpConnectionRevocationState>,
+    interval: Duration,
+) {
+    info!(
+        interval_secs = interval.as_secs(),
+        "mcp connection revocation deny-list refresher running"
+    );
+    loop {
+        refresh_connections_once(src.as_ref(), &state).await;
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Spawn the connection-revocation refresh loop iff the feature is enabled.
+/// Safe no-op otherwise. Mirrors [`spawn_if_enabled`]; live polling defaults
+/// OFF (gated on the L1b env switch + endpoint).
+pub fn spawn_if_enabled_connections(state: &Arc<AppState>) {
+    if !connection_enabled() {
+        return;
+    }
+    let Some(rev) = state.mcp_connection_revocation.clone() else {
+        return;
+    };
+    let Some(ep) = connection_endpoint() else {
+        return;
+    };
+    let interval = Duration::from_secs(
+        std::env::var("FULA_MCP_CONNECTION_REVOCATION_REFRESH_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(30)
+            .max(5),
+    );
+    let src: Arc<dyn McpConnectionRevocationSource> =
+        Arc::new(HttpConnectionRevocationSource::new(ep));
+    tokio::spawn(async move {
+        run_connection_refresh_loop(src, rev, interval).await;
+    });
+    info!("✓ MCP connection revocation deny-list refresher started (honors connection revocation)");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +660,131 @@ mod tests {
         assert!(st.is_revoked("jti"));
         refresh_once(&StaticSource(HashSet::new()), &st).await;
         assert!(!st.is_revoked("jti"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // L1b — CONNECTION-LEVEL revocation tests (mirror the jti tests above).
+    //
+    // Pure-function + mock-source only: NO `std::env::set_var` and NO asserts on
+    // the global `AtomicU64` counters, both of which are process-global and race
+    // at default test parallelism (a flaky global-state test was caught that way
+    // before). The `is_revoked`/`ensure_*`/refresh logic is fully exercisable
+    // without touching env or the network.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn connection_empty_denylist_allows_everything() {
+        let st = McpConnectionRevocationState::empty();
+        assert!(!st.is_revoked("any-pubkey"));
+        assert!(st.is_empty());
+    }
+
+    #[test]
+    fn connection_revoked_pubkey_detected_others_allowed() {
+        let st = McpConnectionRevocationState::empty();
+        let mut set = HashSet::new();
+        set.insert("revoked-pubkey-AAA".to_string());
+        st.swap(set);
+        assert!(st.is_revoked("revoked-pubkey-AAA"));
+        assert!(!st.is_revoked("other-pubkey"));
+    }
+
+    #[test]
+    fn ensure_connection_none_source_is_always_ok() {
+        // Feature off (None state) → every token passes, with or without a pubkey.
+        assert!(ensure_connection_not_revoked(None, Some("anything")).is_ok());
+        assert!(ensure_connection_not_revoked(None, None).is_ok());
+    }
+
+    #[test]
+    fn ensure_connection_denies_only_revoked_pubkey() {
+        let st = McpConnectionRevocationState::empty();
+        let mut set = HashSet::new();
+        set.insert("bad-pubkey".to_string());
+        st.swap(set);
+        // A token with no cnf (storage token / unbound MCP token) can't be on the
+        // list → allowed. THIS IS THE NON-MCP-TOKEN INVARIANT.
+        assert!(ensure_connection_not_revoked(Some(&st), None).is_ok());
+        // A bound token with a non-revoked pubkey passes; the revoked one denies.
+        assert!(ensure_connection_not_revoked(Some(&st), Some("good-pubkey")).is_ok());
+        let err = ensure_connection_not_revoked(Some(&st), Some("bad-pubkey"))
+            .expect_err("a revoked connection pubkey must be denied");
+        // Surfaces as an InvalidToken (mirrors the jti deny).
+        assert!(matches!(err.error_code(), S3ErrorCode::InvalidToken));
+    }
+
+    #[test]
+    fn ensure_connection_non_mcp_token_unaffected_even_with_huge_revoked_set() {
+        // Hardened restatement of the invariant: even with a large revoked set,
+        // a token that carries NO cnf (pubkey == None) is NEVER denied.
+        let st = McpConnectionRevocationState::empty();
+        let set: HashSet<String> = (0..10_000).map(|i| format!("revoked-{i}")).collect();
+        st.swap(set);
+        assert!(
+            ensure_connection_not_revoked(Some(&st), None).is_ok(),
+            "a storage token (no cnf → no pubkey) must never be denied"
+        );
+    }
+
+    #[test]
+    fn connection_body_parses_revoked_pubkeys_array() {
+        // The feed contract: `{ "revoked_pubkeys": [...] }`. Parsed directly
+        // (no network), mirroring how the jti side avoids real HTTP.
+        let json = r#"{ "revoked_pubkeys": ["pk-1", "pk-2", "pk-3"] }"#;
+        let body: RevokedPubkeysBody = serde_json::from_str(json).expect("body parses");
+        assert_eq!(body.revoked_pubkeys.len(), 3);
+        assert!(body.revoked_pubkeys.contains(&"pk-2".to_string()));
+
+        // Tolerant: extra fields ignored, missing array defaults to empty.
+        let extra = r#"{ "revoked_pubkeys": ["pk-1"], "generated_at": 123, "note": "x" }"#;
+        let body: RevokedPubkeysBody = serde_json::from_str(extra).expect("tolerant parse");
+        assert_eq!(body.revoked_pubkeys, vec!["pk-1".to_string()]);
+        let empty: RevokedPubkeysBody = serde_json::from_str("{}").expect("absent array → empty");
+        assert!(empty.revoked_pubkeys.is_empty());
+    }
+
+    // ── Mock source: refresh loads then keeps previous set on error ──────────
+    struct StaticConnectionSource(HashSet<String>);
+    #[async_trait::async_trait]
+    impl McpConnectionRevocationSource for StaticConnectionSource {
+        async fn revoked_pubkeys(&self) -> anyhow::Result<HashSet<String>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct FailingConnectionSource;
+    #[async_trait::async_trait]
+    impl McpConnectionRevocationSource for FailingConnectionSource {
+        async fn revoked_pubkeys(&self) -> anyhow::Result<HashSet<String>> {
+            anyhow::bail!("simulated connection source failure")
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_refresh_loads_then_keeps_previous_on_error() {
+        // FAIL-OPEN: a failing refresh must NOT wipe the deny-list.
+        let st = McpConnectionRevocationState::empty();
+        let mut set = HashSet::new();
+        set.insert("pubkey-to-revoke".to_string());
+
+        refresh_connections_once(&StaticConnectionSource(set), &st).await;
+        assert!(st.is_revoked("pubkey-to-revoke"));
+
+        refresh_connections_once(&FailingConnectionSource, &st).await;
+        assert!(
+            st.is_revoked("pubkey-to-revoke"),
+            "a fetch error must keep the previous revoked set (fail-open)"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_refresh_can_clear_a_pubkey_when_unrevoked() {
+        let st = McpConnectionRevocationState::empty();
+        let mut set = HashSet::new();
+        set.insert("pubkey".to_string());
+        refresh_connections_once(&StaticConnectionSource(set), &st).await;
+        assert!(st.is_revoked("pubkey"));
+        refresh_connections_once(&StaticConnectionSource(HashSet::new()), &st).await;
+        assert!(!st.is_revoked("pubkey"));
     }
 }

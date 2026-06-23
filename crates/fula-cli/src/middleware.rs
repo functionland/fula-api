@@ -430,6 +430,7 @@ mod tests {
                 pins_db: None,
                 revocation: None,
                 mcp_revocation: None,
+                mcp_connection_revocation: None,
             })
         }
 

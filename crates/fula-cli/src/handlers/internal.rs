@@ -271,6 +271,7 @@ mod tests {
             pins_db: None,
             revocation: None,
             mcp_revocation: None,
+            mcp_connection_revocation: None,
         })
     }
 
@@ -486,6 +487,7 @@ mod tests {
             pins_db: None,
             revocation: None,
             mcp_revocation: None,
+            mcp_connection_revocation: None,
         });
 
         let _ = state_path; // silence unused; only here to mirror prod path layout
@@ -540,6 +542,7 @@ mod tests {
             pins_db: None,
             revocation: None,
             mcp_revocation: None,
+            mcp_connection_revocation: None,
         });
 
         let app = crate::routes::create_router(Arc::clone(&state));
