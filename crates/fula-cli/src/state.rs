@@ -594,6 +594,14 @@ pub struct UserSession {
     /// AFTER `claims_to_session`; defaults to `None` in [`Self::new`] so all
     /// other constructors stay untouched.
     pub mcp_scope: Option<crate::mcp_scope::McpScope>,
+    /// Connection-binding pubkey (L1b). `Some(base64)` ONLY for a
+    /// connection-bound MCP token (one carrying a `cnf.mcp_pub_b64` claim);
+    /// `None` for every storage token, unbound MCP token, and dev/admin session.
+    /// This is the key the connection-revocation deny-list is matched on. Set by
+    /// `auth_middleware` from `claims.cnf` after `claims_to_session`; defaults to
+    /// `None` in [`Self::new`] so all other constructors stay untouched and the
+    /// non-MCP-token invariant holds (no `cnf` ⇒ `None` ⇒ never revoked).
+    pub connection_pubkey: Option<String>,
 }
 
 impl UserSession {
@@ -610,6 +618,10 @@ impl UserSession {
             // P12: non-MCP by default. `auth_middleware` overwrites this with a
             // validated scope for MCP tokens; everything else stays `None`.
             mcp_scope: None,
+            // L1b: no connection binding by default. `auth_middleware` sets this
+            // from `claims.cnf` for connection-bound MCP tokens; everything else
+            // stays `None`.
+            connection_pubkey: None,
         }
     }
 

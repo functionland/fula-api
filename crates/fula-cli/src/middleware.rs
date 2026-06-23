@@ -117,9 +117,14 @@ pub async fn auth_middleware(
             // token it REQUIRES a valid `mcp` claim or the token is refused.
             // Computed before `claims` is moved into `claims_to_session`.
             let mcp_scope = crate::auth::mcp_scope_from_claims(&claims)?;
+            // L1b: the connection-binding pubkey (`cnf.mcp_pub_b64`), if any.
+            // `None` for a non-MCP/unbound token (no `cnf` ⇒ never revoked).
+            // Captured before `claims` is moved into `claims_to_session`.
+            let connection_pubkey = claims.cnf.as_ref().map(|c| c.mcp_pub_b64.clone());
             // Pass the raw JWT token to the session for forwarding to pinning service
             let mut session = claims_to_session(claims, token);
             session.mcp_scope = mcp_scope;
+            session.connection_pubkey = connection_pubkey;
             session
         }
         None => {
@@ -475,6 +480,7 @@ mod tests {
                         perms: vec!["read".into(), "write".into(), "list".into()],
                     }],
                 }),
+                cnf: None,
             };
             mint(&claims)
         }
@@ -491,6 +497,7 @@ mod tests {
                 jti: None,
                 token_use: None,
                 mcp: None,
+                cnf: None,
             };
             mint(&claims)
         }

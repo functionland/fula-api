@@ -46,6 +46,30 @@ pub struct Claims {
     /// [`crate::mcp_scope`]. `serde(default)` ⇒ absent on storage tokens.
     #[serde(default)]
     pub mcp: Option<McpScopeClaim>,
+    /// Connection-binding confirmation claim (L1b, RFC 7800 `cnf`). Present ONLY
+    /// on a connection-bound MCP token; carries the MCP connection's X25519
+    /// public key (base64), which is the key the connection-revocation deny-list
+    /// (`crate::mcp_revocation::McpConnectionRevocationState`) is matched on.
+    /// `serde(default)` ⇒ a storage token (or an unbound MCP token) has no `cnf`
+    /// and deserializes unchanged. The issuer emits `cnf` as a SIBLING of `mcp`
+    /// and only ever as `{ mcp_pub_b64 }`, so a non-MCP token never carries it
+    /// (see `pinning-webui/server/mcpTokens.ts::McpCnfClaim`).
+    #[serde(default)]
+    pub cnf: Option<ConnectionConfirmation>,
+}
+
+/// The `cnf` connection-binding claim on a connection-bound MCP-S3 JWT (L1b).
+/// Mirrors the issuer's `McpCnfClaim` in `pinning-webui/server/mcpTokens.ts`.
+/// The gateway only reads `mcp_pub_b64` to match it against the
+/// connection-revocation deny-list; `Serialize` is derived solely so tests can
+/// mint connection-bound tokens via the existing `create_test_token` helper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionConfirmation {
+    /// The MCP connection's X25519 public key, base64 of the raw 32 bytes. The
+    /// issuer normalizes this to a canonical base64 form on both mint and
+    /// verify, so it is compared VERBATIM against the revoked-pubkeys feed
+    /// (exactly as the jti is compared as-is) — no re-normalization here.
+    pub mcp_pub_b64: String,
 }
 
 /// The `mcp` claim on a scoped MCP-S3 JWT (P12). Mirrors the issuer's contract
@@ -530,6 +554,7 @@ mod tests {
             jti: None,
             token_use: None,
             mcp: None,
+            cnf: None,
         };
 
         let token = create_test_token(&claims, secret);
@@ -552,6 +577,7 @@ mod tests {
             jti: None,
             token_use: None,
             mcp: None,
+            cnf: None,
         };
 
         let token = create_test_token(&claims, secret);
@@ -574,6 +600,7 @@ mod tests {
             jti: None,
             token_use: None,
             mcp: None,
+            cnf: None,
         };
 
         let session = claims_to_session(claims, "test-jwt-token".to_string());
@@ -747,6 +774,9 @@ mod tests {
                     perms: perms.iter().map(|s| s.to_string()).collect(),
                 }],
             }),
+            // No connection binding by default; the L1b connection-revocation
+            // tests set this to `Some(...)` after calling the helper.
+            cnf: None,
         }
     }
 
@@ -872,6 +902,7 @@ mod tests {
             jti: None,
             token_use: None,
             mcp: None,
+            cnf: None,
         };
         let session = session_from_claims(&claims, secret);
 
