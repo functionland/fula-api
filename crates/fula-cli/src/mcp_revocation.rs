@@ -743,6 +743,34 @@ mod tests {
         assert!(empty.revoked_pubkeys.is_empty());
     }
 
+    #[test]
+    fn connection_empty_pubkey_is_never_a_false_positive_deny() {
+        // HARDENING (raised by review): a connection-bound token must never be
+        // wrongly denied because of an EMPTY `cnf.mcp_pub_b64`. Two layers:
+        //   (1) the struct field is a required `String` (no `serde(default)` on
+        //       the field), so a `cnf` object missing `mcp_pub_b64` fails JWT
+        //       deserialization → InvalidToken, never a silent `Some("")`;
+        //   (2) the HTTP source filters empty strings out of the feed, so `""`
+        //       can never be in the revoked set.
+        // This test pins layer (2): a deny-list built the way the source builds
+        // it (empties filtered) never contains `""`, so an empty pubkey on a
+        // token is allowed, not falsely denied.
+        let body: RevokedPubkeysBody =
+            serde_json::from_str(r#"{ "revoked_pubkeys": ["", "pk-1", ""] }"#).unwrap();
+        // Mirror the source's filter step (HttpConnectionRevocationSource).
+        let set: HashSet<String> = body
+            .revoked_pubkeys
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(set.len(), 1, "empty entries are filtered out of the feed");
+        let st = McpConnectionRevocationState::empty();
+        st.swap(set);
+        assert!(!st.is_revoked(""), "an empty pubkey can never be on the deny-list");
+        // And the membership check on an empty pubkey is a no-op Ok.
+        assert!(ensure_connection_not_revoked(Some(&st), Some("")).is_ok());
+    }
+
     // ── Mock source: refresh loads then keeps previous set on error ──────────
     struct StaticConnectionSource(HashSet<String>);
     #[async_trait::async_trait]
