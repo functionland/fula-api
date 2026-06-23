@@ -112,6 +112,17 @@ pub async fn auth_middleware(
                 state.mcp_revocation.as_deref(),
                 claims.jti.as_deref(),
             )?;
+            // L1b: MCP CONNECTION revocation deny-list. Sibling of the jti deny
+            // above but keyed on the connection-binding pubkey
+            // (`cnf.mcp_pub_b64`). No-op unless the connection-revocation source
+            // is enabled (env switch + endpoint); FAIL-OPEN on a source outage.
+            // A non-MCP/unbound token has no `cnf` ⇒ pubkey is `None` ⇒ never
+            // denied here. Read from `claims` BEFORE it is moved into the
+            // session, exactly like the jti check above reads `claims.jti`.
+            crate::mcp_revocation::ensure_connection_not_revoked(
+                state.mcp_connection_revocation.as_deref(),
+                claims.cnf.as_ref().map(|c| c.mcp_pub_b64.as_str()),
+            )?;
             // P12: derive the scoped-MCP fence (fail-closed). For a normal
             // storage token this is `None` and changes nothing; for an MCP
             // token it REQUIRES a valid `mcp` claim or the token is refused.
@@ -550,6 +561,188 @@ mod tests {
                 let s = status_for(Arc::clone(&state), m.clone(), uri, &storage_token()).await;
                 assert_eq!(s, StatusCode::OK, "storage token must pass the allowlist on {uri}");
             }
+        }
+    }
+
+    // ── L1b connection-revocation (real auth_middleware, end-to-end) ─────────
+    //
+    // Proves the wiring actually fires against axum's router: a connection-bound
+    // MCP token whose `cnf.mcp_pub_b64` is in the populated deny-list is DENIED
+    // (403) at `auth_middleware` even on an allowed data route; a bound token
+    // with a NON-revoked pubkey is allowed; and a normal storage token (no
+    // `cnf`) is NEVER denied even though the deny-list is populated — the
+    // non-MCP-token invariant, exercised through the real middleware (not just
+    // the `ensure_connection_not_revoked` unit test).
+    mod connection_revocation_integration {
+        use super::*;
+        use crate::auth::{Claims, ConnectionConfirmation, McpScopeClaim, McpScopeEntry};
+        use crate::mcp_revocation::McpConnectionRevocationState;
+        use crate::state::AppState;
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use axum::routing::{get, put};
+        use axum::Router;
+        use chrono::{Duration as ChronoDuration, Utc};
+        use fula_blockstore::{FlexibleBlockStore, MemoryBlockStore};
+        use fula_core::BucketManager;
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        use std::collections::HashSet;
+        use tower::ServiceExt;
+
+        const SECRET: &str = "conn-rev-test-secret";
+        const REVOKED_PUBKEY: &str = "revoked-connection-pubkey-AAAA";
+        const GOOD_PUBKEY: &str = "live-connection-pubkey-BBBB";
+
+        /// State whose connection-revocation deny-list contains REVOKED_PUBKEY.
+        /// (Built directly — no env mutation — so it can't race other tests.)
+        async fn revoking_state() -> Arc<AppState> {
+            let block_store = Arc::new(FlexibleBlockStore::Memory(MemoryBlockStore::new()));
+            let bucket_manager = Arc::new(BucketManager::new(Arc::clone(&block_store)));
+            let mut config = crate::config::GatewayConfig::default();
+            config.auth_enabled = true;
+            config.jwt_secret = Some(SECRET.to_string());
+            config.use_memory_store = true;
+
+            let rev = McpConnectionRevocationState::empty();
+            let mut set = HashSet::new();
+            set.insert(REVOKED_PUBKEY.to_string());
+            rev.swap(set);
+
+            Arc::new(AppState {
+                config,
+                block_store,
+                bucket_manager,
+                multipart_manager: Arc::new(crate::multipart::MultipartManager::new(60)),
+                lock_store: crate::handlers::locks::LockStore::new(),
+                users_index_publisher: None,
+                pin_queue: None,
+                entries_store: None,
+                local_retain: None,
+                index_pin_set: None,
+                pins_db: None,
+                revocation: None,
+                mcp_revocation: None,
+                mcp_connection_revocation: Some(Arc::new(rev)),
+            })
+        }
+
+        async fn ok_handler() -> StatusCode {
+            StatusCode::OK
+        }
+
+        fn router(state: Arc<AppState>) -> Router {
+            Router::new()
+                .route("/{bucket}", put(ok_handler))
+                .route("/{bucket}/{*key}", get(ok_handler))
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    auth_middleware,
+                ))
+                .with_state(state)
+        }
+
+        fn mint(claims: &Claims) -> String {
+            encode(&Header::default(), claims, &EncodingKey::from_secret(SECRET.as_bytes())).unwrap()
+        }
+
+        /// A connection-bound MCP token carrying the given `cnf.mcp_pub_b64`.
+        fn bound_mcp_token(pubkey: &str) -> String {
+            let claims = Claims {
+                sub: "user-sub".to_string(),
+                exp: Some((Utc::now() + ChronoDuration::hours(1)).timestamp()),
+                iat: Some(Utc::now().timestamp()),
+                iss: None,
+                aud: None,
+                scope: String::new(),
+                name: None,
+                jti: Some("jti-conn".to_string()),
+                token_use: Some("mcp_s3".to_string()),
+                mcp: Some(McpScopeClaim {
+                    v: 1,
+                    scopes: vec![McpScopeEntry {
+                        bucket: "fula-ai-workspace".to_string(),
+                        prefix: "ai/".to_string(),
+                        perms: vec!["read".into(), "write".into(), "list".into()],
+                    }],
+                }),
+                cnf: Some(ConnectionConfirmation {
+                    mcp_pub_b64: pubkey.to_string(),
+                }),
+            };
+            mint(&claims)
+        }
+
+        /// A normal storage token — no `cnf`, no MCP scope.
+        fn storage_token() -> String {
+            let claims = Claims {
+                sub: "storage-user".to_string(),
+                exp: None,
+                iat: None,
+                iss: None,
+                aud: None,
+                scope: "storage:read storage:write".to_string(),
+                name: None,
+                jti: None,
+                token_use: None,
+                mcp: None,
+                cnf: None,
+            };
+            mint(&claims)
+        }
+
+        async fn status_for(state: Arc<AppState>, method: Method, uri: &str, token: &str) -> StatusCode {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            router(state).oneshot(req).await.unwrap().status()
+        }
+
+        #[tokio::test]
+        async fn revoked_connection_token_is_denied_on_data_route() {
+            // The bound token's pubkey is on the deny-list → 403 InvalidToken,
+            // even on an allowed data route (the membership deny runs before the
+            // allowlist).
+            let state = revoking_state().await;
+            let s = status_for(
+                Arc::clone(&state),
+                Method::GET,
+                "/fula-ai-workspace/ai/x.txt",
+                &bound_mcp_token(REVOKED_PUBKEY),
+            )
+            .await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "a revoked connection must be denied");
+        }
+
+        #[tokio::test]
+        async fn non_revoked_connection_token_is_allowed() {
+            // A bound token whose pubkey is NOT revoked reaches the handler.
+            let state = revoking_state().await;
+            let s = status_for(
+                Arc::clone(&state),
+                Method::GET,
+                "/fula-ai-workspace/ai/x.txt",
+                &bound_mcp_token(GOOD_PUBKEY),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "a non-revoked connection must be allowed");
+        }
+
+        #[tokio::test]
+        async fn storage_token_unaffected_by_connection_revocation() {
+            // NON-MCP INVARIANT (end-to-end): a storage token has no `cnf`, so it
+            // is never denied even though the deny-list is populated.
+            let state = revoking_state().await;
+            let s = status_for(
+                Arc::clone(&state),
+                Method::PUT,
+                "/some-bucket",
+                &storage_token(),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "a storage token must never hit the connection deny-list");
         }
     }
 }
