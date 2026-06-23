@@ -516,7 +516,7 @@ FULA_MCP_CAPABILITY = "&lt;paste your connection bundle from FxFiles&gt;"</pre>
             <ul>
                 <li><strong>Every file is individually encrypted</strong> with its own random per-file key (a fresh data-encryption key per file), using authenticated encryption (AES-256-GCM by default; ChaCha20-Poly1305 is also supported).</li>
                 <li><strong>Per-file keys are wrapped to recipients,</strong> so a file the AI writes can be unwrapped by you (its owner) without exposing any other file's key.</li>
-                <li><strong>Metadata privacy.</strong> Filenames and paths are not stored in the clear: storage keys are obfuscated (hashed), and the index that maps your logical paths to stored objects is itself encrypted. An observer of raw storage does not learn your filenames or folder structure.</li>
+                <li><strong>Metadata privacy.</strong> Filenames and paths are not stored in the clear: storage keys are obfuscated (hashed), and the index that maps your logical paths to stored objects is itself encrypted. An observer of raw storage does not learn your filenames or folder structure. (As with any storage service, the operator can still see coarse metadata such as file sizes and access timing &mdash; but not your content, filenames, or folder structure.)</li>
             </ul>
 
             <div class="note-box">
