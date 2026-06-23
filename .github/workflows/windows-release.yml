@@ -11,6 +11,12 @@ env:
 
 jobs:
   build-windows:
+    # Skip for fula-mcp releases (tag `fula-mcp-v*`): those publish the MCP
+    # binary via fula-mcp-release.yml and must NOT get a flutter DLL attached.
+    # This guard only affects the `release: published` trigger; flutter `v*`
+    # releases (whose tags do not start with `fula-mcp-`) are unaffected, and
+    # manual workflow_dispatch still runs.
+    if: ${{ github.event_name == 'workflow_dispatch' || !startsWith(github.event.release.tag_name, 'fula-mcp-') }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
