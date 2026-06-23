@@ -90,6 +90,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::capability::{CapabilityBundle, CapabilityError, Permission};
+use crate::retry::with_refresh_retry;
 use crate::store::{WORKSPACE_BUCKET, WORKSPACE_KEY_PREFIX};
 
 /// The logical key the AI's tag-metadata document lives at, inside
@@ -467,10 +468,22 @@ fn apply_tagging(
 /// yet. A genuine not-found returns `Ok(None)` (the caller starts fresh); a
 /// document that exists but fails to parse is a [`TagError::CorruptDocument`]
 /// (we never silently clobber it).
+///
+/// Takes `cap` (not a pre-built client) so the GET runs through the L1c
+/// refresh-on-auth retry: an expired scoped JWT is refreshed once and the GET
+/// retried. The client is (re)built from `cap` inside the wrapper; a no-op
+/// without a `refresh_token`. The not-found classification is unchanged — it runs
+/// on the wrapper's final error, so a refreshed-then-not-found GET still maps to
+/// `Ok(None)`.
 async fn load_tag_document(
-    client: &fula_client::EncryptedClient,
+    cap: &CapabilityBundle,
 ) -> Result<Option<TagCloudMetadata>, TagError> {
-    match client.get_object_flat(WORKSPACE_BUCKET, TAG_METADATA_KEY).await {
+    let client = cap.workspace_client()?;
+    let got = with_refresh_retry(cap, client, |c| async move {
+        c.get_object_flat(WORKSPACE_BUCKET, TAG_METADATA_KEY).await
+    })
+    .await;
+    match got {
         Ok(bytes) => {
             let parsed: TagCloudMetadata =
                 serde_json::from_slice(&bytes).map_err(|e| TagError::CorruptDocument {
@@ -534,11 +547,10 @@ pub async fn tag_file(
     let now = now_iso8601();
     let user_id = resolve_user_id(cap);
 
-    let client = cap.workspace_client()?;
-
     // Load (or start fresh). A corrupt existing document is an error, NOT an
-    // overwrite.
-    let mut doc = load_tag_document(&client)
+    // overwrite. `load_tag_document` runs the GET through the L1c refresh-on-auth
+    // retry internally, so a JWT that expired before this call is refreshed here.
+    let mut doc = load_tag_document(cap)
         .await?
         .unwrap_or_else(|| TagCloudMetadata::empty(&user_id, &now));
 
@@ -552,17 +564,26 @@ pub async fn tag_file(
     doc.updated_at = now.clone();
 
     // Serialize + write back. `to_vec` (compact) — the app uses `jsonEncode`
-    // (also compact), so the byte shape matches.
+    // (also compact), so the byte shape matches. The PUT is wrapped in the L1c
+    // refresh-on-auth retry too (the JWT could expire between the load and this
+    // write); the client is (re)built here so it carries any JWT swapped by the
+    // load above. `bytes` is non-Copy, so the closure borrows it and clones the
+    // (small) tag-doc per attempt to keep the `Fn` bound (the wrapper may call it
+    // twice). The closure MUST use its own `c` (the rebuilt, fresh-JWT client).
     let bytes = serde_json::to_vec(&doc).map_err(|e| TagError::Serialize(e.to_string()))?;
-    client
-        .put_object_flat(
+    let client = cap.workspace_client()?;
+    let bytes_ref = &bytes;
+    with_refresh_retry(cap, client, |c| async move {
+        c.put_object_flat(
             WORKSPACE_BUCKET,
             TAG_METADATA_KEY,
-            bytes,
+            bytes_ref.clone(),
             Some("application/json"),
         )
         .await
-        .map_err(|e| TagError::Client(format!("put tag document: {e}")))?;
+    })
+    .await
+    .map_err(|e| TagError::Client(format!("put tag document: {e}")))?;
 
     Ok(TagOutcome {
         metadata: doc,
@@ -583,8 +604,9 @@ pub async fn tag_file(
 pub async fn list_tags(cap: &CapabilityBundle) -> Result<Vec<FileTag>, TagError> {
     // GATE FIRST — authorize the READ of the tag document before any I/O.
     cap.assert_in_scope(TAG_METADATA_KEY, WORKSPACE_KEY_PREFIX, Permission::Read)?;
-    let client = cap.workspace_client()?;
-    match load_tag_document(&client).await? {
+    // `load_tag_document` builds the client + runs the GET through the L1c
+    // refresh-on-auth retry internally.
+    match load_tag_document(cap).await? {
         Some(doc) => Ok(doc.tags),
         None => Ok(Vec::new()),
     }
@@ -605,8 +627,7 @@ pub async fn tags_for_file(
     file_key: &str,
 ) -> Result<Vec<FileTag>, TagError> {
     cap.assert_in_scope(TAG_METADATA_KEY, WORKSPACE_KEY_PREFIX, Permission::Read)?;
-    let client = cap.workspace_client()?;
-    let doc = match load_tag_document(&client).await? {
+    let doc = match load_tag_document(cap).await? {
         Some(doc) => doc,
         None => return Ok(Vec::new()),
     };

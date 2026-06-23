@@ -1,0 +1,6 @@
+{
+  "_comment": "PLACEHOLDER. Real SHA-256 digests are written here by .github/workflows/fula-mcp-release.yml at release time (from the cross-compiled binaries) and bundled into the published npm tarball. A published package always ships real values under `checksums`; this committed placeholder is intentionally empty so an accidental `npm publish` from a dev checkout has NO valid checksums and therefore refuses to exec any download.",
+  "version": "0.0.0-placeholder",
+  "tag": "",
+  "checksums": {}
+}

@@ -118,6 +118,12 @@ pub async fn run_server(config: GatewayConfig) -> anyhow::Result<()> {
     // membership deny runs in auth_middleware.
     crate::mcp_revocation::spawn_if_enabled(&state);
 
+    // L1b — MCP CONNECTION revocation deny-list refresher. No-op unless
+    // FULA_MCP_CONNECTION_REVOCATION_ENABLED + endpoint are set (default OFF).
+    // Keyed on the connection pubkey (`cnf.mcp_pub_b64`); fail-open; the
+    // membership deny runs in auth_middleware beside the jti deny.
+    crate::mcp_revocation::spawn_if_enabled_connections(&state);
+
     // Create router
     let app = routes::create_router(state);
 
@@ -230,6 +236,11 @@ pub async fn run_server_with_shutdown(
     // P12 — MCP `jti` revocation deny-list refresher (see run_server). No-op
     // unless FULA_MCP_REVOCATION_ENABLED + endpoint are set (default OFF).
     crate::mcp_revocation::spawn_if_enabled(&state);
+
+    // L1b — MCP CONNECTION revocation deny-list refresher (see run_server).
+    // No-op unless FULA_MCP_CONNECTION_REVOCATION_ENABLED + endpoint are set
+    // (default OFF). Keyed on the connection pubkey; fail-open.
+    crate::mcp_revocation::spawn_if_enabled_connections(&state);
 
     let app = routes::create_router(state);
 

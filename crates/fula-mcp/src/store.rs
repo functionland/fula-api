@@ -73,6 +73,7 @@ use uuid::Uuid;
 use crate::capability::{CapabilityBundle, CapabilityError, Permission};
 use crate::category::{classify, native_category_bucket, Category};
 use crate::quota::QuotaDecision;
+use crate::retry::with_refresh_retry;
 
 /// The S3 error code the gateway returns when a write is rejected for being over
 /// quota / out of credits (see `fula-cli/src/handlers/object.rs`,
@@ -469,22 +470,49 @@ pub async fn store_file(
         return Err(StoreError::QuotaExceeded);
     }
 
-    // Build the workspace client ONCE and reuse it for the put + the metadata
-    // fetch + the unwrap, so the SAME keypair that wrote the wrapped DEK is the
-    // one that unwraps it.
-    let client = cap.workspace_client()?;
-
     // 4. Upload (HPKE DEK-wrap + storage-key obfuscation + chunked content
     //    encryption + forest-index write — the real SDK path). A gateway quota /
     //    rate rejection of the PUT is mapped to the SAME clean `QuotaExceeded` /
     //    `RateLimited` signal as the pre-checks (via `classify_put_error`), so
     //    the model gets one actionable error whether the pre-check or the real
     //    PUT caught it (e.g. when the pre-check failed open or was skipped).
+    //
+    //    The PUT is the first (and dominant) gateway call, so it is wrapped in the
+    //    L1c refresh-on-auth retry: if the scoped JWT has expired, refresh it once
+    //    and retry the PUT (a no-op when no refresh_token is configured — the auth
+    //    error then surfaces, mapped exactly as before). A retry is safe: an
+    //    auth-rejected PUT (401) stored nothing, so the post-refresh attempt is
+    //    the first real write — no double-write / orphan. The wrapper consumes the
+    //    `first` client (forcing the deliberate rebuild below for the post-put
+    //    steps, which then carry any swapped JWT). `content` (Bytes) is non-Copy,
+    //    so the closure borrows it and clones (a cheap refcount bump) per attempt
+    //    to keep the `Fn` bound. The closure MUST use its own `c`.
     let content_type = mime.filter(|m| !m.is_empty());
-    let put = client
-        .put_object_flat(WORKSPACE_BUCKET, &key, content, content_type)
+    let first_client = cap.workspace_client()?;
+    // Capture explicit references so the `async move` future moves only Copy
+    // references (`&Bytes`, `&String`), leaving `key` / `content` owned by this
+    // fn for the post-put steps below. `content_ref.clone()` is a cheap Bytes
+    // refcount bump per attempt; `key_ref.as_str()` borrows without moving.
+    let content_ref = &content;
+    let key_ref = &key;
+    let put = with_refresh_retry(cap, first_client, |c| async move {
+        c.put_object_flat(
+            WORKSPACE_BUCKET,
+            key_ref.as_str(),
+            content_ref.clone(),
+            content_type,
+        )
         .await
-        .map_err(classify_put_error)?;
+    })
+    .await
+    .map_err(classify_put_error)?;
+
+    // Rebuild the workspace client for the post-put resolve→recover→mint steps so
+    // they carry any JWT swapped by the PUT's refresh above. Building is cheap and
+    // a no-op (same token) when no refresh happened. The SAME keypair that wrote
+    // the wrapped DEK is the one that unwraps it (the workspace secret is
+    // unchanged across a JWT swap — only the bearer token differs).
+    let client = cap.workspace_client()?;
 
     // From here the object EXISTS in the workspace. Run the resolve→recover→mint
     // steps in an inner block that returns Result, so that if ANY of them fails

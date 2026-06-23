@@ -83,6 +83,7 @@ use thiserror::Error;
 
 use crate::capability::{CapabilityBundle, CapabilityError, Permission};
 use crate::category::{classify, Category};
+use crate::retry::with_refresh_retry;
 use crate::store::WORKSPACE_KEY_PREFIX;
 
 use fula_client::FileMetadata;
@@ -193,11 +194,15 @@ pub async fn list_files(
     cap.assert_in_scope(&scope_key, WORKSPACE_KEY_PREFIX, Permission::Read)?;
 
     // Authorized: build the workspace client (own secret) and list ITS OWN forest.
+    // Wrapped in the L1c refresh-on-auth retry (no-op without a refresh_token):
+    // an expired scoped JWT is refreshed once and the listing retried. The closure
+    // MUST use its own `c` (the rebuilt, fresh-JWT client).
     let client = cap.workspace_client()?;
-    let entries = client
-        .list_files_from_forest(crate::store::WORKSPACE_BUCKET)
-        .await
-        .map_err(|e| ListError::Client(format!("list_files_from_forest: {e}")))?;
+    let entries = with_refresh_retry(cap, client, |c| async move {
+        c.list_files_from_forest(crate::store::WORKSPACE_BUCKET).await
+    })
+    .await
+    .map_err(|e| ListError::Client(format!("list_files_from_forest: {e}")))?;
 
     // Confine to `ai/`, apply the feature filters, and project to FileEntry. This
     // is the pure step the offline tests drive directly with hand-built entries.
