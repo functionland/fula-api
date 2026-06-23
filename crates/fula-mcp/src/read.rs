@@ -91,6 +91,7 @@ use fula_crypto::ShareToken;
 use thiserror::Error;
 
 use crate::capability::{CapabilityBundle, CapabilityError, Permission};
+use crate::retry::with_refresh_retry;
 use crate::store::{WORKSPACE_BUCKET, WORKSPACE_KEY_PREFIX};
 
 /// A scoped read the AI wishes to perform. The two variants map to the two
@@ -231,12 +232,16 @@ pub async fn read_workspace_file(cap: &CapabilityBundle, key: &str) -> Result<By
 
     // Authorized: build the workspace client (own secret) and read by LOGICAL
     // key. get_object_flat resolves key -> storage_key in our own forest and
-    // decrypts with the workspace keypair.
+    // decrypts with the workspace keypair. Wrapped in the L1c refresh-on-auth
+    // retry: if the scoped JWT has expired, refresh it once and retry (a no-op
+    // when no refresh_token is configured — the auth error then surfaces as
+    // before). The closure MUST use its own `c` (the rebuilt, fresh-JWT client).
     let client = cap.workspace_client()?;
-    client
-        .get_object_flat(WORKSPACE_BUCKET, key)
-        .await
-        .map_err(|e| classify_client_error(key, e))
+    with_refresh_retry(cap, client, |c| async move {
+        c.get_object_flat(WORKSPACE_BUCKET, key).await
+    })
+    .await
+    .map_err(|e| classify_client_error(key, e))
 }
 
 /// Read a file the owner explicitly granted to the MCP, scope-gated.
@@ -285,11 +290,17 @@ pub async fn read_granted_file(
 
     // 3. Authorized: fetch by storage_key, decrypt with the share's DEK. (The
     //    SDK re-checks is_path_allowed(original_key) + can_read internally as
-    //    defense-in-depth; we have already enforced the stronger gate.)
-    cap.workspace_client()?
-        .get_object_with_share(bucket, storage_key, original_key, &accepted)
-        .await
-        .map_err(|e| classify_client_error(original_key, e))
+    //    defense-in-depth; we have already enforced the stronger gate.) Wrapped in
+    //    the L1c refresh-on-auth retry (no-op without a refresh_token). `accepted`
+    //    is borrowed by the closure (it is reused across the single retry).
+    let client = cap.workspace_client()?;
+    let accepted_ref = &accepted;
+    with_refresh_retry(cap, client, |c| async move {
+        c.get_object_with_share(bucket, storage_key, original_key, accepted_ref)
+            .await
+    })
+    .await
+    .map_err(|e| classify_client_error(original_key, e))
 }
 
 /// Map a `fula-client` error into the right [`ReadError`]: a not-found resolves

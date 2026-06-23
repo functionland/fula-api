@@ -66,6 +66,21 @@
 //! reading `FULA_MCP_CAPABILITY` for the JSON and `FULA_MCP_JWT` to override the
 //! token out-of-band). The JSON is consumed and dropped immediately; only the
 //! in-memory typed bundle survives.
+//!
+//! ## Optional L1c connection auto-refresh fields
+//!
+//! Two OPTIONAL, snake_case fields enable the L1c silent gateway-JWT auto-refresh
+//! (so a paired connection works indefinitely without re-pairing):
+//!
+//! - `refresh_token` — a long-lived **connection refresh token** (a secret).
+//! - `refresh_url` — the explicit refresh endpoint
+//!   (`POST /api/mcp/tokens/refresh-connection`); if omitted it is derived from
+//!   `storage_api_url`.
+//!
+//! Both default to absent. A bundle WITHOUT `refresh_token` behaves exactly as a
+//! pre-L1c bundle: when the short gateway JWT expires, the op's auth error
+//! surfaces unchanged (no refresh, no retry). See [`refresh_connection_jwt`] and
+//! the op-layer `with_refresh_retry` wrapper for the runtime behavior.
 
 use std::time::Duration;
 
@@ -86,6 +101,12 @@ use crate::quota::{
 
 /// The default S3 client request timeout when the bundle does not specify one.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+/// The well-known path of pinning-webui's connection-JWT refresh endpoint (L1c).
+/// Appended to the trimmed `storage_api_url` base when the bundle does not carry
+/// an explicit `refresh_url`. Matches the L1a contract
+/// (`POST /api/mcp/tokens/refresh-connection`).
+const REFRESH_CONNECTION_PATH: &str = "/api/mcp/tokens/refresh-connection";
 
 /// Environment variable that carries the capability bundle JSON.
 pub const ENV_CAPABILITY: &str = "FULA_MCP_CAPABILITY";
@@ -250,7 +271,15 @@ pub struct CapabilityBundle {
     /// S3 / gateway endpoint URL.
     endpoint: String,
     /// Scoped gateway JWT (bearer token). Carried verbatim; treated as a secret.
-    jwt: String,
+    ///
+    /// Wrapped in an [`RwLock`](std::sync::RwLock) for **interior mutability**
+    /// (L1c): the short-lived JWT is swapped in place by [`Self::set_jwt`] when an
+    /// auto-refresh succeeds, while the bundle is shared immutably behind an `Arc`
+    /// (see `server.rs`). This mirrors the [`write_bucket`](Self::write_bucket)
+    /// interior-mutability pattern (a `Mutex` inside a shared-`&self` bundle). The
+    /// lock is only ever held briefly to clone/replace the string — never across
+    /// an `.await` — so a std lock (not a tokio one) is correct and cheap.
+    jwt: std::sync::RwLock<String>,
     /// Client request timeout.
     timeout: Duration,
     /// The dedicated AI-workspace encryption secret (NOT the user's master KEK).
@@ -271,6 +300,18 @@ pub struct CapabilityBundle {
     /// gateway's `storage_api_url = None` behavior. Validated HTTPS-or-loopback at
     /// parse time (see [`validate_storage_api_url`]).
     storage_api_url: Option<String>,
+    /// The long-lived connection refresh token (L1c), if the session injector
+    /// supplied one. `None` → auto-refresh is OFF for this session (an expired
+    /// gateway JWT surfaces as the op's normal auth error, exactly as pre-L1c). A
+    /// SECRET, treated like the JWT: never logged, redacted in [`Debug`].
+    refresh_token: Option<String>,
+    /// The effective connection-JWT refresh endpoint (L1c): the bundle's explicit
+    /// `refresh_url` if present, else derived from `storage_api_url` by appending
+    /// the well-known refresh path. `None` only when neither was configured (then
+    /// a refresh can never be attempted even if a `refresh_token` were present).
+    /// Validated HTTPS-or-loopback at parse time (the refresh token is POSTed
+    /// here, so the same anti-leak guard as `storage_api_url` applies).
+    refresh_url: Option<String>,
     /// The positive scoped grants this session holds.
     grants: Vec<Capability>,
     /// Per-session WRITE rate limiter (P10). A token bucket constructed ONCE here
@@ -309,6 +350,22 @@ struct CapabilityBundleJson {
     /// parse).
     #[serde(default)]
     storage_api_url: Option<String>,
+    /// Optional long-lived **connection refresh token** (L1c). When present, an
+    /// expired-JWT gateway rejection triggers a silent refresh against
+    /// [`Self::refresh_url`] (or the URL derived from `storage_api_url`) and a
+    /// single retry. Absent → NO auto-refresh (behavior byte-identical to a
+    /// pre-L1c bundle: the op's auth error surfaces as before). A SECRET — never
+    /// logged. Populated by FxFiles in L1d; optional here keeps L1c standalone.
+    #[serde(default)]
+    refresh_token: Option<String>,
+    /// Optional explicit URL for the connection-JWT refresh endpoint (L1c),
+    /// pinning-webui's `POST /api/mcp/tokens/refresh-connection`. If absent, the
+    /// effective refresh URL is DERIVED from `storage_api_url` (append the
+    /// well-known path to the trimmed base). Validated HTTPS-or-loopback (the
+    /// `refresh_token` is sent here, so it must not leak to an unintended
+    /// origin). Absent in older bundles (still parse).
+    #[serde(default)]
+    refresh_url: Option<String>,
     /// Optional override for the P10 write-rate-limit burst (token-bucket
     /// capacity). Defaults to [`DEFAULT_WRITE_BURST`].
     #[serde(default)]
@@ -335,6 +392,10 @@ impl std::fmt::Debug for CapabilityBundle {
             // Public key is, by definition, public — safe to show.
             .field("mcp_public", &self.mcp_keypair.public_key())
             .field("owner_public", &self.owner_public)
+            // The refresh token is a SECRET (like the JWT) — redact it. The
+            // refresh URL is not a secret (it's a well-known endpoint).
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "<redacted>"))
+            .field("refresh_url", &self.refresh_url)
             .field("grants", &self.grants)
             .finish()
     }
@@ -429,6 +490,28 @@ impl CapabilityBundle {
             None => None,
         };
 
+        // L1c: compute the EFFECTIVE connection-JWT refresh URL. Prefer an explicit
+        // `refresh_url`; otherwise derive it from `storage_api_url` by appending the
+        // well-known path to the trimmed base. Either way it is validated
+        // HTTPS-or-loopback (the refresh token is POSTed here — same anti-leak guard
+        // as the quota host). When neither is configured the effective URL is `None`
+        // (a refresh can then never fire, even if a refresh_token were present).
+        let refresh_url = match parsed.refresh_url.take().filter(|s| !s.is_empty()) {
+            Some(u) => {
+                validate_storage_api_url(&u)?;
+                Some(u)
+            }
+            // `storage_api_url` is already validated above; the derived URL has
+            // the same scheme/host, so it inherits the HTTPS-or-loopback property —
+            // we just trim a trailing slash and append the path.
+            None => storage_api_url.as_ref().map(|base| {
+                format!("{}{}", base.trim_end_matches('/'), REFRESH_CONNECTION_PATH)
+            }),
+        };
+        // The refresh token itself (a secret) — kept verbatim, redacted in Debug,
+        // never logged. An empty string is treated as "not configured".
+        let refresh_token = parsed.refresh_token.take().filter(|s| !s.is_empty());
+
         // Build the per-session WRITE rate limiter ONCE (so it limits across
         // calls). Defaults are generous; the bundle may override both knobs.
         let write_bucket = TokenBucket::new(
@@ -440,19 +523,23 @@ impl CapabilityBundle {
 
         let bundle = CapabilityBundle {
             endpoint: std::mem::take(&mut parsed.endpoint),
-            jwt: std::mem::take(&mut parsed.jwt),
+            jwt: std::sync::RwLock::new(std::mem::take(&mut parsed.jwt)),
             timeout,
             workspace_secret,
             mcp_keypair,
             owner_public,
             user_id: parsed.user_id.take().filter(|s| !s.is_empty()),
             storage_api_url,
+            refresh_token,
+            refresh_url,
             grants: std::mem::take(&mut parsed.grants),
             write_bucket,
         };
 
         // Best-effort wipe of the base64 secret strings in the parsed struct
         // before it drops (the typed keys above are the authoritative copies).
+        // The refresh_token was MOVED out via `.take()` above, so the parsed
+        // struct no longer holds it.
         parsed.workspace_secret_b64.zeroize();
         parsed.mcp_secret_b64.zeroize();
 
@@ -480,7 +567,10 @@ impl CapabilityBundle {
         let mut bundle = Self::from_json(&json)?;
         if let Ok(jwt) = std::env::var(ENV_JWT_OVERRIDE) {
             if !jwt.is_empty() {
-                bundle.jwt = jwt;
+                // `bundle` is still uniquely owned here, but go through the
+                // interior-mutability setter so there is ONE place that writes the
+                // JWT lock (the L1c refresh path uses the same `set_jwt`).
+                bundle.set_jwt(jwt);
             }
         }
         if let Ok(url) = std::env::var(ENV_STORAGE_API_URL) {
@@ -538,6 +628,34 @@ impl CapabilityBundle {
         self.storage_api_url.as_deref()
     }
 
+    /// The long-lived connection refresh token (L1c), if configured. `None` means
+    /// auto-refresh is OFF for this session — an expired gateway JWT surfaces as
+    /// the op's normal auth error (pre-L1c behavior). This is a SECRET; callers
+    /// pass it to [`refresh_connection_jwt`] but MUST NEVER log it.
+    pub fn refresh_token(&self) -> Option<&str> {
+        self.refresh_token.as_deref()
+    }
+
+    /// The effective connection-JWT refresh endpoint (L1c): the explicit
+    /// `refresh_url` if the bundle carried one, else derived from
+    /// `storage_api_url`. `None` when neither was configured (a refresh can then
+    /// never be attempted). Validated HTTPS-or-loopback at parse time.
+    pub fn refresh_url(&self) -> Option<&str> {
+        self.refresh_url.as_deref()
+    }
+
+    /// Swap in a freshly-refreshed scoped gateway JWT (L1c), in place, behind the
+    /// shared `&self`. Called after [`refresh_connection_jwt`] returns a new token
+    /// on an expired-JWT gateway rejection; the very next [`Self::workspace_client`]
+    /// (and [`Self::check_quota`]) then builds a client carrying the new token.
+    ///
+    /// Write-locks the JWT for the brief moment of the replace; the lock is never
+    /// held across an `.await`, so this is cheap and deadlock-free. `new` is a
+    /// SECRET — the caller must never log it.
+    pub fn set_jwt(&self, new: String) {
+        *self.jwt.write().expect("jwt lock poisoned") = new;
+    }
+
     /// Run the P10 fail-fast quota pre-check for this session, reusing the
     /// session's scoped JWT against the configured credit host. Returns a 3-state
     /// [`QuotaDecision`]; only [`QuotaDecision::Denied`] should block a write —
@@ -548,7 +666,11 @@ impl CapabilityBundle {
     /// The JWT / URL are read from the bundle's private fields here so callers
     /// never need to handle the token themselves.
     pub async fn check_quota(&self) -> QuotaDecision {
-        check_quota(self.storage_api_url.as_deref(), Some(self.jwt.as_str())).await
+        // Read the (possibly-refreshed) JWT under the lock and hand an owned copy
+        // to the check. The lock is released immediately (the clone is cheap and
+        // the guard is NOT held across the `.await`).
+        let jwt = self.jwt.read().expect("jwt lock poisoned").clone();
+        check_quota(self.storage_api_url.as_deref(), Some(jwt.as_str())).await
     }
 
     /// Try to take one WRITE token from the per-session rate limiter. Returns
@@ -572,8 +694,12 @@ impl CapabilityBundle {
     /// # Errors
     /// [`CapabilityError::Client`] if the underlying client cannot be built.
     pub fn workspace_client(&self) -> Result<EncryptedClient, CapabilityError> {
+        // Read the current JWT under the lock (it may have been swapped by an L1c
+        // refresh). Cloning the string out releases the lock immediately, so a
+        // concurrent `set_jwt` is never blocked by client construction.
+        let jwt = self.jwt.read().expect("jwt lock poisoned").clone();
         let config = Config::new(self.endpoint.clone())
-            .with_token(self.jwt.clone())
+            .with_token(jwt)
             .with_encryption()
             .with_timeout(self.timeout);
         // `EncryptionConfig::from_secret_key` takes the secret by value; clone the
@@ -969,13 +1095,15 @@ mod tests {
         let owner_public = owner_secret.public_key();
         CapabilityBundle {
             endpoint: "https://gw.example".to_string(),
-            jwt: "test-jwt".to_string(),
+            jwt: std::sync::RwLock::new("test-jwt".to_string()),
             timeout: Duration::from_secs(60),
             workspace_secret: SecretKey::from_bytes(&ws).unwrap(),
             mcp_keypair: KekKeyPair::from_secret_key(SecretKey::from_bytes(&mcp).unwrap()),
             owner_public,
             user_id: None,
             storage_api_url: None,
+            refresh_token: None,
+            refresh_url: None,
             grants,
             // A generous default bucket; the capability tests here never exercise
             // the rate limiter (that lives in `quota.rs` + `store.rs` tests).
@@ -1203,6 +1331,146 @@ mod tests {
         );
     }
 
+    // ── L1c: refresh_token / refresh_url bundle fields ─────────────────────
+
+    /// A bundle JSON with the standard required fields plus an arbitrary set of
+    /// extra raw key/value JSON fragments (already formatted, comma-joined).
+    fn bundle_json_with_extra(extra: &str) -> String {
+        let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        let mcp = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
+        let owner = base64::engine::general_purpose::STANDARD
+            .encode(SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key().as_bytes());
+        let tail = if extra.is_empty() {
+            String::new()
+        } else {
+            format!(", {extra}")
+        };
+        format!(
+            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}"{tail} }}"#
+        )
+    }
+
+    #[test]
+    fn bundle_without_refresh_fields_is_backward_compatible() {
+        // The crux of L1c backward-compat: a pre-L1c bundle (no refresh_token,
+        // no refresh_url, no storage_api_url) parses fine and the getters return
+        // None → auto-refresh is OFF, behavior byte-identical to before.
+        let b = CapabilityBundle::from_json(&bundle_json_with_extra("")).unwrap();
+        assert_eq!(b.refresh_token(), None);
+        assert_eq!(b.refresh_url(), None);
+    }
+
+    #[test]
+    fn bundle_explicit_refresh_url_is_used_verbatim() {
+        // An explicit refresh_url is surfaced as-is (validated HTTPS); the token
+        // is surfaced too.
+        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
+            r#""refresh_token": "rt-secret", "refresh_url": "https://webui.fx.land/api/mcp/tokens/refresh-connection""#,
+        ))
+        .unwrap();
+        assert_eq!(b.refresh_token(), Some("rt-secret"));
+        assert_eq!(
+            b.refresh_url(),
+            Some("https://webui.fx.land/api/mcp/tokens/refresh-connection")
+        );
+    }
+
+    #[test]
+    fn bundle_refresh_url_derived_from_storage_api_url_when_absent() {
+        // No explicit refresh_url → derive from storage_api_url by appending the
+        // well-known path to the trimmed base (trailing slash dropped).
+        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
+            r#""refresh_token": "rt", "storage_api_url": "https://cloud.fx.land/""#,
+        ))
+        .unwrap();
+        assert_eq!(
+            b.refresh_url(),
+            Some("https://cloud.fx.land/api/mcp/tokens/refresh-connection")
+        );
+
+        // Without a trailing slash on the base, the join is identical.
+        let b2 = CapabilityBundle::from_json(&bundle_json_with_extra(
+            r#""refresh_token": "rt", "storage_api_url": "https://cloud.fx.land""#,
+        ))
+        .unwrap();
+        assert_eq!(
+            b2.refresh_url(),
+            Some("https://cloud.fx.land/api/mcp/tokens/refresh-connection")
+        );
+    }
+
+    #[test]
+    fn bundle_refresh_token_without_any_url_yields_no_refresh_url() {
+        // A refresh_token but NEITHER refresh_url NOR storage_api_url → the
+        // effective refresh URL is None (a refresh can never fire — no panic).
+        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
+            r#""refresh_token": "rt""#,
+        ))
+        .unwrap();
+        assert_eq!(b.refresh_token(), Some("rt"));
+        assert_eq!(b.refresh_url(), None);
+    }
+
+    #[test]
+    fn bundle_explicit_refresh_url_overrides_derivation() {
+        // When BOTH refresh_url and storage_api_url are present, the explicit
+        // refresh_url wins (no derivation).
+        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
+            r#""refresh_token": "rt", "refresh_url": "https://explicit.example/refresh", "storage_api_url": "https://cloud.fx.land""#,
+        ))
+        .unwrap();
+        assert_eq!(b.refresh_url(), Some("https://explicit.example/refresh"));
+    }
+
+    #[test]
+    fn bundle_rejects_insecure_refresh_url() {
+        // A plaintext http:// non-loopback refresh_url is rejected (the refresh
+        // token would leak to an unintended origin in cleartext).
+        assert!(matches!(
+            CapabilityBundle::from_json(&bundle_json_with_extra(
+                r#""refresh_url": "http://evil.example/refresh""#
+            ))
+            .unwrap_err(),
+            CapabilityError::InvalidStorageApiUrl { .. }
+        ));
+        // Loopback http:// IS allowed (local/dev webui).
+        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
+            r#""refresh_url": "http://127.0.0.1:3000/api/mcp/tokens/refresh-connection""#,
+        ))
+        .unwrap();
+        assert_eq!(
+            b.refresh_url(),
+            Some("http://127.0.0.1:3000/api/mcp/tokens/refresh-connection")
+        );
+    }
+
+    #[test]
+    fn bundle_empty_refresh_token_is_treated_as_absent() {
+        // An empty-string refresh_token → None (not configured), same convention
+        // as user_id / storage_api_url.
+        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
+            r#""refresh_token": """#,
+        ))
+        .unwrap();
+        assert_eq!(b.refresh_token(), None);
+    }
+
+    #[test]
+    fn debug_redacts_refresh_token() {
+        // The refresh token is a secret — it must never appear in Debug output.
+        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
+            r#""refresh_token": "super-secret-refresh-token", "refresh_url": "https://webui.example/refresh""#,
+        ))
+        .unwrap();
+        let dbg = format!("{b:?}");
+        assert!(
+            !dbg.contains("super-secret-refresh-token"),
+            "Debug leaked the refresh token: {dbg}"
+        );
+        // The non-secret URL may appear; the redaction marker must be present.
+        assert!(dbg.contains("<redacted>"));
+    }
+
     #[test]
     fn validate_storage_api_url_accepts_https_and_loopback_rejects_others() {
         assert!(validate_storage_api_url("https://cloud.fx.land").is_ok());
@@ -1230,6 +1498,37 @@ mod tests {
         assert!(b.try_consume_write_token(), "1st write token");
         assert!(b.try_consume_write_token(), "2nd write token");
         assert!(!b.try_consume_write_token(), "3rd write over burst → denied");
+    }
+
+    #[test]
+    fn set_jwt_swap_is_visible_to_next_workspace_client() {
+        // L1c: after set_jwt swaps the token, the NEXT workspace_client() must
+        // build a client carrying the NEW JWT (the refresh-then-retry contract).
+        // We read it back via the client's public Config.access_token.
+        let b = CapabilityBundle::from_json(&sample_bundle_json()).unwrap();
+        let before = b
+            .workspace_client()
+            .unwrap()
+            .inner()
+            .config()
+            .access_token
+            .clone();
+        assert_eq!(before.as_deref(), Some("super-secret-jwt-value"));
+
+        b.set_jwt("freshly-refreshed-jwt".to_string());
+
+        let after = b
+            .workspace_client()
+            .unwrap()
+            .inner()
+            .config()
+            .access_token
+            .clone();
+        assert_eq!(
+            after.as_deref(),
+            Some("freshly-refreshed-jwt"),
+            "the rebuilt client must carry the swapped JWT"
+        );
     }
 
     #[tokio::test]
