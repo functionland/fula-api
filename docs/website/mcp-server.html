@@ -480,8 +480,8 @@ FULA_MCP_CAPABILITY = "&lt;paste your connection bundle from FxFiles&gt;"</pre>
             <h2>Security, Privacy &amp; Data Protection</h2>
             <p>This section states what is <strong>guaranteed</strong> and what the honest <strong>limits</strong> are. We do not claim more than the design delivers.</p>
 
-            <h3>Guaranteed: the AI can never touch your other files</h3>
-            <p>This is the one absolute guarantee, and it holds for both the local binary and the hosted server. It rests on <strong>two independent mechanisms</strong> &mdash; either one alone would block access to your other files; both must be defeated for any leak, and the second does not depend on the cryptography of the first:</p>
+            <h3>Guaranteed: the AI can never reach your other files on its own</h3>
+            <p>This is the one absolute guarantee, and it holds for both the local binary and the hosted server: the AI can never reach your other files <strong>on its own &mdash; without an explicit action by you</strong> (the single, owner-initiated exception is described just below). It rests on <strong>two independent mechanisms</strong> &mdash; either one alone would block access to your other files; both must be defeated for any leak, and the second does not depend on the cryptography of the first:</p>
             <ul>
                 <li><strong>1. The master key is never shared.</strong> The AI never receives the master key that decrypts your real files. It receives only a dedicated <strong>AI-workspace key</strong>, computed as a <strong>one-way derivation</strong> of your master key (a BLAKE3 key-derivation under a fixed, workspace-specific label). One-way means the AI cannot work backwards from the workspace key to your master key, and the workspace key unlocks <em>only</em> the AI workspace &mdash; not your real files, not anything else.</li>
                 <li><strong>2. The storage gateway independently enforces scope.</strong> The AI's access token is restricted by the storage gateway itself to the AI-workspace bucket and operations. Even if the encryption were somehow bypassed, the gateway still refuses any request outside that scope. Crucially, isolation <em>between different users</em> comes from the gateway opening storage per account (keyed to your hashed user id and the token's subject) &mdash; not merely from a path prefix.</li>
@@ -493,23 +493,23 @@ FULA_MCP_CAPABILITY = "&lt;paste your connection bundle from FxFiles&gt;"</pre>
             <h3>Your AI workspace &mdash; local binary</h3>
             <p>With the local binary, the connection bundle lives in your AI client's configuration file <strong>on your own computer</strong>. The server is stateless: it loads the bundle into memory at startup, never writes secrets to disk, and never logs them.</p>
             <div class="warning-box">
-                <p><strong>Your responsibility:</strong> because the bundle sits in a config file on your machine, keep that file secure (do not paste it into shared chats or public repos). Anyone who obtains the bundle can use your AI workspace until you disconnect. They still cannot reach your other files or your master key.</p>
+                <p><strong>Your responsibility:</strong> because the bundle sits in a config file on your machine, keep that file secure (do not paste it into shared chats or public repos). Anyone who obtains the bundle can use your AI workspace until you disconnect &mdash; after which their current session still runs until its short-lived token expires (about an hour by default, up to 24). They still cannot reach your other files or your master key.</p>
             </div>
 
             <h3>Your AI workspace &mdash; hosted server</h3>
-            <p>The hosted server is designed so that a stolen database or disk reveals nothing useful. By design, it stores your workspace key <strong>encrypted</strong>, with the encryption key held in your <strong>own self-hosted OpenBao</strong> (a separate secrets vault &mdash; a distinct trust domain). The server must call OpenBao to decrypt a workspace key in order to serve a request.</p>
             <div class="warning-box">
-                <p><strong>Status &mdash; be aware:</strong> the hosted server is <strong>not deployed as a public service</strong>; the protections in this subsection describe the <em>intended design of the self-hosted server</em>, not a running system you can rely on today. Deploy your own (see <a href="#hosted">Hosted Server Setup</a>) to obtain them.</p>
+                <p><strong>Status &mdash; read first:</strong> the hosted server is <strong>not deployed as a public service</strong>. Everything in this subsection describes the <em>intended design of the self-hosted server</em>, not a running system you can rely on today. Deploy your own (see <a href="#hosted">Hosted Server Setup</a>) to obtain these protections.</p>
             </div>
+            <p>By design, the hosted server is built so that a stolen database or disk reveals nothing useful: it stores your workspace key <strong>encrypted</strong>, with the encryption key held in your <strong>own self-hosted OpenBao</strong> (a separate secrets vault &mdash; a distinct trust domain). The server must call OpenBao to decrypt a workspace key in order to serve a request. (This holds as long as your OpenBao unseal/root keys are not kept on the same machine as the database.)</p>
             <div class="note-box">
                 <p><strong>Honest limit of any hosted server:</strong> a stolen <em>database or disk</em> alone reveals nothing (the keys are encrypted, and the vault key is elsewhere). But a <em>live, fully-compromised</em> server &mdash; one an attacker actively controls while it is decrypting to serve requests &mdash; could read the workspaces of <strong>currently-active sessions</strong>. This is unavoidable for <em>any</em> server that decrypts data to hand it to an AI. Even then, it can <strong>never</strong> reach your master key, and <strong>never</strong> your other (non-workspace) files. Running the server yourself keeps that risk inside your own trust domain.</p>
             </div>
 
             <h3>Connection model &amp; revoking access</h3>
             <p>You connect once, and it keeps working until you disconnect. The AI carries a <strong>short-lived</strong> session token (about an hour by default, and at most 24 hours if a server is configured for a longer lifetime) and <strong>cannot renew it on its own</strong>.</p>
-            <p>When you <strong>Disconnect</strong> a connection in FxFiles, the pairing is removed immediately, so the AI gets <strong>no new access</strong> from that moment. Its current session keeps working only until the short-lived token expires &mdash; about an hour by default &mdash; and then it is permanently locked out.</p>
+            <p>When you <strong>Disconnect</strong> a connection in FxFiles, the pairing is removed immediately, so the AI gets <strong>no new access</strong> from that moment. Its current session keeps working only until the short-lived token expires &mdash; about an hour by default, and up to 24 hours at most &mdash; and then it is permanently locked out.</p>
             <div class="note-box">
-                <p><strong>Honest limit:</strong> "Disconnect" is not an instant kill switch for a session already in progress; it stops renewal and lets the short-lived token run out (default ~1 hour). A near-instant (~30 second) server-side revocation exists in the gateway but is <strong>off by default</strong> &mdash; an operator can enable it on a deployment that needs faster cut-off. Files the AI already stored remain in your library.</p>
+                <p><strong>Honest limit:</strong> "Disconnect" is not an instant kill switch for a session already in progress; it stops renewal and lets the short-lived token run out (default ~1 hour). A near-instant (~30 second) server-side token-revocation deny-list exists in the gateway but is <strong>off by default</strong>, and wiring "Disconnect" to trigger it is a planned follow-up &mdash; so today, disconnect is expiry-bound. Files the AI already stored remain in your library.</p>
             </div>
 
             <h3>Encryption</h3>
@@ -520,7 +520,7 @@ FULA_MCP_CAPABILITY = "&lt;paste your connection bundle from FxFiles&gt;"</pre>
             </ul>
 
             <div class="note-box">
-                <p><strong>In short:</strong> the no-other-files guarantee is absolute (two independent mechanisms, local and hosted alike). Workspace privacy is strong but has the honest limits stated above &mdash; a stolen local bundle, or a live-compromised hosted server, can expose the <em>AI workspace</em> (never your master key, never your other files). We deliberately do <strong>not</strong> claim "100% everything."</p>
+                <p><strong>In short:</strong> the guarantee that the AI cannot reach your other files <em>on its own</em> is absolute (two independent mechanisms, local and hosted alike); the only way it reads a real file is if you explicitly share that one file. Workspace privacy is strong but has the honest limits stated above &mdash; a stolen local bundle, or a live-compromised hosted server, can expose the <em>AI workspace</em> (never your master key, never your other files). We deliberately do <strong>not</strong> claim "100% everything."</p>
             </div>
         </section>
 
