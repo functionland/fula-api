@@ -73,6 +73,21 @@ pub mod tags;
 /// after the scope check, before the heavy encrypt+upload. See [`quota`].
 pub mod quota;
 
+/// Silent connection-JWT auto-refresh (L1c). When a gateway op is rejected with
+/// an auth error (the short scoped JWT expired), the MCP refreshes the JWT
+/// against pinning-webui's `POST /api/mcp/tokens/refresh-connection` using the
+/// long-lived connection refresh token, swaps it in, and retries the op ONCE. A
+/// refresh that itself 401/403s means the connection was REVOKED (terminal). See
+/// [`refresh::refresh_connection_jwt`] (the HTTP helper) and [`retry`] (the
+/// op-layer refresh-on-auth-error wrapper). Backward-compatible: a bundle with no
+/// `refresh_token` never refreshes (the op's auth error surfaces as before).
+pub mod refresh;
+
+/// The shared refresh-on-auth-error retry wrapper (L1c). Wraps a single gateway
+/// call so an auth rejection triggers exactly one refresh-then-retry. See
+/// [`retry::with_refresh_retry`] and [`retry::is_gateway_auth_error`].
+pub mod retry;
+
 /// The stdio MCP server that exposes the six P5–P8 ops as Model Context Protocol
 /// tools (P9). Loads the [`capability::CapabilityBundle`] from the environment
 /// once at startup (in memory only) and runs over stdio via the `rmcp` SDK. See
