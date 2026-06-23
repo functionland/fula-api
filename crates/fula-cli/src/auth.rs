@@ -11,7 +11,27 @@ use crate::{ApiError, S3ErrorCode};
 use crate::state::UserSession;
 use axum::http::HeaderMap;
 use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserialize a JWT `aud` claim that may be a single string or an array of
+/// strings (RFC 7519 §4.1.3), normalizing to `Option<Vec<String>>`.
+fn deserialize_aud<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        One(String),
+        Many(Vec<String>),
+    }
+    let opt = Option::<StringOrVec>::deserialize(deserializer)?;
+    Ok(match opt {
+        None => None,
+        Some(StringOrVec::One(s)) => Some(vec![s]),
+        Some(StringOrVec::Many(v)) => Some(v),
+    })
+}
 use chrono::{DateTime, Utc, Duration};
 
 /// JWT claims structure
@@ -25,7 +45,12 @@ pub struct Claims {
     pub iat: Option<i64>,
     /// Issuer
     pub iss: Option<String>,
-    /// Audience
+    /// Audience. RFC 7519 §4.1.3 allows `aud` to be EITHER a single string OR an
+    /// array of strings. The issuer (pinning-webui) mints it as a single string
+    /// ("fula-s3-gateway"); accept both forms so an MCP/connection-bound token
+    /// deserializes instead of failing with `invalid type: string, expected a
+    /// sequence` (which would 403 every MCP token before the revocation check).
+    #[serde(default, deserialize_with = "deserialize_aud")]
     pub aud: Option<Vec<String>>,
     /// Scopes
     #[serde(default)]
@@ -46,6 +71,30 @@ pub struct Claims {
     /// [`crate::mcp_scope`]. `serde(default)` ⇒ absent on storage tokens.
     #[serde(default)]
     pub mcp: Option<McpScopeClaim>,
+    /// Connection-binding confirmation claim (L1b, RFC 7800 `cnf`). Present ONLY
+    /// on a connection-bound MCP token; carries the MCP connection's X25519
+    /// public key (base64), which is the key the connection-revocation deny-list
+    /// (`crate::mcp_revocation::McpConnectionRevocationState`) is matched on.
+    /// `serde(default)` ⇒ a storage token (or an unbound MCP token) has no `cnf`
+    /// and deserializes unchanged. The issuer emits `cnf` as a SIBLING of `mcp`
+    /// and only ever as `{ mcp_pub_b64 }`, so a non-MCP token never carries it
+    /// (see `pinning-webui/server/mcpTokens.ts::McpCnfClaim`).
+    #[serde(default)]
+    pub cnf: Option<ConnectionConfirmation>,
+}
+
+/// The `cnf` connection-binding claim on a connection-bound MCP-S3 JWT (L1b).
+/// Mirrors the issuer's `McpCnfClaim` in `pinning-webui/server/mcpTokens.ts`.
+/// The gateway only reads `mcp_pub_b64` to match it against the
+/// connection-revocation deny-list; `Serialize` is derived solely so tests can
+/// mint connection-bound tokens via the existing `create_test_token` helper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionConfirmation {
+    /// The MCP connection's X25519 public key, base64 of the raw 32 bytes. The
+    /// issuer normalizes this to a canonical base64 form on both mint and
+    /// verify, so it is compared VERBATIM against the revoked-pubkeys feed
+    /// (exactly as the jti is compared as-is) — no re-normalization here.
+    pub mcp_pub_b64: String,
 }
 
 /// The `mcp` claim on a scoped MCP-S3 JWT (P12). Mirrors the issuer's contract
@@ -130,11 +179,20 @@ pub fn validate_token_with_config(
         validation.set_issuer(&[iss]);
     }
     
-    // Security audit fix #6: Set audience validation if configured
+    // Security audit fix #6: Set audience validation if configured.
+    // L1b: when NO audience is pinned, disable aud validation entirely. In
+    // jsonwebtoken 9.x `validate_aud` defaults to true, so a token that merely
+    // *carries* an `aud` claim (every MCP-S3 token: aud="fula-s3-gateway") is
+    // rejected with InvalidAudience even though no expected audience is set —
+    // while audience-less storage tokens pass. Mirror the existing
+    // `validate_exp = false` posture: signature (HMAC secret) + issuer remain
+    // enforced; the audience is simply not pinned here.
     if let Some(ref aud) = config.audience {
         validation.set_audience(&[aud]);
+    } else {
+        validation.validate_aud = false;
     }
-    
+
     decode::<Claims>(token, &key, &validation)
         .map(|data| data.claims)
         .map_err(|e| {
@@ -530,6 +588,7 @@ mod tests {
             jti: None,
             token_use: None,
             mcp: None,
+            cnf: None,
         };
 
         let token = create_test_token(&claims, secret);
@@ -552,6 +611,7 @@ mod tests {
             jti: None,
             token_use: None,
             mcp: None,
+            cnf: None,
         };
 
         let token = create_test_token(&claims, secret);
@@ -574,6 +634,7 @@ mod tests {
             jti: None,
             token_use: None,
             mcp: None,
+            cnf: None,
         };
 
         let session = claims_to_session(claims, "test-jwt-token".to_string());
@@ -747,6 +808,9 @@ mod tests {
                     perms: perms.iter().map(|s| s.to_string()).collect(),
                 }],
             }),
+            // No connection binding by default; the L1b connection-revocation
+            // tests set this to `Some(...)` after calling the helper.
+            cnf: None,
         }
     }
 
@@ -872,6 +936,7 @@ mod tests {
             jti: None,
             token_use: None,
             mcp: None,
+            cnf: None,
         };
         let session = session_from_claims(&claims, secret);
 

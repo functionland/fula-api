@@ -94,6 +94,18 @@ pub struct AppState {
     /// but keyed on jti, with a fail-CLOSED-on-write policy for the
     /// enabled-but-unreachable case (per-action wiring deferred).
     pub mcp_revocation: Option<Arc<crate::mcp_revocation::McpRevocationState>>,
+    /// L1b — MCP CONNECTION revocation deny-list. `Some` when
+    /// `FULA_MCP_CONNECTION_REVOCATION_ENABLED` is set AND an endpoint is
+    /// configured; `None` (default) → `mcp_revocation::ensure_connection_not_revoked`
+    /// is a no-op. A background refresher
+    /// (`mcp_revocation::spawn_if_enabled_connections`) mirrors revoked
+    /// connection pubkeys into it; `auth_middleware` rejects a token whose
+    /// `cnf.mcp_pub_b64` is present. Sibling of [`Self::mcp_revocation`] but
+    /// keyed on the connection pubkey, with a plain FAIL-OPEN policy (an
+    /// unreachable source keeps the previous set; storage tokens — no `cnf` —
+    /// are never affected).
+    pub mcp_connection_revocation:
+        Option<Arc<crate::mcp_revocation::McpConnectionRevocationState>>,
 }
 
 impl AppState {
@@ -351,6 +363,19 @@ impl AppState {
             None
         };
 
+        // L1b — MCP CONNECTION revocation deny-list. Allocated EMPTY (= allow
+        // all) only when the env switch is set AND an endpoint is configured;
+        // the background refresher (spawn_if_enabled_connections) performs the
+        // first load. Default OFF → `None` → no-op, byte-identical auth.
+        let mcp_connection_revocation = if crate::mcp_revocation::connection_enabled() {
+            info!("✓ MCP connection revocation deny-list enabled (FULA_MCP_CONNECTION_REVOCATION_ENABLED); honoring connection revocation, loads on first refresh");
+            Some(Arc::new(
+                crate::mcp_revocation::McpConnectionRevocationState::empty(),
+            ))
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             block_store,
@@ -365,6 +390,7 @@ impl AppState {
             pins_db,
             revocation,
             mcp_revocation,
+            mcp_connection_revocation,
         })
     }
 
@@ -594,6 +620,14 @@ pub struct UserSession {
     /// AFTER `claims_to_session`; defaults to `None` in [`Self::new`] so all
     /// other constructors stay untouched.
     pub mcp_scope: Option<crate::mcp_scope::McpScope>,
+    /// Connection-binding pubkey (L1b). `Some(base64)` ONLY for a
+    /// connection-bound MCP token (one carrying a `cnf.mcp_pub_b64` claim);
+    /// `None` for every storage token, unbound MCP token, and dev/admin session.
+    /// This is the key the connection-revocation deny-list is matched on. Set by
+    /// `auth_middleware` from `claims.cnf` after `claims_to_session`; defaults to
+    /// `None` in [`Self::new`] so all other constructors stay untouched and the
+    /// non-MCP-token invariant holds (no `cnf` ⇒ `None` ⇒ never revoked).
+    pub connection_pubkey: Option<String>,
 }
 
 impl UserSession {
@@ -610,6 +644,10 @@ impl UserSession {
             // P12: non-MCP by default. `auth_middleware` overwrites this with a
             // validated scope for MCP tokens; everything else stays `None`.
             mcp_scope: None,
+            // L1b: no connection binding by default. `auth_middleware` sets this
+            // from `claims.cnf` for connection-bound MCP tokens; everything else
+            // stays `None`.
+            connection_pubkey: None,
         }
     }
 
