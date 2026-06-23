@@ -1,0 +1,44 @@
+{
+  "name": "@functionland/fula-mcp",
+  "version": "0.6.16",
+  "description": "Local MCP (Model Context Protocol) stdio server for Fula decentralized storage — store/retrieve files in FxFiles' end-to-end-encrypted format directly from Claude Desktop, Claude Code, Codex CLI, or Gemini CLI. Run build-free via `npx @functionland/fula-mcp`.",
+  "bin": {
+    "fula-mcp": "bin/fula-mcp.js"
+  },
+  "type": "commonjs",
+  "files": [
+    "bin/",
+    "lib/",
+    "checksums.json",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/functionland/fula-api.git"
+  },
+  "homepage": "https://github.com/functionland/fula-api/tree/main/crates/fula-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/functionland/fula-api/issues"
+  },
+  "keywords": [
+    "fula",
+    "mcp",
+    "model-context-protocol",
+    "ipfs",
+    "decentralized",
+    "storage",
+    "encryption",
+    "claude",
+    "codex",
+    "gemini",
+    "ai"
+  ],
+  "author": "Functionland <hi@fx.land>",
+  "license": "MIT OR Apache-2.0"
+}
