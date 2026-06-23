@@ -501,17 +501,12 @@ impl CapabilityBundle {
                 validate_storage_api_url(&u)?;
                 Some(u)
             }
-            None => match &storage_api_url {
-                // `storage_api_url` is already validated above; the derived URL has
-                // the same scheme/host, so it inherits the HTTPS-or-loopback
-                // property — we just trim a trailing slash and append the path.
-                Some(base) => Some(format!(
-                    "{}{}",
-                    base.trim_end_matches('/'),
-                    REFRESH_CONNECTION_PATH
-                )),
-                None => None,
-            },
+            // `storage_api_url` is already validated above; the derived URL has
+            // the same scheme/host, so it inherits the HTTPS-or-loopback property —
+            // we just trim a trailing slash and append the path.
+            None => storage_api_url.as_ref().map(|base| {
+                format!("{}{}", base.trim_end_matches('/'), REFRESH_CONNECTION_PATH)
+            }),
         };
         // The refresh token itself (a secret) — kept verbatim, redacted in Debug,
         // never logged. An empty string is treated as "not configured".
