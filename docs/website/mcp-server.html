@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
+    <title>MCP Server - Fula API Documentation</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="css/security.css">
+    <link rel="stylesheet" href="css/i18n.css">
+    <script>
+        (function() {
+            const savedTheme = localStorage.getItem('fula-docs-theme');
+            if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
+            const savedLang = localStorage.getItem('fula-docs-language');
+            if (savedLang && ['fa', 'ar'].includes(savedLang)) {
+                document.documentElement.setAttribute('dir', 'rtl');
+                document.documentElement.setAttribute('lang', savedLang);
+            }
+        })();
+    </script>
+    <style>
+        .x402-hero {
+            text-align: center;
+            padding: 40px 20px;
+        }
+        .x402-hero img {
+            max-width: 100%;
+            height: auto;
+            max-height: 200px;
+            border-radius: 12px;
+            margin-bottom: 24px;
+        }
+        .x402-section {
+            padding: 40px 20px;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        .x402-section h2 {
+            color: var(--text-heading);
+            font-size: 1.6rem;
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid var(--accent-blue);
+        }
+        .x402-section h3 {
+            color: var(--text-heading);
+            font-size: 1.2rem;
+            margin-top: 24px;
+            margin-bottom: 12px;
+        }
+        .x402-section p, .x402-section li {
+            color: var(--text-primary);
+            line-height: 1.7;
+            margin-bottom: 10px;
+        }
+        .x402-section ul {
+            padding-left: 20px;
+            margin-bottom: 16px;
+        }
+        .endpoint-card {
+            background: var(--bg-code);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+        .endpoint-card h4 {
+            color: var(--text-heading);
+            margin-bottom: 8px;
+        }
+        .endpoint-card .method {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 4px;
+            font-weight: 700;
+            font-size: 0.8rem;
+            margin-right: 8px;
+            color: #fff;
+        }
+        .method-get { background: var(--method-get); }
+        .method-put { background: var(--method-put); }
+        .method-post { background: var(--method-post); }
+        .method-delete { background: var(--method-delete); }
+        .method-head { background: var(--method-head); }
+        .endpoint-card .path {
+            font-family: monospace;
+            color: var(--accent-blue);
+            font-size: 0.95rem;
+        }
+        .endpoint-card p {
+            margin-top: 8px;
+            font-size: 0.9rem;
+        }
+        .code-block {
+            background: var(--bg-code);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            overflow-x: auto;
+            margin: 12px 0 20px;
+        }
+        .code-block pre {
+            margin: 0;
+            font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+            font-size: 0.875rem;
+            line-height: 1.6;
+            color: var(--code-text);
+        }
+        .test-card {
+            background: var(--bg-code);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .test-card h4 {
+            color: var(--accent-green);
+            margin-bottom: 8px;
+        }
+        .test-card p {
+            font-size: 0.9rem;
+            margin-bottom: 12px;
+        }
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+            margin: 20px 0;
+        }
+        .info-card {
+            background: var(--bg-code);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+        }
+        .info-card h4 {
+            color: var(--text-heading);
+            margin-bottom: 8px;
+        }
+        .info-card p {
+            font-size: 0.9rem;
+        }
+        .pricing-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0;
+        }
+        .pricing-table th, .pricing-table td {
+            padding: 10px 14px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .pricing-table th {
+            color: var(--text-heading);
+            font-weight: 600;
+            background: var(--bg-sidebar);
+        }
+        .pricing-table td {
+            color: var(--text-primary);
+        }
+        .pricing-table code {
+            background: var(--bg-code);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+        }
+        .flow-diagram {
+            background: var(--bg-code);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            margin: 16px 0;
+            overflow-x: auto;
+        }
+        .flow-diagram pre {
+            font-family: 'SFMono-Regular', Consolas, monospace;
+            font-size: 0.85rem;
+            line-height: 1.5;
+            color: var(--code-text);
+        }
+        .note-box {
+            background: rgba(88, 166, 255, 0.1);
+            border-left: 4px solid var(--accent-blue);
+            padding: 14px 18px;
+            border-radius: 0 8px 8px 0;
+            margin: 16px 0;
+        }
+        .note-box p {
+            margin: 0;
+            font-size: 0.9rem;
+        }
+        .warning-box {
+            background: rgba(210, 153, 34, 0.1);
+            border-left: 4px solid var(--accent-yellow);
+            padding: 14px 18px;
+            border-radius: 0 8px 8px 0;
+            margin: 16px 0;
+        }
+        .warning-box p {
+            margin: 0;
+            font-size: 0.9rem;
+        }
+        a.ext-link {
+            color: var(--accent-blue);
+            text-decoration: none;
+        }
+        a.ext-link:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <!-- Mobile Header -->
+    <header class="mobile-header">
+        <button class="hamburger" aria-label="Toggle menu">
+            <span></span>
+            <span></span>
+            <span></span>
+        </button>
+        <span class="logo-text">Fula API</span>
+        <div class="mobile-header-actions">
+            <button class="theme-toggle" aria-label="Toggle theme">
+                <span class="icon-sun">☀️</span>
+                <span class="icon-moon">🌙</span>
+            </button>
+        </div>
+    </header>
+
+    <div class="sidebar-overlay"></div>
+
+    <nav class="sidebar">
+        <div class="sidebar-header">
+            <div class="logo">
+                <h1>Fula API</h1>
+                <span class="version">v0.4.1</span>
+            </div>
+            <button class="theme-toggle" aria-label="Toggle theme">
+                <span class="icon-sun">☀️</span>
+                <span class="icon-moon">🌙</span>
+            </button>
+        </div>
+        <div class="nav-section">
+            <h3>Documentation</h3>
+            <ul>
+                <li><a href="index.html">Introduction</a></li>
+                <li><a href="security.html">Security & Encryption</a></li>
+                <li><a href="api.html">API Reference</a></li>
+                <li><a href="sdk.html">SDK Examples</a></li>
+                <li><a href="platforms.html">Platform Guides</a></li>
+                <li><a href="x402.html">x402 AI Agent Storage</a></li>
+                <li><a href="mcp-server.html" class="active">MCP Server</a></li>
+                <li><a href="benchmark.html">Benchmark</a></li>
+            </ul>
+        </div>
+        <div class="nav-section">
+            <h3>On This Page</h3>
+            <ul>
+                <li><a href="#overview">What It Is</a></li>
+                <li><a href="#two-ways">Two Ways to Use It</a></li>
+                <li><a href="#local-binary">Local Binary Setup</a></li>
+                <li><a href="#hosted">Hosted Server Setup</a></li>
+                <li><a href="#connect">How to Connect</a></li>
+                <li><a href="#capabilities">What the AI Can Do</a></li>
+                <li><a href="#security">Security &amp; Privacy</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <main class="content security-content">
+        <!-- Hero Section -->
+        <section class="x402-hero">
+            <h1>Fula MCP Server</h1>
+            <p class="hero-subtitle">Let AI assistants store and read files in your own encrypted Fula workspace</p>
+            <div class="hero-badges">
+                <span class="badge-item">🤖 Works with Claude, ChatGPT, Gemini, Codex</span>
+                <span class="badge-item">🔐 End-to-End Encrypted</span>
+                <span class="badge-item">🔑 Never Sees Your Master Key</span>
+                <span class="badge-item">🧩 Model Context Protocol</span>
+            </div>
+        </section>
+
+        <!-- Overview / What it is -->
+        <section id="overview" class="x402-section">
+            <h2>What It Is</h2>
+            <p>The Fula <strong>MCP server</strong> lets AI assistants &mdash; like Claude, ChatGPT, Gemini, or Codex &mdash; store and read files in <em>your</em> Fula <strong>AI workspace</strong>. Files the AI writes are encrypted in exactly the same end-to-end-encrypted format the <a href="https://fx.land" class="ext-link">FxFiles</a> app uses, so they appear right alongside your own files in FxFiles.</p>
+            <p>The important part: the AI does this <strong>without ever getting the key that decrypts your other files</strong>. It is handed a dedicated workspace key that unlocks only its own AI workspace &mdash; nothing else. Your master encryption key never leaves your device and is never given to the AI or to any server.</p>
+            <p><a href="https://modelcontextprotocol.io/" class="ext-link">MCP (Model Context Protocol)</a> is the open standard AI assistants use to connect to external tools. The Fula MCP server is one such tool: it exposes a small set of "store / read / list / search / tag" file operations that the AI can call.</p>
+
+            <div class="info-grid">
+                <div class="info-card">
+                    <h4>🤖 For your AI assistant</h4>
+                    <p>Give an AI a place to keep notes, documents, and results that persist across chats &mdash; encrypted, decentralized, and owned by you.</p>
+                </div>
+                <div class="info-card">
+                    <h4>🔐 Same encryption as FxFiles</h4>
+                    <p>Every file the AI stores is individually encrypted in the FxFiles format. Open FxFiles and the AI's files are simply there, decryptable by you.</p>
+                </div>
+                <div class="info-card">
+                    <h4>🔑 Your other files stay private</h4>
+                    <p>The AI receives a workspace-only key derived one-way from your master key. It cannot reverse it, and it cannot reach your real files.</p>
+                </div>
+                <div class="info-card">
+                    <h4>🧩 Built on an open standard</h4>
+                    <p>Works with any MCP-capable assistant. No proprietary plugin &mdash; just the standard Model Context Protocol.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Two ways to use it -->
+        <section id="two-ways" class="x402-section">
+            <h2>Two Ways to Use It</h2>
+            <p>There are two ways to connect an AI to your Fula workspace. Pick the one that matches your AI assistant:</p>
+
+            <div class="info-grid">
+                <div class="info-card">
+                    <h4>💻 Local binary</h4>
+                    <p>For desktop / terminal AI tools that run on your own computer &mdash; <strong>Claude Desktop, Claude Code, Codex CLI, Gemini CLI</strong>. The MCP server runs locally on your machine. No build step: it starts with a single <code>npx</code> command. This is the path that is available today.</p>
+                </div>
+                <div class="info-card">
+                    <h4>🌐 Hosted server</h4>
+                    <p>For web AI assistants that can only reach a URL &mdash; <strong>Claude.ai, ChatGPT (web)</strong>. You add a hosted server URL as a custom connector and sign in. This path requires a hosted server to be deployed first (see below).</p>
+                </div>
+            </div>
+
+            <div class="note-box">
+                <p><strong>Not sure which?</strong> If your AI runs as an app or in a terminal on your computer, use the <strong>local binary</strong>. If you use the AI through a website, you need the <strong>hosted server</strong>.</p>
+            </div>
+        </section>
+
+        <!-- Local binary setup -->
+        <section id="local-binary" class="x402-section">
+            <h2>Local Binary Setup</h2>
+            <p>The local server is published as an npm package, <code>@functionland/fula-mcp</code>. You never build anything &mdash; <code>npx</code> downloads a verified, prebuilt binary for your platform the first time it runs and caches it. Your AI client launches it automatically.</p>
+
+            <div class="code-block">
+                <pre>npx @functionland/fula-mcp</pre>
+            </div>
+
+            <p>In every example below you paste a <strong>connection bundle</strong> into the <code>FULA_MCP_CAPABILITY</code> environment variable. You get that bundle from the FxFiles app (see <a href="#connect">How to Connect</a>). It contains your scoped, workspace-only access &mdash; <strong>not</strong> your master key.</p>
+
+            <div class="warning-box">
+                <p><strong>Tip:</strong> Run <code>npx -y @functionland/fula-mcp</code> once in a terminal first. This warms the binary cache so your AI client does not time out waiting for the first download.</p>
+            </div>
+
+            <h3>Claude Desktop</h3>
+            <p>Edit <code>claude_desktop_config.json</code> (on Windows: <code>%APPDATA%\Claude\claude_desktop_config.json</code>; on macOS: <code>~/Library/Application Support/Claude/claude_desktop_config.json</code>) and add a <code>fula</code> entry under <code>mcpServers</code>, then fully quit and reopen Claude Desktop:</p>
+            <div class="code-block">
+                <pre>{
+  "mcpServers": {
+    "fula": {
+      "command": "npx",
+      "args": ["-y", "@functionland/fula-mcp"],
+      "env": {
+        "FULA_MCP_CAPABILITY": "&lt;paste your connection bundle from FxFiles&gt;"
+      }
+    }
+  }
+}</pre>
+            </div>
+
+            <h3>Claude Code</h3>
+            <p>Claude Code stores MCP servers in the same <code>mcpServers</code> shape (in <code>.mcp.json</code>). The simplest way to add one with an environment variable is the <code>add-json</code> command:</p>
+            <div class="code-block">
+                <pre>claude mcp add-json fula '{
+  "type": "stdio",
+  "command": "npx",
+  "args": ["-y", "@functionland/fula-mcp"],
+  "env": { "FULA_MCP_CAPABILITY": "&lt;paste your connection bundle from FxFiles&gt;" }
+}'</pre>
+            </div>
+            <p>Use <code>--scope user</code> to make the server available across all your projects, or <code>--scope project</code> to share it with a repo via a checked-in <code>.mcp.json</code>.</p>
+
+            <h3>Codex CLI</h3>
+            <p>Codex reads MCP servers from <code>~/.codex/config.toml</code>. Add a server section &mdash; note the table name is <code>mcp_servers</code> (with an underscore), and the environment variables go in a nested <code>.env</code> table:</p>
+            <div class="code-block">
+                <pre>[mcp_servers.fula]
+command = "npx"
+args = ["-y", "@functionland/fula-mcp"]
+
+[mcp_servers.fula.env]
+FULA_MCP_CAPABILITY = "&lt;paste your connection bundle from FxFiles&gt;"</pre>
+            </div>
+            <p>Or add it from the command line:</p>
+            <div class="code-block">
+                <pre>codex mcp add fula --env FULA_MCP_CAPABILITY="&lt;bundle&gt;" -- npx -y @functionland/fula-mcp</pre>
+            </div>
+
+            <h3>Gemini CLI</h3>
+            <p>Gemini CLI uses the same <code>mcpServers</code> object in its <code>settings.json</code>:</p>
+            <div class="code-block">
+                <pre>{
+  "mcpServers": {
+    "fula": {
+      "command": "npx",
+      "args": ["-y", "@functionland/fula-mcp"],
+      "env": { "FULA_MCP_CAPABILITY": "&lt;paste your connection bundle from FxFiles&gt;" }
+    }
+  }
+}</pre>
+            </div>
+
+            <div class="note-box">
+                <p><strong>Note:</strong> The <code>@functionland/fula-mcp</code> package and its config shape match the package's own README. MCP client configuration formats do change between releases &mdash; if an example does not match your installed version, check that client's current MCP documentation and use its <code>mcpServers</code> / <code>mcp_servers</code> equivalent with the same <code>command</code>, <code>args</code>, and <code>FULA_MCP_CAPABILITY</code> environment variable.</p>
+            </div>
+        </section>
+
+        <!-- Hosted server setup -->
+        <section id="hosted" class="x402-section">
+            <h2>Hosted Server Setup</h2>
+            <p>Web-based AI assistants (Claude.ai, ChatGPT on the web) cannot launch a local program &mdash; they can only reach a server over the internet. For those, you connect to a <strong>hosted</strong> Fula MCP server:</p>
+            <ul>
+                <li>In the AI assistant's settings, add a <strong>custom connector</strong> and paste the hosted server's <strong>URL</strong>.</li>
+                <li><strong>Sign in (OAuth)</strong> when prompted, to link the connector to your Fula account.</li>
+                <li>The AI can then store and read files in your AI workspace, the same way the local binary does.</li>
+            </ul>
+
+            <div class="warning-box">
+                <p><strong>Availability:</strong> The hosted server is <strong>not a public service yet</strong>. It is designed to be <strong>self-hosted</strong> so you stay in control of your own trust domain. Until you (or your organization) deploy one, only the <a href="#local-binary">local binary</a> path is available. The hosted server lives in the <a href="https://github.com/functionland/fula-api" class="ext-link">Fula API repository</a>; follow the repository's setup notes to deploy your own.</p>
+            </div>
+        </section>
+
+        <!-- How to connect -->
+        <section id="connect" class="x402-section">
+            <h2>How to Connect</h2>
+            <p>You grant an AI access from inside the FxFiles app, under <strong>AI Connections</strong>. You stay in control: you create the connection, and you can disconnect it at any time.</p>
+
+            <div class="info-grid">
+                <div class="info-card">
+                    <h4>Connect an AI (local)</h4>
+                    <p>Choose <strong>"Connect an AI"</strong>. FxFiles creates a one-time <strong>connection bundle</strong> for you to paste into your AI client's config (the <code>FULA_MCP_CAPABILITY</code> value above).</p>
+                </div>
+                <div class="info-card">
+                    <h4>Connect a hosted AI</h4>
+                    <p>Choose <strong>"Connect a hosted AI"</strong> to pair a web assistant with your hosted server by URL (the OAuth flow above).</p>
+                </div>
+                <div class="info-card">
+                    <h4>Disconnect anytime</h4>
+                    <p>Each connection is listed in FxFiles. <strong>Disconnect</strong> to cut off future access &mdash; see exactly how that takes effect in the <a href="#security">security section</a>.</p>
+                </div>
+            </div>
+
+            <div class="note-box">
+                <p><strong>The bundle is sensitive.</strong> The connection bundle carries your workspace access. Treat it like a password: do not share it or commit it to a public repository. (It still cannot reach your non-workspace files &mdash; but anyone holding it can use your AI workspace until you disconnect.)</p>
+            </div>
+        </section>
+
+        <!-- What the AI can do -->
+        <section id="capabilities" class="x402-section">
+            <h2>What the AI Can Do</h2>
+            <p>The MCP server exposes a small, fixed set of file operations. The AI can only call these, and only within its own workspace (plus any specific file you explicitly share with it):</p>
+
+            <div class="endpoint-card">
+                <h4><span class="method method-put">STORE</span> <span class="path">store a file</span></h4>
+                <p>Save a file into the AI's encrypted workspace. The file is individually encrypted and shows up in your FxFiles library.</p>
+            </div>
+            <div class="endpoint-card">
+                <h4><span class="method method-get">READ</span> <span class="path">read a file</span></h4>
+                <p>Read back a file from the workspace (or a specific file you granted the AI access to). Anything outside that scope is refused before any network request is made.</p>
+            </div>
+            <div class="endpoint-card">
+                <h4><span class="method method-get">LIST</span> <span class="path">list files</span></h4>
+                <p>Enumerate the files in the AI's workspace, optionally narrowed by category or sub-folder.</p>
+            </div>
+            <div class="endpoint-card">
+                <h4><span class="method method-get">SEARCH</span> <span class="path">search files</span></h4>
+                <p>Find workspace files by filename (case-insensitive substring match).</p>
+            </div>
+            <div class="endpoint-card">
+                <h4><span class="method method-post">TAG</span> <span class="path">tag a file / list tags</span></h4>
+                <p>Apply tags to a stored file, and list the tags in the workspace &mdash; written in the same tag format FxFiles uses, so your app can adopt them.</p>
+            </div>
+
+            <div class="note-box">
+                <p><strong>Scope is enforced, not advisory.</strong> Every operation is checked against the workspace scope before any work happens. A request for a key outside the AI workspace is denied outright.</p>
+            </div>
+        </section>
+
+        <!-- Security, privacy & data protection -->
+        <section id="security" class="x402-section">
+            <h2>Security, Privacy &amp; Data Protection</h2>
+            <p>This section states what is <strong>guaranteed</strong> and what the honest <strong>limits</strong> are. We do not claim more than the design delivers.</p>
+
+            <h3>Guaranteed: the AI can never touch your other files</h3>
+            <p>This is the one absolute guarantee, and it holds for both the local binary and the hosted server. It rests on <strong>two independent mechanisms</strong> &mdash; either one alone would block access to your other files; both must be defeated for any leak, and the second does not depend on the cryptography of the first:</p>
+            <ul>
+                <li><strong>1. The master key is never shared.</strong> The AI never receives the master key that decrypts your real files. It receives only a dedicated <strong>AI-workspace key</strong>, computed as a <strong>one-way derivation</strong> of your master key (a BLAKE3 key-derivation under a fixed, workspace-specific label). One-way means the AI cannot work backwards from the workspace key to your master key, and the workspace key unlocks <em>only</em> the AI workspace &mdash; not your real files, not anything else.</li>
+                <li><strong>2. The storage gateway independently enforces scope.</strong> The AI's access token is restricted by the storage gateway itself to the AI-workspace bucket and operations. Even if the encryption were somehow bypassed, the gateway still refuses any request outside that scope. Crucially, isolation <em>between different users</em> comes from the gateway opening storage per account (keyed to your hashed user id and the token's subject) &mdash; not merely from a path prefix.</li>
+            </ul>
+            <div class="note-box">
+                <p><strong>What "your other files" means:</strong> your real FxFiles library, encrypted under your master key, is never reachable by the AI on its own. The one exception is intentional and owner-initiated: if <em>you</em> explicitly share a specific file with the AI, it can read <em>that</em> file &mdash; and nothing else. The AI can never reach your files unilaterally.</p>
+            </div>
+
+            <h3>Your AI workspace &mdash; local binary</h3>
+            <p>With the local binary, the connection bundle lives in your AI client's configuration file <strong>on your own computer</strong>. The server is stateless: it loads the bundle into memory at startup, never writes secrets to disk, and never logs them.</p>
+            <div class="warning-box">
+                <p><strong>Your responsibility:</strong> because the bundle sits in a config file on your machine, keep that file secure (do not paste it into shared chats or public repos). Anyone who obtains the bundle can use your AI workspace until you disconnect. They still cannot reach your other files or your master key.</p>
+            </div>
+
+            <h3>Your AI workspace &mdash; hosted server</h3>
+            <p>The hosted server is designed so that a stolen database or disk reveals nothing useful. By design, it stores your workspace key <strong>encrypted</strong>, with the encryption key held in your <strong>own self-hosted OpenBao</strong> (a separate secrets vault &mdash; a distinct trust domain). The server must call OpenBao to decrypt a workspace key in order to serve a request.</p>
+            <div class="warning-box">
+                <p><strong>Status &mdash; be aware:</strong> the hosted server is <strong>not deployed as a public service</strong>; the protections in this subsection describe the <em>intended design of the self-hosted server</em>, not a running system you can rely on today. Deploy your own (see <a href="#hosted">Hosted Server Setup</a>) to obtain them.</p>
+            </div>
+            <div class="note-box">
+                <p><strong>Honest limit of any hosted server:</strong> a stolen <em>database or disk</em> alone reveals nothing (the keys are encrypted, and the vault key is elsewhere). But a <em>live, fully-compromised</em> server &mdash; one an attacker actively controls while it is decrypting to serve requests &mdash; could read the workspaces of <strong>currently-active sessions</strong>. This is unavoidable for <em>any</em> server that decrypts data to hand it to an AI. Even then, it can <strong>never</strong> reach your master key, and <strong>never</strong> your other (non-workspace) files. Running the server yourself keeps that risk inside your own trust domain.</p>
+            </div>
+
+            <h3>Connection model &amp; revoking access</h3>
+            <p>You connect once, and it keeps working until you disconnect. The AI carries a <strong>short-lived</strong> session token (about an hour by default, and at most 24 hours if a server is configured for a longer lifetime) and <strong>cannot renew it on its own</strong>.</p>
+            <p>When you <strong>Disconnect</strong> a connection in FxFiles, the pairing is removed immediately, so the AI gets <strong>no new access</strong> from that moment. Its current session keeps working only until the short-lived token expires &mdash; about an hour by default &mdash; and then it is permanently locked out.</p>
+            <div class="note-box">
+                <p><strong>Honest limit:</strong> "Disconnect" is not an instant kill switch for a session already in progress; it stops renewal and lets the short-lived token run out (default ~1 hour). A near-instant (~30 second) server-side revocation exists in the gateway but is <strong>off by default</strong> &mdash; an operator can enable it on a deployment that needs faster cut-off. Files the AI already stored remain in your library.</p>
+            </div>
+
+            <h3>Encryption</h3>
+            <ul>
+                <li><strong>Every file is individually encrypted</strong> with its own random per-file key (a fresh data-encryption key per file), using authenticated encryption (AES-256-GCM by default; ChaCha20-Poly1305 is also supported).</li>
+                <li><strong>Per-file keys are wrapped to recipients,</strong> so a file the AI writes can be unwrapped by you (its owner) without exposing any other file's key.</li>
+                <li><strong>Metadata privacy.</strong> Filenames and paths are not stored in the clear: storage keys are obfuscated (hashed), and the index that maps your logical paths to stored objects is itself encrypted. An observer of raw storage does not learn your filenames or folder structure.</li>
+            </ul>
+
+            <div class="note-box">
+                <p><strong>In short:</strong> the no-other-files guarantee is absolute (two independent mechanisms, local and hosted alike). Workspace privacy is strong but has the honest limits stated above &mdash; a stolen local bundle, or a live-compromised hosted server, can expose the <em>AI workspace</em> (never your master key, never your other files). We deliberately do <strong>not</strong> claim "100% everything."</p>
+            </div>
+        </section>
+
+        <footer>
+            <p>Fula API MCP Server Documentation &bull; Built with ❤️ for decentralized, AI-native storage</p>
+            <p class="footer-links">
+                <a href="https://github.com/functionland/fula-api">GitHub</a> &bull;
+                <a href="https://fx.land">Functionland</a>
+            </p>
+        </footer>
+    </main>
+
+    <script src="js/i18n.js"></script>
+    <script src="js/translations.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
