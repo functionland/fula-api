@@ -11,7 +11,27 @@ use crate::{ApiError, S3ErrorCode};
 use crate::state::UserSession;
 use axum::http::HeaderMap;
 use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserialize a JWT `aud` claim that may be a single string or an array of
+/// strings (RFC 7519 §4.1.3), normalizing to `Option<Vec<String>>`.
+fn deserialize_aud<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        One(String),
+        Many(Vec<String>),
+    }
+    let opt = Option::<StringOrVec>::deserialize(deserializer)?;
+    Ok(match opt {
+        None => None,
+        Some(StringOrVec::One(s)) => Some(vec![s]),
+        Some(StringOrVec::Many(v)) => Some(v),
+    })
+}
 use chrono::{DateTime, Utc, Duration};
 
 /// JWT claims structure
@@ -25,7 +45,12 @@ pub struct Claims {
     pub iat: Option<i64>,
     /// Issuer
     pub iss: Option<String>,
-    /// Audience
+    /// Audience. RFC 7519 §4.1.3 allows `aud` to be EITHER a single string OR an
+    /// array of strings. The issuer (pinning-webui) mints it as a single string
+    /// ("fula-s3-gateway"); accept both forms so an MCP/connection-bound token
+    /// deserializes instead of failing with `invalid type: string, expected a
+    /// sequence` (which would 403 every MCP token before the revocation check).
+    #[serde(default, deserialize_with = "deserialize_aud")]
     pub aud: Option<Vec<String>>,
     /// Scopes
     #[serde(default)]
@@ -154,11 +179,20 @@ pub fn validate_token_with_config(
         validation.set_issuer(&[iss]);
     }
     
-    // Security audit fix #6: Set audience validation if configured
+    // Security audit fix #6: Set audience validation if configured.
+    // L1b: when NO audience is pinned, disable aud validation entirely. In
+    // jsonwebtoken 9.x `validate_aud` defaults to true, so a token that merely
+    // *carries* an `aud` claim (every MCP-S3 token: aud="fula-s3-gateway") is
+    // rejected with InvalidAudience even though no expected audience is set —
+    // while audience-less storage tokens pass. Mirror the existing
+    // `validate_exp = false` posture: signature (HMAC secret) + issuer remain
+    // enforced; the audience is simply not pinned here.
     if let Some(ref aud) = config.audience {
         validation.set_audience(&[aud]);
+    } else {
+        validation.validate_aud = false;
     }
-    
+
     decode::<Claims>(token, &key, &validation)
         .map(|data| data.claims)
         .map_err(|e| {
