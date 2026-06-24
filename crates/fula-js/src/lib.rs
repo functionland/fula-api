@@ -815,6 +815,35 @@ pub async fn put_encrypted_with_type(
         .map_err(|e| JsError::new(&format!("Serialization error: {}", e)))
 }
 
+/// Upload encrypted data AND register it in the bucket's private-forest index,
+/// then flush the forest manifest. Unlike `putEncryptedWithType` (a raw
+/// encrypted-object PUT that never touches the forest), this calls the
+/// forest-tracked `put_object_flat` — REQUIRED for the object to appear in
+/// `listDecrypted` / `listFilesFromForest` / `listDirectory`. The hosted MCP
+/// MUST use this for AI-workspace writes so the owner can enumerate them. It is
+/// the same write FxFiles' own `uploadObject` already uses for every file.
+#[wasm_bindgen(js_name = putFlat)]
+pub async fn put_flat(
+    client: &EncryptedClient,
+    bucket: &str,
+    key: &str,
+    data: &[u8],
+    content_type: &str,
+) -> Result<JsValue, JsError> {
+    let guard = client.inner.lock().await;
+    let result = guard
+        .put_object_flat(bucket, key, Bytes::from(data.to_vec()), Some(content_type))
+        .await
+        .map_err(|e| JsError::new(&format!("Upload failed: {}", e)))?;
+
+    let js_result = JsPutResult {
+        etag: result.etag,
+        version_id: result.version_id,
+    };
+    serde_wasm_bindgen::to_value(&js_result)
+        .map_err(|e| JsError::new(&format!("Serialization error: {}", e)))
+}
+
 /// Download and decrypt data by original key
 ///
 /// @param client - EncryptedClient handle
@@ -855,6 +884,25 @@ pub async fn get_decrypted_by_storage_key(
     let data = guard.get_object_decrypted_by_storage_key(bucket, storage_key)
         .await
         .map_err(|e| client_error_to_js_error("get_decrypted_by_storage_key", e))?;
+    Ok(data.to_vec())
+}
+
+/// Download + decrypt a file by its logical path via the forest — the read that
+/// PAIRS with `putFlat`. Resolves the key through the private-forest index and
+/// recovers by CID when the obfuscated storage key is gc-orphaned, unlike
+/// `getDecrypted` (which reads the raw obfuscated key directly and fails on a
+/// forest-tracked write). Mirrors FxFiles' `getFlat` (the Flutter FFI's
+/// `get_flat`), so the hosted MCP can read back exactly what it `putFlat`-wrote.
+#[wasm_bindgen(js_name = getFlat)]
+pub async fn get_flat(
+    client: &EncryptedClient,
+    bucket: &str,
+    key: &str,
+) -> Result<Vec<u8>, JsError> {
+    let guard = client.inner.lock().await;
+    let data = guard.get_object_flat(bucket, key)
+        .await
+        .map_err(|e| client_error_to_js_error("get_flat", e))?;
     Ok(data.to_vec())
 }
 
@@ -901,6 +949,37 @@ pub async fn list_decrypted(
 
     let guard = client.inner.lock().await;
     let result = guard.list_objects_decrypted(bucket, list_opts)
+        .await
+        .map_err(|e| JsError::new(&format!("List failed: {}", e)))?;
+
+    let js_result: Vec<JsFileMetadata> = result.into_iter().map(|m| JsFileMetadata {
+        storage_key: m.storage_key,
+        original_key: m.original_key,
+        size: m.original_size,
+        content_type: m.content_type,
+        created_at: m.created_at,
+        modified_at: m.modified_at,
+        is_encrypted: m.is_encrypted,
+    }).collect();
+
+    serde_wasm_bindgen::to_value(&js_result)
+        .map_err(|e| JsError::new(&format!("Serialization error: {}", e)))
+}
+
+/// List the bucket's files straight from the decrypted private-forest index
+/// (the "catalog") — the correct enumeration for flatNamespace + metadata-privacy
+/// buckets. Unlike `listDecrypted` (which filters a prefix against the OBFUSCATED
+/// storage keys and therefore returns 0 for such buckets), this walks the forest
+/// and returns decrypted original keys. Mirrors FxFiles' `listFromForest` (the
+/// Flutter FFI's `list_from_forest`), so the hosted MCP enumerates the same way
+/// the app does.
+#[wasm_bindgen(js_name = listFilesFromForest)]
+pub async fn list_files_from_forest(
+    client: &EncryptedClient,
+    bucket: &str,
+) -> Result<JsValue, JsError> {
+    let guard = client.inner.lock().await;
+    let result = guard.list_files_from_forest(bucket)
         .await
         .map_err(|e| JsError::new(&format!("List failed: {}", e)))?;
 
