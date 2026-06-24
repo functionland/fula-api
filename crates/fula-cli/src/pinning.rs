@@ -383,12 +383,18 @@ pub async fn check_can_upload(
     let url = format!("{}/api/v1/storage", api_url.trim_end_matches('/'));
     debug!(url = %url, "Checking storage balance");
 
-    // Call storage API
+    // Call storage API. For MCP/AI writes the token is a gateway-scoped JWT (not
+    // a login session), so assert the user via service-auth (HMAC) — the SAME
+    // identity path the pin uses — so the quota check resolves the user and
+    // enforces their credit. Normal session tokens keep the Bearer path.
     let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", token))
-        .timeout(Duration::from_secs(5))
+    let pin_secret = std::env::var("FULA_PIN_SERVICE_SECRET").unwrap_or_default();
+    let req = client.get(&url).timeout(Duration::from_secs(5));
+    let req = match fula_blockstore::service_auth_for_token(token, &pin_secret) {
+        Some(h) => req.header(fula_blockstore::SERVICE_AUTH_HEADER, h),
+        None => req.header("Authorization", format!("Bearer {}", token)),
+    };
+    let response = req
         .send()
         .await
         .map_err(|e| {

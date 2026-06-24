@@ -45,6 +45,10 @@ pub struct PinningServiceConfig {
     pub timeout: Duration,
     /// Maximum retries for failed requests
     pub max_retries: u32,
+    /// When `Some`, the request authenticates via the `X-Fula-Service-Auth`
+    /// header (HMAC service-auth) INSTEAD of `Authorization: Bearer` — for AI/MCP
+    /// pins whose token is a gateway-scoped JWT, not a pinning-service session.
+    pub service_auth: Option<String>,
 }
 
 impl PinningServiceConfig {
@@ -55,6 +59,7 @@ impl PinningServiceConfig {
             access_token: access_token.into(),
             timeout: Duration::from_secs(60),
             max_retries: 3,
+            service_auth: None,
         }
     }
 
@@ -261,10 +266,14 @@ impl PinningServiceClient {
     }
 
     async fn try_add_pin(&self, url: &str, pin: &Pin) -> std::result::Result<PinStatusResponse, PinAttempt> {
-        let response = self
-            .client
-            .post(url)
-            .header("Authorization", self.auth_header())
+        let mut req = self.client.post(url);
+        // MCP/AI pins authenticate via HMAC service-auth (the gateway-scoped JWT
+        // is NOT a pinning-service session); normal pins use the Bearer token.
+        req = match &self.config.service_auth {
+            Some(h) => req.header(crate::service_auth::SERVICE_AUTH_HEADER, h),
+            None => req.header("Authorization", self.auth_header()),
+        };
+        let response = req
             .header("Content-Type", "application/json")
             .json(pin)
             .send()

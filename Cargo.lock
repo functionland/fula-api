@@ -1809,6 +1809,7 @@ version = "0.6.16"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "bytes",
  "cid 0.11.1",
@@ -1816,6 +1817,7 @@ dependencies = [
  "dashmap 6.1.0",
  "fula-crypto",
  "futures",
+ "hmac",
  "httpmock",
  "ipld-core",
  "libipld",
@@ -1830,6 +1832,7 @@ dependencies = [
  "serde_bytes",
  "serde_ipld_dagcbor",
  "serde_json",
+ "sha2",
  "tempfile",
  "test-log",
  "thiserror 2.0.17",

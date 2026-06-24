@@ -269,8 +269,13 @@ impl IpfsPinningBlockStore {
             return self.pin_cid(cid, name).await;
         }
 
-        // Create a temporary pinning client with the user's token
-        let config = PinningServiceConfig::new(endpoint, token);
+        // Create a temporary pinning client. For AI/MCP writes (token is a
+        // gateway-scoped JWT, NOT a pinning-service session) assert the user via
+        // HMAC service-auth instead of forwarding the token; normal tokens use
+        // Bearer. Secret from env; absent ⇒ service-auth disabled ⇒ Bearer.
+        let mut config = PinningServiceConfig::new(endpoint, token);
+        let pin_secret = std::env::var("FULA_PIN_SERVICE_SECRET").unwrap_or_default();
+        config.service_auth = crate::service_auth::service_auth_for_token(token, &pin_secret);
         let client = PinningServiceClient::new(config)?;
 
         // Create pin request with origins hint pointing to the local IPFS

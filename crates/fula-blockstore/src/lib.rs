@@ -43,6 +43,7 @@ pub mod ipfs;
 pub mod ipfs_pinning;
 pub mod memory;
 pub mod pinning_service;
+pub mod service_auth;
 
 pub use block::{Block, BlockData, BlockRef};
 pub use chunker::{Chunker, ChunkerConfig, ChunkResult};
@@ -53,6 +54,7 @@ pub use error::{BlockStoreError, Result};
 pub use ipfs::{IpfsBlockStore, IpfsConfig, PinOutcome};
 pub use ipfs_pinning::{FlexibleBlockStore, IpfsPinningBlockStore, IpfsPinningConfig};
 pub use memory::MemoryBlockStore;
+pub use service_auth::{mint_service_auth, service_auth_for_token, SERVICE_AUTH_HEADER};
 pub use pinning_service::{
     ListPinsQuery, Pin, PinningServiceClient, PinningServiceConfig, PinningStatus,
     PinStatusResponse,
