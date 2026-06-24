@@ -188,6 +188,8 @@ impl PinningCredentials {
 
     /// Create a pinning service client from these credentials
     pub fn create_client(&self) -> Result<PinningServiceClient, fula_blockstore::BlockStoreError> {
+        // For MCP/AI tokens, service-auth is derived inside
+        // PinningServiceConfig::new (covers pin_for_user + every other pin path).
         let config = PinningServiceConfig::new(&self.endpoint, &self.token);
         PinningServiceClient::new(config)
     }
