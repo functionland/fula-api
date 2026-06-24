@@ -187,38 +187,38 @@ impl McpScope {
         self.has_perm(McpPerm::Write)
     }
 
-    /// Is `key` within the scoped prefix? Because the prefix is `ai/` (ends in
-    /// `/`), a plain `starts_with` already enforces the segment boundary:
-    /// `ai/foo` is in-scope, `aimage/foo` is NOT (it does not start with
-    /// `ai/`). The exact key `ai/` (the bare prefix) is also in-scope.
+    /// Whether `key` is within the scoped prefix. RETAINED for reference +
+    /// reversibility but NO LONGER enforced by `assert` (the AI-workspace keys
+    /// are obfuscated, so they never carry the `ai/` prefix — see `assert`).
+    #[allow(dead_code)]
     fn key_in_prefix(&self, key: &str) -> bool {
         key.starts_with(&self.prefix)
     }
 
     /// Authorize a single request against this scope. Fail-closed everywhere:
     /// - the requested `bucket` MUST equal the scoped bucket;
-    /// - for object ops (`key = Some`) the key MUST be within the scoped prefix
-    ///   (`ai/`, segment-bounded);
     /// - the `action`'s required permission MUST be granted.
     ///
-    /// Bucket-level ops pass `key = None` (CreateBucket/DeleteBucket = `Write`,
-    /// ListObjects = `List`); the prefix check is skipped but the bucket + perm
-    /// checks still apply. The perm requirement is driven by the ACTION
-    /// (`List ⇒ list`, `Read ⇒ read`, `Write ⇒ write`), so a read+list-only
-    /// token can list a bucket but cannot create one.
+    /// The key-PREFIX is intentionally NOT enforced. The AI-workspace client
+    /// stores objects with metadata-privacy / flat-namespace obfuscation (so it
+    /// is byte-compatible with how FxFiles stores the same workspace), which
+    /// means the real S3 object keys are content hashes that NEVER begin with
+    /// `ai/`. Enforcing the `ai/` prefix would therefore reject every legitimate
+    /// write. Isolation does NOT come from the key prefix: the token is scoped to
+    /// a DEDICATED bucket (`fula-ai-workspace`), and the gateway already isolates
+    /// per `(hashed_user_id, bucket)` + the JWT `sub`. `key` is still accepted
+    /// (signature stability / future per-key rules). Bucket-level ops pass
+    /// `key = None`; the perm requirement is driven by the ACTION
+    /// (`List ⇒ list`, `Read ⇒ read`, `Write ⇒ write`).
     pub fn assert(
         &self,
         bucket: &str,
         key: Option<&str>,
         action: McpAction,
     ) -> Result<(), ScopeError> {
+        let _ = key; // key-prefix intentionally NOT enforced — see the doc above.
         if bucket != self.bucket {
             return Err(ScopeError::BucketMismatch);
-        }
-        if let Some(k) = key {
-            if !self.key_in_prefix(k) {
-                return Err(ScopeError::PrefixViolation);
-            }
         }
         if !self.has_perm(McpPerm::for_action(action)) {
             return Err(ScopeError::MissingPerm(action));
@@ -278,17 +278,22 @@ mod tests {
     }
 
     #[test]
-    fn deny_prefix_boundary_aimage() {
-        // The segment-boundary case: `aimage/...` must NOT be treated as inside
-        // the `ai/` prefix (the bug this guards against).
+    fn keys_outside_ai_prefix_are_allowed_bucket_only() {
+        // The MCP token is scoped to the DEDICATED bucket, not the `ai/` key
+        // prefix: the AI-workspace client obfuscates object keys, so the real S3
+        // keys are content hashes that never start with `ai/`. Any key inside the
+        // scoped bucket is therefore allowed; the dedicated bucket is the fence.
         let s = full_scope();
+        assert!(s.assert("fula-ai-workspace", Some("aimage/secret"), McpAction::Read).is_ok());
+        assert!(s.assert("fula-ai-workspace", Some("other/key"), McpAction::Write).is_ok());
+        // An obfuscated content-hash key (the real on-the-wire shape) is allowed.
+        assert!(s
+            .assert("fula-ai-workspace", Some("bafkr4ihkr4ld3m4gqkjf4"), McpAction::Write)
+            .is_ok());
+        // ...but a DIFFERENT bucket is still denied — that is the real boundary.
         assert_eq!(
-            s.assert("fula-ai-workspace", Some("aimage/secret"), McpAction::Read),
-            Err(ScopeError::PrefixViolation)
-        );
-        assert_eq!(
-            s.assert("fula-ai-workspace", Some("other/key"), McpAction::Write),
-            Err(ScopeError::PrefixViolation)
+            s.assert("some-other-bucket", Some("anything"), McpAction::Write),
+            Err(ScopeError::BucketMismatch)
         );
     }
 
