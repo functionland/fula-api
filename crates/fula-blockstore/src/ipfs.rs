@@ -872,9 +872,16 @@ impl BlockStore for IpfsBlockStore {
 pub struct NodeInfo {
     #[serde(rename = "ID")]
     pub id: String,
-    pub public_key: String,
     pub addresses: Vec<String>,
+    // Only `addresses` is used (by `origins()`). The rest vary by kubo version
+    // — e.g. kubo 0.41 dropped `ProtocolVersion` in favour of a `Protocols`
+    // list — so default them; otherwise a missing field fails the whole
+    // `/api/v0/id` decode and silently disables the pinning `origins` hint.
+    #[serde(default)]
+    pub public_key: String,
+    #[serde(default)]
     pub agent_version: String,
+    #[serde(default)]
     pub protocol_version: String,
 }
 
