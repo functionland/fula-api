@@ -269,7 +269,9 @@ impl IpfsPinningBlockStore {
             return self.pin_cid(cid, name).await;
         }
 
-        // Create a temporary pinning client with the user's token
+        // Create a temporary pinning client with the user's token. For MCP/AI
+        // tokens, service-auth is derived inside PinningServiceConfig::new
+        // (covers all pin paths structurally); normal tokens use Bearer.
         let config = PinningServiceConfig::new(endpoint, token);
         let client = PinningServiceClient::new(config)?;
 

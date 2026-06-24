@@ -28,6 +28,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_bytes = { workspace = true }
 
+# Service-auth (HMAC over user_id+exp for the co-located pinning service)
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hmac = "0.12"
+
 # HTTP client
 reqwest = { workspace = true }
 

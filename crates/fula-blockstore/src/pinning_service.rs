@@ -45,16 +45,32 @@ pub struct PinningServiceConfig {
     pub timeout: Duration,
     /// Maximum retries for failed requests
     pub max_retries: u32,
+    /// When `Some`, the request authenticates via the `X-Fula-Service-Auth`
+    /// header (HMAC service-auth) INSTEAD of `Authorization: Bearer` — for AI/MCP
+    /// pins whose token is a gateway-scoped JWT, not a pinning-service session.
+    pub service_auth: Option<String>,
 }
 
 impl PinningServiceConfig {
     /// Create a new pinning service config
     pub fn new(endpoint: impl Into<String>, access_token: impl Into<String>) -> Self {
+        let access_token = access_token.into();
+        // MCP/AI pins carry a gateway-scoped JWT (token_use=mcp_s3), not a login
+        // session; the co-located pinning service rejects it. If this token is
+        // MCP-scoped, authenticate via HMAC service-auth instead of Bearer. Doing
+        // this in the constructor covers EVERY pin path structurally — object
+        // pins, registry persist, index pins, the pin-queue drainer, pin_for_user
+        // — since all of them build their client through here, so there is no
+        // per-site change to miss. Non-MCP tokens => None => Bearer (normal users
+        // untouched). Secret from env; absent => disabled => Bearer.
+        let secret = std::env::var("FULA_PIN_SERVICE_SECRET").unwrap_or_default();
+        let service_auth = crate::service_auth::service_auth_for_token(&access_token, &secret);
         Self {
             endpoint: endpoint.into(),
-            access_token: access_token.into(),
+            access_token,
             timeout: Duration::from_secs(60),
             max_retries: 3,
+            service_auth,
         }
     }
 
@@ -261,10 +277,14 @@ impl PinningServiceClient {
     }
 
     async fn try_add_pin(&self, url: &str, pin: &Pin) -> std::result::Result<PinStatusResponse, PinAttempt> {
-        let response = self
-            .client
-            .post(url)
-            .header("Authorization", self.auth_header())
+        let mut req = self.client.post(url);
+        // MCP/AI pins authenticate via HMAC service-auth (the gateway-scoped JWT
+        // is NOT a pinning-service session); normal pins use the Bearer token.
+        req = match &self.config.service_auth {
+            Some(h) => req.header(crate::service_auth::SERVICE_AUTH_HEADER, h),
+            None => req.header("Authorization", self.auth_header()),
+        };
+        let response = req
             .header("Content-Type", "application/json")
             .json(pin)
             .send()
