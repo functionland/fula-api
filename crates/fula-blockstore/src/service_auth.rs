@@ -43,6 +43,9 @@ pub fn mint_service_auth(user_id: &str, exp_unix: i64, secret: &str) -> String {
 struct AuthClaims {
     sub: Option<String>,
     token_use: Option<String>,
+    #[serde(default)]
+    aud: serde_json::Value,
+    exp: Option<i64>,
 }
 
 fn decode_jwt_claims(token: &str) -> Option<AuthClaims> {
@@ -62,14 +65,31 @@ pub fn service_auth_for_token(token: &str, secret: &str) -> Option<String> {
         return None;
     }
     let claims = decode_jwt_claims(token)?;
+    // Defense-in-depth: mint only for a still-valid, gateway-audience MCP token.
+    // The gateway validates the token upstream, but a queued pin can be drained
+    // after expiry and a future caller could reach here with an unvalidated
+    // token — so re-check token_use, aud, and exp from the payload before
+    // minting. (This is NOT a signature check — no key here — it only narrows
+    // which tokens are eligible; it does not replace the gateway's validation.)
     if claims.token_use.as_deref() != Some("mcp_s3") {
         return None;
     }
-    let sub = claims.sub.filter(|s| !s.is_empty())?;
+    let aud_ok = match &claims.aud {
+        serde_json::Value::String(s) => s == "fula-s3-gateway",
+        serde_json::Value::Array(a) => a.iter().any(|v| v.as_str() == Some("fula-s3-gateway")),
+        _ => false,
+    };
+    if !aud_ok {
+        return None;
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    if claims.exp.map_or(true, |e| e <= now) {
+        return None; // original token missing exp or already expired
+    }
+    let sub = claims.sub.filter(|s| !s.is_empty())?;
     Some(mint_service_auth(&sub, now + SERVICE_AUTH_TTL_SECS, secret))
 }
 
@@ -98,9 +118,29 @@ mod tests {
 
     #[test]
     fn mcp_token_mints_service_auth() {
-        let t = token_with(br#"{"sub":"user-abc","token_use":"mcp_s3"}"#);
+        // valid: mcp_s3 + correct aud + far-future exp
+        let t = token_with(br#"{"sub":"user-abc","token_use":"mcp_s3","aud":"fula-s3-gateway","exp":4102444800}"#);
         let got = service_auth_for_token(&t, "secret").expect("mcp token should mint");
         assert!(got.starts_with("v1."));
+        // aud may also be an array that contains the expected value
+        let t2 = token_with(br#"{"sub":"u","token_use":"mcp_s3","aud":["x","fula-s3-gateway"],"exp":4102444800}"#);
+        assert!(service_auth_for_token(&t2, "secret").is_some());
+    }
+
+    #[test]
+    fn wrong_or_missing_aud_is_none() {
+        let wrong = token_with(br#"{"sub":"u","token_use":"mcp_s3","aud":"someone-else","exp":4102444800}"#);
+        assert!(service_auth_for_token(&wrong, "secret").is_none());
+        let missing = token_with(br#"{"sub":"u","token_use":"mcp_s3","exp":4102444800}"#);
+        assert!(service_auth_for_token(&missing, "secret").is_none());
+    }
+
+    #[test]
+    fn expired_or_missing_exp_is_none() {
+        let expired = token_with(br#"{"sub":"u","token_use":"mcp_s3","aud":"fula-s3-gateway","exp":100}"#);
+        assert!(service_auth_for_token(&expired, "secret").is_none());
+        let missing = token_with(br#"{"sub":"u","token_use":"mcp_s3","aud":"fula-s3-gateway"}"#);
+        assert!(service_auth_for_token(&missing, "secret").is_none());
     }
 
     #[test]
