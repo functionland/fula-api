@@ -33,6 +33,17 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 zeroize = "1.8"
 
+# Collaboration manifest + collab-file crypto (`manifest.rs`): a byte-exact Rust
+# port of the Dart `share_link_builder.dart` / `CollaborationService` routines
+# (and the TS portal's `sharingService.ts`). The RustCrypto primitives are used
+# DIRECTLY (rather than via fula-crypto's `Aead`) for full control over the
+# on-wire layout the Dart/WebCrypto side produces: HKDF-SHA256 with an EMPTY salt
+# for key derivation, and AES-256-GCM with a 12-byte random nonce laid out as
+# `nonce(12) || ciphertext || tag(16)`. Workspace pins: sha2=0.10, aes-gcm=0.10.
+hkdf = "0.12"
+sha2 = { workspace = true }
+aes-gcm = { workspace = true }
+
 # Filename->MIME fallback for categorization (P4), mirroring the Dart `mime`
 # package's lookupMimeType. The de-facto Rust equivalent.
 mime_guess = "2"

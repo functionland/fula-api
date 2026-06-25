@@ -34,6 +34,24 @@ use thiserror::Error;
 
 pub mod capability;
 
+/// Collaboration manifest + collab-file crypto — a byte-exact Rust port of the
+/// Dart `share_link_builder.dart` / `CollaborationService` (and TS
+/// `sharingService.ts`) routines the FxFiles app and web portal use in
+/// production. HKDF-SHA256 (empty salt) key derivation + AES-256-GCM
+/// (`nonce||ct||tag`) for the `"ENC1:"` manifest envelope and raw collab files,
+/// plus the [`manifest::CollaborationGroup`] / [`manifest::CollaborationFile`]
+/// model (with the CRDT [`merge_with`](manifest::CollaborationGroup::merge_with)).
+/// Correctness is gated by decrypting REAL Dart-produced vectors in
+/// `tests/collab_crypto_vectors.rs`.
+pub mod manifest;
+
+/// The MCP's persistent collaboration identity (Method-2 X25519 keypair). Wraps
+/// [`fula_crypto::KekKeyPair`] with the `"FULA-..."` share-id helpers, local
+/// secret persistence, and [`accept_link_secret`](identity::McpIdentity::accept_link_secret)
+/// which recovers an owner-wrapped link secret via `fula_crypto::sharing`
+/// (no HPKE reimplementation).
+pub mod identity;
+
 /// File categorization + native-bucket routing, a faithful port of FxFiles'
 /// `ShelfClassifier` + the content-bucket map (P4).
 pub mod category;
