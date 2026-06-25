@@ -855,17 +855,28 @@ mod tests {
     }
 
     #[test]
-    fn mcp_token_aimage_boundary_key_is_access_denied() {
-        // The segment-boundary regression: `aimage/...` must NOT be inside `ai/`.
+    fn mcp_token_keys_in_scoped_bucket_allowed_regardless_of_prefix() {
+        // The MCP token is scoped to the DEDICATED bucket, NOT the `ai/` key
+        // prefix: the AI-workspace client obfuscates object keys (metadata-privacy
+        // / flat-namespace for FxFiles compat), so the real S3 keys never carry
+        // `ai/`. Enforcing the prefix would 403 every legitimate AI write.
+        // Isolation is the dedicated bucket + (hashed_user_id, bucket) + sub.
+        // (Mirrors mcp_scope.rs's `keys_outside_ai_prefix_are_allowed_bucket_only`
+        // — see commit a12ed4d3; this is the duplicate that commit missed.)
         let secret = "test-secret";
         let claims = mcp_claims("user-sub", "fula-ai-workspace", "ai/", &["read", "write", "list"]);
         let session = session_from_claims(&claims, secret);
 
+        // Any key in the SCOPED bucket is allowed — the prefix is not enforced.
         assert!(session
             .assert_mcp_scope("fula-ai-workspace", Some("aimage/secret.txt"), McpAction::Read)
-            .is_err());
+            .is_ok());
         assert!(session
             .assert_mcp_scope("fula-ai-workspace", Some("other/key"), McpAction::Write)
+            .is_ok());
+        // Isolation comes from the BUCKET: a different bucket is still denied.
+        assert!(session
+            .assert_mcp_scope("victim-bucket", Some("ai/x"), McpAction::Read)
             .is_err());
     }
 
