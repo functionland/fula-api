@@ -2070,12 +2070,14 @@ dependencies = [
 name = "fula-mcp"
 version = "0.6.17"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "base64 0.22.1",
  "bytes",
  "fula-client",
  "fula-crypto",
  "hex",
+ "hkdf",
  "mime_guess",
  "rand 0.8.5",
  "reqwest",
@@ -2083,6 +2085,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
