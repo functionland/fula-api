@@ -874,6 +874,11 @@ mod tests {
         assert!(session
             .assert_mcp_scope("fula-ai-workspace", Some("other/key"), McpAction::Write)
             .is_ok());
+        // The REAL gateway case: an obfuscated content-hash storage key (what the
+        // gateway actually sees in flat-namespace mode) is allowed.
+        assert!(session
+            .assert_mcp_scope("fula-ai-workspace", Some("Qm9aF3hashLikeStorageKey"), McpAction::Read)
+            .is_ok());
         // Isolation comes from the BUCKET: a different bucket is still denied.
         assert!(session
             .assert_mcp_scope("victim-bucket", Some("ai/x"), McpAction::Read)
