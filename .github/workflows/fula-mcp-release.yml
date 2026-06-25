@@ -4,7 +4,7 @@ name: fula-mcp Release
 # as the npm wrapper `@functionland/fula-mcp` (run build-free via
 # `npx @functionland/fula-mcp`).
 #
-# Trigger: a tag of the form `fula-mcp-v*` (e.g. `fula-mcp-v0.6.16`).
+# Trigger: a tag of the form `fula-mcp-v*` (e.g. `fula-mcp-v0.6.17`).
 #   * Deliberately NOT `v*` — that prefix belongs to flutter-release.yml, which
 #     publishes @functionland/fula-client. `fula-mcp-v*` does not match `v*`, so
 #     the two release trains never collide.
@@ -12,7 +12,7 @@ name: fula-mcp Release
 # Release process (user-driven; this workflow only runs on the tag push):
 #   1. Bump `crates/fula-mcp/npm/package.json` "version" (and, if desired, the
 #      workspace version) on the branch, commit.
-#   2. git tag fula-mcp-v0.6.16 && git push origin fula-mcp-v0.6.16
+#   2. git tag fula-mcp-v0.6.17 && git push origin fula-mcp-v0.6.17
 #   3. This workflow cross-compiles all 5 targets, computes SHA-256 of each,
 #      writes checksums.json INTO the npm package, uploads binaries + checksums
 #      to the GitHub Release, then `npm publish --provenance` via OIDC.
@@ -56,7 +56,7 @@ jobs:
       - name: Get version from tag
         id: version
         run: |
-          # GITHUB_REF_NAME is e.g. "fula-mcp-v0.6.16" -> "0.6.16"
+          # GITHUB_REF_NAME is e.g. "fula-mcp-v0.6.17" -> "0.6.17"
           VERSION="${GITHUB_REF_NAME#fula-mcp-v}"
           if [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
             echo "::error::Tag '$GITHUB_REF_NAME' does not start with 'fula-mcp-v'." >&2

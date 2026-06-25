@@ -24,3 +24,4 @@ Thumbs.db
 /target
 /__pycache__
 /target
+/packages/fula_client/android/.gradle

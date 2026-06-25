@@ -50,21 +50,21 @@ test('resolveTarget throws EUNSUPPORTED for unknown platform/arch', () => {
 });
 
 test('releaseTag uses the collision-safe fula-mcp-v prefix (NOT bare v)', () => {
-  assert.equal(releaseTag('0.6.16'), 'fula-mcp-v0.6.16');
+  assert.equal(releaseTag('0.6.17'), 'fula-mcp-v0.6.17');
   assert.equal(releaseTag('1.2.3-rc.1'), 'fula-mcp-v1.2.3-rc.1');
 });
 
 test('downloadUrl builds the functionland/fula-api release asset URL', () => {
   const { assetName } = resolveTarget('linux', 'x64');
   assert.equal(
-    downloadUrl('0.6.16', assetName),
+    downloadUrl('0.6.17', assetName),
     'https://github.com/functionland/fula-api/releases/download/' +
-      'fula-mcp-v0.6.16/fula-mcp-x86_64-unknown-linux-gnu'
+      'fula-mcp-v0.6.17/fula-mcp-x86_64-unknown-linux-gnu'
   );
   const win = resolveTarget('win32', 'x64');
   assert.equal(
-    downloadUrl('0.6.16', win.assetName),
+    downloadUrl('0.6.17', win.assetName),
     'https://github.com/functionland/fula-api/releases/download/' +
-      'fula-mcp-v0.6.16/fula-mcp-x86_64-pc-windows-msvc.exe'
+      'fula-mcp-v0.6.17/fula-mcp-x86_64-pc-windows-msvc.exe'
   );
 });

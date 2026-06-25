@@ -71,7 +71,7 @@ function resolveTarget(platform, arch) {
 /**
  * Build the git tag for a given package version.
  * @param {string} version - the npm package version (semver, no leading 'v').
- * @returns {string} e.g. 'fula-mcp-v0.6.16'
+ * @returns {string} e.g. 'fula-mcp-v0.6.17'
  */
 function releaseTag(version) {
   return `${TAG_PREFIX}${version}`;
