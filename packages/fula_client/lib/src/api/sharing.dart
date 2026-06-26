@@ -62,6 +62,41 @@ Future<String> createShareTokenWithMode({
   expiresAt: expiresAt,
 );
 
+/// Wrap an ARBITRARY 32-byte secret for a recipient X25519 public key,
+/// producing a serialized v5 ShareToken (JSON).
+///
+/// Unlike [`create_share_token`], this needs NO client and NO previously-stored
+/// file: it wraps the raw 32 bytes you pass in. It is the producer side of the
+/// secure "Method 2" AI-pairing — FxFiles' fail-closed `CollabLinkSecretWrapper`
+/// calls this to wrap a collaboration link secret for an AI/MCP recipient's
+/// public key. The recipient (the local MCP's
+/// `McpIdentity::accept_link_secret`, i.e. `fula_crypto` `ShareRecipient`)
+/// opens the token to recover the EXACT secret bytes.
+///
+/// The sender/owner keypair is generated EPHEMERALLY inside `fula-crypto`: the
+/// v5 token AAD binds the RECIPIENT public key, not the sender, so the caller
+/// needs no stable identity of its own.
+///
+/// # Arguments
+/// * `secret` - the 32 raw secret bytes to wrap.
+/// * `recipient_public_key` - the recipient's 32-byte X25519 public key.
+/// * `path_scope` - optional scope string bound into the token (defaults to `"/"`).
+/// * `expires_in_seconds` - optional expiry as seconds-from-now (`None` = never).
+///
+/// Returns the JSON-serialized ShareToken. Fails closed (returns `Err`) if
+/// `secret` or `recipient_public_key` is not exactly 32 bytes.
+Future<String> wrapSecretForRecipient({
+  required List<int> secret,
+  required List<int> recipientPublicKey,
+  String? pathScope,
+  PlatformInt64? expiresInSeconds,
+}) => RustLib.instance.api.crateApiSharingWrapSecretForRecipient(
+  secret: secret,
+  recipientPublicKey: recipientPublicKey,
+  pathScope: pathScope,
+  expiresInSeconds: expiresInSeconds,
+);
+
 /// Accept a share token received from another user
 Future<AcceptedShareHandle> acceptShare({
   required EncryptedClientHandle client,

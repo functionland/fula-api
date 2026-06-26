@@ -73,7 +73,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => 1846171626;
+  int get rustContentHash => 613956912;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -159,6 +159,8 @@ abstract class RustLibApi extends BaseApi {
     required EncryptionConfig encryption,
     required PinningConfig pinning,
   });
+
+  Future<ProgressHandle> crateApiForestCreateProgressHandle();
 
   Future<RotationManagerHandle> crateApiRotationCreateRotationManager({
     required EncryptedClientHandle client,
@@ -493,6 +495,10 @@ abstract class RustLibApi extends BaseApi {
     required EncryptedClientHandle client,
   });
 
+  Future<UploadProgress> crateApiForestPollProgress({
+    required ProgressHandle handle,
+  });
+
   Future<PutResult> crateApiChunkedPutChunked({
     required EncryptedClientHandle client,
     required String bucket,
@@ -567,6 +573,36 @@ abstract class RustLibApi extends BaseApi {
     required CancelHandle cancel,
   });
 
+  Future<PutResult> crateApiForestPutFlatResumableFromPathWithProgress({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required String filePath,
+    required String manifestPath,
+    String? contentType,
+    required CancelHandle cancel,
+    required ProgressHandle progress,
+  });
+
+  Future<PutResult> crateApiForestPutFlatWithProgress({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required List<int> data,
+    String? contentType,
+    required ProgressHandle progress,
+  });
+
+  Future<PutResult> crateApiForestPutFlatWithProgressCancellable({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required List<int> data,
+    String? contentType,
+    required ProgressHandle progress,
+    required CancelHandle cancel,
+  });
+
   Future<PutResult> crateApiClientPutObject({
     required FulaClientHandle client,
     required String bucket,
@@ -593,6 +629,14 @@ abstract class RustLibApi extends BaseApi {
     required String manifestPath,
     required String filePath,
     required CancelHandle cancel,
+  });
+
+  Future<PutResult> crateApiForestResumeFlatUploadFromPathWithProgress({
+    required EncryptedClientHandle client,
+    required String manifestPath,
+    required String filePath,
+    required CancelHandle cancel,
+    required ProgressHandle progress,
   });
 
   Future<int> crateApiRotationRewrapObject({
@@ -636,6 +680,32 @@ abstract class RustLibApi extends BaseApi {
     required int maxConcurrency,
   });
 
+  Future<StreamingUploadHandle> crateApiForestStreamingUploadBegin({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+    String? contentType,
+  });
+
+  Future<void> crateApiForestStreamingUploadChunk({
+    required StreamingUploadHandle handle,
+    required int chunkIndex,
+    required List<int> bytes,
+  });
+
+  Future<StreamingPlanInfo> crateApiForestStreamingUploadFinalizePlan({
+    required StreamingUploadHandle handle,
+  });
+
+  Future<PutResult> crateApiForestStreamingUploadFinish({
+    required StreamingUploadHandle handle,
+  });
+
+  Future<void> crateApiForestStreamingUploadPlanChunk({
+    required StreamingUploadHandle handle,
+    required List<int> bytes,
+  });
+
   Future<String> crateApiMultipartUploadLargeFileSimple({
     required FulaClientHandle client,
     required String bucket,
@@ -660,6 +730,13 @@ abstract class RustLibApi extends BaseApi {
   Future<BigInt> crateApiMetricsWalAppendFailureCount();
 
   Future<BigInt> crateApiMetricsWalTruncatedGroupsCount();
+
+  Future<String> crateApiSharingWrapSecretForRecipient({
+    required List<int> secret,
+    required List<int> recipientPublicKey,
+    String? pathScope,
+    PlatformInt64? expiresInSeconds,
+  });
 
   RustArcIncrementStrongCountFnType
   get rust_arc_increment_strong_count_AcceptedShareHandle;
@@ -706,6 +783,15 @@ abstract class RustLibApi extends BaseApi {
   get rust_arc_decrement_strong_count_MultipartHandlePtr;
 
   RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_ProgressHandle;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_ProgressHandle;
+
+  CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_ProgressHandlePtr;
+
+  RustArcIncrementStrongCountFnType
   get rust_arc_increment_strong_count_RotationManagerHandle;
 
   RustArcDecrementStrongCountFnType
@@ -713,6 +799,15 @@ abstract class RustLibApi extends BaseApi {
 
   CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_RotationManagerHandlePtr;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_StreamingUploadHandle;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_StreamingUploadHandle;
+
+  CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_StreamingUploadHandlePtr;
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -1254,6 +1349,28 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         debugName: "create_encrypted_client_with_pinning",
         argNames: ["config", "encryption", "pinning"],
       );
+
+  @override
+  Future<ProgressHandle> crateApiForestCreateProgressHandle() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          return wire.wire__crate__api__forest__create_progress_handle(port_);
+        },
+        codec: DcoCodec(
+          decodeSuccessData:
+              dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiForestCreateProgressHandleConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestCreateProgressHandleConstMeta =>
+      const TaskConstMeta(debugName: "create_progress_handle", argNames: []);
 
   @override
   Future<RotationManagerHandle> crateApiRotationCreateRotationManager({
@@ -3668,6 +3785,33 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<UploadProgress> crateApiForestPollProgress({
+    required ProgressHandle handle,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+                handle,
+              );
+          return wire.wire__crate__api__forest__poll_progress(port_, arg0);
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_upload_progress,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiForestPollProgressConstMeta,
+        argValues: [handle],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestPollProgressConstMeta =>
+      const TaskConstMeta(debugName: "poll_progress", argNames: ["handle"]);
+
+  @override
   Future<PutResult> crateApiChunkedPutChunked({
     required EncryptedClientHandle client,
     required String bucket,
@@ -4105,6 +4249,210 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<PutResult> crateApiForestPutFlatResumableFromPathWithProgress({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required String filePath,
+    required String manifestPath,
+    String? contentType,
+    required CancelHandle cancel,
+    required ProgressHandle progress,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(path);
+          var arg3 = cst_encode_String(filePath);
+          var arg4 = cst_encode_String(manifestPath);
+          var arg5 = cst_encode_opt_String(contentType);
+          var arg6 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+                cancel,
+              );
+          var arg7 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+                progress,
+              );
+          return wire
+              .wire__crate__api__forest__put_flat_resumable_from_path_with_progress(
+                port_,
+                arg0,
+                arg1,
+                arg2,
+                arg3,
+                arg4,
+                arg5,
+                arg6,
+                arg7,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestPutFlatResumableFromPathWithProgressConstMeta,
+        argValues: [
+          client,
+          bucket,
+          path,
+          filePath,
+          manifestPath,
+          contentType,
+          cancel,
+          progress,
+        ],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta
+  get kCrateApiForestPutFlatResumableFromPathWithProgressConstMeta =>
+      const TaskConstMeta(
+        debugName: "put_flat_resumable_from_path_with_progress",
+        argNames: [
+          "client",
+          "bucket",
+          "path",
+          "filePath",
+          "manifestPath",
+          "contentType",
+          "cancel",
+          "progress",
+        ],
+      );
+
+  @override
+  Future<PutResult> crateApiForestPutFlatWithProgress({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required List<int> data,
+    String? contentType,
+    required ProgressHandle progress,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(path);
+          var arg3 = cst_encode_list_prim_u_8_loose(data);
+          var arg4 = cst_encode_opt_String(contentType);
+          var arg5 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+                progress,
+              );
+          return wire.wire__crate__api__forest__put_flat_with_progress(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+            arg5,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestPutFlatWithProgressConstMeta,
+        argValues: [client, bucket, path, data, contentType, progress],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestPutFlatWithProgressConstMeta =>
+      const TaskConstMeta(
+        debugName: "put_flat_with_progress",
+        argNames: [
+          "client",
+          "bucket",
+          "path",
+          "data",
+          "contentType",
+          "progress",
+        ],
+      );
+
+  @override
+  Future<PutResult> crateApiForestPutFlatWithProgressCancellable({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String path,
+    required List<int> data,
+    String? contentType,
+    required ProgressHandle progress,
+    required CancelHandle cancel,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(path);
+          var arg3 = cst_encode_list_prim_u_8_loose(data);
+          var arg4 = cst_encode_opt_String(contentType);
+          var arg5 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+                progress,
+              );
+          var arg6 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+                cancel,
+              );
+          return wire
+              .wire__crate__api__forest__put_flat_with_progress_cancellable(
+                port_,
+                arg0,
+                arg1,
+                arg2,
+                arg3,
+                arg4,
+                arg5,
+                arg6,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestPutFlatWithProgressCancellableConstMeta,
+        argValues: [client, bucket, path, data, contentType, progress, cancel],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestPutFlatWithProgressCancellableConstMeta =>
+      const TaskConstMeta(
+        debugName: "put_flat_with_progress_cancellable",
+        argNames: [
+          "client",
+          "bucket",
+          "path",
+          "data",
+          "contentType",
+          "progress",
+          "cancel",
+        ],
+      );
+
+  @override
   Future<PutResult> crateApiClientPutObject({
     required FulaClientHandle client,
     required String bucket,
@@ -4274,6 +4622,59 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(
         debugName: "resume_flat_upload_from_path_cancellable",
         argNames: ["client", "manifestPath", "filePath", "cancel"],
+      );
+
+  @override
+  Future<PutResult> crateApiForestResumeFlatUploadFromPathWithProgress({
+    required EncryptedClientHandle client,
+    required String manifestPath,
+    required String filePath,
+    required CancelHandle cancel,
+    required ProgressHandle progress,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(manifestPath);
+          var arg2 = cst_encode_String(filePath);
+          var arg3 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerCancelHandle(
+                cancel,
+              );
+          var arg4 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+                progress,
+              );
+          return wire
+              .wire__crate__api__forest__resume_flat_upload_from_path_with_progress(
+                port_,
+                arg0,
+                arg1,
+                arg2,
+                arg3,
+                arg4,
+              );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestResumeFlatUploadFromPathWithProgressConstMeta,
+        argValues: [client, manifestPath, filePath, cancel, progress],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta
+  get kCrateApiForestResumeFlatUploadFromPathWithProgressConstMeta =>
+      const TaskConstMeta(
+        debugName: "resume_flat_upload_from_path_with_progress",
+        argNames: ["client", "manifestPath", "filePath", "cancel", "progress"],
       );
 
   @override
@@ -4564,6 +4965,190 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<StreamingUploadHandle> crateApiForestStreamingUploadBegin({
+    required EncryptedClientHandle client,
+    required String bucket,
+    required String key,
+    String? contentType,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerEncryptedClientHandle(
+                client,
+              );
+          var arg1 = cst_encode_String(bucket);
+          var arg2 = cst_encode_String(key);
+          var arg3 = cst_encode_opt_String(contentType);
+          return wire.wire__crate__api__forest__streaming_upload_begin(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData:
+              dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestStreamingUploadBeginConstMeta,
+        argValues: [client, bucket, key, contentType],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestStreamingUploadBeginConstMeta =>
+      const TaskConstMeta(
+        debugName: "streaming_upload_begin",
+        argNames: ["client", "bucket", "key", "contentType"],
+      );
+
+  @override
+  Future<void> crateApiForestStreamingUploadChunk({
+    required StreamingUploadHandle handle,
+    required int chunkIndex,
+    required List<int> bytes,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+                handle,
+              );
+          var arg1 = cst_encode_u_32(chunkIndex);
+          var arg2 = cst_encode_list_prim_u_8_loose(bytes);
+          return wire.wire__crate__api__forest__streaming_upload_chunk(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestStreamingUploadChunkConstMeta,
+        argValues: [handle, chunkIndex, bytes],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestStreamingUploadChunkConstMeta =>
+      const TaskConstMeta(
+        debugName: "streaming_upload_chunk",
+        argNames: ["handle", "chunkIndex", "bytes"],
+      );
+
+  @override
+  Future<StreamingPlanInfo> crateApiForestStreamingUploadFinalizePlan({
+    required StreamingUploadHandle handle,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+                handle,
+              );
+          return wire.wire__crate__api__forest__streaming_upload_finalize_plan(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_streaming_plan_info,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestStreamingUploadFinalizePlanConstMeta,
+        argValues: [handle],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestStreamingUploadFinalizePlanConstMeta =>
+      const TaskConstMeta(
+        debugName: "streaming_upload_finalize_plan",
+        argNames: ["handle"],
+      );
+
+  @override
+  Future<PutResult> crateApiForestStreamingUploadFinish({
+    required StreamingUploadHandle handle,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+                handle,
+              );
+          return wire.wire__crate__api__forest__streaming_upload_finish(
+            port_,
+            arg0,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_put_result,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestStreamingUploadFinishConstMeta,
+        argValues: [handle],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestStreamingUploadFinishConstMeta =>
+      const TaskConstMeta(
+        debugName: "streaming_upload_finish",
+        argNames: ["handle"],
+      );
+
+  @override
+  Future<void> crateApiForestStreamingUploadPlanChunk({
+    required StreamingUploadHandle handle,
+    required List<int> bytes,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 =
+              cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+                handle,
+              );
+          var arg1 = cst_encode_list_prim_u_8_loose(bytes);
+          return wire.wire__crate__api__forest__streaming_upload_plan_chunk(
+            port_,
+            arg0,
+            arg1,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_unit,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiForestStreamingUploadPlanChunkConstMeta,
+        argValues: [handle, bytes],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiForestStreamingUploadPlanChunkConstMeta =>
+      const TaskConstMeta(
+        debugName: "streaming_upload_plan_chunk",
+        argNames: ["handle", "bytes"],
+      );
+
+  @override
   Future<String> crateApiMultipartUploadLargeFileSimple({
     required FulaClientHandle client,
     required String bucket,
@@ -4735,6 +5320,50 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         argNames: [],
       );
 
+  @override
+  Future<String> crateApiSharingWrapSecretForRecipient({
+    required List<int> secret,
+    required List<int> recipientPublicKey,
+    String? pathScope,
+    PlatformInt64? expiresInSeconds,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          var arg0 = cst_encode_list_prim_u_8_loose(secret);
+          var arg1 = cst_encode_list_prim_u_8_loose(recipientPublicKey);
+          var arg2 = cst_encode_opt_String(pathScope);
+          var arg3 = cst_encode_opt_box_autoadd_i_64(expiresInSeconds);
+          return wire.wire__crate__api__sharing__wrap_secret_for_recipient(
+            port_,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+          );
+        },
+        codec: DcoCodec(
+          decodeSuccessData: dco_decode_String,
+          decodeErrorData: dco_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiSharingWrapSecretForRecipientConstMeta,
+        argValues: [secret, recipientPublicKey, pathScope, expiresInSeconds],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSharingWrapSecretForRecipientConstMeta =>
+      const TaskConstMeta(
+        debugName: "wrap_secret_for_recipient",
+        argNames: [
+          "secret",
+          "recipientPublicKey",
+          "pathScope",
+          "expiresInSeconds",
+        ],
+      );
+
   RustArcIncrementStrongCountFnType
   get rust_arc_increment_strong_count_AcceptedShareHandle => wire
       .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle;
@@ -4776,12 +5405,28 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle;
 
   RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_ProgressHandle => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_ProgressHandle => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle;
+
+  RustArcIncrementStrongCountFnType
   get rust_arc_increment_strong_count_RotationManagerHandle => wire
       .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle;
 
   RustArcDecrementStrongCountFnType
   get rust_arc_decrement_strong_count_RotationManagerHandle => wire
       .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_StreamingUploadHandle => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_StreamingUploadHandle => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle;
 
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw) {
@@ -4835,12 +5480,30 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  ProgressHandle
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return ProgressHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
   RotationManagerHandle
   dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     dynamic raw,
   ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return RotationManagerHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  StreamingUploadHandle
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return StreamingUploadHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
@@ -4889,12 +5552,30 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  ProgressHandle
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return ProgressHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
   RotationManagerHandle
   dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     dynamic raw,
   ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return RotationManagerHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  StreamingUploadHandle
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return StreamingUploadHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
@@ -4943,12 +5624,30 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  ProgressHandle
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return ProgressHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
   RotationManagerHandle
   dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     dynamic raw,
   ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return RotationManagerHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  StreamingUploadHandle
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return StreamingUploadHandleImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
@@ -5576,6 +6275,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  StreamingPlanInfo dco_decode_streaming_plan_info(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return StreamingPlanInfo(
+      numChunks: dco_decode_u_32(arr[0]),
+      chunkSize: dco_decode_u_32(arr[1]),
+    );
+  }
+
+  @protected
   int dco_decode_u_32(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as int;
@@ -5688,12 +6399,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  ProgressHandle
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return ProgressHandleImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
   RotationManagerHandle
   sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     SseDeserializer deserializer,
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return RotationManagerHandleImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  StreamingUploadHandle
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return StreamingUploadHandleImpl.frbInternalSseDecode(
       sse_decode_usize(deserializer),
       sse_decode_i_32(deserializer),
     );
@@ -5760,12 +6495,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  ProgressHandle
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return ProgressHandleImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
   RotationManagerHandle
   sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     SseDeserializer deserializer,
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return RotationManagerHandleImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  StreamingUploadHandle
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return StreamingUploadHandleImpl.frbInternalSseDecode(
       sse_decode_usize(deserializer),
       sse_decode_i_32(deserializer),
     );
@@ -5832,12 +6591,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  ProgressHandle
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return ProgressHandleImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
   RotationManagerHandle
   sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     SseDeserializer deserializer,
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return RotationManagerHandleImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  StreamingUploadHandle
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return StreamingUploadHandleImpl.frbInternalSseDecode(
       sse_decode_usize(deserializer),
       sse_decode_i_32(deserializer),
     );
@@ -6622,6 +7405,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  StreamingPlanInfo sse_decode_streaming_plan_info(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_numChunks = sse_decode_u_32(deserializer);
+    var var_chunkSize = sse_decode_u_32(deserializer);
+    return StreamingPlanInfo(
+      numChunks: var_numChunks,
+      chunkSize: var_chunkSize,
+    );
+  }
+
+  @protected
   int sse_decode_u_32(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getUint32();
@@ -6719,12 +7515,32 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle raw,
+  ) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    // ignore: invalid_use_of_internal_member
+    return (raw as ProgressHandleImpl).frbInternalCstEncode(move: true);
+  }
+
+  @protected
+  int
   cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle raw,
   ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
     // ignore: invalid_use_of_internal_member
     return (raw as RotationManagerHandleImpl).frbInternalCstEncode(move: true);
+  }
+
+  @protected
+  int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle raw,
+  ) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    // ignore: invalid_use_of_internal_member
+    return (raw as StreamingUploadHandleImpl).frbInternalCstEncode(move: true);
   }
 
   @protected
@@ -6779,12 +7595,32 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle raw,
+  ) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    // ignore: invalid_use_of_internal_member
+    return (raw as ProgressHandleImpl).frbInternalCstEncode(move: false);
+  }
+
+  @protected
+  int
   cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle raw,
   ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
     // ignore: invalid_use_of_internal_member
     return (raw as RotationManagerHandleImpl).frbInternalCstEncode(move: false);
+  }
+
+  @protected
+  int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle raw,
+  ) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    // ignore: invalid_use_of_internal_member
+    return (raw as StreamingUploadHandleImpl).frbInternalCstEncode(move: false);
   }
 
   @protected
@@ -6839,12 +7675,32 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle raw,
+  ) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    // ignore: invalid_use_of_internal_member
+    return (raw as ProgressHandleImpl).frbInternalCstEncode();
+  }
+
+  @protected
+  int
   cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle raw,
   ) {
     // Codec=Cst (C-struct based), see doc to use other codecs
     // ignore: invalid_use_of_internal_member
     return (raw as RotationManagerHandleImpl).frbInternalCstEncode();
+  }
+
+  @protected
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle raw,
+  ) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    // ignore: invalid_use_of_internal_member
+    return (raw as StreamingUploadHandleImpl).frbInternalCstEncode();
   }
 
   @protected
@@ -6971,6 +7827,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as ProgressHandleImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
+  }
+
+  @protected
+  void
   sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle self,
     SseSerializer serializer,
@@ -6978,6 +7847,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
       (self as RotationManagerHandleImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as StreamingUploadHandleImpl).frbInternalSseEncode(move: true),
       serializer,
     );
   }
@@ -7049,6 +7931,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as ProgressHandleImpl).frbInternalSseEncode(move: false),
+      serializer,
+    );
+  }
+
+  @protected
+  void
   sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle self,
     SseSerializer serializer,
@@ -7056,6 +7951,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
       (self as RotationManagerHandleImpl).frbInternalSseEncode(move: false),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as StreamingUploadHandleImpl).frbInternalSseEncode(move: false),
       serializer,
     );
   }
@@ -7127,6 +8035,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as ProgressHandleImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
+  }
+
+  @protected
+  void
   sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle self,
     SseSerializer serializer,
@@ -7134,6 +8055,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
       (self as RotationManagerHandleImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as StreamingUploadHandleImpl).frbInternalSseEncode(move: null),
       serializer,
     );
   }
@@ -7827,6 +8761,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_streaming_plan_info(
+    StreamingPlanInfo self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_32(self.numChunks, serializer);
+    sse_encode_u_32(self.chunkSize, serializer);
+  }
+
+  @protected
   void sse_encode_u_32(int self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putUint32(self);
@@ -7992,6 +8936,26 @@ class MultipartHandleImpl extends RustOpaque implements MultipartHandle {
 }
 
 @sealed
+class ProgressHandleImpl extends RustOpaque implements ProgressHandle {
+  // Not to be used by end users
+  ProgressHandleImpl.frbInternalDcoDecode(List<dynamic> wire)
+    : super.frbInternalDcoDecode(wire, _kStaticData);
+
+  // Not to be used by end users
+  ProgressHandleImpl.frbInternalSseDecode(BigInt ptr, int externalSizeOnNative)
+    : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+
+  static final _kStaticData = RustArcStaticData(
+    rustArcIncrementStrongCount:
+        RustLib.instance.api.rust_arc_increment_strong_count_ProgressHandle,
+    rustArcDecrementStrongCount:
+        RustLib.instance.api.rust_arc_decrement_strong_count_ProgressHandle,
+    rustArcDecrementStrongCountPtr:
+        RustLib.instance.api.rust_arc_decrement_strong_count_ProgressHandlePtr,
+  );
+}
+
+@sealed
 class RotationManagerHandleImpl extends RustOpaque
     implements RotationManagerHandle {
   // Not to be used by end users
@@ -8017,5 +8981,34 @@ class RotationManagerHandleImpl extends RustOpaque
         .instance
         .api
         .rust_arc_decrement_strong_count_RotationManagerHandlePtr,
+  );
+}
+
+@sealed
+class StreamingUploadHandleImpl extends RustOpaque
+    implements StreamingUploadHandle {
+  // Not to be used by end users
+  StreamingUploadHandleImpl.frbInternalDcoDecode(List<dynamic> wire)
+    : super.frbInternalDcoDecode(wire, _kStaticData);
+
+  // Not to be used by end users
+  StreamingUploadHandleImpl.frbInternalSseDecode(
+    BigInt ptr,
+    int externalSizeOnNative,
+  ) : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+
+  static final _kStaticData = RustArcStaticData(
+    rustArcIncrementStrongCount: RustLib
+        .instance
+        .api
+        .rust_arc_increment_strong_count_StreamingUploadHandle,
+    rustArcDecrementStrongCount: RustLib
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_StreamingUploadHandle,
+    rustArcDecrementStrongCountPtr: RustLib
+        .instance
+        .api
+        .rust_arc_decrement_strong_count_StreamingUploadHandlePtr,
   );
 }
