@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueNom,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.11.1";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1846171626;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 613956912;
 
 // Section: executor
 
@@ -640,6 +640,30 @@ fn wire__crate__api__client__create_encrypted_client_with_pinning_impl(
                             api_pinning,
                         )
                         .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__forest__create_progress_handle_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "create_progress_handle",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            move |context| async move {
+                transform_result_dco::<_, _, ()>(
+                    (move || async move {
+                        let output_ok = Result::<_, ()>::Ok(
+                            crate::api::forest::create_progress_handle().await,
+                        )?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -3859,6 +3883,53 @@ fn wire__crate__api__client__poll_master_health_events_encrypted_impl(
         },
     )
 }
+fn wire__crate__api__forest__poll_progress_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    handle: impl CstDecode<
+        RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>,
+    >,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "poll_progress",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_handle = handle.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, ()>(
+                    (move || async move {
+                        let mut api_handle_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_handle,
+                                    0,
+                                    false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_handle_guard =
+                                        Some(api_handle.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_handle_guard = api_handle_guard.unwrap();
+                        let output_ok = Result::<_, ()>::Ok(
+                            crate::api::forest::poll_progress(&*api_handle_guard).await,
+                        )?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__chunked__put_chunked_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     client: impl CstDecode<
@@ -4439,6 +4510,282 @@ fn wire__crate__api__forest__put_flat_resumable_from_path_cancellable_impl(
         },
     )
 }
+fn wire__crate__api__forest__put_flat_resumable_from_path_with_progress_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    client: impl CstDecode<
+        RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EncryptedClientHandle>,
+        >,
+    >,
+    bucket: impl CstDecode<String>,
+    path: impl CstDecode<String>,
+    file_path: impl CstDecode<String>,
+    manifest_path: impl CstDecode<String>,
+    content_type: impl CstDecode<Option<String>>,
+    cancel: impl CstDecode<
+        RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<CancelHandle>>,
+    >,
+    progress: impl CstDecode<
+        RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>,
+    >,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "put_flat_resumable_from_path_with_progress",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_client = client.cst_decode();
+            let api_bucket = bucket.cst_decode();
+            let api_path = path.cst_decode();
+            let api_file_path = file_path.cst_decode();
+            let api_manifest_path = manifest_path.cst_decode();
+            let api_content_type = content_type.cst_decode();
+            let api_cancel = cancel.cst_decode();
+            let api_progress = progress.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let mut api_client_guard = None;
+                        let mut api_cancel_guard = None;
+                        let mut api_progress_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![
+                                    flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                        &api_client,
+                                        0,
+                                        false,
+                                    ),
+                                    flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                        &api_cancel,
+                                        1,
+                                        false,
+                                    ),
+                                    flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                        &api_progress,
+                                        2,
+                                        false,
+                                    ),
+                                ],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_client_guard =
+                                        Some(api_client.lockable_decode_async_ref().await)
+                                }
+                                1 => {
+                                    api_cancel_guard =
+                                        Some(api_cancel.lockable_decode_async_ref().await)
+                                }
+                                2 => {
+                                    api_progress_guard =
+                                        Some(api_progress.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_client_guard = api_client_guard.unwrap();
+                        let api_cancel_guard = api_cancel_guard.unwrap();
+                        let api_progress_guard = api_progress_guard.unwrap();
+                        let output_ok =
+                            crate::api::forest::put_flat_resumable_from_path_with_progress(
+                                &*api_client_guard,
+                                api_bucket,
+                                api_path,
+                                api_file_path,
+                                api_manifest_path,
+                                api_content_type,
+                                &*api_cancel_guard,
+                                &*api_progress_guard,
+                            )
+                            .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__forest__put_flat_with_progress_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    client: impl CstDecode<
+        RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EncryptedClientHandle>,
+        >,
+    >,
+    bucket: impl CstDecode<String>,
+    path: impl CstDecode<String>,
+    data: impl CstDecode<Vec<u8>>,
+    content_type: impl CstDecode<Option<String>>,
+    progress: impl CstDecode<
+        RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>,
+    >,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "put_flat_with_progress",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_client = client.cst_decode();
+            let api_bucket = bucket.cst_decode();
+            let api_path = path.cst_decode();
+            let api_data = data.cst_decode();
+            let api_content_type = content_type.cst_decode();
+            let api_progress = progress.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let mut api_client_guard = None;
+                        let mut api_progress_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![
+                                    flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                        &api_client,
+                                        0,
+                                        false,
+                                    ),
+                                    flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                        &api_progress,
+                                        1,
+                                        false,
+                                    ),
+                                ],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_client_guard =
+                                        Some(api_client.lockable_decode_async_ref().await)
+                                }
+                                1 => {
+                                    api_progress_guard =
+                                        Some(api_progress.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_client_guard = api_client_guard.unwrap();
+                        let api_progress_guard = api_progress_guard.unwrap();
+                        let output_ok = crate::api::forest::put_flat_with_progress(
+                            &*api_client_guard,
+                            api_bucket,
+                            api_path,
+                            api_data,
+                            api_content_type,
+                            &*api_progress_guard,
+                        )
+                        .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__forest__put_flat_with_progress_cancellable_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    client: impl CstDecode<
+        RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EncryptedClientHandle>,
+        >,
+    >,
+    bucket: impl CstDecode<String>,
+    path: impl CstDecode<String>,
+    data: impl CstDecode<Vec<u8>>,
+    content_type: impl CstDecode<Option<String>>,
+    progress: impl CstDecode<
+        RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>,
+    >,
+    cancel: impl CstDecode<
+        RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<CancelHandle>>,
+    >,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "put_flat_with_progress_cancellable",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_client = client.cst_decode();
+            let api_bucket = bucket.cst_decode();
+            let api_path = path.cst_decode();
+            let api_data = data.cst_decode();
+            let api_content_type = content_type.cst_decode();
+            let api_progress = progress.cst_decode();
+            let api_cancel = cancel.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let mut api_client_guard = None;
+                        let mut api_progress_guard = None;
+                        let mut api_cancel_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![
+                                    flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                        &api_client,
+                                        0,
+                                        false,
+                                    ),
+                                    flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                        &api_progress,
+                                        1,
+                                        false,
+                                    ),
+                                    flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                        &api_cancel,
+                                        2,
+                                        false,
+                                    ),
+                                ],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_client_guard =
+                                        Some(api_client.lockable_decode_async_ref().await)
+                                }
+                                1 => {
+                                    api_progress_guard =
+                                        Some(api_progress.lockable_decode_async_ref().await)
+                                }
+                                2 => {
+                                    api_cancel_guard =
+                                        Some(api_cancel.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_client_guard = api_client_guard.unwrap();
+                        let api_progress_guard = api_progress_guard.unwrap();
+                        let api_cancel_guard = api_cancel_guard.unwrap();
+                        let output_ok = crate::api::forest::put_flat_with_progress_cancellable(
+                            &*api_client_guard,
+                            api_bucket,
+                            api_path,
+                            api_data,
+                            api_content_type,
+                            &*api_progress_guard,
+                            &*api_cancel_guard,
+                        )
+                        .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__client__put_object_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     client: impl CstDecode<
@@ -4677,6 +5024,97 @@ fn wire__crate__api__forest__resume_flat_upload_from_path_cancellable_impl(
                                 api_manifest_path,
                                 api_file_path,
                                 &*api_cancel_guard,
+                            )
+                            .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__forest__resume_flat_upload_from_path_with_progress_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    client: impl CstDecode<
+        RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EncryptedClientHandle>,
+        >,
+    >,
+    manifest_path: impl CstDecode<String>,
+    file_path: impl CstDecode<String>,
+    cancel: impl CstDecode<
+        RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<CancelHandle>>,
+    >,
+    progress: impl CstDecode<
+        RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>,
+    >,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "resume_flat_upload_from_path_with_progress",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_client = client.cst_decode();
+            let api_manifest_path = manifest_path.cst_decode();
+            let api_file_path = file_path.cst_decode();
+            let api_cancel = cancel.cst_decode();
+            let api_progress = progress.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let mut api_client_guard = None;
+                        let mut api_cancel_guard = None;
+                        let mut api_progress_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![
+                                    flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                        &api_client,
+                                        0,
+                                        false,
+                                    ),
+                                    flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                        &api_cancel,
+                                        1,
+                                        false,
+                                    ),
+                                    flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                        &api_progress,
+                                        2,
+                                        false,
+                                    ),
+                                ],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_client_guard =
+                                        Some(api_client.lockable_decode_async_ref().await)
+                                }
+                                1 => {
+                                    api_cancel_guard =
+                                        Some(api_cancel.lockable_decode_async_ref().await)
+                                }
+                                2 => {
+                                    api_progress_guard =
+                                        Some(api_progress.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_client_guard = api_client_guard.unwrap();
+                        let api_cancel_guard = api_cancel_guard.unwrap();
+                        let api_progress_guard = api_progress_guard.unwrap();
+                        let output_ok =
+                            crate::api::forest::resume_flat_upload_from_path_with_progress(
+                                &*api_client_guard,
+                                api_manifest_path,
+                                api_file_path,
+                                &*api_cancel_guard,
+                                &*api_progress_guard,
                             )
                             .await?;
                         Ok(output_ok)
@@ -5075,6 +5513,271 @@ fn wire__crate__api__multipart__start_multipart_with_concurrency_impl(
         },
     )
 }
+fn wire__crate__api__forest__streaming_upload_begin_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    client: impl CstDecode<
+        RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EncryptedClientHandle>,
+        >,
+    >,
+    bucket: impl CstDecode<String>,
+    key: impl CstDecode<String>,
+    content_type: impl CstDecode<Option<String>>,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "streaming_upload_begin",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_client = client.cst_decode();
+            let api_bucket = bucket.cst_decode();
+            let api_key = key.cst_decode();
+            let api_content_type = content_type.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let mut api_client_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_client,
+                                    0,
+                                    false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_client_guard =
+                                        Some(api_client.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_client_guard = api_client_guard.unwrap();
+                        let output_ok = crate::api::forest::streaming_upload_begin(
+                            &*api_client_guard,
+                            api_bucket,
+                            api_key,
+                            api_content_type,
+                        )
+                        .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__forest__streaming_upload_chunk_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    handle: impl CstDecode<
+        RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
+        >,
+    >,
+    chunk_index: impl CstDecode<u32>,
+    bytes: impl CstDecode<Vec<u8>>,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "streaming_upload_chunk",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_handle = handle.cst_decode();
+            let api_chunk_index = chunk_index.cst_decode();
+            let api_bytes = bytes.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let mut api_handle_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_handle,
+                                    0,
+                                    false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_handle_guard =
+                                        Some(api_handle.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_handle_guard = api_handle_guard.unwrap();
+                        let output_ok = crate::api::forest::streaming_upload_chunk(
+                            &*api_handle_guard,
+                            api_chunk_index,
+                            api_bytes,
+                        )
+                        .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__forest__streaming_upload_finalize_plan_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    handle: impl CstDecode<
+        RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
+        >,
+    >,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "streaming_upload_finalize_plan",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_handle = handle.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let mut api_handle_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_handle,
+                                    0,
+                                    false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_handle_guard =
+                                        Some(api_handle.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_handle_guard = api_handle_guard.unwrap();
+                        let output_ok =
+                            crate::api::forest::streaming_upload_finalize_plan(&*api_handle_guard)
+                                .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__forest__streaming_upload_finish_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    handle: impl CstDecode<
+        RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
+        >,
+    >,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "streaming_upload_finish",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_handle = handle.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let mut api_handle_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_handle,
+                                    0,
+                                    false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_handle_guard =
+                                        Some(api_handle.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_handle_guard = api_handle_guard.unwrap();
+                        let output_ok =
+                            crate::api::forest::streaming_upload_finish(&*api_handle_guard).await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__forest__streaming_upload_plan_chunk_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    handle: impl CstDecode<
+        RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
+        >,
+    >,
+    bytes: impl CstDecode<Vec<u8>>,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "streaming_upload_plan_chunk",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_handle = handle.cst_decode();
+            let api_bytes = bytes.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let mut api_handle_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_handle,
+                                    0,
+                                    false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_handle_guard =
+                                        Some(api_handle.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_handle_guard = api_handle_guard.unwrap();
+                        let output_ok = crate::api::forest::streaming_upload_plan_chunk(
+                            &*api_handle_guard,
+                            api_bytes,
+                        )
+                        .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__multipart__upload_large_file_simple_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     client: impl CstDecode<
@@ -5269,6 +5972,42 @@ fn wire__crate__api__metrics__wal_truncated_groups_count_impl(
         },
     )
 }
+fn wire__crate__api__sharing__wrap_secret_for_recipient_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    secret: impl CstDecode<Vec<u8>>,
+    recipient_public_key: impl CstDecode<Vec<u8>>,
+    path_scope: impl CstDecode<Option<String>>,
+    expires_in_seconds: impl CstDecode<Option<i64>>,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::DcoCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "wrap_secret_for_recipient",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let api_secret = secret.cst_decode();
+            let api_recipient_public_key = recipient_public_key.cst_decode();
+            let api_path_scope = path_scope.cst_decode();
+            let api_expires_in_seconds = expires_in_seconds.cst_decode();
+            move |context| async move {
+                transform_result_dco::<_, _, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let output_ok = crate::api::sharing::wrap_secret_for_recipient(
+                            api_secret,
+                            api_recipient_public_key,
+                            api_path_scope,
+                            api_expires_in_seconds,
+                        )
+                        .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
 
 // Section: dart2rust
 
@@ -5402,11 +6141,31 @@ impl SseDecode for MultipartHandle {
     }
 }
 
+impl SseDecode for ProgressHandle {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>,
+        >>::sse_decode(deserializer);
+        return flutter_rust_bridge::for_generated::rust_auto_opaque_decode_owned(inner);
+    }
+}
+
 impl SseDecode for RotationManagerHandle {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         let mut inner = <RustOpaqueNom<
             flutter_rust_bridge::for_generated::RustAutoOpaqueInner<RotationManagerHandle>,
+        >>::sse_decode(deserializer);
+        return flutter_rust_bridge::for_generated::rust_auto_opaque_decode_owned(inner);
+    }
+}
+
+impl SseDecode for StreamingUploadHandle {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
         >>::sse_decode(deserializer);
         return flutter_rust_bridge::for_generated::rust_auto_opaque_decode_owned(inner);
     }
@@ -5465,8 +6224,30 @@ impl SseDecode
 }
 
 impl SseDecode
+    for RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>
+{
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <usize>::sse_decode(deserializer);
+        return unsafe { decode_rust_opaque_nom(inner) };
+    }
+}
+
+impl SseDecode
     for RustOpaqueNom<
         flutter_rust_bridge::for_generated::RustAutoOpaqueInner<RotationManagerHandle>,
+    >
+{
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <usize>::sse_decode(deserializer);
+        return unsafe { decode_rust_opaque_nom(inner) };
+    }
+}
+
+impl SseDecode
+    for RustOpaqueNom<
+        flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
     >
 {
     // Codec=Sse (Serialization based), see doc to use other codecs
@@ -6270,6 +7051,18 @@ impl SseDecode for crate::api::types::SharePermissions {
     }
 }
 
+impl SseDecode for crate::api::forest::StreamingPlanInfo {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_numChunks = <u32>::sse_decode(deserializer);
+        let mut var_chunkSize = <u32>::sse_decode(deserializer);
+        return crate::api::forest::StreamingPlanInfo {
+            num_chunks: var_numChunks,
+            chunk_size: var_chunkSize,
+        };
+    }
+}
+
 impl SseDecode for u32 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -6432,6 +7225,21 @@ impl flutter_rust_bridge::IntoIntoDart<FrbWrapper<MultipartHandle>> for Multipar
 }
 
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for FrbWrapper<ProgressHandle> {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, StdArc<_>>(self.0)
+            .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for FrbWrapper<ProgressHandle> {}
+
+impl flutter_rust_bridge::IntoIntoDart<FrbWrapper<ProgressHandle>> for ProgressHandle {
+    fn into_into_dart(self) -> FrbWrapper<ProgressHandle> {
+        self.into()
+    }
+}
+
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for FrbWrapper<RotationManagerHandle> {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, StdArc<_>>(self.0)
@@ -6447,6 +7255,26 @@ impl flutter_rust_bridge::IntoIntoDart<FrbWrapper<RotationManagerHandle>>
     for RotationManagerHandle
 {
     fn into_into_dart(self) -> FrbWrapper<RotationManagerHandle> {
+        self.into()
+    }
+}
+
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for FrbWrapper<StreamingUploadHandle> {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, StdArc<_>>(self.0)
+            .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for FrbWrapper<StreamingUploadHandle>
+{
+}
+
+impl flutter_rust_bridge::IntoIntoDart<FrbWrapper<StreamingUploadHandle>>
+    for StreamingUploadHandle
+{
+    fn into_into_dart(self) -> FrbWrapper<StreamingUploadHandle> {
         self.into()
     }
 }
@@ -7182,6 +8010,27 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::types::SharePermissions>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::forest::StreamingPlanInfo {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.num_chunks.into_into_dart().into_dart(),
+            self.chunk_size.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::forest::StreamingPlanInfo
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::forest::StreamingPlanInfo>
+    for crate::api::forest::StreamingPlanInfo
+{
+    fn into_into_dart(self) -> crate::api::forest::StreamingPlanInfo {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::types::UploadProgress {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
@@ -7253,11 +8102,30 @@ impl SseEncode for MultipartHandle {
     }
 }
 
+impl SseEncode for ProgressHandle {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>>::sse_encode(flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, StdArc<_>>(self), serializer);
+    }
+}
+
 impl SseEncode for RotationManagerHandle {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <RustOpaqueNom<
             flutter_rust_bridge::for_generated::RustAutoOpaqueInner<RotationManagerHandle>,
+        >>::sse_encode(
+            flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, StdArc<_>>(self),
+            serializer,
+        );
+    }
+}
+
+impl SseEncode for StreamingUploadHandle {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
         >>::sse_encode(
             flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, StdArc<_>>(self),
             serializer,
@@ -7323,8 +8191,32 @@ impl SseEncode
 }
 
 impl SseEncode
+    for RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>
+{
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        let (ptr, size) = self.sse_encode_raw();
+        <usize>::sse_encode(ptr, serializer);
+        <i32>::sse_encode(size, serializer);
+    }
+}
+
+impl SseEncode
     for RustOpaqueNom<
         flutter_rust_bridge::for_generated::RustAutoOpaqueInner<RotationManagerHandle>,
+    >
+{
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        let (ptr, size) = self.sse_encode_raw();
+        <usize>::sse_encode(ptr, serializer);
+        <i32>::sse_encode(size, serializer);
+    }
+}
+
+impl SseEncode
+    for RustOpaqueNom<
+        flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
     >
 {
     // Codec=Sse (Serialization based), see doc to use other codecs
@@ -7944,6 +8836,14 @@ impl SseEncode for crate::api::types::SharePermissions {
     }
 }
 
+impl SseEncode for crate::api::forest::StreamingPlanInfo {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <u32>::sse_encode(self.num_chunks, serializer);
+        <u32>::sse_encode(self.chunk_size, serializer);
+    }
+}
+
 impl SseEncode for u32 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -8081,12 +8981,36 @@ mod io {
             ))
         }
     }
+    impl CstDecode<ProgressHandle> for usize {
+        // Codec=Cst (C-struct based), see doc to use other codecs
+        fn cst_decode(self) -> ProgressHandle {
+            flutter_rust_bridge::for_generated::rust_auto_opaque_decode_owned(CstDecode::<
+                RustOpaqueNom<
+                    flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>,
+                >,
+            >::cst_decode(
+                self
+            ))
+        }
+    }
     impl CstDecode<RotationManagerHandle> for usize {
         // Codec=Cst (C-struct based), see doc to use other codecs
         fn cst_decode(self) -> RotationManagerHandle {
             flutter_rust_bridge::for_generated::rust_auto_opaque_decode_owned(CstDecode::<
                 RustOpaqueNom<
                     flutter_rust_bridge::for_generated::RustAutoOpaqueInner<RotationManagerHandle>,
+                >,
+            >::cst_decode(
+                self
+            ))
+        }
+    }
+    impl CstDecode<StreamingUploadHandle> for usize {
+        // Codec=Cst (C-struct based), see doc to use other codecs
+        fn cst_decode(self) -> StreamingUploadHandle {
+            flutter_rust_bridge::for_generated::rust_auto_opaque_decode_owned(CstDecode::<
+                RustOpaqueNom<
+                    flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
                 >,
             >::cst_decode(
                 self
@@ -8168,6 +9092,19 @@ mod io {
     }
     impl
         CstDecode<
+            RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>,
+        > for usize
+    {
+        // Codec=Cst (C-struct based), see doc to use other codecs
+        fn cst_decode(
+            self,
+        ) -> RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>
+        {
+            unsafe { decode_rust_opaque_nom(self as _) }
+        }
+    }
+    impl
+        CstDecode<
             RustOpaqueNom<
                 flutter_rust_bridge::for_generated::RustAutoOpaqueInner<RotationManagerHandle>,
             >,
@@ -8178,6 +9115,22 @@ mod io {
             self,
         ) -> RustOpaqueNom<
             flutter_rust_bridge::for_generated::RustAutoOpaqueInner<RotationManagerHandle>,
+        > {
+            unsafe { decode_rust_opaque_nom(self as _) }
+        }
+    }
+    impl
+        CstDecode<
+            RustOpaqueNom<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
+            >,
+        > for usize
+    {
+        // Codec=Cst (C-struct based), see doc to use other codecs
+        fn cst_decode(
+            self,
+        ) -> RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
         > {
             unsafe { decode_rust_opaque_nom(self as _) }
         }
@@ -8772,6 +9725,15 @@ mod io {
             }
         }
     }
+    impl CstDecode<crate::api::forest::StreamingPlanInfo> for wire_cst_streaming_plan_info {
+        // Codec=Cst (C-struct based), see doc to use other codecs
+        fn cst_decode(self) -> crate::api::forest::StreamingPlanInfo {
+            crate::api::forest::StreamingPlanInfo {
+                num_chunks: self.num_chunks.cst_decode(),
+                chunk_size: self.chunk_size.cst_decode(),
+            }
+        }
+    }
     impl CstDecode<crate::api::types::UploadProgress> for wire_cst_upload_progress {
         // Codec=Cst (C-struct based), see doc to use other codecs
         fn cst_decode(self) -> crate::api::types::UploadProgress {
@@ -9173,6 +10135,19 @@ mod io {
             Self::new_with_null_ptr()
         }
     }
+    impl NewWithNullPtr for wire_cst_streaming_plan_info {
+        fn new_with_null_ptr() -> Self {
+            Self {
+                num_chunks: Default::default(),
+                chunk_size: Default::default(),
+            }
+        }
+    }
+    impl Default for wire_cst_streaming_plan_info {
+        fn default() -> Self {
+            Self::new_with_null_ptr()
+        }
+    }
     impl NewWithNullPtr for wire_cst_upload_progress {
         fn new_with_null_ptr() -> Self {
             Self {
@@ -9335,6 +10310,13 @@ mod io {
         wire__crate__api__client__create_encrypted_client_with_pinning_impl(
             port_, config, encryption, pinning,
         )
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__forest__create_progress_handle(
+        port_: i64,
+    ) {
+        wire__crate__api__forest__create_progress_handle_impl(port_)
     }
 
     #[unsafe(no_mangle)]
@@ -10016,6 +10998,14 @@ mod io {
     }
 
     #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__forest__poll_progress(
+        port_: i64,
+        handle: usize,
+    ) {
+        wire__crate__api__forest__poll_progress_impl(port_, handle)
+    }
+
+    #[unsafe(no_mangle)]
     pub extern "C" fn frbgen_fula_client_wire__crate__api__chunked__put_chunked(
         port_: i64,
         client: usize,
@@ -10171,6 +11161,75 @@ mod io {
     }
 
     #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__forest__put_flat_resumable_from_path_with_progress(
+        port_: i64,
+        client: usize,
+        bucket: *mut wire_cst_list_prim_u_8_strict,
+        path: *mut wire_cst_list_prim_u_8_strict,
+        file_path: *mut wire_cst_list_prim_u_8_strict,
+        manifest_path: *mut wire_cst_list_prim_u_8_strict,
+        content_type: *mut wire_cst_list_prim_u_8_strict,
+        cancel: usize,
+        progress: usize,
+    ) {
+        wire__crate__api__forest__put_flat_resumable_from_path_with_progress_impl(
+            port_,
+            client,
+            bucket,
+            path,
+            file_path,
+            manifest_path,
+            content_type,
+            cancel,
+            progress,
+        )
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__forest__put_flat_with_progress(
+        port_: i64,
+        client: usize,
+        bucket: *mut wire_cst_list_prim_u_8_strict,
+        path: *mut wire_cst_list_prim_u_8_strict,
+        data: *mut wire_cst_list_prim_u_8_loose,
+        content_type: *mut wire_cst_list_prim_u_8_strict,
+        progress: usize,
+    ) {
+        wire__crate__api__forest__put_flat_with_progress_impl(
+            port_,
+            client,
+            bucket,
+            path,
+            data,
+            content_type,
+            progress,
+        )
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__forest__put_flat_with_progress_cancellable(
+        port_: i64,
+        client: usize,
+        bucket: *mut wire_cst_list_prim_u_8_strict,
+        path: *mut wire_cst_list_prim_u_8_strict,
+        data: *mut wire_cst_list_prim_u_8_loose,
+        content_type: *mut wire_cst_list_prim_u_8_strict,
+        progress: usize,
+        cancel: usize,
+    ) {
+        wire__crate__api__forest__put_flat_with_progress_cancellable_impl(
+            port_,
+            client,
+            bucket,
+            path,
+            data,
+            content_type,
+            progress,
+            cancel,
+        )
+    }
+
+    #[unsafe(no_mangle)]
     pub extern "C" fn frbgen_fula_client_wire__crate__api__client__put_object(
         port_: i64,
         client: usize,
@@ -10224,6 +11283,25 @@ mod io {
             manifest_path,
             file_path,
             cancel,
+        )
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__forest__resume_flat_upload_from_path_with_progress(
+        port_: i64,
+        client: usize,
+        manifest_path: *mut wire_cst_list_prim_u_8_strict,
+        file_path: *mut wire_cst_list_prim_u_8_strict,
+        cancel: usize,
+        progress: usize,
+    ) {
+        wire__crate__api__forest__resume_flat_upload_from_path_with_progress_impl(
+            port_,
+            client,
+            manifest_path,
+            file_path,
+            cancel,
+            progress,
         )
     }
 
@@ -10309,6 +11387,58 @@ mod io {
     }
 
     #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__forest__streaming_upload_begin(
+        port_: i64,
+        client: usize,
+        bucket: *mut wire_cst_list_prim_u_8_strict,
+        key: *mut wire_cst_list_prim_u_8_strict,
+        content_type: *mut wire_cst_list_prim_u_8_strict,
+    ) {
+        wire__crate__api__forest__streaming_upload_begin_impl(
+            port_,
+            client,
+            bucket,
+            key,
+            content_type,
+        )
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__forest__streaming_upload_chunk(
+        port_: i64,
+        handle: usize,
+        chunk_index: u32,
+        bytes: *mut wire_cst_list_prim_u_8_loose,
+    ) {
+        wire__crate__api__forest__streaming_upload_chunk_impl(port_, handle, chunk_index, bytes)
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__forest__streaming_upload_finalize_plan(
+        port_: i64,
+        handle: usize,
+    ) {
+        wire__crate__api__forest__streaming_upload_finalize_plan_impl(port_, handle)
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__forest__streaming_upload_finish(
+        port_: i64,
+        handle: usize,
+    ) {
+        wire__crate__api__forest__streaming_upload_finish_impl(port_, handle)
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__forest__streaming_upload_plan_chunk(
+        port_: i64,
+        handle: usize,
+        bytes: *mut wire_cst_list_prim_u_8_loose,
+    ) {
+        wire__crate__api__forest__streaming_upload_plan_chunk_impl(port_, handle, bytes)
+    }
+
+    #[unsafe(no_mangle)]
     pub extern "C" fn frbgen_fula_client_wire__crate__api__multipart__upload_large_file_simple(
         port_: i64,
         client: usize,
@@ -10361,6 +11491,23 @@ mod io {
         port_: i64,
     ) {
         wire__crate__api__metrics__wal_truncated_groups_count_impl(port_)
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_wire__crate__api__sharing__wrap_secret_for_recipient(
+        port_: i64,
+        secret: *mut wire_cst_list_prim_u_8_loose,
+        recipient_public_key: *mut wire_cst_list_prim_u_8_loose,
+        path_scope: *mut wire_cst_list_prim_u_8_strict,
+        expires_in_seconds: *mut i64,
+    ) {
+        wire__crate__api__sharing__wrap_secret_for_recipient_impl(
+            port_,
+            secret,
+            recipient_public_key,
+            path_scope,
+            expires_in_seconds,
+        )
     }
 
     #[unsafe(no_mangle)]
@@ -10454,6 +11601,24 @@ mod io {
     }
 
     #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+        ptr: *const std::ffi::c_void,
+    ) {
+        unsafe {
+            StdArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>::increment_strong_count(ptr as _);
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+        ptr: *const std::ffi::c_void,
+    ) {
+        unsafe {
+            StdArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>::decrement_strong_count(ptr as _);
+        }
+    }
+
+    #[unsafe(no_mangle)]
     pub extern "C" fn frbgen_fula_client_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
         ptr: *const std::ffi::c_void,
     ) {
@@ -10468,6 +11633,24 @@ mod io {
     ) {
         unsafe {
             StdArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<RotationManagerHandle>>::decrement_strong_count(ptr as _);
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+        ptr: *const std::ffi::c_void,
+    ) {
+        unsafe {
+            StdArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>>::increment_strong_count(ptr as _);
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_fula_client_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+        ptr: *const std::ffi::c_void,
+    ) {
+        unsafe {
+            StdArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>>::decrement_strong_count(ptr as _);
         }
     }
 
@@ -11120,6 +12303,12 @@ mod io {
         can_read: bool,
         can_write: bool,
         expires_at: *mut i64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct wire_cst_streaming_plan_info {
+        num_chunks: u32,
+        chunk_size: u32,
     }
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -11873,6 +13062,26 @@ mod web {
             }
         }
     }
+    impl CstDecode<crate::api::forest::StreamingPlanInfo>
+        for flutter_rust_bridge::for_generated::wasm_bindgen::JsValue
+    {
+        // Codec=Cst (C-struct based), see doc to use other codecs
+        fn cst_decode(self) -> crate::api::forest::StreamingPlanInfo {
+            let self_ = self
+                .dyn_into::<flutter_rust_bridge::for_generated::js_sys::Array>()
+                .unwrap();
+            assert_eq!(
+                self_.length(),
+                2,
+                "Expected 2 elements, got {}",
+                self_.length()
+            );
+            crate::api::forest::StreamingPlanInfo {
+                num_chunks: self_.get(0).cst_decode(),
+                chunk_size: self_.get(1).cst_decode(),
+            }
+        }
+    }
     impl CstDecode<crate::api::types::UploadProgress>
         for flutter_rust_bridge::for_generated::wasm_bindgen::JsValue
     {
@@ -11966,6 +13175,18 @@ mod web {
             ))
         }
     }
+    impl CstDecode<ProgressHandle> for flutter_rust_bridge::for_generated::wasm_bindgen::JsValue {
+        // Codec=Cst (C-struct based), see doc to use other codecs
+        fn cst_decode(self) -> ProgressHandle {
+            flutter_rust_bridge::for_generated::rust_auto_opaque_decode_owned(CstDecode::<
+                RustOpaqueNom<
+                    flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>,
+                >,
+            >::cst_decode(
+                self
+            ))
+        }
+    }
     impl CstDecode<RotationManagerHandle>
         for flutter_rust_bridge::for_generated::wasm_bindgen::JsValue
     {
@@ -11974,6 +13195,20 @@ mod web {
             flutter_rust_bridge::for_generated::rust_auto_opaque_decode_owned(CstDecode::<
                 RustOpaqueNom<
                     flutter_rust_bridge::for_generated::RustAutoOpaqueInner<RotationManagerHandle>,
+                >,
+            >::cst_decode(
+                self
+            ))
+        }
+    }
+    impl CstDecode<StreamingUploadHandle>
+        for flutter_rust_bridge::for_generated::wasm_bindgen::JsValue
+    {
+        // Codec=Cst (C-struct based), see doc to use other codecs
+        fn cst_decode(self) -> StreamingUploadHandle {
+            flutter_rust_bridge::for_generated::rust_auto_opaque_decode_owned(CstDecode::<
+                RustOpaqueNom<
+                    flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
                 >,
             >::cst_decode(
                 self
@@ -12075,6 +13310,23 @@ mod web {
     }
     impl
         CstDecode<
+            RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>,
+        > for flutter_rust_bridge::for_generated::wasm_bindgen::JsValue
+    {
+        // Codec=Cst (C-struct based), see doc to use other codecs
+        fn cst_decode(
+            self,
+        ) -> RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>
+        {
+            #[cfg(target_pointer_width = "64")]
+            {
+                compile_error!("64-bit pointers are not supported.");
+            }
+            unsafe { decode_rust_opaque_nom((self.as_f64().unwrap() as usize) as _) }
+        }
+    }
+    impl
+        CstDecode<
             RustOpaqueNom<
                 flutter_rust_bridge::for_generated::RustAutoOpaqueInner<RotationManagerHandle>,
             >,
@@ -12085,6 +13337,26 @@ mod web {
             self,
         ) -> RustOpaqueNom<
             flutter_rust_bridge::for_generated::RustAutoOpaqueInner<RotationManagerHandle>,
+        > {
+            #[cfg(target_pointer_width = "64")]
+            {
+                compile_error!("64-bit pointers are not supported.");
+            }
+            unsafe { decode_rust_opaque_nom((self.as_f64().unwrap() as usize) as _) }
+        }
+    }
+    impl
+        CstDecode<
+            RustOpaqueNom<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
+            >,
+        > for flutter_rust_bridge::for_generated::wasm_bindgen::JsValue
+    {
+        // Codec=Cst (C-struct based), see doc to use other codecs
+        fn cst_decode(
+            self,
+        ) -> RustOpaqueNom<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>,
         > {
             #[cfg(target_pointer_width = "64")]
             {
@@ -12317,6 +13589,13 @@ mod web {
         wire__crate__api__client__create_encrypted_client_with_pinning_impl(
             port_, config, encryption, pinning,
         )
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__forest__create_progress_handle(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+    ) {
+        wire__crate__api__forest__create_progress_handle_impl(port_)
     }
 
     #[wasm_bindgen]
@@ -13002,6 +14281,14 @@ mod web {
     }
 
     #[wasm_bindgen]
+    pub fn wire__crate__api__forest__poll_progress(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        handle: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+    ) {
+        wire__crate__api__forest__poll_progress_impl(port_, handle)
+    }
+
+    #[wasm_bindgen]
     pub fn wire__crate__api__chunked__put_chunked(
         port_: flutter_rust_bridge::for_generated::MessagePort,
         client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
@@ -13157,6 +14444,75 @@ mod web {
     }
 
     #[wasm_bindgen]
+    pub fn wire__crate__api__forest__put_flat_resumable_from_path_with_progress(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        bucket: String,
+        path: String,
+        file_path: String,
+        manifest_path: String,
+        content_type: Option<String>,
+        cancel: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        progress: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+    ) {
+        wire__crate__api__forest__put_flat_resumable_from_path_with_progress_impl(
+            port_,
+            client,
+            bucket,
+            path,
+            file_path,
+            manifest_path,
+            content_type,
+            cancel,
+            progress,
+        )
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__forest__put_flat_with_progress(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        bucket: String,
+        path: String,
+        data: Box<[u8]>,
+        content_type: Option<String>,
+        progress: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+    ) {
+        wire__crate__api__forest__put_flat_with_progress_impl(
+            port_,
+            client,
+            bucket,
+            path,
+            data,
+            content_type,
+            progress,
+        )
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__forest__put_flat_with_progress_cancellable(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        bucket: String,
+        path: String,
+        data: Box<[u8]>,
+        content_type: Option<String>,
+        progress: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        cancel: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+    ) {
+        wire__crate__api__forest__put_flat_with_progress_cancellable_impl(
+            port_,
+            client,
+            bucket,
+            path,
+            data,
+            content_type,
+            progress,
+            cancel,
+        )
+    }
+
+    #[wasm_bindgen]
     pub fn wire__crate__api__client__put_object(
         port_: flutter_rust_bridge::for_generated::MessagePort,
         client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
@@ -13210,6 +14566,25 @@ mod web {
             manifest_path,
             file_path,
             cancel,
+        )
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__forest__resume_flat_upload_from_path_with_progress(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        manifest_path: String,
+        file_path: String,
+        cancel: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        progress: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+    ) {
+        wire__crate__api__forest__resume_flat_upload_from_path_with_progress_impl(
+            port_,
+            client,
+            manifest_path,
+            file_path,
+            cancel,
+            progress,
         )
     }
 
@@ -13295,6 +14670,58 @@ mod web {
     }
 
     #[wasm_bindgen]
+    pub fn wire__crate__api__forest__streaming_upload_begin(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        bucket: String,
+        key: String,
+        content_type: Option<String>,
+    ) {
+        wire__crate__api__forest__streaming_upload_begin_impl(
+            port_,
+            client,
+            bucket,
+            key,
+            content_type,
+        )
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__forest__streaming_upload_chunk(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        handle: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        chunk_index: u32,
+        bytes: Box<[u8]>,
+    ) {
+        wire__crate__api__forest__streaming_upload_chunk_impl(port_, handle, chunk_index, bytes)
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__forest__streaming_upload_finalize_plan(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        handle: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+    ) {
+        wire__crate__api__forest__streaming_upload_finalize_plan_impl(port_, handle)
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__forest__streaming_upload_finish(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        handle: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+    ) {
+        wire__crate__api__forest__streaming_upload_finish_impl(port_, handle)
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__forest__streaming_upload_plan_chunk(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        handle: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+        bytes: Box<[u8]>,
+    ) {
+        wire__crate__api__forest__streaming_upload_plan_chunk_impl(port_, handle, bytes)
+    }
+
+    #[wasm_bindgen]
     pub fn wire__crate__api__multipart__upload_large_file_simple(
         port_: flutter_rust_bridge::for_generated::MessagePort,
         client: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
@@ -13347,6 +14774,23 @@ mod web {
         port_: flutter_rust_bridge::for_generated::MessagePort,
     ) {
         wire__crate__api__metrics__wal_truncated_groups_count_impl(port_)
+    }
+
+    #[wasm_bindgen]
+    pub fn wire__crate__api__sharing__wrap_secret_for_recipient(
+        port_: flutter_rust_bridge::for_generated::MessagePort,
+        secret: Box<[u8]>,
+        recipient_public_key: Box<[u8]>,
+        path_scope: Option<String>,
+        expires_in_seconds: flutter_rust_bridge::for_generated::wasm_bindgen::JsValue,
+    ) {
+        wire__crate__api__sharing__wrap_secret_for_recipient_impl(
+            port_,
+            secret,
+            recipient_public_key,
+            path_scope,
+            expires_in_seconds,
+        )
     }
 
     #[wasm_bindgen]
@@ -13440,6 +14884,24 @@ mod web {
     }
 
     #[wasm_bindgen]
+    pub fn rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+        ptr: *const std::ffi::c_void,
+    ) {
+        unsafe {
+            StdArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>::increment_strong_count(ptr as _);
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+        ptr: *const std::ffi::c_void,
+    ) {
+        unsafe {
+            StdArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>::decrement_strong_count(ptr as _);
+        }
+    }
+
+    #[wasm_bindgen]
     pub fn rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
         ptr: *const std::ffi::c_void,
     ) {
@@ -13454,6 +14916,24 @@ mod web {
     ) {
         unsafe {
             StdArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<RotationManagerHandle>>::decrement_strong_count(ptr as _);
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+        ptr: *const std::ffi::c_void,
+    ) {
+        unsafe {
+            StdArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>>::increment_strong_count(ptr as _);
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+        ptr: *const std::ffi::c_void,
+    ) {
+        unsafe {
+            StdArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>>::decrement_strong_count(ptr as _);
         }
     }
 }

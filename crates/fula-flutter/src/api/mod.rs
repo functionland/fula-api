@@ -112,6 +112,7 @@ pub use forest::{
 pub use sharing::{
     create_share_token,
     create_share_token_with_mode,
+    wrap_secret_for_recipient,
     accept_share,
     get_with_share,
     get_with_token,

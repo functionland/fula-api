@@ -7,7 +7,9 @@ import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'types.dart';
 
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`
+// These functions are ignored because they are not marked as `pub`: `progress_cb`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `ProgressState`, `StreamingPhase`, `StreamingUploadInner`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`
 
 /// Load the forest index from storage.
 ///
@@ -338,6 +340,157 @@ Future<void> abortResumableUpload({
 Future<BigInt> getFileSize({required String filePath}) =>
     RustLib.instance.api.crateApiForestGetFileSize(filePath: filePath);
 
+/// Create a fresh progress handle (0 / 0). Pass it to a `_with_progress`
+/// upload function and read it via [`poll_progress`].
+Future<ProgressHandle> createProgressHandle() =>
+    RustLib.instance.api.crateApiForestCreateProgressHandle();
+
+/// Read the latest progress for an in-flight (or finished) upload. Safe to
+/// call any time, from any thread; returns 0% before the first chunk lands.
+///
+/// **100% caveat:** cumulative bytes reach `total` when the LAST content
+/// chunk's PUT returns — BEFORE the index PUT + forest-flush tail. UIs that
+/// show a determinate bar should cap at <100% until their own completion
+/// signal (the upload future resolving), mirroring the mobile clamp.
+Future<UploadProgress> pollProgress({required ProgressHandle handle}) =>
+    RustLib.instance.api.crateApiForestPollProgress(handle: handle);
+
+/// [`put_flat`] with live progress (web + native). Drive a percentage by
+/// polling [`poll_progress`] on the passed [`ProgressHandle`] while this
+/// future runs.
+Future<PutResult> putFlatWithProgress({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String path,
+  required List<int> data,
+  String? contentType,
+  required ProgressHandle progress,
+}) => RustLib.instance.api.crateApiForestPutFlatWithProgress(
+  client: client,
+  bucket: bucket,
+  path: path,
+  data: data,
+  contentType: contentType,
+  progress: progress,
+);
+
+/// [`put_flat_with_progress`] with cooperative cancellation (web + native).
+/// Non-resumable: triggering `cancel` aborts the in-flight upload (chunks
+/// already in flight finish, later chunks short-circuit, uploaded chunks are
+/// cleaned up) and the call returns a `Cancelled` error. A cancelled upload
+/// restarts from scratch — wasm resumable support lands separately. This is
+/// web's cancel path (the native resumable+manifest cancel is the
+/// `*_from_path` family, which is native-only).
+Future<PutResult> putFlatWithProgressCancellable({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String path,
+  required List<int> data,
+  String? contentType,
+  required ProgressHandle progress,
+  required CancelHandle cancel,
+}) => RustLib.instance.api.crateApiForestPutFlatWithProgressCancellable(
+  client: client,
+  bucket: bucket,
+  path: path,
+  data: data,
+  contentType: contentType,
+  progress: progress,
+  cancel: cancel,
+);
+
+/// Begin a streaming upload: run the prelude (DEK, storage_key, wrapped DEK,
+/// KEK version) and create the plan-only encoder. Drive the returned handle via
+/// `streaming_upload_plan_chunk` (×N, in order) → `streaming_upload_finalize_plan`
+/// → `streaming_upload_chunk` (×N) → `streaming_upload_finish`.
+Future<StreamingUploadHandle> streamingUploadBegin({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String key,
+  String? contentType,
+}) => RustLib.instance.api.crateApiForestStreamingUploadBegin(
+  client: client,
+  bucket: bucket,
+  key: key,
+  contentType: contentType,
+);
+
+/// Pass 1 — feed one plaintext slice (pushed from Dart) into the plan-only
+/// encoder. MUST be called sequentially in file order (BAO is order-sensitive).
+Future<void> streamingUploadPlanChunk({
+  required StreamingUploadHandle handle,
+  required List<int> bytes,
+}) => RustLib.instance.api.crateApiForestStreamingUploadPlanChunk(
+  handle: handle,
+  bytes: bytes,
+);
+
+/// End of pass 1 — finalize the plan, commit per-file metadata, and return the
+/// chunk count + chunk size so Dart can slice pass 2.
+Future<StreamingPlanInfo> streamingUploadFinalizePlan({
+  required StreamingUploadHandle handle,
+}) => RustLib.instance.api.crateApiForestStreamingUploadFinalizePlan(
+  handle: handle,
+);
+
+/// Pass 2 — encrypt + upload one chunk (pushed from Dart) using its committed
+/// nonce. Safe to call concurrently for distinct indices (Dart bounds the
+/// concurrency) and idempotent, so safe to retry.
+Future<void> streamingUploadChunk({
+  required StreamingUploadHandle handle,
+  required int chunkIndex,
+  required List<int> bytes,
+}) => RustLib.instance.api.crateApiForestStreamingUploadChunk(
+  handle: handle,
+  chunkIndex: chunkIndex,
+  bytes: bytes,
+);
+
+/// Finalize ("commit") — write the index object, register the file in the
+/// encrypted forest, and flush. After this the file is listable; before it the
+/// uploaded chunks are unreferenced.
+Future<PutResult> streamingUploadFinish({
+  required StreamingUploadHandle handle,
+}) => RustLib.instance.api.crateApiForestStreamingUploadFinish(handle: handle);
+
+/// [`put_flat_resumable_from_path_cancellable`] with live progress (native).
+Future<PutResult> putFlatResumableFromPathWithProgress({
+  required EncryptedClientHandle client,
+  required String bucket,
+  required String path,
+  required String filePath,
+  required String manifestPath,
+  String? contentType,
+  required CancelHandle cancel,
+  required ProgressHandle progress,
+}) => RustLib.instance.api.crateApiForestPutFlatResumableFromPathWithProgress(
+  client: client,
+  bucket: bucket,
+  path: path,
+  filePath: filePath,
+  manifestPath: manifestPath,
+  contentType: contentType,
+  cancel: cancel,
+  progress: progress,
+);
+
+/// [`resume_flat_upload_from_path_cancellable`] with live progress (native).
+/// Progress continues from the chunks the interrupted attempt already
+/// uploaded (the SDK seeds the counter), so the bar resumes mid-way.
+Future<PutResult> resumeFlatUploadFromPathWithProgress({
+  required EncryptedClientHandle client,
+  required String manifestPath,
+  required String filePath,
+  required CancelHandle cancel,
+  required ProgressHandle progress,
+}) => RustLib.instance.api.crateApiForestResumeFlatUploadFromPathWithProgress(
+  client: client,
+  manifestPath: manifestPath,
+  filePath: filePath,
+  cancel: cancel,
+  progress: progress,
+);
+
 /// Extract a subtree from the forest for sharing
 ///
 /// This creates a serialized subtree that can be shared with others.
@@ -354,3 +507,29 @@ Future<ForestSubtree> getForestSubtree({
 
 // Rust type: RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<CancelHandle>>
 abstract class CancelHandle implements RustOpaqueInterface {}
+
+// Rust type: RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ProgressHandle>>
+abstract class ProgressHandle implements RustOpaqueInterface {}
+
+// Rust type: RustOpaqueNom<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StreamingUploadHandle>>
+abstract class StreamingUploadHandle implements RustOpaqueInterface {}
+
+/// Returned by `streaming_upload_finalize_plan` so Dart knows how to slice
+/// pass 2 (chunk `i` = file bytes `[i*chunk_size .. min((i+1)*chunk_size, len)]`).
+class StreamingPlanInfo {
+  final int numChunks;
+  final int chunkSize;
+
+  const StreamingPlanInfo({required this.numChunks, required this.chunkSize});
+
+  @override
+  int get hashCode => numChunks.hashCode ^ chunkSize.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is StreamingPlanInfo &&
+          runtimeType == other.runtimeType &&
+          numChunks == other.numChunks &&
+          chunkSize == other.chunkSize;
+}

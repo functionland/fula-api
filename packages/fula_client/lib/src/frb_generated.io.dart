@@ -48,8 +48,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       ._rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandlePtr;
 
   CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_ProgressHandlePtr => wire
+      ._rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandlePtr;
+
+  CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_RotationManagerHandlePtr => wire
       ._rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandlePtr;
+
+  CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_StreamingUploadHandlePtr => wire
+      ._rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandlePtr;
 
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw);
@@ -85,8 +93,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ProgressHandle
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    dynamic raw,
+  );
+
+  @protected
   RotationManagerHandle
   dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    dynamic raw,
+  );
+
+  @protected
+  StreamingUploadHandle
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
     dynamic raw,
   );
 
@@ -121,8 +141,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ProgressHandle
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    dynamic raw,
+  );
+
+  @protected
   RotationManagerHandle
   dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    dynamic raw,
+  );
+
+  @protected
+  StreamingUploadHandle
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
     dynamic raw,
   );
 
@@ -157,8 +189,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ProgressHandle
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    dynamic raw,
+  );
+
+  @protected
   RotationManagerHandle
   dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    dynamic raw,
+  );
+
+  @protected
+  StreamingUploadHandle
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
     dynamic raw,
   );
 
@@ -339,6 +383,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   SharePermissions dco_decode_share_permissions(dynamic raw);
 
   @protected
+  StreamingPlanInfo dco_decode_streaming_plan_info(dynamic raw);
+
+  @protected
   int dco_decode_u_32(dynamic raw);
 
   @protected
@@ -390,8 +437,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ProgressHandle
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   RotationManagerHandle
   sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  StreamingUploadHandle
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
     SseDeserializer deserializer,
   );
 
@@ -426,8 +485,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ProgressHandle
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   RotationManagerHandle
   sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  StreamingUploadHandle
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
     SseDeserializer deserializer,
   );
 
@@ -462,8 +533,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ProgressHandle
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   RotationManagerHandle
   sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  StreamingUploadHandle
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
     SseDeserializer deserializer,
   );
 
@@ -670,6 +753,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   SharePermissions sse_decode_share_permissions(SseDeserializer deserializer);
+
+  @protected
+  StreamingPlanInfo sse_decode_streaming_plan_info(
+    SseDeserializer deserializer,
+  );
 
   @protected
   int sse_decode_u_32(SseDeserializer deserializer);
@@ -1519,6 +1607,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   }
 
   @protected
+  void cst_api_fill_to_wire_streaming_plan_info(
+    StreamingPlanInfo apiObj,
+    wire_cst_streaming_plan_info wireObj,
+  ) {
+    wireObj.num_chunks = cst_encode_u_32(apiObj.numChunks);
+    wireObj.chunk_size = cst_encode_u_32(apiObj.chunkSize);
+  }
+
+  @protected
   void cst_api_fill_to_wire_upload_progress(
     UploadProgress apiObj,
     wire_cst_upload_progress wireObj,
@@ -1562,8 +1659,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle raw,
+  );
+
+  @protected
+  int
   cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle raw,
+  );
+
+  @protected
+  int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle raw,
   );
 
   @protected
@@ -1598,8 +1707,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle raw,
+  );
+
+  @protected
+  int
   cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle raw,
+  );
+
+  @protected
+  int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle raw,
   );
 
   @protected
@@ -1634,8 +1755,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle raw,
+  );
+
+  @protected
+  int
   cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle raw,
+  );
+
+  @protected
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle raw,
   );
 
   @protected
@@ -1705,8 +1838,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
   sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle self,
     SseSerializer serializer,
   );
 
@@ -1747,8 +1894,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
   sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle self,
     SseSerializer serializer,
   );
 
@@ -1789,8 +1950,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
   sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle self,
     SseSerializer serializer,
   );
 
@@ -2070,6 +2245,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_share_permissions(
     SharePermissions self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_streaming_plan_info(
+    StreamingPlanInfo self,
     SseSerializer serializer,
   );
 
@@ -2522,6 +2703,18 @@ class RustLibWire implements BaseWire {
               ffi.Pointer<wire_cst_pinning_config>,
             )
           >();
+
+  void wire__crate__api__forest__create_progress_handle(int port_) {
+    return _wire__crate__api__forest__create_progress_handle(port_);
+  }
+
+  late final _wire__crate__api__forest__create_progress_handlePtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64)>>(
+        'frbgen_fula_client_wire__crate__api__forest__create_progress_handle',
+      );
+  late final _wire__crate__api__forest__create_progress_handle =
+      _wire__crate__api__forest__create_progress_handlePtr
+          .asFunction<void Function(int)>();
 
   void wire__crate__api__rotation__create_rotation_manager(
     int port_,
@@ -4335,6 +4528,18 @@ class RustLibWire implements BaseWire {
       _wire__crate__api__client__poll_master_health_events_encryptedPtr
           .asFunction<void Function(int, int)>();
 
+  void wire__crate__api__forest__poll_progress(int port_, int handle) {
+    return _wire__crate__api__forest__poll_progress(port_, handle);
+  }
+
+  late final _wire__crate__api__forest__poll_progressPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64, ffi.UintPtr)>>(
+        'frbgen_fula_client_wire__crate__api__forest__poll_progress',
+      );
+  late final _wire__crate__api__forest__poll_progress =
+      _wire__crate__api__forest__poll_progressPtr
+          .asFunction<void Function(int, int)>();
+
   void wire__crate__api__chunked__put_chunked(
     int port_,
     int client,
@@ -4747,6 +4952,166 @@ class RustLibWire implements BaseWire {
             )
           >();
 
+  void wire__crate__api__forest__put_flat_resumable_from_path_with_progress(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> bucket,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> file_path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> manifest_path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> content_type,
+    int cancel,
+    int progress,
+  ) {
+    return _wire__crate__api__forest__put_flat_resumable_from_path_with_progress(
+      port_,
+      client,
+      bucket,
+      path,
+      file_path,
+      manifest_path,
+      content_type,
+      cancel,
+      progress,
+    );
+  }
+
+  late final _wire__crate__api__forest__put_flat_resumable_from_path_with_progressPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.UintPtr,
+            ffi.UintPtr,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__forest__put_flat_resumable_from_path_with_progress',
+      );
+  late final _wire__crate__api__forest__put_flat_resumable_from_path_with_progress =
+      _wire__crate__api__forest__put_flat_resumable_from_path_with_progressPtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              int,
+              int,
+            )
+          >();
+
+  void wire__crate__api__forest__put_flat_with_progress(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> bucket,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> path,
+    ffi.Pointer<wire_cst_list_prim_u_8_loose> data,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> content_type,
+    int progress,
+  ) {
+    return _wire__crate__api__forest__put_flat_with_progress(
+      port_,
+      client,
+      bucket,
+      path,
+      data,
+      content_type,
+      progress,
+    );
+  }
+
+  late final _wire__crate__api__forest__put_flat_with_progressPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.UintPtr,
+          )
+        >
+      >('frbgen_fula_client_wire__crate__api__forest__put_flat_with_progress');
+  late final _wire__crate__api__forest__put_flat_with_progress =
+      _wire__crate__api__forest__put_flat_with_progressPtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              int,
+            )
+          >();
+
+  void wire__crate__api__forest__put_flat_with_progress_cancellable(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> bucket,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> path,
+    ffi.Pointer<wire_cst_list_prim_u_8_loose> data,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> content_type,
+    int progress,
+    int cancel,
+  ) {
+    return _wire__crate__api__forest__put_flat_with_progress_cancellable(
+      port_,
+      client,
+      bucket,
+      path,
+      data,
+      content_type,
+      progress,
+      cancel,
+    );
+  }
+
+  late final _wire__crate__api__forest__put_flat_with_progress_cancellablePtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.UintPtr,
+            ffi.UintPtr,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__forest__put_flat_with_progress_cancellable',
+      );
+  late final _wire__crate__api__forest__put_flat_with_progress_cancellable =
+      _wire__crate__api__forest__put_flat_with_progress_cancellablePtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              int,
+              int,
+            )
+          >();
+
   void wire__crate__api__client__put_object(
     int port_,
     int client,
@@ -4909,6 +5274,52 @@ class RustLibWire implements BaseWire {
               int,
               ffi.Pointer<wire_cst_list_prim_u_8_strict>,
               ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              int,
+            )
+          >();
+
+  void wire__crate__api__forest__resume_flat_upload_from_path_with_progress(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> manifest_path,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> file_path,
+    int cancel,
+    int progress,
+  ) {
+    return _wire__crate__api__forest__resume_flat_upload_from_path_with_progress(
+      port_,
+      client,
+      manifest_path,
+      file_path,
+      cancel,
+      progress,
+    );
+  }
+
+  late final _wire__crate__api__forest__resume_flat_upload_from_path_with_progressPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.UintPtr,
+            ffi.UintPtr,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__forest__resume_flat_upload_from_path_with_progress',
+      );
+  late final _wire__crate__api__forest__resume_flat_upload_from_path_with_progress =
+      _wire__crate__api__forest__resume_flat_upload_from_path_with_progressPtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              int,
               int,
             )
           >();
@@ -5145,6 +5556,145 @@ class RustLibWire implements BaseWire {
             )
           >();
 
+  void wire__crate__api__forest__streaming_upload_begin(
+    int port_,
+    int client,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> bucket,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> key,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> content_type,
+  ) {
+    return _wire__crate__api__forest__streaming_upload_begin(
+      port_,
+      client,
+      bucket,
+      key,
+      content_type,
+    );
+  }
+
+  late final _wire__crate__api__forest__streaming_upload_beginPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+          )
+        >
+      >('frbgen_fula_client_wire__crate__api__forest__streaming_upload_begin');
+  late final _wire__crate__api__forest__streaming_upload_begin =
+      _wire__crate__api__forest__streaming_upload_beginPtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            )
+          >();
+
+  void wire__crate__api__forest__streaming_upload_chunk(
+    int port_,
+    int handle,
+    int chunk_index,
+    ffi.Pointer<wire_cst_list_prim_u_8_loose> bytes,
+  ) {
+    return _wire__crate__api__forest__streaming_upload_chunk(
+      port_,
+      handle,
+      chunk_index,
+      bytes,
+    );
+  }
+
+  late final _wire__crate__api__forest__streaming_upload_chunkPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Uint32,
+            ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+          )
+        >
+      >('frbgen_fula_client_wire__crate__api__forest__streaming_upload_chunk');
+  late final _wire__crate__api__forest__streaming_upload_chunk =
+      _wire__crate__api__forest__streaming_upload_chunkPtr
+          .asFunction<
+            void Function(
+              int,
+              int,
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+            )
+          >();
+
+  void wire__crate__api__forest__streaming_upload_finalize_plan(
+    int port_,
+    int handle,
+  ) {
+    return _wire__crate__api__forest__streaming_upload_finalize_plan(
+      port_,
+      handle,
+    );
+  }
+
+  late final _wire__crate__api__forest__streaming_upload_finalize_planPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64, ffi.UintPtr)>>(
+        'frbgen_fula_client_wire__crate__api__forest__streaming_upload_finalize_plan',
+      );
+  late final _wire__crate__api__forest__streaming_upload_finalize_plan =
+      _wire__crate__api__forest__streaming_upload_finalize_planPtr
+          .asFunction<void Function(int, int)>();
+
+  void wire__crate__api__forest__streaming_upload_finish(
+    int port_,
+    int handle,
+  ) {
+    return _wire__crate__api__forest__streaming_upload_finish(port_, handle);
+  }
+
+  late final _wire__crate__api__forest__streaming_upload_finishPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Int64, ffi.UintPtr)>>(
+        'frbgen_fula_client_wire__crate__api__forest__streaming_upload_finish',
+      );
+  late final _wire__crate__api__forest__streaming_upload_finish =
+      _wire__crate__api__forest__streaming_upload_finishPtr
+          .asFunction<void Function(int, int)>();
+
+  void wire__crate__api__forest__streaming_upload_plan_chunk(
+    int port_,
+    int handle,
+    ffi.Pointer<wire_cst_list_prim_u_8_loose> bytes,
+  ) {
+    return _wire__crate__api__forest__streaming_upload_plan_chunk(
+      port_,
+      handle,
+      bytes,
+    );
+  }
+
+  late final _wire__crate__api__forest__streaming_upload_plan_chunkPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.UintPtr,
+            ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__forest__streaming_upload_plan_chunk',
+      );
+  late final _wire__crate__api__forest__streaming_upload_plan_chunk =
+      _wire__crate__api__forest__streaming_upload_plan_chunkPtr
+          .asFunction<
+            void Function(int, int, ffi.Pointer<wire_cst_list_prim_u_8_loose>)
+          >();
+
   void wire__crate__api__multipart__upload_large_file_simple(
     int port_,
     int client,
@@ -5282,6 +5832,48 @@ class RustLibWire implements BaseWire {
   late final _wire__crate__api__metrics__wal_truncated_groups_count =
       _wire__crate__api__metrics__wal_truncated_groups_countPtr
           .asFunction<void Function(int)>();
+
+  void wire__crate__api__sharing__wrap_secret_for_recipient(
+    int port_,
+    ffi.Pointer<wire_cst_list_prim_u_8_loose> secret,
+    ffi.Pointer<wire_cst_list_prim_u_8_loose> recipient_public_key,
+    ffi.Pointer<wire_cst_list_prim_u_8_strict> path_scope,
+    ffi.Pointer<ffi.Int64> expires_in_seconds,
+  ) {
+    return _wire__crate__api__sharing__wrap_secret_for_recipient(
+      port_,
+      secret,
+      recipient_public_key,
+      path_scope,
+      expires_in_seconds,
+    );
+  }
+
+  late final _wire__crate__api__sharing__wrap_secret_for_recipientPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Void Function(
+            ffi.Int64,
+            ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+            ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+            ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+            ffi.Pointer<ffi.Int64>,
+          )
+        >
+      >(
+        'frbgen_fula_client_wire__crate__api__sharing__wrap_secret_for_recipient',
+      );
+  late final _wire__crate__api__sharing__wrap_secret_for_recipient =
+      _wire__crate__api__sharing__wrap_secret_for_recipientPtr
+          .asFunction<
+            void Function(
+              int,
+              ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+              ffi.Pointer<wire_cst_list_prim_u_8_loose>,
+              ffi.Pointer<wire_cst_list_prim_u_8_strict>,
+              ffi.Pointer<ffi.Int64>,
+            )
+          >();
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
@@ -5454,6 +6046,40 @@ class RustLibWire implements BaseWire {
           .asFunction<void Function(ffi.Pointer<ffi.Void>)>();
 
   void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ffi.Pointer<ffi.Void> ptr,
+  ) {
+    return _rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+      ptr,
+    );
+  }
+
+  late final _rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandlePtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void>)>>(
+        'frbgen_fula_client_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle',
+      );
+  late final _rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle =
+      _rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandlePtr
+          .asFunction<void Function(ffi.Pointer<ffi.Void>)>();
+
+  void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ffi.Pointer<ffi.Void> ptr,
+  ) {
+    return _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+      ptr,
+    );
+  }
+
+  late final _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandlePtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void>)>>(
+        'frbgen_fula_client_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle',
+      );
+  late final _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle =
+      _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandlePtr
+          .asFunction<void Function(ffi.Pointer<ffi.Void>)>();
+
+  void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     ffi.Pointer<ffi.Void> ptr,
   ) {
@@ -5485,6 +6111,40 @@ class RustLibWire implements BaseWire {
       );
   late final _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle =
       _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandlePtr
+          .asFunction<void Function(ffi.Pointer<ffi.Void>)>();
+
+  void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    ffi.Pointer<ffi.Void> ptr,
+  ) {
+    return _rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+      ptr,
+    );
+  }
+
+  late final _rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandlePtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void>)>>(
+        'frbgen_fula_client_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle',
+      );
+  late final _rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle =
+      _rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandlePtr
+          .asFunction<void Function(ffi.Pointer<ffi.Void>)>();
+
+  void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    ffi.Pointer<ffi.Void> ptr,
+  ) {
+    return _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+      ptr,
+    );
+  }
+
+  late final _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandlePtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void>)>>(
+        'frbgen_fula_client_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle',
+      );
+  late final _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle =
+      _rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandlePtr
           .asFunction<void Function(ffi.Pointer<ffi.Void>)>();
 
   ffi.Pointer<wire_cst_encryption_config>
@@ -6314,6 +6974,14 @@ final class wire_cst_share_permissions extends ffi.Struct {
   external bool can_write;
 
   external ffi.Pointer<ffi.Int64> expires_at;
+}
+
+final class wire_cst_streaming_plan_info extends ffi.Struct {
+  @ffi.Uint32()
+  external int num_chunks;
+
+  @ffi.Uint32()
+  external int chunk_size;
 }
 
 final class wire_cst_upload_progress extends ffi.Struct {

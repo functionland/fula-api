@@ -582,6 +582,118 @@ fn generate_share_id() -> String {
     hex::encode(bytes)
 }
 
+/// Wrap an ARBITRARY 32-byte `secret` for a recipient X25519 public key,
+/// producing a `version = 5` [`ShareToken`] whose wrapped "DEK" *is* the secret.
+///
+/// This is the producer side of the MCP "Method-2" link-secret pairing: the
+/// recipient recovers the exact 32 secret bytes via
+/// [`ShareRecipient::accept_share`] (or the local MCP's
+/// `McpIdentity::accept_link_secret`, which is `accept_share` followed by
+/// `*AcceptedShare.dek.as_bytes()`).
+///
+/// It is a THIN composition of the already-tested [`ShareBuilder`] primitive —
+/// it introduces no new crypto. The only specialization is that the 32-byte
+/// secret is carried in the [`DekKey`] slot (exactly as the merged
+/// `McpIdentity::accept_link_secret` test does), so the recipient gets the
+/// secret back verbatim.
+///
+/// ## Ephemeral sender
+///
+/// The sender/owner keypair is generated FRESH inside this function and then
+/// dropped. The v5 share-token AAD binds the **recipient** public key
+/// (verified in [`ShareRecipient::accept_share`]), *not* the sender, so a
+/// stable owner identity is neither required nor leaked — `accept_share` never
+/// inspects the sender. This lets a caller (FxFiles' fail-closed
+/// `CollabLinkSecretWrapper`, or the Cloudflare Worker) wrap a secret for an
+/// AI/MCP recipient without holding any long-lived key of its own.
+///
+/// ## Security properties the caller MUST uphold
+///
+/// - **No sender authentication.** Because the sender is ephemeral and unbound,
+///   the token proves to the recipient only "this was wrapped *for my* public
+///   key" — NOT *who* wrapped it. Anyone who knows the recipient's (published)
+///   public key can mint a structurally valid token. The recovered secret is
+///   therefore a **bearer / possession** capability: the consumer (the MCP) must
+///   authorize a session on POSSESSION of the recovered secret, not on the
+///   wrap's origin. If owner attribution is ever required, the (currently
+///   unused) `owner_keypair` signing slot in [`ShareBuilder`] is where it would
+///   be added — it is intentionally not relied upon here.
+/// - **Authenticate the recipient public key out-of-band.** This function wraps
+///   for whatever public key you pass. If the caller obtained that key over an
+///   unauthenticated channel, a man-in-the-middle can substitute their own key
+///   and the wrap still "succeeds" — for the attacker. Callers MUST pin / verify
+///   the recipient's `FULA-` identity (TOFU-with-persistence, or signed by a
+///   stable owner key) before wrapping. This is the standard HPKE trust
+///   assumption, not a defect of this function.
+/// - **Recipient key validation.** Any 32 bytes are accepted as the recipient
+///   public key (matching `create_share_token`). The all-zero key and X25519
+///   low-order points are closed by RFC 9180 DHKEM, which aborts on an all-zero
+///   Diffie-Hellman shared secret, so `build()` returns `Err` rather than
+///   producing a trivially-decryptable token.
+/// - **Expiry semantics.** `expires_in_seconds` is a duration ADDED to "now":
+///   the token expires at `now + expires_in_seconds`. A negative value yields a
+///   born-expired token that `accept_share` rejects (fail-closed); `None` never
+///   expires.
+///
+/// ## Fail-closed input validation
+///
+/// Both `secret` and `recipient_public_key` MUST be exactly 32 bytes; any other
+/// length returns [`CryptoError::InvalidKey`] WITHOUT building a token.
+///
+/// # Arguments
+/// * `secret` - the 32 raw secret bytes to wrap (e.g. a collaboration link
+///   secret). Carried in the wrapped-DEK slot; recovered verbatim by the recipient.
+/// * `recipient_public_key` - the recipient's 32-byte X25519 public key.
+/// * `path_scope` - optional path/scope string bound into the token AAD
+///   (defaults to `"/"` when `None`; round-trips to the recipient unchanged).
+/// * `expires_in_seconds` - optional expiry as a duration from now, in seconds
+///   (`None` = never expires).
+///
+/// # Errors
+/// * [`CryptoError::InvalidKey`] if `secret` or `recipient_public_key` is not 32 bytes.
+/// * any error surfaced by the underlying HPKE DEK wrap.
+pub fn wrap_secret_for_recipient(
+    secret: &[u8],
+    recipient_public_key: &[u8],
+    path_scope: Option<&str>,
+    expires_in_seconds: Option<i64>,
+) -> Result<ShareToken> {
+    // Fail closed on bad lengths. `DekKey::from_bytes` / `PublicKey::from_bytes`
+    // also enforce 32, but check explicitly so the error names the bad field
+    // (and so no `KekKeyPair` is generated for an already-doomed call).
+    if secret.len() != 32 {
+        return Err(CryptoError::InvalidKey(format!(
+            "secret must be exactly 32 bytes, got {}",
+            secret.len()
+        )));
+    }
+    if recipient_public_key.len() != 32 {
+        return Err(CryptoError::InvalidKey(format!(
+            "recipient public key must be exactly 32 bytes, got {}",
+            recipient_public_key.len()
+        )));
+    }
+
+    // The 32-byte secret rides in the DEK slot; the recipient recovers it
+    // verbatim from `AcceptedShare.dek`.
+    let dek = DekKey::from_bytes(secret)?;
+    let recipient_pk = PublicKey::from_bytes(recipient_public_key)?;
+
+    // Ephemeral sender — see the "Ephemeral sender" doc section above. `build()`
+    // does not read `owner_keypair`; the recipient-pk binding lives in the AAD.
+    let ephemeral_sender = KekKeyPair::generate();
+
+    let mut builder = ShareBuilder::new(&ephemeral_sender, &recipient_pk, &dek);
+    if let Some(scope) = path_scope {
+        builder = builder.path_scope(scope);
+    }
+    if let Some(seconds) = expires_in_seconds {
+        builder = builder.expires_in(seconds);
+    }
+
+    builder.build()
+}
+
 /// Folder share manager for managing multiple shares
 #[derive(Default)]
 pub struct FolderShareManager {
@@ -876,6 +988,53 @@ mod tests {
         assert_eq!(accepted.path_scope, "/shared/");
         assert!(accepted.permissions.can_read);
         assert!(accepted.permissions.can_write);
+    }
+
+    #[test]
+    fn test_wrap_secret_for_recipient_round_trips() {
+        // The producer side of the MCP Method-2 pairing: wrap an arbitrary
+        // 32-byte secret for a recipient and recover it verbatim.
+        let recipient = KekKeyPair::generate();
+        let secret: [u8; 32] = std::array::from_fn(|i| i as u8); // 0x00..0x1f
+
+        let token = wrap_secret_for_recipient(
+            &secret,
+            recipient.public_key().as_bytes(),
+            Some("/collab/group-xyz"),
+            Some(3600),
+        )
+        .unwrap();
+
+        // It is a strict v5 token (the only kind accept_share will take).
+        assert_eq!(token.version, SHARE_TOKEN_AAD_V5);
+        assert_eq!(token.path_scope, "/collab/group-xyz");
+        assert!(token.expires_at.is_some());
+
+        // Survives a JSON round-trip (the wire form the bindings return) and
+        // the recipient recovers the EXACT secret bytes.
+        let json = serde_json::to_string(&token).unwrap();
+        let back: ShareToken = serde_json::from_str(&json).unwrap();
+        let accepted = ShareRecipient::new(&recipient).accept_share(&back).unwrap();
+        assert_eq!(accepted.dek.as_bytes(), &secret);
+
+        // A DIFFERENT recipient cannot recover it (recipient-pk AAD binding).
+        let stranger = KekKeyPair::generate();
+        assert!(ShareRecipient::new(&stranger).accept_share(&back).is_err());
+    }
+
+    #[test]
+    fn test_wrap_secret_for_recipient_rejects_bad_lengths() {
+        let recipient = KekKeyPair::generate();
+        let pk = recipient.public_key().as_bytes();
+
+        // Secret must be exactly 32 bytes.
+        assert!(wrap_secret_for_recipient(&[0u8; 31], pk, None, None).is_err());
+        assert!(wrap_secret_for_recipient(&[0u8; 33], pk, None, None).is_err());
+        // Recipient public key must be exactly 32 bytes.
+        assert!(wrap_secret_for_recipient(&[7u8; 32], &[0u8; 31], None, None).is_err());
+        assert!(wrap_secret_for_recipient(&[7u8; 32], &[0u8; 33], None, None).is_err());
+        // The all-valid case still succeeds (guards against a wholesale-reject bug).
+        assert!(wrap_secret_for_recipient(&[7u8; 32], pk, None, None).is_ok());
     }
 
     #[test]

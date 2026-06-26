@@ -50,8 +50,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
       .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMultipartHandle;
 
   CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_ProgressHandlePtr => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle;
+
+  CrossPlatformFinalizerArg
   get rust_arc_decrement_strong_count_RotationManagerHandlePtr => wire
       .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle;
+
+  CrossPlatformFinalizerArg
+  get rust_arc_decrement_strong_count_StreamingUploadHandlePtr => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle;
 
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw);
@@ -87,8 +95,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ProgressHandle
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    dynamic raw,
+  );
+
+  @protected
   RotationManagerHandle
   dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    dynamic raw,
+  );
+
+  @protected
+  StreamingUploadHandle
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
     dynamic raw,
   );
 
@@ -123,8 +143,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ProgressHandle
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    dynamic raw,
+  );
+
+  @protected
   RotationManagerHandle
   dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    dynamic raw,
+  );
+
+  @protected
+  StreamingUploadHandle
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
     dynamic raw,
   );
 
@@ -159,8 +191,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ProgressHandle
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    dynamic raw,
+  );
+
+  @protected
   RotationManagerHandle
   dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    dynamic raw,
+  );
+
+  @protected
+  StreamingUploadHandle
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
     dynamic raw,
   );
 
@@ -341,6 +385,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   SharePermissions dco_decode_share_permissions(dynamic raw);
 
   @protected
+  StreamingPlanInfo dco_decode_streaming_plan_info(dynamic raw);
+
+  @protected
   int dco_decode_u_32(dynamic raw);
 
   @protected
@@ -392,8 +439,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ProgressHandle
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   RotationManagerHandle
   sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  StreamingUploadHandle
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
     SseDeserializer deserializer,
   );
 
@@ -428,8 +487,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ProgressHandle
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   RotationManagerHandle
   sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  StreamingUploadHandle
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
     SseDeserializer deserializer,
   );
 
@@ -464,8 +535,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  ProgressHandle
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   RotationManagerHandle
   sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  StreamingUploadHandle
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
     SseDeserializer deserializer,
   );
 
@@ -672,6 +755,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   SharePermissions sse_decode_share_permissions(SseDeserializer deserializer);
+
+  @protected
+  StreamingPlanInfo sse_decode_streaming_plan_info(
+    SseDeserializer deserializer,
+  );
 
   @protected
   int sse_decode_u_32(SseDeserializer deserializer);
@@ -1241,6 +1329,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   }
 
   @protected
+  JSAny cst_encode_streaming_plan_info(StreamingPlanInfo raw) {
+    // Codec=Cst (C-struct based), see doc to use other codecs
+    return [
+      cst_encode_u_32(raw.numChunks),
+      cst_encode_u_32(raw.chunkSize),
+    ].jsify()!;
+  }
+
+  @protected
   JSAny cst_encode_u_64(BigInt raw) {
     // Codec=Cst (C-struct based), see doc to use other codecs
     return castNativeBigInt(raw);
@@ -1296,8 +1393,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle raw,
+  );
+
+  @protected
+  int
   cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle raw,
+  );
+
+  @protected
+  int
+  cst_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle raw,
   );
 
   @protected
@@ -1332,8 +1441,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle raw,
+  );
+
+  @protected
+  int
   cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle raw,
+  );
+
+  @protected
+  int
+  cst_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle raw,
   );
 
   @protected
@@ -1368,8 +1489,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle raw,
+  );
+
+  @protected
+  int
   cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle raw,
+  );
+
+  @protected
+  int
+  cst_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle raw,
   );
 
   @protected
@@ -1439,8 +1572,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
   sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle self,
     SseSerializer serializer,
   );
 
@@ -1481,8 +1628,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
   sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle self,
     SseSerializer serializer,
   );
 
@@ -1523,8 +1684,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    ProgressHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
   sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     RotationManagerHandle self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    StreamingUploadHandle self,
     SseSerializer serializer,
   );
 
@@ -1808,6 +1983,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_streaming_plan_info(
+    StreamingPlanInfo self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_u_32(int self, SseSerializer serializer);
 
   @protected
@@ -1967,6 +2148,9 @@ class RustLibWire implements BaseWire {
         encryption,
         pinning,
       );
+
+  void wire__crate__api__forest__create_progress_handle(NativePortType port_) =>
+      wasmModule.wire__crate__api__forest__create_progress_handle(port_);
 
   void wire__crate__api__rotation__create_rotation_manager(
     NativePortType port_,
@@ -2609,6 +2793,11 @@ class RustLibWire implements BaseWire {
     client,
   );
 
+  void wire__crate__api__forest__poll_progress(
+    NativePortType port_,
+    int handle,
+  ) => wasmModule.wire__crate__api__forest__poll_progress(port_, handle);
+
   void wire__crate__api__chunked__put_chunked(
     NativePortType port_,
     int client,
@@ -2758,6 +2947,67 @@ class RustLibWire implements BaseWire {
         cancel,
       );
 
+  void wire__crate__api__forest__put_flat_resumable_from_path_with_progress(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    String file_path,
+    String manifest_path,
+    String? content_type,
+    int cancel,
+    int progress,
+  ) => wasmModule
+      .wire__crate__api__forest__put_flat_resumable_from_path_with_progress(
+        port_,
+        client,
+        bucket,
+        path,
+        file_path,
+        manifest_path,
+        content_type,
+        cancel,
+        progress,
+      );
+
+  void wire__crate__api__forest__put_flat_with_progress(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    JSAny data,
+    String? content_type,
+    int progress,
+  ) => wasmModule.wire__crate__api__forest__put_flat_with_progress(
+    port_,
+    client,
+    bucket,
+    path,
+    data,
+    content_type,
+    progress,
+  );
+
+  void wire__crate__api__forest__put_flat_with_progress_cancellable(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    JSAny data,
+    String? content_type,
+    int progress,
+    int cancel,
+  ) => wasmModule.wire__crate__api__forest__put_flat_with_progress_cancellable(
+    port_,
+    client,
+    bucket,
+    path,
+    data,
+    content_type,
+    progress,
+    cancel,
+  );
+
   void wire__crate__api__client__put_object(
     NativePortType port_,
     int client,
@@ -2813,6 +3063,23 @@ class RustLibWire implements BaseWire {
         manifest_path,
         file_path,
         cancel,
+      );
+
+  void wire__crate__api__forest__resume_flat_upload_from_path_with_progress(
+    NativePortType port_,
+    int client,
+    String manifest_path,
+    String file_path,
+    int cancel,
+    int progress,
+  ) => wasmModule
+      .wire__crate__api__forest__resume_flat_upload_from_path_with_progress(
+        port_,
+        client,
+        manifest_path,
+        file_path,
+        cancel,
+        progress,
       );
 
   void wire__crate__api__rotation__rewrap_object(
@@ -2894,6 +3161,58 @@ class RustLibWire implements BaseWire {
     max_concurrency,
   );
 
+  void wire__crate__api__forest__streaming_upload_begin(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    String? content_type,
+  ) => wasmModule.wire__crate__api__forest__streaming_upload_begin(
+    port_,
+    client,
+    bucket,
+    key,
+    content_type,
+  );
+
+  void wire__crate__api__forest__streaming_upload_chunk(
+    NativePortType port_,
+    int handle,
+    int chunk_index,
+    JSAny bytes,
+  ) => wasmModule.wire__crate__api__forest__streaming_upload_chunk(
+    port_,
+    handle,
+    chunk_index,
+    bytes,
+  );
+
+  void wire__crate__api__forest__streaming_upload_finalize_plan(
+    NativePortType port_,
+    int handle,
+  ) => wasmModule.wire__crate__api__forest__streaming_upload_finalize_plan(
+    port_,
+    handle,
+  );
+
+  void wire__crate__api__forest__streaming_upload_finish(
+    NativePortType port_,
+    int handle,
+  ) => wasmModule.wire__crate__api__forest__streaming_upload_finish(
+    port_,
+    handle,
+  );
+
+  void wire__crate__api__forest__streaming_upload_plan_chunk(
+    NativePortType port_,
+    int handle,
+    JSAny bytes,
+  ) => wasmModule.wire__crate__api__forest__streaming_upload_plan_chunk(
+    port_,
+    handle,
+    bytes,
+  );
+
   void wire__crate__api__multipart__upload_large_file_simple(
     NativePortType port_,
     int client,
@@ -2943,6 +3262,20 @@ class RustLibWire implements BaseWire {
   void wire__crate__api__metrics__wal_truncated_groups_count(
     NativePortType port_,
   ) => wasmModule.wire__crate__api__metrics__wal_truncated_groups_count(port_);
+
+  void wire__crate__api__sharing__wrap_secret_for_recipient(
+    NativePortType port_,
+    JSAny secret,
+    JSAny recipient_public_key,
+    String? path_scope,
+    JSAny? expires_in_seconds,
+  ) => wasmModule.wire__crate__api__sharing__wrap_secret_for_recipient(
+    port_,
+    secret,
+    recipient_public_key,
+    path_scope,
+    expires_in_seconds,
+  );
 
   void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerAcceptedShareHandle(
@@ -3025,6 +3358,22 @@ class RustLibWire implements BaseWire {
       );
 
   void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+        ptr,
+      );
+
+  void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+        ptr,
+      );
+
+  void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     int ptr,
   ) => wasmModule
@@ -3037,6 +3386,22 @@ class RustLibWire implements BaseWire {
     int ptr,
   ) => wasmModule
       .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+        ptr,
+      );
+
+  void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+        ptr,
+      );
+
+  void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    int ptr,
+  ) => wasmModule
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
         ptr,
       );
 }
@@ -3138,6 +3503,10 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     JSAny config,
     JSAny encryption,
     JSAny pinning,
+  );
+
+  external void wire__crate__api__forest__create_progress_handle(
+    NativePortType port_,
   );
 
   external void wire__crate__api__rotation__create_rotation_manager(
@@ -3567,6 +3936,11 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     int client,
   );
 
+  external void wire__crate__api__forest__poll_progress(
+    NativePortType port_,
+    int handle,
+  );
+
   external void wire__crate__api__chunked__put_chunked(
     NativePortType port_,
     int client,
@@ -3651,6 +4025,40 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     int cancel,
   );
 
+  external void
+  wire__crate__api__forest__put_flat_resumable_from_path_with_progress(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    String file_path,
+    String manifest_path,
+    String? content_type,
+    int cancel,
+    int progress,
+  );
+
+  external void wire__crate__api__forest__put_flat_with_progress(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    JSAny data,
+    String? content_type,
+    int progress,
+  );
+
+  external void wire__crate__api__forest__put_flat_with_progress_cancellable(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String path,
+    JSAny data,
+    String? content_type,
+    int progress,
+    int cancel,
+  );
+
   external void wire__crate__api__client__put_object(
     NativePortType port_,
     int client,
@@ -3682,6 +4090,16 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     String manifest_path,
     String file_path,
     int cancel,
+  );
+
+  external void
+  wire__crate__api__forest__resume_flat_upload_from_path_with_progress(
+    NativePortType port_,
+    int client,
+    String manifest_path,
+    String file_path,
+    int cancel,
+    int progress,
   );
 
   external void wire__crate__api__rotation__rewrap_object(
@@ -3735,6 +4153,37 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
     int max_concurrency,
   );
 
+  external void wire__crate__api__forest__streaming_upload_begin(
+    NativePortType port_,
+    int client,
+    String bucket,
+    String key,
+    String? content_type,
+  );
+
+  external void wire__crate__api__forest__streaming_upload_chunk(
+    NativePortType port_,
+    int handle,
+    int chunk_index,
+    JSAny bytes,
+  );
+
+  external void wire__crate__api__forest__streaming_upload_finalize_plan(
+    NativePortType port_,
+    int handle,
+  );
+
+  external void wire__crate__api__forest__streaming_upload_finish(
+    NativePortType port_,
+    int handle,
+  );
+
+  external void wire__crate__api__forest__streaming_upload_plan_chunk(
+    NativePortType port_,
+    int handle,
+    JSAny bytes,
+  );
+
   external void wire__crate__api__multipart__upload_large_file_simple(
     NativePortType port_,
     int client,
@@ -3765,6 +4214,14 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
 
   external void wire__crate__api__metrics__wal_truncated_groups_count(
     NativePortType port_,
+  );
+
+  external void wire__crate__api__sharing__wrap_secret_for_recipient(
+    NativePortType port_,
+    JSAny secret,
+    JSAny recipient_public_key,
+    String? path_scope,
+    JSAny? expires_in_seconds,
   );
 
   external void
@@ -3818,12 +4275,32 @@ extension type RustLibWasmModule._(JSObject _) implements JSObject {
   );
 
   external void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    int ptr,
+  );
+
+  external void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerProgressHandle(
+    int ptr,
+  );
+
+  external void
   rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
     int ptr,
   );
 
   external void
   rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerRotationManagerHandle(
+    int ptr,
+  );
+
+  external void
+  rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
+    int ptr,
+  );
+
+  external void
+  rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStreamingUploadHandle(
     int ptr,
   );
 }
