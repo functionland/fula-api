@@ -9,10 +9,13 @@
 
 use crate::{
     CryptoError, Result,
+    chunked::{ChunkedDecoder, ChunkedFileMetadata},
     hpke::{Encryptor, Decryptor, EncryptedData, SharePermissions},
     keys::{DekKey, KekKeyPair, PublicKey, SecretKey},
+    symmetric::{Aead, Nonce},
     time::now_timestamp,
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -692,6 +695,215 @@ pub fn wrap_secret_for_recipient(
     }
 
     builder.build()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// METHOD-2 RECIPIENT CONSUMER: link-secret unwrap + owner-file decrypt
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// These are the RECIPIENT-side counterparts to `wrap_secret_for_recipient`,
+// exposed (via the `fula-js` wasm bindings) so the hosted Cloudflare Worker can
+// consume a Method-2 collaboration share WITHOUT re-implementing any `fula:v4`
+// crypto in TypeScript. They are THIN compositions of already-tested primitives
+// (`ShareRecipient::accept_share`, `Aead`, `Nonce`, `ChunkedDecoder`) — they add
+// NO new crypto.
+//
+// The owner-file decrypt logic ([`decrypt_accepted_single_block`] /
+// [`assemble_accepted_chunked`]) is a byte-for-byte mirror of the native MCP read
+// path (`crates/fula-mcp/src/read.rs` `decrypt_single_block` / `assemble_chunked`).
+// A `#[cfg(test)]` cross-check in that file asserts the two stay byte-identical,
+// so the Worker (wasm) and the native MCP cannot silently drift.
+
+/// Accept a strict-v5 share token with raw recipient X25519 secret-key bytes.
+///
+/// Centralizes the fail-closed 32-byte length check + [`ShareRecipient::accept_share`]
+/// so the unwrap / describe / decrypt entry points share ONE accept path.
+/// `accept_share` itself enforces the strict-v5 gate, the expiry check, and the
+/// recipient-public-key AAD binding (a wrong key, an expired token, or any
+/// tampered field ⇒ a generic authentication failure).
+fn accept_token(recipient_secret_key: &[u8], token: &ShareToken) -> Result<AcceptedShare> {
+    if recipient_secret_key.len() != 32 {
+        return Err(CryptoError::InvalidKey(format!(
+            "recipient secret key must be exactly 32 bytes, got {}",
+            recipient_secret_key.len()
+        )));
+    }
+    let secret = SecretKey::from_bytes(recipient_secret_key)?;
+    ShareRecipient::from_secret_key(secret).accept_share(token)
+}
+
+/// Recipient counterpart to [`wrap_secret_for_recipient`]: recover the EXACT
+/// 32-byte secret a producer wrapped for this recipient's X25519 public key.
+///
+/// For the Method-2 collaboration pairing the recovered "DEK" *is* the group
+/// link secret (the recipient then derives the manifest / collab-file keys from
+/// it). Fail-closed: a non-32-byte key, a pre-v5 / expired / tampered token, or a
+/// token addressed to a different key all return `Err`.
+///
+/// This is the shared core that the `fula-js` `unwrapSecretForRecipient` binding
+/// and the cross-impl KAT both call.
+pub fn unwrap_secret_for_recipient(
+    recipient_secret_key: &[u8],
+    token: &ShareToken,
+) -> Result<[u8; 32]> {
+    let accepted = accept_token(recipient_secret_key, token)?;
+    Ok(*accepted.dek.as_bytes())
+}
+
+/// Non-secret framing of an owner (`encType:"fula"`) share: whether the file is
+/// chunked and, if so, how many chunks. Lets a recipient that fetches ciphertext
+/// itself (the Worker) learn how many chunk objects to fetch BEFORE fetching —
+/// `num_chunks` lives INSIDE the encrypted share, so it is otherwise unknowable.
+///
+/// Deliberately carries NO key material (no DEK, no nonce, no metadata plaintext);
+/// only the framing the caller needs to drive its fetch loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedFileFraming {
+    /// True when the file is stored as multiple per-chunk objects.
+    pub chunked: bool,
+    /// Number of chunk objects to fetch (`1` for a single-block file).
+    pub num_chunks: u32,
+    /// The content encryption version recorded in the share (`None` = legacy v2).
+    pub encryption_version: Option<u8>,
+}
+
+/// Accept a share and report its [`SharedFileFraming`] (chunked? how many
+/// chunks?) WITHOUT exposing any key material. The DEK is decrypted only to
+/// authenticate the share, then dropped.
+pub fn describe_shared_file(
+    recipient_secret_key: &[u8],
+    token: &ShareToken,
+) -> Result<SharedFileFraming> {
+    let accepted = accept_token(recipient_secret_key, token)?;
+    let (chunked, num_chunks) = match accepted.chunked_metadata.as_deref() {
+        Some(meta_json) => (true, parse_chunked_metadata(meta_json)?.num_chunks),
+        None => (false, 1),
+    };
+    Ok(SharedFileFraming {
+        chunked,
+        num_chunks,
+        encryption_version: accepted.encryption_version,
+    })
+}
+
+/// Decrypt a SINGLE-BLOCK owner file: accept the share, then decrypt the
+/// already-fetched whole ciphertext. Errors if the share is actually chunked
+/// (the caller must use [`decrypt_shared_file_chunked`]).
+///
+/// Mirrors `read.rs::decrypt_single_block` exactly: the nonce is the
+/// base64-STANDARD decode of the share `nonce`; the AAD is
+/// `fula:v4:content:{storage_key}`; the version gate is `Some(>=4)` ⇒ AAD,
+/// `Some(<4)` ⇒ no AAD, `None` ⇒ try-AAD-then-plaintext.
+pub fn decrypt_shared_file_single_block(
+    recipient_secret_key: &[u8],
+    token: &ShareToken,
+    storage_key: &str,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>> {
+    let accepted = accept_token(recipient_secret_key, token)?;
+    if accepted.chunked_metadata.is_some() {
+        return Err(CryptoError::InvalidFormat(
+            "share is for a chunked file; use decrypt_shared_file_chunked".to_string(),
+        ));
+    }
+    decrypt_accepted_single_block(&accepted, ciphertext, storage_key)
+}
+
+/// Decrypt a CHUNKED owner file: accept the share, then assemble the
+/// already-fetched per-chunk ciphertexts. `chunks` MUST be in ascending chunk
+/// order (`chunks[i]` is chunk index `i`, fetched from `{storage_key}.chunks/{i:08}`).
+/// Errors if the share is single-block, or if `chunks.len()` does not match the
+/// share's `num_chunks` (checked BEFORE any per-chunk AEAD open).
+///
+/// Mirrors `read.rs::assemble_chunked` exactly: `format == "streaming-v2"` ⇒
+/// `ChunkedDecoder::with_aad(dek, meta, "fula:v4:chunk:{storage_key}")` (the
+/// decoder appends `:{index}` to the AAD per chunk), otherwise the legacy no-AAD
+/// decoder.
+pub fn decrypt_shared_file_chunked(
+    recipient_secret_key: &[u8],
+    token: &ShareToken,
+    storage_key: &str,
+    chunks: Vec<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let accepted = accept_token(recipient_secret_key, token)?;
+    let meta_json = accepted.chunked_metadata.as_deref().ok_or_else(|| {
+        CryptoError::InvalidFormat(
+            "share is for a single-block file; use decrypt_shared_file_single_block".to_string(),
+        )
+    })?;
+    let meta = parse_chunked_metadata(meta_json)?;
+    if chunks.len() != meta.num_chunks as usize {
+        return Err(CryptoError::InvalidFormat(format!(
+            "chunk count mismatch: share declares {} chunk(s), got {}",
+            meta.num_chunks,
+            chunks.len()
+        )));
+    }
+    let indexed: Vec<(u32, Vec<u8>)> = chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| (i as u32, c))
+        .collect();
+    assemble_accepted_chunked(accepted.dek, meta, &indexed, storage_key)
+}
+
+/// Parse a share's `chunked_metadata` JSON into [`ChunkedFileMetadata`].
+fn parse_chunked_metadata(meta_json: &str) -> Result<ChunkedFileMetadata> {
+    serde_json::from_str(meta_json)
+        .map_err(|e| CryptoError::InvalidFormat(format!("chunked metadata parse failed: {e}")))
+}
+
+/// Decrypt a single-block owner object from an ALREADY-accepted share. PURE (no
+/// I/O). Byte-for-byte mirror of `read.rs::decrypt_single_block` — the native MCP
+/// and the wasm binding share this exact logic (enforced by a cross-check test in
+/// `read.rs`).
+pub fn decrypt_accepted_single_block(
+    accepted: &AcceptedShare,
+    ciphertext: &[u8],
+    storage_key: &str,
+) -> Result<Vec<u8>> {
+    let nonce_b64 = accepted.nonce.as_deref().ok_or_else(|| {
+        CryptoError::InvalidFormat("single-block fula file has no nonce".to_string())
+    })?;
+    let nonce_bytes = base64::engine::general_purpose::STANDARD
+        .decode(nonce_b64)
+        .map_err(|e| CryptoError::InvalidFormat(format!("nonce base64: {e}")))?;
+    let nonce = Nonce::from_bytes(&nonce_bytes)?;
+
+    let aead = Aead::new_default(&accepted.dek);
+    let aad = format!("fula:v4:content:{storage_key}");
+
+    // Version gate — identical to fula-client's `get_object_with_share`.
+    let plaintext = match accepted.encryption_version {
+        Some(v) if v >= 4 => aead.decrypt_with_aad(&nonce, ciphertext, aad.as_bytes())?,
+        Some(_) => aead.decrypt(&nonce, ciphertext)?,
+        None => match aead.decrypt_with_aad(&nonce, ciphertext, aad.as_bytes()) {
+            Ok(p) => p,
+            Err(_) => aead.decrypt(&nonce, ciphertext)?,
+        },
+    };
+    Ok(plaintext)
+}
+
+/// Assemble a chunked owner object from already-fetched per-chunk ciphertexts and
+/// an already-accepted share's DEK + metadata. PURE (no I/O). Byte-for-byte mirror
+/// of `read.rs::assemble_chunked` (enforced by a cross-check test in `read.rs`).
+pub fn assemble_accepted_chunked(
+    dek: DekKey,
+    meta: ChunkedFileMetadata,
+    chunks: &[(u32, Vec<u8>)],
+    storage_key: &str,
+) -> Result<Vec<u8>> {
+    let mut decoder = if meta.format == "streaming-v2" {
+        ChunkedDecoder::with_aad(dek, meta, format!("fula:v4:chunk:{storage_key}"))
+    } else {
+        ChunkedDecoder::new(dek, meta)
+    };
+    for (i, ct) in chunks {
+        decoder.decrypt_chunk(*i, ct)?;
+    }
+    decoder.finalize().map(|b| b.to_vec())
 }
 
 /// Folder share manager for managing multiple shares

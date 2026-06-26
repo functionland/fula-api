@@ -1352,6 +1352,129 @@ pub fn wrap_secret_for_recipient(
         .map_err(|e| JsError::new(&format!("Failed to serialize share token: {}", e)))
 }
 
+// ----------------------------------------------------------------------------
+// Method-2 RECIPIENT bindings (sibling of `wrapSecretForRecipient`)
+// ----------------------------------------------------------------------------
+//
+// These let a Method-2 recipient (the hosted Cloudflare Worker) consume a v5
+// `ShareToken` WITHOUT an `EncryptedClient` and WITHOUT re-implementing any
+// `fula:v4` crypto in TypeScript. Each delegates to the shared
+// `fula_crypto::sharing` core that the cross-impl KAT also exercises; all are
+// fail-closed (they throw on a bad key length, malformed token JSON, a pre-v5 /
+// expired / tampered token, a token not addressed to this key, the wrong
+// single-block-vs-chunked path, or a chunk-count mismatch). HPKE acceptance
+// consumes no randomness, so these need no wasm RNG.
+
+/// Recover the raw 32-byte secret a producer wrapped for this recipient — the
+/// consumer half of `wrapSecretForRecipient`. For the Method-2 collaboration
+/// pairing the recovered bytes ARE the group link secret, from which the caller
+/// derives the manifest / collab-file keys.
+///
+/// @param recipient_secret_key - the recipient's 32-byte X25519 secret key (Uint8Array)
+/// @param token_json - the JSON-serialized v5 ShareToken
+/// @returns the recovered 32 secret bytes (Uint8Array)
+#[wasm_bindgen(js_name = unwrapSecretForRecipient)]
+pub fn unwrap_secret_for_recipient(
+    recipient_secret_key: &[u8],
+    token_json: &str,
+) -> Result<Vec<u8>, JsError> {
+    let token: fula_crypto::ShareToken = serde_json::from_str(token_json)
+        .map_err(|e| JsError::new(&format!("Invalid share token JSON: {}", e)))?;
+    let secret = fula_crypto::sharing::unwrap_secret_for_recipient(recipient_secret_key, &token)
+        .map_err(|e| JsError::new(&format!("Failed to unwrap secret for recipient: {}", e)))?;
+    Ok(secret.to_vec())
+}
+
+/// Report the NON-SECRET framing of an owner (`encType:"fula"`) share so the
+/// caller can plan its fetches: `{ chunked: boolean, numChunks: number,
+/// encryptionVersion: number | null }`. `numChunks` lives inside the encrypted
+/// share, so the caller must accept the share to learn how many chunk objects to
+/// fetch. Exposes NO key material (DEK / nonce / metadata stay in wasm).
+///
+/// @param recipient_secret_key - the recipient's 32-byte X25519 secret key (Uint8Array)
+/// @param token_json - the JSON-serialized v5 ShareToken
+/// @returns `{ chunked, numChunks, encryptionVersion }`
+#[wasm_bindgen(js_name = describeSharedFile)]
+pub fn describe_shared_file(
+    recipient_secret_key: &[u8],
+    token_json: &str,
+) -> Result<JsValue, JsError> {
+    let token: fula_crypto::ShareToken = serde_json::from_str(token_json)
+        .map_err(|e| JsError::new(&format!("Invalid share token JSON: {}", e)))?;
+    let framing = fula_crypto::sharing::describe_shared_file(recipient_secret_key, &token)
+        .map_err(|e| JsError::new(&format!("Failed to describe shared file: {}", e)))?;
+    serde_wasm_bindgen::to_value(&framing)
+        .map_err(|e| JsError::new(&format!("Failed to serialize framing: {}", e)))
+}
+
+/// Decrypt a SINGLE-BLOCK owner file (`encType:"fula"`): the caller fetches the
+/// whole ciphertext itself, then hands it here with the file's share token and
+/// obfuscated `storage_key`. Mirrors the native MCP read path exactly (AAD
+/// `fula:v4:content:{storage_key}` + the share nonce + the version gate). Throws
+/// if the share is actually chunked.
+///
+/// @param recipient_secret_key - the recipient's 32-byte X25519 secret key (Uint8Array)
+/// @param token_json - the JSON-serialized v5 ShareToken for this file
+/// @param storage_key - the file's obfuscated storage key (the AAD binding)
+/// @param ciphertext - the whole fetched ciphertext (Uint8Array)
+/// @returns the decrypted plaintext (Uint8Array)
+#[wasm_bindgen(js_name = decryptSharedFileSingleBlock)]
+pub fn decrypt_shared_file_single_block(
+    recipient_secret_key: &[u8],
+    token_json: &str,
+    storage_key: &str,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    let token: fula_crypto::ShareToken = serde_json::from_str(token_json)
+        .map_err(|e| JsError::new(&format!("Invalid share token JSON: {}", e)))?;
+    fula_crypto::sharing::decrypt_shared_file_single_block(
+        recipient_secret_key,
+        &token,
+        storage_key,
+        ciphertext,
+    )
+    .map_err(|e| JsError::new(&format!("Failed to decrypt owner file: {}", e)))
+}
+
+/// Decrypt a CHUNKED owner file (`encType:"fula"`): the caller fetches each chunk
+/// object itself (in order, from `{storage_key}.chunks/{i:08}`) and passes the
+/// ordered array of chunk ciphertexts here. `chunks[i]` MUST be chunk index `i`.
+/// Mirrors the native MCP read path exactly (`streaming-v2` ⇒ per-chunk AAD
+/// `fula:v4:chunk:{storage_key}:{index}`). Throws if the share is single-block or
+/// if the chunk count does not match the share.
+///
+/// @param recipient_secret_key - the recipient's 32-byte X25519 secret key (Uint8Array)
+/// @param token_json - the JSON-serialized v5 ShareToken for this file
+/// @param storage_key - the file's obfuscated storage key (the AAD binding)
+/// @param chunks - the ordered per-chunk ciphertexts (Array<Uint8Array>)
+/// @returns the decrypted, reassembled plaintext (Uint8Array)
+#[wasm_bindgen(js_name = decryptSharedFileChunked)]
+pub fn decrypt_shared_file_chunked(
+    recipient_secret_key: &[u8],
+    token_json: &str,
+    storage_key: &str,
+    chunks: js_sys::Array,
+) -> Result<Vec<u8>, JsError> {
+    let token: fula_crypto::ShareToken = serde_json::from_str(token_json)
+        .map_err(|e| JsError::new(&format!("Invalid share token JSON: {}", e)))?;
+    // Convert the JS `Array<Uint8Array>` to `Vec<Vec<u8>>`, failing closed on any
+    // element that is not a Uint8Array.
+    let mut owned: Vec<Vec<u8>> = Vec::with_capacity(chunks.length() as usize);
+    for (i, val) in chunks.iter().enumerate() {
+        let arr = val
+            .dyn_into::<js_sys::Uint8Array>()
+            .map_err(|_| JsError::new(&format!("chunk at index {} is not a Uint8Array", i)))?;
+        owned.push(arr.to_vec());
+    }
+    fula_crypto::sharing::decrypt_shared_file_chunked(
+        recipient_secret_key,
+        &token,
+        storage_key,
+        owned,
+    )
+    .map_err(|e| JsError::new(&format!("Failed to decrypt chunked owner file: {}", e)))
+}
+
 /// Accept a share token and get an AcceptedShare for accessing shared files
 ///
 /// @param client - EncryptedClient handle

@@ -444,4 +444,129 @@ mod tests {
         let out = assemble_chunked(accepted.dek, meta, &chunks, storage_key).unwrap();
         assert_eq!(out, payload);
     }
+
+    /// NO-DRIFT GATE: the native private `decrypt_single_block` / `assemble_chunked`
+    /// in this file and the shared `fula_crypto::sharing` cores that the wasm
+    /// recipient bindings call MUST produce BYTE-IDENTICAL output for the same
+    /// inputs. If anyone edits one copy of the `fula:v4` AAD / version-gate / chunk
+    /// logic without the other, this test fails — keeping the hosted Worker (wasm)
+    /// and the native MCP in lockstep. (The bindings live in `crates/fula-js`; this
+    /// test is the cheapest place that can see BOTH the private native fns and the
+    /// public shared cores.)
+    #[test]
+    fn native_and_shared_owner_file_cores_are_byte_identical() {
+        use fula_crypto::sharing::{assemble_accepted_chunked, decrypt_accepted_single_block};
+
+        // ── single block ──
+        let owner = KekKeyPair::generate();
+        let link = KekKeyPair::generate();
+        let dek = DekKey::generate();
+        let storage_key = "obfs-crosscheck-single";
+        let plaintext = b"cross-check single-block payload";
+        let nonce = Nonce::generate();
+        let aad = format!("fula:v4:content:{storage_key}");
+        let ciphertext = Aead::new_default(&dek)
+            .encrypt_with_aad(&nonce, plaintext, aad.as_bytes())
+            .unwrap();
+        let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce.as_bytes());
+        let token = ShareBuilder::new(&owner, link.public_key(), &dek)
+            .path_scope(storage_key)
+            .nonce(nonce_b64)
+            .encryption_version(4)
+            .build()
+            .unwrap();
+        let accepted = ShareRecipient::new(&link).accept_share(&token).unwrap();
+
+        let native = decrypt_single_block(&accepted, &ciphertext, storage_key).unwrap();
+        let shared = decrypt_accepted_single_block(&accepted, &ciphertext, storage_key).unwrap();
+        assert_eq!(native, shared, "single-block cores diverged");
+        assert_eq!(native.as_slice(), plaintext);
+
+        // Both reject a wrong storage_key (AAD mismatch) identically.
+        assert!(decrypt_single_block(&accepted, &ciphertext, "wrong-key").is_err());
+        assert!(decrypt_accepted_single_block(&accepted, &ciphertext, "wrong-key").is_err());
+
+        // ── single block, version Some(2) (legacy, NO AAD) — cross-check the no-AAD arm ──
+        {
+            let dek_v2 = DekKey::generate();
+            let sk = "obfs-crosscheck-single-v2";
+            let pt = b"cross-check v2 no-aad payload";
+            let nonce_v2 = Nonce::generate();
+            let ct_v2 = Aead::new_default(&dek_v2).encrypt(&nonce_v2, pt).unwrap(); // no AAD
+            let nb64 = base64::engine::general_purpose::STANDARD.encode(nonce_v2.as_bytes());
+            let tok = ShareBuilder::new(&owner, link.public_key(), &dek_v2)
+                .path_scope(sk)
+                .nonce(nb64)
+                .encryption_version(2)
+                .build()
+                .unwrap();
+            let acc = ShareRecipient::new(&link).accept_share(&tok).unwrap();
+            let n = decrypt_single_block(&acc, &ct_v2, sk).unwrap();
+            let s = decrypt_accepted_single_block(&acc, &ct_v2, sk).unwrap();
+            assert_eq!(n, s, "single-block Some(<4) cores diverged");
+            assert_eq!(n.as_slice(), pt);
+        }
+        // ── single block, version None (try-AAD-then-plaintext) — cross-check BOTH sub-paths ──
+        {
+            let dek_none = DekKey::generate();
+            let sk = "obfs-crosscheck-single-none";
+            let pt = b"cross-check none-arm payload";
+            // (i) None + AAD-bound ciphertext (the primary try-AAD path)
+            let nonce_a = Nonce::generate();
+            let aad_n = format!("fula:v4:content:{sk}");
+            let ct_aad = Aead::new_default(&dek_none)
+                .encrypt_with_aad(&nonce_a, pt, aad_n.as_bytes())
+                .unwrap();
+            let nb64a = base64::engine::general_purpose::STANDARD.encode(nonce_a.as_bytes());
+            let tok_a = ShareBuilder::new(&owner, link.public_key(), &dek_none)
+                .path_scope(sk)
+                .nonce(nb64a)
+                .build()
+                .unwrap(); // no encryption_version => None
+            let acc_a = ShareRecipient::new(&link).accept_share(&tok_a).unwrap();
+            assert_eq!(
+                decrypt_single_block(&acc_a, &ct_aad, sk).unwrap(),
+                decrypt_accepted_single_block(&acc_a, &ct_aad, sk).unwrap(),
+                "single-block None+AAD cores diverged"
+            );
+            // (ii) None + no-AAD ciphertext (the plaintext fallback)
+            let nonce_b = Nonce::generate();
+            let ct_plain = Aead::new_default(&dek_none).encrypt(&nonce_b, pt).unwrap();
+            let nb64b = base64::engine::general_purpose::STANDARD.encode(nonce_b.as_bytes());
+            let tok_b = ShareBuilder::new(&owner, link.public_key(), &dek_none)
+                .path_scope(sk)
+                .nonce(nb64b)
+                .build()
+                .unwrap();
+            let acc_b = ShareRecipient::new(&link).accept_share(&tok_b).unwrap();
+            let n = decrypt_single_block(&acc_b, &ct_plain, sk).unwrap();
+            let s = decrypt_accepted_single_block(&acc_b, &ct_plain, sk).unwrap();
+            assert_eq!(n, s, "single-block None+plaintext-fallback cores diverged");
+            assert_eq!(n.as_slice(), pt);
+        }
+
+        // ── chunked (streaming-v2, multi-chunk) ──
+        let dek2 = DekKey::generate();
+        let storage_key2 = "obfs-crosscheck-chunk";
+        let payload = vec![0x5au8; 200_000]; // > one 64 KiB chunk ⇒ multi-chunk
+        let prefix = format!("fula:v4:chunk:{storage_key2}");
+        let mut enc =
+            ChunkedEncoder::with_aad_and_chunk_size(dek2.clone(), prefix.into_bytes(), 64 * 1024);
+        let mut chunks: Vec<(u32, Vec<u8>)> = enc
+            .update(&payload)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.index, c.ciphertext.to_vec()))
+            .collect();
+        let (final_chunk, meta, _ob) = enc.finalize().unwrap();
+        if let Some(c) = final_chunk {
+            chunks.push((c.index, c.ciphertext.to_vec()));
+        }
+        assert!(meta.num_chunks > 1, "test must be multi-chunk");
+
+        let native_c = assemble_chunked(dek2.clone(), meta.clone(), &chunks, storage_key2).unwrap();
+        let shared_c = assemble_accepted_chunked(dek2, meta, &chunks, storage_key2).unwrap();
+        assert_eq!(native_c, shared_c, "chunked cores diverged");
+        assert_eq!(native_c, payload);
+    }
 }
