@@ -1313,6 +1313,45 @@ pub fn ed25519_public_key(signing_seed: &[u8]) -> Result<Vec<u8>, JsError> {
 // Sharing
 // ============================================================================
 
+/// Wrap an ARBITRARY 32-byte secret for a recipient X25519 public key,
+/// producing a serialized v5 ShareToken (JSON).
+///
+/// This is the producer side of the secure "Method 2" AI-pairing for the
+/// Cloudflare Worker: wrap a collaboration link secret for an AI/MCP recipient's
+/// public key and hand the recipient a token they open with
+/// `McpIdentity::accept_link_secret` (i.e. `fula_crypto` `ShareRecipient`) to
+/// recover the EXACT secret bytes. Needs NO client and NO stored file — it wraps
+/// the raw bytes you pass in.
+///
+/// The sender/owner keypair is generated EPHEMERALLY inside `fula-crypto`: the
+/// v5 token AAD binds the RECIPIENT public key, not the sender, so the caller
+/// needs no stable identity of its own. Fails closed (throws) on non-32-byte
+/// inputs.
+///
+/// @param secret - the 32 raw secret bytes to wrap (Uint8Array)
+/// @param recipientPublicKey - the recipient's 32-byte X25519 public key (Uint8Array)
+/// @param pathScope - optional scope string bound into the token (defaults to "/")
+/// @param expiresInSeconds - optional expiry as seconds-from-now (null = never)
+/// @returns JSON-serialized ShareToken string
+#[wasm_bindgen(js_name = wrapSecretForRecipient)]
+pub fn wrap_secret_for_recipient(
+    secret: &[u8],
+    recipient_public_key: &[u8],
+    path_scope: Option<String>,
+    expires_in_seconds: Option<i64>,
+) -> Result<String, JsError> {
+    let token = fula_crypto::sharing::wrap_secret_for_recipient(
+        secret,
+        recipient_public_key,
+        path_scope.as_deref(),
+        expires_in_seconds,
+    )
+    .map_err(|e| JsError::new(&format!("Failed to wrap secret for recipient: {}", e)))?;
+
+    serde_json::to_string(&token)
+        .map_err(|e| JsError::new(&format!("Failed to serialize share token: {}", e)))
+}
+
 /// Accept a share token and get an AcceptedShare for accessing shared files
 ///
 /// @param client - EncryptedClient handle
@@ -1766,5 +1805,42 @@ mod tests {
     fn test_version() {
         let version = get_version();
         assert!(!version.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn test_wrap_secret_for_recipient_round_trips() {
+        // The `wrapSecretForRecipient` binding must produce a parseable v5
+        // ShareToken whose wrapped secret the recipient recovers verbatim.
+        use fula_crypto::sharing::ShareRecipient;
+        use fula_crypto::{SecretKey, ShareToken};
+
+        // Recipient (the AI/MCP) — derive its pubkey from known secret bytes.
+        let recipient_secret_bytes = [0x55u8; 32];
+        let recipient_secret = SecretKey::from_bytes(&recipient_secret_bytes).unwrap();
+        let recipient_pub = recipient_secret.public_key();
+
+        let secret: Vec<u8> = (0u8..32).collect(); // 0x00..0x1f
+
+        let token_json = wrap_secret_for_recipient(
+            &secret,
+            recipient_pub.as_bytes(),
+            Some("/collab/group-wasm".to_string()),
+            Some(3600),
+        )
+        .expect("binding must succeed for valid 32-byte inputs");
+
+        // Parses as a strict v5 ShareToken.
+        let token: ShareToken = serde_json::from_str(&token_json).unwrap();
+        assert_eq!(token.version, 5);
+        assert_eq!(token.path_scope, "/collab/group-wasm");
+
+        // Recipient recovers the EXACT secret (producer<->consumer round-trip).
+        let accepted = ShareRecipient::from_secret_key(recipient_secret)
+            .accept_share(&token)
+            .expect("recipient must accept the token");
+        assert_eq!(accepted.dek.as_bytes().as_slice(), secret.as_slice());
+
+        // Non-32-byte secret fails closed.
+        assert!(wrap_secret_for_recipient(&[0u8; 31], recipient_pub.as_bytes(), None, None).is_err());
     }
 }
