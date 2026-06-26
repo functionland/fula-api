@@ -32,7 +32,21 @@
 
 use thiserror::Error;
 
+/// The MCP's per-session collaboration authority bundle — the per-group link
+/// secret (recovered once from the wrapped share token via the local
+/// [`identity`]), the optional write token, and the shared HTTP client — parsed
+/// from `FULA_MCP_CAPABILITY`. Replaces the old workspace/grant bundle.
 pub mod capability;
+
+/// The collaboration HTTP client for the `/api/collab/{group_id}/*` endpoints:
+/// manifest-sync (GET/PUT), collab-file get + upload, and owner-file `fula-fetch`.
+/// All crypto is delegated to [`manifest`] / `fula-crypto`.
+pub mod collab;
+
+/// Pure path / tree helpers over the manifest (logical paths, folder
+/// normalization, directory markers, tombstone filtering) shared by the read /
+/// list / store ops.
+pub mod tree;
 
 /// Collaboration manifest + collab-file crypto — a byte-exact Rust port of the
 /// Dart `share_link_builder.dart` / `CollaborationService` (and TS
@@ -56,31 +70,31 @@ pub mod identity;
 /// `ShelfClassifier` + the content-bucket map (P4).
 pub mod category;
 
-/// The AI's scoped, encrypted WRITE operation: `store_file` (P5). Writes a file
-/// into the AI's own encrypted workspace and mints an owner-readable share
-/// token for it. See [`store::store_file`].
+/// The AI's collaboration WRITE ops: `store_file` / `create_folder` /
+/// `remove_file`. Each encrypts (for `store_file`) + uploads a per-file blob and
+/// commits an additive change to the group manifest via GET-latest →
+/// `remote.merge_with(&local)` → PUT (merge-on-write, so concurrent human edits
+/// survive). Removal is a manifest TOMBSTONE, never a server delete. See
+/// [`store::store_file`].
 pub mod store;
 
-/// The AI's scoped, decrypting READ operation: `read_file` (P6). The home of the
-/// default-deny read guarantee — reads ONLY the AI's own workspace files (`ai/`
-/// scope) or files the owner explicitly granted via a share token, rejecting
-/// anything else before any network I/O. See [`read::read_file`].
+/// The AI's collaboration READ op: `read_file` (by file id or logical path).
+/// Resolves the entry in the group manifest and decrypts it — `collab` blobs with
+/// the per-file collab key, `fula` (owner) files by accepting the share token with
+/// the group link keypair and mirroring `fula-client`'s single-block / chunked
+/// decrypt. See [`read::read_file`].
 pub mod read;
 
-/// The AI's scoped ENUMERATION operations: `list_files` + `search` (P7).
-/// Enumerates ONLY the AI's own `ai/` workspace forest — confined by the P3
-/// segment-boundary geometry so the user's real buckets can never leak — with
-/// optional category / sub-prefix narrowing and filename search. See
-/// [`list::list_files`] and [`list::search`].
+/// The AI's collaboration ENUMERATION ops: `list_files` + `search` over the group
+/// manifest, with an optional folder-prefix / category filter and directory-marker
+/// awareness so a folder tree can be derived. See [`list::list_files`] and
+/// [`list::search`].
 pub mod list;
 
-/// The AI's TAG operations: `tag_file` + `list_tags` (P8). Writes the AI's tags
-/// into its OWN workspace as a [`TagCloudMetadata`](tags::TagCloudMetadata)
-/// document whose JSON byte-shape is identical to FxFiles' native tag format, so
-/// FxFiles can adopt them with a straight additive-by-id merge. The document is
-/// NOT the user's master-key-encrypted `tag-metadata-v8` doc — it lives under the
-/// `ai/` scope in the workspace bucket (encrypted with the workspace secret). See
-/// [`tags::tag_file`] and [`tags::list_tags`].
+/// The AI's TAG operations — DEFERRED in collaboration mode. The manifest is
+/// byte-exact with the Dart/TS producers, so embedding tags would lose them
+/// cross-client; the tools return an explicit "unsupported (deferred)" outcome
+/// rather than silently succeeding. See [`tags`] for the rationale + TODO.
 pub mod tags;
 
 /// Fail-fast credit/quota pre-check + a per-session WRITE rate limiter (P10).
@@ -88,26 +102,26 @@ pub mod tags;
 /// OPEN on any error (the gateway re-enforces quota on the real PUT, so a check
 /// outage degrades to "the PUT may fail later," not "all writes blocked"); the
 /// token-bucket limiter throttles a runaway AI's writes per session. Both run
-/// after the scope check, before the heavy encrypt+upload. See [`quota`].
+/// after input validation, before the heavy encrypt+upload. See [`quota`].
 pub mod quota;
 
-/// Silent connection-JWT auto-refresh (L1c). When a gateway op is rejected with
-/// an auth error (the short scoped JWT expired), the MCP refreshes the JWT
-/// against pinning-webui's `POST /api/mcp/tokens/refresh-connection` using the
-/// long-lived connection refresh token, swaps it in, and retries the op ONCE. A
-/// refresh that itself 401/403s means the connection was REVOKED (terminal). See
-/// [`refresh::refresh_connection_jwt`] (the HTTP helper) and [`retry`] (the
-/// op-layer refresh-on-auth-error wrapper). Backward-compatible: a bundle with no
-/// `refresh_token` never refreshes (the op's auth error surfaces as before).
+/// Silent token auto-refresh. POSTs `{refresh_token}` to `refresh_url` and parses
+/// the fresh `{token}` (the `POST /api/mcp/tokens/refresh-connection` contract); a
+/// refresh that itself 401/403s means REVOKED (terminal). Reused by [`retry`] to
+/// re-mint the `collab_write_token` on a write 401/403. Backward-compatible: with
+/// no `refresh_token`/`refresh_url`, no refresh is attempted. See
+/// [`refresh::refresh_connection_jwt`].
 pub mod refresh;
 
-/// The shared refresh-on-auth-error retry wrapper (L1c). Wraps a single gateway
-/// call so an auth rejection triggers exactly one refresh-then-retry. See
-/// [`retry::with_refresh_retry`] and [`retry::is_gateway_auth_error`].
+/// The collab write-token refresh-on-auth retry wrapper. Wraps a single
+/// collaboration WRITE call so a 401/403 re-mints the `collab_write_token` (via
+/// [`refresh::refresh_connection_jwt`]'s `{refresh_token} → {token}` shape) and
+/// retries exactly once. See [`retry::with_collab_write_retry`].
 pub mod retry;
 
-/// The stdio MCP server that exposes the six P5–P8 ops as Model Context Protocol
-/// tools (P9). Loads the [`capability::CapabilityBundle`] from the environment
+/// The stdio MCP server that exposes the collaboration ops (read / list / search /
+/// store / create_folder / remove_file; tag tools deferred) as Model Context
+/// Protocol tools. Loads the [`capability::CapabilityBundle`] from the environment
 /// once at startup (in memory only) and runs over stdio via the `rmcp` SDK. See
 /// [`server::run`] (env-driven entrypoint) and [`server::FulaMcpServer`].
 pub mod server;

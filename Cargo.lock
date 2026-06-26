@@ -2074,6 +2074,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "fula-client",
  "fula-crypto",
  "hex",
@@ -2091,6 +2092,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
  "zeroize",
 ]
 

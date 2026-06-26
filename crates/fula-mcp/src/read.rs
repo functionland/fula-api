@@ -1,698 +1,447 @@
-//! # `read_file` — the AI's scoped, DECRYPT-ing READ operation (P6)
+//! # `read_file` — the AI's collaboration READ operation
 //!
-//! The read counterpart to P5's [`crate::store`]. This is where the
-//! **default-deny read guarantee** lives: the AI (the MCP server) may read ONLY
+//! Reads a file referenced by the group's manifest, by its `file_id` or by a
+//! logical `path`. Authorization is membership in the group: every entry the
+//! manifest lists is, by construction, shared with the group, so there is no
+//! `ai/`-scope gate — only "is this entry in THIS group's manifest".
 //!
-//! 1. **its own workspace files** — objects it wrote under the `ai/` scope into
-//!    [`WORKSPACE_BUCKET`] (decrypted with the dedicated workspace secret), and
-//! 2. **files the owner explicitly granted** to the MCP — delivered as an
-//!    `owner → MCP` [`ShareToken`] (decrypted with the per-file DEK the token
-//!    wraps to the MCP's keypair).
+//! ## Two on-wire encodings (`encType`)
 //!
-//! Anything else is **rejected with a [`ReadError::Capability`] BEFORE any
-//! network I/O** — never silently read. The MCP-protocol wiring (tool dispatch)
-//! comes later (P9); here we build + test the operation as a plain async
-//! library call.
+//! - **`collab`** — a blob encrypted under the per-file collab key (HKDF of the
+//!   link secret + file id). Fetched whole from `GET /file/{id}` and decrypted with
+//!   [`collab_file_decrypt`].
+//! - **`fula`** — an OWNER's fula-encrypted object, shared into the group via a
+//!   `fula_crypto` [`ShareToken`] (in `share_token_json`, addressed to the group
+//!   **link keypair**). We accept the share to recover the DEK + nonce / chunked
+//!   metadata, fetch the ciphertext via `GET /fula-fetch`, and decrypt.
 //!
-//! ## The two read modes (both scope-enforced, gate runs before I/O)
+//! ## fula decrypt — a faithful port of `fula-client`'s share-read path
 //!
-//! ### 1. Workspace read — the AI's OWN files
-//! [`read_workspace_file`]:
-//! ```text
-//! assert_in_scope(key, WORKSPACE_KEY_PREFIX, Read)?   // gate, no I/O
-//! workspace_client()?.get_object_flat(WORKSPACE_BUCKET, key)   // decrypt w/ own secret
-//! ```
-//! The workspace client is built from the dedicated workspace secret (NOT the
-//! user's master KEK), so it can only ever decrypt the AI's own forest. The gate
-//! requires the bundle to actually hold a `Read` grant for the `ai/` scope and
-//! the key to be segment-contained in it.
+//! The recipe below mirrors `fula-client`'s `get_object_with_share` byte-for-byte
+//! (the path the FxFiles app + web portal use), so the MCP reads exactly what
+//! those clients produce:
 //!
-//! ### 2. Granted read — a file the owner explicitly shared to the MCP
-//! [`read_granted_file`]:
-//! ```text
-//! accepted = accept_grant(token)?                              // in-memory crypto, NO I/O
-//! assert_in_scope(original_key, &accepted.path_scope, Read)?   // gate, no I/O
-//! get_object_with_share(bucket, storage_key, original_key, &accepted)   // decrypt w/ share DEK
-//! ```
-//! [`CapabilityBundle::accept_grant`] is pure in-memory HPKE unwrap — it touches
-//! no network — so it legitimately precedes the gate (the gate still runs before
-//! the one call that DOES hit the wire, [`EncryptedClient::get_object_with_share`]).
+//! - **single block** (`chunked_metadata` absent): one fetch of `storage_key`;
+//!   nonce = base64-STANDARD decode of the share's `nonce`; AAD =
+//!   `fula:v4:content:{storage_key}`; decrypt gated on `encryption_version`
+//!   (`Some(>=4)` ⇒ AAD; `Some(<4)` ⇒ no AAD; `None` ⇒ try-AAD-then-plaintext).
+//! - **chunked** (`chunked_metadata` present): decoder gated on the metadata
+//!   `format` (`"streaming-v2"` ⇒ AAD prefix `fula:v4:chunk:{storage_key}`, else no
+//!   AAD); each chunk fetched as a SEPARATE object at `{storage_key}.chunks/{i:08}`
+//!   (via [`ChunkedFileMetadata::chunk_key`]); the decoder appends the decimal
+//!   `:{i}` to the AAD internally.
 //!
-//! ## The granted-read scope gate (the security crux) — and its invariant
-//!
-//! The gate for a granted read is the single call
-//! `assert_in_scope(original_key, &accepted.path_scope, Permission::Read)`. That
-//! one call enforces BOTH halves the task requires, and is *strictly stronger*
-//! than the SDK's own share check:
-//!
-//! - **Geometry** — `original_key` must be inside `accepted.path_scope` by P3's
-//!   **path-segment** boundary. This is the part that beats the footgun: the
-//!   crypto layer's [`AcceptedShare::is_path_allowed`] is a naive *substring*
-//!   `path.starts_with(path_scope)`, which would wrongly admit `ai/notebook.txt`
-//!   under a grant of `ai/note`. The segment check rejects exactly that. (The
-//!   SDK's substring check still runs underneath inside `get_object_with_share`
-//!   as defense-in-depth; we simply never *rely* on it.)
-//! - **Authority** — the session [`CapabilityBundle`] must hold a `Read` grant
-//!   whose canonical scope **EQUALS** `accepted.path_scope`. Mere possession of a
-//!   valid `ShareToken` is NOT sufficient: the token's scope must correspond to
-//!   an authority grant injected into the session. This is the fail-closed,
-//!   auditable choice (confirmed by the P6 design review with the built-in
-//!   advisor + Codex/GPT-5.5): a stolen or stale token the session was never
-//!   granted authority for is denied.
-//!
-//! ### INVARIANT the session injector (P9) must uphold
-//!
-//! Because the authority check is **equality** (not "a broader grant covers the
-//! token scope"), the component that builds the [`CapabilityBundle`] for a
-//! session MUST add a `Read` grant whose canonical scope equals each granted
-//! token's `path_scope`. A broad bundle grant (`photos/`) does NOT by itself
-//! authorize a read against a narrower token (`photos/2026/x.jpg`) — the bundle
-//! must also carry the `photos/2026/x.jpg` grant. This keeps "the owner granted
-//! the AI authority over THIS scope" explicit and coordinated with token
-//! minting, rather than letting token possession silently widen what the AI can
-//! read. If a future product model wants broad-grant→narrow-token delegation,
-//! that is a deliberate spec change (add a separate, explicitly-named coverage
-//! API — do NOT loosen `assert_in_scope` to mean coverage).
-//!
-//! ## What this module deliberately does NOT do
-//!
-//! - It does not hardcode the bucket for granted reads — the caller supplies the
-//!   target `bucket` (per the P5 [`crate::store::StoreOutcome`] contract: a
-//!   reader reads `bucket`, never assumes [`WORKSPACE_BUCKET`]). Workspace reads
-//!   DO use [`WORKSPACE_BUCKET`] because that is, by definition, where the AI's
-//!   own files live.
-//! - It never gates on the obfuscated `storage_key`. The gate always runs on the
-//!   **logical** key (`key` for workspace, `original_key` for granted) — the
-//!   human-meaningful path the scope commits to. Bytes are fetched by
-//!   `storage_key`, but authority is decided on the logical path.
+//! NOTE (deliberate fidelity, flagged for review): the `encryption_version == None`
+//! single-block branch keeps `fula-client`'s try-AAD-then-plaintext fallback. That
+//! fallback drops the storage-key AAD binding for legacy (`None`-version) objects.
+//! We mirror the authoritative reader rather than being stricter (compatibility:
+//! the MCP must read everything the app can). Hardening that fallback belongs in
+//! `fula-client` (which this crate must not modify). Collab `fula` files written by
+//! current clients carry `encryption_version = Some(4)`, so the common path is
+//! always AAD-bound.
 
 use bytes::Bytes;
-use fula_crypto::ShareToken;
-use thiserror::Error;
 
-use crate::capability::{CapabilityBundle, CapabilityError, Permission};
-use crate::retry::with_refresh_retry;
-use crate::store::{WORKSPACE_BUCKET, WORKSPACE_KEY_PREFIX};
+use base64::Engine as _;
+use fula_crypto::{
+    Aead, AcceptedShare, ChunkedDecoder, ChunkedFileMetadata, DekKey, Nonce, ShareRecipient,
+    ShareToken,
+};
 
-/// A scoped read the AI wishes to perform. The two variants map to the two
-/// (and only two) legitimate read modes; there is no "read an arbitrary path"
-/// variant by construction.
-///
-/// Carried as owned data so a later MCP tool-dispatch layer (P9) can build one
-/// from a deserialized request and hand it to [`read_file`].
-#[derive(Clone)]
-pub enum ReadRequest {
-    /// Read one of the AI's OWN workspace files by its logical key
-    /// (`ai/<category>/<uuid>-<name>`). Authorized under the `ai/` grant;
-    /// decrypted with the workspace secret.
-    Workspace {
-        /// The canonical logical key (must be inside the `ai/` scope).
-        key: String,
-    },
-    /// Read a file the owner explicitly shared to the MCP.
-    ///
-    /// `token` is the `owner → MCP` share (wrapping the file's content DEK to
-    /// the MCP keypair). `bucket` + `storage_key` locate the ciphertext;
-    /// `original_key` is the file's logical path, which the gate checks against
-    /// the token's `path_scope`.
-    Granted {
-        /// The owner-minted share token addressed to the MCP keypair.
-        ///
-        /// Boxed: a [`ShareToken`] is large (wrapped DEK + several optional
-        /// fields), so boxing keeps [`ReadRequest`] small and avoids bloating
-        /// the [`Workspace`](ReadRequest::Workspace) variant
-        /// (clippy::large_enum_variant). A request is built once per call, so
-        /// the indirection is free.
-        token: Box<ShareToken>,
-        /// The bucket the granted object lives in (NOT assumed to be the
-        /// workspace bucket).
-        bucket: String,
-        /// The obfuscated storage key the bytes are fetched by.
-        storage_key: String,
-        /// The logical path of the file (gated against `token.path_scope`).
-        original_key: String,
-    },
+use crate::capability::{CapabilityBundle, CapabilityError};
+use crate::collab::{self, CollabError};
+use crate::manifest::{collab_file_decrypt, CollaborationFile, CollaborationGroup};
+use crate::tree::{is_directory, is_tombstoned, logical_path_of, normalize_folder};
+
+/// How the caller addresses the file to read.
+#[derive(Debug, Clone)]
+pub enum ReadBy {
+    /// By the file's UUID (the unambiguous, primary key).
+    FileId(String),
+    /// By a logical path (best-effort: matched against each entry's derived
+    /// logical path, then its bare filename).
+    Path(String),
 }
 
-impl std::fmt::Debug for ReadRequest {
-    /// Redacting debug — a [`ShareToken`] wraps a content DEK, so we never print
-    /// it. Only non-sensitive shape is shown.
+/// Errors surfaced by [`read_file`].
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    /// A collaboration HTTP / manifest failure (incl. a 404 on the blob).
+    #[error("collaboration error: {0}")]
+    Collab(#[from] CollabError),
+
+    /// Deriving the group link keypair failed (malformed link secret).
+    #[error("capability error: {0}")]
+    Capability(#[from] CapabilityError),
+
+    /// Neither a file id nor a path was supplied, or it was empty.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
+    /// No matching file in the manifest (or the manifest itself is absent).
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// Parsing / accepting the `fula` share token failed.
+    #[error("share acceptance failed: {0}")]
+    Share(String),
+
+    /// Decryption (collab blob or owner file) failed.
+    #[error("decryption failed: {0}")]
+    Crypto(String),
+}
+
+/// The plaintext + metadata of a read file. `bytes` are redacted from [`Debug`].
+#[derive(Clone)]
+pub struct ReadOutcome {
+    /// The file's UUID.
+    pub file_id: String,
+    /// The display filename.
+    pub file_name: String,
+    /// The derived logical path.
+    pub path: String,
+    /// The recorded MIME type, if any.
+    pub content_type: Option<String>,
+    /// The on-wire encoding (`"collab"` / `"fula"`).
+    pub enc_type: String,
+    /// Plaintext size in bytes.
+    pub size: usize,
+    /// The decrypted plaintext.
+    pub bytes: Bytes,
+}
+
+impl std::fmt::Debug for ReadOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReadRequest::Workspace { key } => {
-                f.debug_struct("ReadRequest::Workspace").field("key", key).finish()
+        f.debug_struct("ReadOutcome")
+            .field("file_id", &self.file_id)
+            .field("file_name", &self.file_name)
+            .field("path", &self.path)
+            .field("content_type", &self.content_type)
+            .field("enc_type", &self.enc_type)
+            .field("size", &self.size)
+            .field("bytes", &"<redacted plaintext>")
+            .finish()
+    }
+}
+
+/// Resolve a [`ReadBy`] to a live (non-tombstoned, non-directory) manifest entry.
+fn resolve<'a>(
+    manifest: &'a CollaborationGroup,
+    by: &ReadBy,
+) -> Result<&'a CollaborationFile, ReadError> {
+    match by {
+        ReadBy::FileId(id) => {
+            let id = id.trim();
+            if id.is_empty() {
+                return Err(ReadError::InvalidInput("file_id is empty".into()));
             }
-            ReadRequest::Granted {
-                bucket,
-                storage_key,
-                original_key,
-                ..
-            } => f
-                .debug_struct("ReadRequest::Granted")
-                .field("token", &"<redacted ShareToken>")
-                .field("bucket", bucket)
-                .field("storage_key", storage_key)
-                .field("original_key", original_key)
-                .finish(),
+            manifest
+                .files
+                .iter()
+                .find(|f| f.id == id && !is_tombstoned(manifest, &f.id) && !is_directory(f))
+                .ok_or_else(|| ReadError::NotFound(format!("no file with id `{id}`")))
+        }
+        ReadBy::Path(p) => {
+            let raw = p.trim();
+            if raw.is_empty() {
+                return Err(ReadError::InvalidInput("path is empty".into()));
+            }
+            let want = normalize_folder(raw)
+                .map_err(|e| ReadError::InvalidInput(e.to_string()))?
+                .ok_or_else(|| {
+                    ReadError::NotFound("path resolves to the group root (not a file)".into())
+                })?;
+            manifest
+                .files
+                .iter()
+                .filter(|f| !is_tombstoned(manifest, &f.id) && !is_directory(f))
+                .find(|f| logical_path_of(f) == want || f.file_name == raw)
+                .ok_or_else(|| ReadError::NotFound(format!("no file at path `{want}`")))
         }
     }
 }
 
-/// Errors surfaced by [`read_file`] and its two mode helpers.
-///
-/// The shape mirrors [`crate::store::StoreError`]: a denial is a *distinct*
-/// variant ([`ReadError::Capability`]) so "never silently read" lives in the
-/// type — a caller (and a test) can tell an access-DENIED outcome apart from a
-/// network failure unambiguously. This is what lets the offline tests prove the
-/// scope gate fires BEFORE any I/O: an out-of-scope read against an unreachable
-/// endpoint returns `Capability`, not `Client`.
-#[derive(Debug, Error)]
-pub enum ReadError {
-    /// The scope/authority check failed, or the key/scope failed
-    /// canonicalization. This is the access-DENIED / bad-key outcome and is
-    /// raised BEFORE any network I/O. Includes: key outside `ai/` (workspace),
-    /// `original_key` outside the token's `path_scope` (granted), the bundle not
-    /// holding a matching `Read` grant, and a non-canonical key.
-    #[error("read denied by capability check: {0}")]
-    Capability(#[from] CapabilityError),
-
-    /// Building the workspace client, accepting the grant token, or the storage
-    /// GET / decrypt failed. (Network / crypto failure, NOT an authorization
-    /// outcome.)
-    #[error("read storage operation failed: {0}")]
-    Client(String),
-
-    /// The object was not found at the resolved location.
-    #[error("object not found for read: {0}")]
-    NotFound(String),
-}
-
-/// Perform a scoped, decrypting read.
-///
-/// Dispatches on the [`ReadRequest`] variant to [`read_workspace_file`] or
-/// [`read_granted_file`]. In BOTH paths the scope gate runs before any network
-/// I/O and an out-of-scope key is rejected with [`ReadError::Capability`].
-///
-/// This is the single entrypoint a later MCP tool-dispatch layer (P9) calls; it
-/// can also call the two mode helpers directly if it has already split the
-/// request.
-///
-/// # Errors
-/// - [`ReadError::Capability`] — access denied / non-canonical key (NO I/O ran).
-/// - [`ReadError::Client`] — client build / storage GET / decrypt failed.
-/// - [`ReadError::NotFound`] — the object did not exist.
-pub async fn read_file(cap: &CapabilityBundle, req: &ReadRequest) -> Result<Bytes, ReadError> {
-    match req {
-        ReadRequest::Workspace { key } => read_workspace_file(cap, key).await,
-        ReadRequest::Granted {
-            token,
-            bucket,
-            storage_key,
-            original_key,
-        } => read_granted_file(cap, token, bucket, storage_key, original_key).await,
-    }
-}
-
-/// Read one of the AI's OWN workspace files, scope-gated.
-///
-/// Gate (BEFORE any I/O): `assert_in_scope(key, WORKSPACE_KEY_PREFIX,
-/// Permission::Read)`. This rejects a non-canonical key AND a bundle that lacks
-/// the `ai/` read grant — with no network call. Only then is the workspace
-/// client built and the (own-secret-decrypted) object fetched.
-///
-/// # Errors
-/// - [`ReadError::Capability`] if `key` is outside the `ai/` scope, the bundle
-///   lacks the `ai/` read grant, or `key` is non-canonical (NO I/O performed).
-/// - [`ReadError::NotFound`] if the object does not exist in the workspace.
-/// - [`ReadError::Client`] if building the client or the GET/decrypt fails.
-pub async fn read_workspace_file(cap: &CapabilityBundle, key: &str) -> Result<Bytes, ReadError> {
-    // GATE FIRST — no client, no network until this passes. `?` maps
-    // CapabilityError -> ReadError::Capability, the distinct access-DENIED type.
-    cap.assert_in_scope(key, WORKSPACE_KEY_PREFIX, Permission::Read)?;
-
-    // Authorized: build the workspace client (own secret) and read by LOGICAL
-    // key. get_object_flat resolves key -> storage_key in our own forest and
-    // decrypts with the workspace keypair. Wrapped in the L1c refresh-on-auth
-    // retry: if the scoped JWT has expired, refresh it once and retry (a no-op
-    // when no refresh_token is configured — the auth error then surfaces as
-    // before). The closure MUST use its own `c` (the rebuilt, fresh-JWT client).
-    let client = cap.workspace_client()?;
-    with_refresh_retry(cap, client, |c| async move {
-        c.get_object_flat(WORKSPACE_BUCKET, key).await
-    })
-    .await
-    .map_err(|e| classify_client_error(key, e))
-}
-
-/// Read a file the owner explicitly granted to the MCP, scope-gated.
-///
-/// Steps (the GATE runs before the one networked call):
-///
-/// - **Accept** — `accept_grant(token)` is in-memory HPKE unwrap (NO I/O),
-///   recovering the DEK, `path_scope`, nonce / chunked metadata. A token not
-///   addressed to this MCP keypair (or expired) fails here as
-///   [`ReadError::Client`].
-/// - **Gate** — `assert_in_scope(original_key, &accepted.path_scope,
-///   Permission::Read)`: segment-boundary geometry (beats the substring footgun)
-///   plus the bundle must hold a `Read` grant equal to the token's scope.
-/// - **Fetch** — `get_object_with_share(bucket, storage_key, original_key,
-///   &accepted)` fetches ciphertext by `storage_key` and decrypts with the
-///   share's DEK.
-///
-/// See the module docs for the INVARIANT the session injector must uphold so the
-/// equality authority check does not wrongly deny a legitimate narrower token.
-///
-/// # Errors
-/// - [`ReadError::Capability`] if `original_key` is outside the token's
-///   `path_scope`, the bundle holds no `Read` grant equal to that scope, or
-///   `original_key`/scope is non-canonical (raised BEFORE the storage GET).
-/// - [`ReadError::NotFound`] if the object does not exist.
-/// - [`ReadError::Client`] if accepting the grant, or the GET/decrypt, fails.
-pub async fn read_granted_file(
-    cap: &CapabilityBundle,
-    token: &ShareToken,
-    bucket: &str,
+/// Decrypt a single-block `fula` object (ciphertext already fetched). Pure — no
+/// I/O — so the AAD + version-gate + nonce decode are unit-testable.
+fn decrypt_single_block(
+    accepted: &AcceptedShare,
+    ciphertext: &[u8],
     storage_key: &str,
-    original_key: &str,
-) -> Result<Bytes, ReadError> {
-    // 1. Accept the grant. Pure in-memory crypto — no network. Recovers the DEK,
-    //    path_scope, nonce / chunked metadata, encryption_version.
-    let accepted = cap
-        .accept_grant(token)
-        .map_err(|e| ReadError::Client(format!("accept grant token: {e}")))?;
+) -> Result<Vec<u8>, ReadError> {
+    let nonce_b64 = accepted
+        .nonce
+        .as_deref()
+        .ok_or_else(|| ReadError::Crypto("single-block fula file has no nonce".into()))?;
+    let nonce_bytes = base64::engine::general_purpose::STANDARD
+        .decode(nonce_b64)
+        .map_err(|e| ReadError::Crypto(format!("nonce base64: {e}")))?;
+    let nonce = Nonce::from_bytes(&nonce_bytes).map_err(|e| ReadError::Crypto(e.to_string()))?;
 
-    // 2. GATE on the LOGICAL key against the token's own declared scope, with the
-    //    bundle's authority. This is the security crux: segment-boundary geometry
-    //    (strictly stronger than the SDK substring is_path_allowed) AND the
-    //    bundle must hold a Read grant whose scope EQUALS accepted.path_scope.
-    //    Runs before get_object_with_share (the only call that hits the wire).
-    cap.assert_in_scope(original_key, &accepted.path_scope, Permission::Read)?;
+    let aead = Aead::new_default(&accepted.dek);
+    let aad = format!("fula:v4:content:{storage_key}");
 
-    // 3. Authorized: fetch by storage_key, decrypt with the share's DEK. (The
-    //    SDK re-checks is_path_allowed(original_key) + can_read internally as
-    //    defense-in-depth; we have already enforced the stronger gate.) Wrapped in
-    //    the L1c refresh-on-auth retry (no-op without a refresh_token). `accepted`
-    //    is borrowed by the closure (it is reused across the single retry).
-    let client = cap.workspace_client()?;
-    let accepted_ref = &accepted;
-    with_refresh_retry(cap, client, |c| async move {
-        c.get_object_with_share(bucket, storage_key, original_key, accepted_ref)
-            .await
-    })
-    .await
-    .map_err(|e| classify_client_error(original_key, e))
+    // Version gate — mirrors fula-client's get_object_with_share exactly.
+    let plaintext = match accepted.encryption_version {
+        Some(v) if v >= 4 => aead
+            .decrypt_with_aad(&nonce, ciphertext, aad.as_bytes())
+            .map_err(|e| ReadError::Crypto(e.to_string()))?,
+        Some(_) => aead
+            .decrypt(&nonce, ciphertext)
+            .map_err(|e| ReadError::Crypto(e.to_string()))?,
+        None => match aead.decrypt_with_aad(&nonce, ciphertext, aad.as_bytes()) {
+            Ok(p) => p,
+            Err(_) => aead
+                .decrypt(&nonce, ciphertext)
+                .map_err(|e| ReadError::Crypto(e.to_string()))?,
+        },
+    };
+    Ok(plaintext)
 }
 
-/// Map a `fula-client` error into the right [`ReadError`]: a not-found resolves
-/// to [`ReadError::NotFound`] (so callers can distinguish "no such object" from
-/// a transport/crypto failure), everything else to [`ReadError::Client`].
-///
-/// We match on the rendered message rather than the concrete error enum to avoid
-/// coupling this crate to `fula-client`'s private error taxonomy; the
-/// `NotFound { bucket, key }` Display contains "not found" / the key.
-fn classify_client_error(key: &str, err: impl std::fmt::Display) -> ReadError {
-    let msg = err.to_string();
-    let lower = msg.to_lowercase();
-    if lower.contains("notfound") || lower.contains("not found") {
-        ReadError::NotFound(format!("{key}: {msg}"))
+/// Assemble a chunked `fula` object from its already-fetched per-chunk
+/// ciphertexts. Pure — no I/O. The decoder choice is gated on the metadata
+/// `format` (streaming-v2 ⇒ AAD prefix `fula:v4:chunk:{storage_key}`).
+fn assemble_chunked(
+    dek: DekKey,
+    meta: ChunkedFileMetadata,
+    chunks: &[(u32, Vec<u8>)],
+    storage_key: &str,
+) -> Result<Vec<u8>, ReadError> {
+    let mut decoder = if meta.format == "streaming-v2" {
+        ChunkedDecoder::with_aad(dek, meta, format!("fula:v4:chunk:{storage_key}"))
     } else {
-        ReadError::Client(msg)
+        ChunkedDecoder::new(dek, meta)
+    };
+    for (i, ct) in chunks {
+        decoder
+            .decrypt_chunk(*i, ct)
+            .map_err(|e| ReadError::Crypto(e.to_string()))?;
     }
+    decoder
+        .finalize()
+        .map(|b| b.to_vec())
+        .map_err(|e| ReadError::Crypto(e.to_string()))
+}
+
+/// Fetch + decrypt a `fula` (owner) file referenced by a manifest entry.
+async fn read_fula(
+    cap: &CapabilityBundle,
+    file: &CollaborationFile,
+    accepted: AcceptedShare,
+) -> Result<Vec<u8>, ReadError> {
+    let storage_key = file.storage_key.as_str();
+
+    if let Some(chunked_json) = accepted.chunked_metadata.as_deref() {
+        let meta: ChunkedFileMetadata = serde_json::from_str(chunked_json)
+            .map_err(|e| ReadError::Crypto(format!("chunked metadata: {e}")))?;
+        let num_chunks = meta.num_chunks;
+        let mut chunks: Vec<(u32, Vec<u8>)> = Vec::with_capacity(num_chunks as usize);
+        for i in 0..num_chunks {
+            let chunk_key = ChunkedFileMetadata::chunk_key(storage_key, i);
+            let ct = collab::fula_fetch(
+                cap.http(),
+                cap.webui_base(),
+                cap.group_id(),
+                &file.bucket,
+                &chunk_key,
+            )
+            .await?;
+            chunks.push((i, ct));
+        }
+        assemble_chunked(accepted.dek, meta, &chunks, storage_key)
+    } else {
+        let ct = collab::fula_fetch(
+            cap.http(),
+            cap.webui_base(),
+            cap.group_id(),
+            &file.bucket,
+            storage_key,
+        )
+        .await?;
+        decrypt_single_block(&accepted, &ct, storage_key)
+    }
+}
+
+/// Read + decrypt a file in the collaboration group, addressed by id or path.
+pub async fn read_file(cap: &CapabilityBundle, by: &ReadBy) -> Result<ReadOutcome, ReadError> {
+    let manifest =
+        collab::fetch_manifest(cap.http(), cap.webui_base(), cap.group_id(), cap.link_secret())
+            .await?
+            .ok_or_else(|| ReadError::NotFound("the group has no manifest".into()))?;
+
+    let file = resolve(&manifest, by)?;
+
+    let plaintext = match file.enc_type.as_str() {
+        "collab" => {
+            let blob =
+                collab::fetch_collab_file(cap.http(), cap.webui_base(), cap.group_id(), &file.id)
+                    .await?;
+            collab_file_decrypt(&blob, cap.link_secret(), &file.id)
+                .map_err(|e| ReadError::Crypto(e.to_string()))?
+        }
+        "fula" => {
+            let link_keypair = cap.link_keypair()?;
+            let token_json = file.share_token_json.as_deref().ok_or_else(|| {
+                ReadError::Share("fula file has no share_token_json".into())
+            })?;
+            let token: ShareToken = serde_json::from_str(token_json)
+                .map_err(|e| ReadError::Share(format!("share token parse: {e}")))?;
+            let accepted = ShareRecipient::new(&link_keypair)
+                .accept_share(&token)
+                .map_err(|e| ReadError::Share(e.to_string()))?;
+            read_fula(cap, file, accepted).await?
+        }
+        other => return Err(ReadError::Crypto(format!("unknown encType `{other}`"))),
+    };
+
+    let path = logical_path_of(file);
+    Ok(ReadOutcome {
+        file_id: file.id.clone(),
+        file_name: file.file_name.clone(),
+        path,
+        content_type: file.content_type.clone(),
+        enc_type: file.enc_type.clone(),
+        size: plaintext.len(),
+        bytes: Bytes::from(plaintext),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::{CollaborationFile, CollaborationGroup};
+    // `Aead`, `Nonce`, `DekKey` come from the module's top-level imports via
+    // `super::*`; only these extras are needed here.
+    use fula_crypto::{sharing::ShareBuilder, ChunkedEncoder, KekKeyPair};
 
-    use base64::Engine as _;
-    use fula_crypto::{
-        Aead, DekKey, KekKeyPair, Nonce, SecretKey, ShareBuilder, SharePermissions,
-    };
-
-    use crate::capability::CapabilityBundle as Bundle;
-
-    // ── Bundle builders (offline; the endpoint is never contacted) ──────────
-
-    /// A bundle JSON whose owner_public is derived from a known owner secret, the
-    /// MCP keypair from a known MCP secret, with a single configurable grant.
-    /// `endpoint` is unreachable so any accidental I/O would fail loudly (and
-    /// differently from a Capability denial).
-    fn bundle_json(grant_scope: &str, can_read: bool, mcp_secret: &[u8; 32], owner_secret: &[u8; 32]) -> String {
-        let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
-        let mcp = base64::engine::general_purpose::STANDARD.encode(mcp_secret);
-        let owner = base64::engine::general_purpose::STANDARD.encode(
-            SecretKey::from_bytes(owner_secret).unwrap().public_key().as_bytes(),
-        );
-        format!(
-            r#"{{ "endpoint": "https://offline.invalid", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "grants": [{{ "scope": "{grant_scope}", "permissions": {{ "can_read": {can_read}, "can_write": false, "can_delete": false }} }}] }}"#
+    fn empty_group() -> CollaborationGroup {
+        serde_json::from_str(
+            r#"{"id":"g","name":"n","ownerPublicKey":"o","manifestKey":"k","createdAt":"c","updatedAt":"u","files":[]}"#,
         )
+        .unwrap()
     }
 
-    /// Bundle with an `ai/` read grant (the normal workspace-read case).
-    fn workspace_bundle() -> Bundle {
-        Bundle::from_json(&bundle_json("ai/", true, &[9u8; 32], &[11u8; 32])).unwrap()
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // WORKSPACE-READ GATE (synchronous replication of the exact pre-I/O check)
-    //
-    // We replicate EXACTLY the gate read_workspace_file performs — same key, same
-    // scope constant, same permission — so these prove the gate's decision
-    // without needing the gateway. (The async "gate fires before I/O" proof is
-    // the separate offline-against-unreachable-endpoint test below.)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// The exact gate read_workspace_file performs.
-    fn workspace_gate(cap: &Bundle, key: &str) -> Result<(), ReadError> {
-        cap.assert_in_scope(key, WORKSPACE_KEY_PREFIX, Permission::Read)?;
-        Ok(())
+    fn file(id: &str, name: &str, scope: Option<&str>, enc: &str) -> CollaborationFile {
+        CollaborationFile {
+            id: id.to_string(),
+            file_name: name.to_string(),
+            content_type: None,
+            bucket: "b".to_string(),
+            storage_key: format!("sk-{id}"),
+            path_scope: scope.map(str::to_string),
+            added_by_public_key: "pk".to_string(),
+            added_at: "2026-01-01T00:00:00.000Z".to_string(),
+            file_size: 1,
+            enc_type: enc.to_string(),
+            share_token_json: None,
+        }
     }
 
     #[test]
-    fn workspace_gate_allows_ai_key_with_read_grant() {
-        let cap = workspace_bundle();
-        assert!(workspace_gate(&cap, "ai/note/abc-summary.txt").is_ok());
-        assert!(workspace_gate(&cap, "ai/image/xyz-photo.png").is_ok());
+    fn resolve_by_id_and_path_and_skips_tombstones_and_dirs() {
+        let mut g = empty_group();
+        g.files.push(file("F1", "memo.txt", Some("/notes"), "collab"));
+        g.files.push(file("F2", "old.txt", None, "collab"));
+        g.removed_file_ids.push("F2".to_string());
+        // A directory marker.
+        let mut dir = file("D1", "notes", Some("/notes"), "collab");
+        dir.content_type = Some(crate::tree::DIRECTORY_CONTENT_TYPE.to_string());
+        g.files.push(dir);
+
+        assert_eq!(resolve(&g, &ReadBy::FileId("F1".into())).unwrap().id, "F1");
+        assert_eq!(
+            resolve(&g, &ReadBy::Path("/notes/memo.txt".into())).unwrap().id,
+            "F1"
+        );
+        // Bare filename fallback.
+        assert_eq!(resolve(&g, &ReadBy::Path("memo.txt".into())).unwrap().id, "F1");
+        // Tombstoned id is not resolvable.
+        assert!(matches!(
+            resolve(&g, &ReadBy::FileId("F2".into())),
+            Err(ReadError::NotFound(_))
+        ));
+        // A directory id is not a readable file.
+        assert!(matches!(
+            resolve(&g, &ReadBy::FileId("D1".into())),
+            Err(ReadError::NotFound(_))
+        ));
+        // Unknown path.
+        assert!(matches!(
+            resolve(&g, &ReadBy::Path("/nope.txt".into())),
+            Err(ReadError::NotFound(_))
+        ));
     }
 
+    /// Single-block fula decrypt via a CONSTRUCTED v4 share token (addressed to the
+    /// group link keypair): builds the exact `fula:v4:content:{storage_key}` AAD +
+    /// inline nonce the producer uses, then decrypts through `decrypt_single_block`.
     #[test]
-    fn workspace_gate_denies_key_outside_ai_scope() {
-        // The crux: a key OUTSIDE ai/ is rejected. `photos/...` is not under ai/.
-        let cap = workspace_bundle();
-        assert!(matches!(
-            workspace_gate(&cap, "photos/2026/vacation.jpg"),
-            Err(ReadError::Capability(CapabilityError::OutOfScope { .. }))
-        ));
-        // First-segment substring footgun: `ai-evil/...` must NOT pass as ai/.
-        assert!(matches!(
-            workspace_gate(&cap, "ai-evil/secret.txt"),
-            Err(ReadError::Capability(CapabilityError::OutOfScope { .. }))
-        ));
-    }
-
-    #[test]
-    fn workspace_gate_denies_when_no_read_grant() {
-        // Bundle whose ai/ grant is NOT readable (can_read:false) → denied.
-        let cap = Bundle::from_json(&bundle_json("ai/", false, &[9u8; 32], &[11u8; 32])).unwrap();
-        assert!(matches!(
-            workspace_gate(&cap, "ai/note/x.txt"),
-            Err(ReadError::Capability(CapabilityError::OutOfScope { .. }))
-        ));
-    }
-
-    #[test]
-    fn workspace_gate_rejects_non_canonical_key() {
-        // A traversal / non-canonical key is rejected as InvalidPath (pre-I/O).
-        let cap = workspace_bundle();
-        assert!(matches!(
-            workspace_gate(&cap, "ai/../secret"),
-            Err(ReadError::Capability(CapabilityError::InvalidPath { .. }))
-        ));
-        assert!(matches!(
-            workspace_gate(&cap, "ai//doubled"),
-            Err(ReadError::Capability(CapabilityError::InvalidPath { .. }))
-        ));
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // GRANTED-READ GATE — the substring footgun is the graded crux.
-    //
-    // We mint a REAL owner→MCP token (the owner plays sender; the bundle's MCP
-    // keypair is the recipient), accept it the way read_granted_file does, then
-    // run the EXACT gate — assert_in_scope(original_key, &accepted.path_scope,
-    // Read) — and assert in-scope passes / out-of-scope (incl. the footgun) is
-    // denied. No network.
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Mint an owner→MCP share token for `path_scope`, addressed to the bundle's
-    /// MCP public key, signed by the `owner` keypair.
-    fn mint_grant_to_mcp(cap: &Bundle, owner: &KekKeyPair, path_scope: &str) -> ShareToken {
+    fn fula_single_block_decrypts_via_constructed_share_token() {
+        let owner = KekKeyPair::generate();
+        let link = KekKeyPair::generate(); // the group link keypair
         let dek = DekKey::generate();
-        ShareBuilder::new(owner, cap.mcp_public_key(), &dek)
-            .path_scope(path_scope)
-            .read_only()
-            .encryption_version(4)
-            .build()
-            .unwrap()
-    }
+        let storage_key = "obfs-single-123";
+        let plaintext = b"hello fula single block payload";
 
-    /// The exact gate read_granted_file performs, after accepting the token.
-    fn granted_gate(cap: &Bundle, token: &ShareToken, original_key: &str) -> Result<(), ReadError> {
-        let accepted = cap
-            .accept_grant(token)
-            .map_err(|e| ReadError::Client(e.to_string()))?;
-        cap.assert_in_scope(original_key, &accepted.path_scope, Permission::Read)?;
-        Ok(())
-    }
-
-    /// A bundle that grants `ai/` read AND holds a known MCP/owner keypair, plus
-    /// a configurable EXTRA grant for the granted-read scope (so the authority
-    /// arm — bundle must hold a grant equal to the token scope — is satisfiable).
-    fn granted_bundle(extra_grant_scope: &str, owner_secret: &[u8; 32]) -> Bundle {
-        let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
-        let mcp = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
-        let owner = base64::engine::general_purpose::STANDARD.encode(
-            SecretKey::from_bytes(owner_secret).unwrap().public_key().as_bytes(),
-        );
-        let json = format!(
-            r#"{{ "endpoint": "https://offline.invalid", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "grants": [ {{ "scope": "ai/", "permissions": {{ "can_read": true, "can_write": true, "can_delete": false }} }}, {{ "scope": "{extra_grant_scope}", "permissions": {{ "can_read": true, "can_write": false, "can_delete": false }} }} ] }}"#
-        );
-        Bundle::from_json(&json).unwrap()
-    }
-
-    #[test]
-    fn granted_gate_allows_key_in_scope_with_matching_grant() {
-        let owner_secret = [11u8; 32];
-        let owner = KekKeyPair::from_secret_key(SecretKey::from_bytes(&owner_secret).unwrap());
-        // Bundle holds a grant EQUAL to the token scope `photos/2026/` (the P9
-        // invariant) → a key inside that scope is authorized.
-        let cap = granted_bundle("photos/2026/", &owner_secret);
-        let token = mint_grant_to_mcp(&cap, &owner, "photos/2026/");
-        assert!(granted_gate(&cap, &token, "photos/2026/vacation.jpg").is_ok());
-        assert!(granted_gate(&cap, &token, "photos/2026/sub/dir/x.png").is_ok());
-    }
-
-    #[test]
-    fn granted_gate_denies_substring_footgun() {
-        // THE GRADED CRUX. Token scope `ai/note`; `ai/notebook.txt` shares the
-        // string prefix `ai/note` but is a DIFFERENT segment — the SDK's
-        // substring is_path_allowed would ADMIT it; our segment gate must DENY.
-        let owner_secret = [11u8; 32];
-        let owner = KekKeyPair::from_secret_key(SecretKey::from_bytes(&owner_secret).unwrap());
-        let cap = granted_bundle("ai/note", &owner_secret);
-        let token = mint_grant_to_mcp(&cap, &owner, "ai/note");
-
-        // First confirm the SDK substring check WOULD be fooled (documents why
-        // our gate matters): accept and ask the crypto layer directly.
-        let accepted = cap.accept_grant(&token).unwrap();
-        assert!(
-            accepted.is_path_allowed("ai/notebook.txt"),
-            "precondition: the SDK substring check admits the footgun key (that's the danger)"
-        );
-
-        // Our gate must REJECT it.
-        assert!(matches!(
-            granted_gate(&cap, &token, "ai/notebook.txt"),
-            Err(ReadError::Capability(CapabilityError::OutOfScope { .. }))
-        ));
-        // The genuine in-scope child still passes.
-        assert!(granted_gate(&cap, &token, "ai/note/today.md").is_ok());
-    }
-
-    #[test]
-    fn granted_gate_denies_key_outside_token_scope() {
-        // A key in a wholly different subtree than the token's scope → denied.
-        let owner_secret = [11u8; 32];
-        let owner = KekKeyPair::from_secret_key(SecretKey::from_bytes(&owner_secret).unwrap());
-        let cap = granted_bundle("photos/2026/", &owner_secret);
-        let token = mint_grant_to_mcp(&cap, &owner, "photos/2026/");
-        assert!(matches!(
-            granted_gate(&cap, &token, "documents/secret.pdf"),
-            Err(ReadError::Capability(CapabilityError::OutOfScope { .. }))
-        ));
-    }
-
-    #[test]
-    fn granted_gate_denies_when_bundle_lacks_matching_grant() {
-        // Possession of a valid token is NOT authority: if the bundle has NO
-        // grant equal to the token's path_scope, the read is denied. Here the
-        // bundle's extra grant is `other/`, but the token scope is `photos/2026/`.
-        let owner_secret = [11u8; 32];
-        let owner = KekKeyPair::from_secret_key(SecretKey::from_bytes(&owner_secret).unwrap());
-        let cap = granted_bundle("other/", &owner_secret);
-        let token = mint_grant_to_mcp(&cap, &owner, "photos/2026/");
-        // Geometry (key inside path_scope) passes, but authority (bundle grant ==
-        // scope) fails → OutOfScope.
-        assert!(matches!(
-            granted_gate(&cap, &token, "photos/2026/x.jpg"),
-            Err(ReadError::Capability(CapabilityError::OutOfScope { .. }))
-        ));
-    }
-
-    #[test]
-    fn granted_gate_denies_broad_bundle_grant_narrow_token() {
-        // Documents the equality invariant explicitly: a BROAD bundle grant
-        // (`photos/`) does NOT authorize a NARROWER token (`photos/2026/`),
-        // because authority is equality, not coverage. P9 must inject a grant
-        // equal to the token scope.
-        let owner_secret = [11u8; 32];
-        let owner = KekKeyPair::from_secret_key(SecretKey::from_bytes(&owner_secret).unwrap());
-        let cap = granted_bundle("photos/", &owner_secret); // broad grant only
-        let token = mint_grant_to_mcp(&cap, &owner, "photos/2026/"); // narrower token
-        assert!(matches!(
-            granted_gate(&cap, &token, "photos/2026/x.jpg"),
-            Err(ReadError::Capability(CapabilityError::OutOfScope { .. }))
-        ));
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // GATE-BEFORE-I/O proof (async, offline against an UNREACHABLE endpoint).
-    //
-    // The bundle endpoint is https://offline.invalid. If the gate did NOT fire
-    // first, the call would proceed to build a client and hit the network,
-    // surfacing a Client/transport error. Asserting we instead get a *Capability*
-    // error is positive proof the synchronous gate short-circuited BEFORE any
-    // client construction / I/O.
-    // ─────────────────────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn read_workspace_file_denies_out_of_scope_before_any_io() {
-        let cap = workspace_bundle();
-        // `photos/...` is outside ai/ → must be a Capability denial, NOT a
-        // network error against offline.invalid.
-        let err = read_workspace_file(&cap, "photos/secret.jpg")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ReadError::Capability(CapabilityError::OutOfScope { .. })),
-            "out-of-scope workspace read must deny pre-I/O (got {err:?})"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_workspace_file_denies_non_canonical_before_any_io() {
-        let cap = workspace_bundle();
-        let err = read_workspace_file(&cap, "ai/../etc/passwd").await.unwrap_err();
-        assert!(
-            matches!(err, ReadError::Capability(CapabilityError::InvalidPath { .. })),
-            "non-canonical workspace key must deny pre-I/O (got {err:?})"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_granted_file_denies_footgun_before_any_io() {
-        // The footgun key, through the REAL async read_granted_file, against an
-        // unreachable endpoint. accept_grant is in-memory (no I/O); the gate then
-        // denies BEFORE get_object_with_share would touch the network.
-        let owner_secret = [11u8; 32];
-        let owner = KekKeyPair::from_secret_key(SecretKey::from_bytes(&owner_secret).unwrap());
-        let cap = granted_bundle("ai/note", &owner_secret);
-        let token = mint_grant_to_mcp(&cap, &owner, "ai/note");
-        let err = read_granted_file(&cap, &token, "some-bucket", "QmStorageKey", "ai/notebook.txt")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ReadError::Capability(CapabilityError::OutOfScope { .. })),
-            "granted footgun read must deny pre-I/O (got {err:?})"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_granted_file_denies_unauthorized_scope_before_any_io() {
-        // Token the bundle has no matching grant for → denied pre-I/O.
-        let owner_secret = [11u8; 32];
-        let owner = KekKeyPair::from_secret_key(SecretKey::from_bytes(&owner_secret).unwrap());
-        let cap = granted_bundle("other/", &owner_secret);
-        let token = mint_grant_to_mcp(&cap, &owner, "photos/2026/");
-        let err = read_granted_file(&cap, &token, "b", "QmK", "photos/2026/x.jpg")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ReadError::Capability(CapabilityError::OutOfScope { .. })),
-            "unauthorized granted read must deny pre-I/O (got {err:?})"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_file_dispatches_to_workspace_and_denies_out_of_scope() {
-        // The ReadRequest entrypoint routes correctly and preserves the gate.
-        let cap = workspace_bundle();
-        let req = ReadRequest::Workspace {
-            key: "nope/secret.txt".to_string(),
-        };
-        let err = read_file(&cap, &req).await.unwrap_err();
-        assert!(matches!(
-            err,
-            ReadError::Capability(CapabilityError::OutOfScope { .. })
-        ));
-    }
-
-    // ── owner→MCP accept round-trip + a full crypto decrypt round-trip ───────
-    //
-    // Proves the granted-read crypto end-to-end OFFLINE: build a v4 single-block
-    // ciphertext exactly as the upload path does, mint the owner→MCP share, accept
-    // it as the MCP, and decrypt — the same DEK/nonce/AAD the live
-    // get_object_with_share would use. (The live byte-fetch is the gated e2e.)
-
-    #[test]
-    fn granted_read_crypto_round_trips_single_block_offline() {
-        let owner_secret = [11u8; 32];
-        let owner = KekKeyPair::from_secret_key(SecretKey::from_bytes(&owner_secret).unwrap());
-        let cap = granted_bundle("docs/", &owner_secret);
-
-        // Owner-side: a file the owner shares with the MCP. Encrypt with the v4
-        // content AAD keyed by storage_key (the upload format).
-        let storage_key = "QmGrantedStorageKeySingle";
-        let plaintext = b"owner-granted file the AI is allowed to read";
-        let dek = DekKey::generate();
         let nonce = Nonce::generate();
-        let aad = format!("fula:v4:content:{storage_key}").into_bytes();
+        let aad = format!("fula:v4:content:{storage_key}");
         let ciphertext = Aead::new_default(&dek)
-            .encrypt_with_aad(&nonce, plaintext, &aad)
+            .encrypt_with_aad(&nonce, plaintext, aad.as_bytes())
             .unwrap();
         let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce.as_bytes());
 
-        // Owner mints the share to the MCP keypair.
-        let token = ShareBuilder::new(&owner, cap.mcp_public_key(), &dek)
-            .path_scope("docs/")
-            .read_only()
-            .encryption_version(4)
+        let token = ShareBuilder::new(&owner, link.public_key(), &dek)
+            .path_scope(storage_key)
             .nonce(nonce_b64)
+            .encryption_version(4)
             .build()
             .unwrap();
+        let accepted = ShareRecipient::new(&link).accept_share(&token).unwrap();
 
-        // MCP accepts (as read_granted_file does) and decrypts.
-        let accepted = cap.accept_grant(&token).unwrap();
-        assert!(accepted.is_path_allowed("docs/report.txt"));
-        assert_eq!(accepted.encryption_version, Some(4));
-        let rec_nonce = {
-            let raw = base64::engine::general_purpose::STANDARD
-                .decode(accepted.nonce.as_ref().unwrap())
-                .unwrap();
-            Nonce::from_bytes(&raw).unwrap()
-        };
-        let decrypted = Aead::new_default(&accepted.dek)
-            .decrypt_with_aad(&rec_nonce, &ciphertext, &aad)
-            .unwrap();
-        assert_eq!(decrypted.as_slice(), plaintext.as_slice());
+        let out = decrypt_single_block(&accepted, &ciphertext, storage_key).unwrap();
+        assert_eq!(out, plaintext);
+
+        // A wrong storage_key (wrong AAD) must fail authentication.
+        assert!(decrypt_single_block(&accepted, &ciphertext, "wrong-key").is_err());
     }
 
+    /// Chunked fula decrypt via a CONSTRUCTED v4 share token: encodes multi-chunk
+    /// streaming-v2 with the `fula:v4:chunk:{storage_key}` AAD prefix, then
+    /// assembles through `assemble_chunked` (the read path's pure core).
     #[test]
-    fn granted_read_token_for_other_mcp_cannot_be_accepted() {
-        // A token addressed to a DIFFERENT MCP keypair cannot be accepted by this
-        // bundle — accept_grant fails (so read_granted_file returns Client, never
-        // silently reads).
-        let owner = KekKeyPair::from_secret_key(SecretKey::from_bytes(&[11u8; 32]).unwrap());
-        let cap = granted_bundle("docs/", &[11u8; 32]);
-        let other_mcp = KekKeyPair::generate();
+    fn fula_chunked_decrypts_via_constructed_share_token() {
+        let owner = KekKeyPair::generate();
+        let link = KekKeyPair::generate();
         let dek = DekKey::generate();
-        let token = ShareBuilder::new(&owner, other_mcp.public_key(), &dek)
-            .path_scope("docs/")
-            .read_only()
+        let storage_key = "obfs-chunk-456";
+        let payload = vec![0x5au8; 200_000]; // > one 64 KiB chunk ⇒ multi-chunk
+
+        let prefix = format!("fula:v4:chunk:{storage_key}");
+        let mut enc =
+            ChunkedEncoder::with_aad_and_chunk_size(dek.clone(), prefix.into_bytes(), 64 * 1024);
+        let mut chunks: Vec<(u32, Vec<u8>)> = enc
+            .update(&payload)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.index, c.ciphertext.to_vec()))
+            .collect();
+        let (final_chunk, meta, _ob) = enc.finalize().unwrap();
+        if let Some(c) = final_chunk {
+            chunks.push((c.index, c.ciphertext.to_vec()));
+        }
+        assert!(meta.num_chunks > 1, "test must be multi-chunk");
+        assert_eq!(meta.format, "streaming-v2");
+
+        let token = ShareBuilder::new(&owner, link.public_key(), &dek)
+            .path_scope(storage_key)
+            .chunked_metadata(serde_json::to_string(&meta).unwrap())
+            .encryption_version(4)
             .build()
             .unwrap();
-        assert!(cap.accept_grant(&token).is_err());
-        // And confirm SharePermissions read-only is what we minted (sanity).
-        assert!(SharePermissions::read_only().can_read);
+        let accepted = ShareRecipient::new(&link).accept_share(&token).unwrap();
+        assert!(accepted.chunked_metadata.is_some());
+
+        let out = assemble_chunked(accepted.dek, meta, &chunks, storage_key).unwrap();
+        assert_eq!(out, payload);
     }
 }

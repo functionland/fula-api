@@ -1,187 +1,150 @@
-//! # Capability bundle — the MCP's in-memory, per-session authority
+//! # Capability bundle — the MCP's in-memory, per-session collaboration authority
 //!
-//! Phase 3 of the stateless-MCP line. The MCP server (the "AI") is a **stateless
-//! proxy**: it persists NO user data. Every piece of capability material is
-//! **injected per session** and held **in memory only** — never written to disk,
-//! never logged.
+//! The MCP server (the "AI") is a **stateless proxy**: it persists NO user data
+//! beyond its own long-lived X25519 identity key. Every piece of capability
+//! material is **injected per session** (via `FULA_MCP_CAPABILITY`) and held **in
+//! memory only** — never logged.
 //!
-//! ## The connection bundle
+//! ## The collaboration bundle (Method 2)
 //!
-//! A [`CapabilityBundle`] carries exactly four things (resolved in P1/P2):
+//! A [`CapabilityBundle`] binds the MCP to exactly ONE collaboration **group**:
 //!
-//! 1. A **scoped gateway JWT** + S3 endpoint. The token's PUT/GET authority is
-//!    limited (by the gateway) to AI-workspace buckets. Gateway-side enforcement
-//!    is a later phase; here we just carry the token and hand it to the client.
-//! 2. A **dedicated AI-workspace encryption secret** — a 32-byte secret that is
-//!    **NOT** the user's master KEK. The AI builds an [`EncryptedClient`] from it
-//!    to read/write its OWN workspace buckets. FxFiles also knows this secret, so
-//!    it can read the workspace directly; the AI cannot read the user's real
-//!    files, because those use a different, never-shared secret.
-//! 3. The MCP's **own X25519 keypair**. Used to ACCEPT `owner -> MCP` grant share
-//!    tokens — the path by which the owner explicitly hands the AI read access to
-//!    a specific real file.
-//! 4. The **owner's X25519 public key**. Used to MINT `AI -> owner` share tokens
-//!    when the AI writes a workspace file, wrapping the per-file content DEK to
-//!    the owner so the owner can read what the AI wrote (the P2 "inverse share"
-//!    pattern, which needs no new crypto and no forest-format change).
+//! 1. **`webui_base`** + **`group_id`** — the base URL and UUID for the group's
+//!    `/api/collab/{group_id}/*` endpoints (see [`crate::collab`]).
+//! 2. **`manifest_bucket`** / **`manifest_key`** — where the group's encrypted
+//!    manifest lives (informational; the manifest is fetched by `group_id`).
+//! 3. **`wrapped_link_secret`** — a [`ShareToken`] (serialized JSON) wrapping the
+//!    group's 32-byte **link secret** for the MCP's OWN X25519 public key. The MCP
+//!    loads/generates its identity LOCALLY ([`crate::identity::McpIdentity`]) and
+//!    unwraps the link secret ONCE at construction. The link secret is what
+//!    derives the manifest key and every collab-file key, and the link *keypair*
+//!    (derived from it) accepts the owner's per-file `fula` share tokens. Holding
+//!    the recovered secret (zeroized on drop) for the process lifetime avoids
+//!    re-running HPKE per op; it is no more sensitive than the keys it derives.
+//! 4. **`collab_write_token`** (optional) — a group-scoped Bearer for the WRITE
+//!    endpoints (`PUT manifest-sync`, `POST upload`). Re-mintable via the optional
+//!    `refresh_token` + `refresh_url` (mirrors the connection-JWT refresh). Absent
+//!    ⇒ the MCP is read-only for this session.
 //!
-//! Plus a list of **grants** ([`Capability`]) — the positive, scoped
-//! read/write/delete authorities this session holds. The workspace itself is a
-//! grant; owner-granted real-file prefixes are grants too. [`assert_in_scope`]
-//! checks an access against this list and is the security boundary that closes
-//! the P2 substring-prefix footgun.
-//!
-//! [`assert_in_scope`]: CapabilityBundle::assert_in_scope
+//! There is NO `ai/`-prefix scope gate anymore: authorization is "the file is in
+//! THIS group's manifest" (the bundle is per-group), so an op simply operates over
+//! the group it was handed.
 //!
 //! ## Security properties
 //!
-//! - **No secret on disk, no secret in logs.** The bundle deliberately does not
-//!   (and cannot) derive [`Debug`] — [`SecretKey`] has no `Debug`. The
-//!   hand-written [`Debug`] impl redacts every secret. Intermediate decoded key
-//!   bytes are zeroized immediately after the typed key is constructed; the
-//!   typed keys ([`SecretKey`]) are `ZeroizeOnDrop`.
-//! - **Scope is a security boundary, not a hint.** [`CapabilityBundle::assert_in_scope`]
-//!   matches on canonicalized path *segments*, so a grant of `ai/note` does not
-//!   admit `ai/notebook`, and a grant of `a` does not admit `ai/foo`. It also
-//!   enforces the requested [`Permission`] against the covering grant.
+//! - **No secret in logs.** The bundle does not derive [`Debug`] automatically;
+//!   the hand-written impl redacts the link secret, the write token, and the
+//!   refresh token. The recovered link secret is wrapped in [`Zeroizing`] so it is
+//!   wiped on drop. The MCP identity's secret never enters the bundle (only its
+//!   public key / FULA id are retained).
+//! - **No bearer leak.** `webui_base`, `refresh_url`, and `storage_api_url` are
+//!   validated HTTPS-or-loopback at parse time, so the write/refresh Bearer is
+//!   never sent to an unintended origin.
 //!
 //! ## Bundle wire format (injected at startup; NEVER persisted)
 //!
-//! A single JSON object (see [`CapabilityBundleJson`]). Example:
-//!
 //! ```json
 //! {
-//!   "endpoint": "https://gateway.example",
-//!   "jwt": "<scoped gateway JWT>",
-//!   "workspace_secret_b64": "<base64 of 32-byte workspace secret>",
-//!   "mcp_secret_b64": "<base64 of 32-byte MCP X25519 secret>",
-//!   "owner_public_b64": "<base64 of 32-byte owner X25519 public key>",
-//!   "grants": [
-//!     { "scope": "ai/", "permissions": { "can_read": true, "can_write": true, "can_delete": true } }
-//!   ]
+//!   "webui_base": "https://cloud.fx.land",
+//!   "group_id": "1b9d…uuid",
+//!   "manifest_bucket": "fula-metadata",
+//!   "manifest_key": "manifests/1b9d….json",
+//!   "wrapped_link_secret": "<serde_json string of a fula ShareToken>",
+//!   "identity_path": "/optional/path/to/mcp_identity.key",
+//!   "collab_write_token": "<optional group-scoped Bearer>",
+//!   "refresh_token": "<optional, re-mints the write token>",
+//!   "refresh_url": "<optional, https or loopback>",
+//!   "storage_api_url": "<optional credit host for the quota pre-check>",
+//!   "user_id": "<optional, informational>",
+//!   "timeout_secs": 60
 //! }
 //! ```
 //!
-//! Load it with [`CapabilityBundle::from_json`] (or [`CapabilityBundle::from_env`]
-//! reading `FULA_MCP_CAPABILITY` for the JSON and `FULA_MCP_JWT` to override the
-//! token out-of-band). The JSON is consumed and dropped immediately; only the
-//! in-memory typed bundle survives.
-//!
-//! ## Optional L1c connection auto-refresh fields
-//!
-//! Two OPTIONAL, snake_case fields enable the L1c silent gateway-JWT auto-refresh
-//! (so a paired connection works indefinitely without re-pairing):
-//!
-//! - `refresh_token` — a long-lived **connection refresh token** (a secret).
-//! - `refresh_url` — the explicit refresh endpoint
-//!   (`POST /api/mcp/tokens/refresh-connection`); if omitted it is derived from
-//!   `storage_api_url`.
-//!
-//! Both default to absent. A bundle WITHOUT `refresh_token` behaves exactly as a
-//! pre-L1c bundle: when the short gateway JWT expires, the op's auth error
-//! surfaces unchanged (no refresh, no retry). See [`refresh_connection_jwt`] and
-//! the op-layer `with_refresh_retry` wrapper for the runtime behavior.
+//! Load it with [`CapabilityBundle::from_json`] / [`CapabilityBundle::from_env`].
 
+use std::path::PathBuf;
 use std::time::Duration;
 
-use base64::Engine as _;
-use fula_client::{Config, EncryptedClient, EncryptionConfig};
-use fula_crypto::{
-    AcceptedShare, DekKey, KekKeyPair, PublicKey, SecretKey, SharePermissions, ShareBuilder,
-    ShareRecipient, ShareToken,
-};
+use fula_crypto::{KekKeyPair, SecretKey, ShareToken};
 use serde::Deserialize;
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
+use crate::identity::McpIdentity;
 use crate::quota::{
     check_quota, QuotaDecision, TokenBucket, DEFAULT_WRITE_BURST, DEFAULT_WRITE_REFILL_PER_SEC,
     ENV_WRITE_BURST, ENV_WRITE_REFILL_PER_SEC,
 };
 
-/// The default S3 client request timeout when the bundle does not specify one.
+/// The default HTTP request timeout when the bundle does not specify one.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
-
-/// The well-known path of pinning-webui's connection-JWT refresh endpoint (L1c).
-/// Appended to the trimmed `storage_api_url` base when the bundle does not carry
-/// an explicit `refresh_url`. Matches the L1a contract
-/// (`POST /api/mcp/tokens/refresh-connection`).
-const REFRESH_CONNECTION_PATH: &str = "/api/mcp/tokens/refresh-connection";
 
 /// Environment variable that carries the capability bundle JSON.
 pub const ENV_CAPABILITY: &str = "FULA_MCP_CAPABILITY";
 
-/// Environment variable that, if set, overrides the bundle's `jwt` field. Lets an
-/// operator inject the short-lived token out-of-band from the rest of the bundle.
-pub const ENV_JWT_OVERRIDE: &str = "FULA_MCP_JWT";
+/// Environment variable that, if set, overrides the bundle's `collab_write_token`
+/// (so the group-scoped write Bearer can be injected out-of-band from the rest of
+/// the bundle, the same way the legacy JWT could be).
+pub const ENV_WRITE_TOKEN_OVERRIDE: &str = "FULA_MCP_COLLAB_WRITE_TOKEN";
 
 /// Environment variable that, if set, overrides the bundle's `storage_api_url`
-/// (the credit/quota host the P10 pre-check calls). Mirrors [`ENV_JWT_OVERRIDE`]
-/// so an operator can inject the credit host out-of-band.
+/// (the credit/quota host the write pre-check calls).
 pub const ENV_STORAGE_API_URL: &str = "FULA_MCP_STORAGE_API_URL";
 
-/// Validate the operator-supplied `storage_api_url` for the quota pre-check.
-///
-/// The pre-check sends the session's bearer JWT to THIS host, which is distinct
-/// from the S3 `endpoint` (e.g. `https://cloud.fx.land` vs `https://s3.cloud.fx.land`).
-/// To avoid leaking a bearer token to an unintended origin we require the URL to
-/// be `https://` — with the sole exception of an explicit `http://localhost` /
-/// `http://127.0.0.1` for local/dev deployments (the gateway's own install
-/// defaults the credit host to `http://127.0.0.1:3001`). Any other scheme (or an
-/// `http://` non-loopback host) is rejected at parse time.
-///
-/// NOTE on threat model: the bundle is OPERATOR-injected, and in the local-stdio
-/// model the operator IS the data owner, so a mis-set URL only ever leaks the
-/// operator's own JWT to a host the operator chose. Same-origin/allowlist
-/// enforcement against the gateway endpoint is a deliberate follow-up for a
-/// hosted/multi-tenant deployment (operator ≠ owner) — the same way this crate
-/// already defers multi-tenant audit-key hashing (`server.rs`). This cheap
-/// HTTPS-or-loopback guard is the proportionate check for the current model.
-///
-/// # Errors
-/// [`CapabilityError::InvalidStorageApiUrl`] if the URL is not HTTPS and not an
-/// explicit loopback `http://` URL.
-fn validate_storage_api_url(url: &str) -> Result<(), CapabilityError> {
-    let lower = url.trim().to_ascii_lowercase();
-    if lower.starts_with("https://") {
-        return Ok(());
+/// Environment variable that, if set, overrides where the MCP persists its X25519
+/// identity (otherwise `identity_path`, otherwise a per-user default).
+pub const ENV_IDENTITY_PATH: &str = "FULA_MCP_IDENTITY_PATH";
+
+/// Validate a URL that will carry a Bearer token (the collab write token or the
+/// refresh token). Require `https://`, with the sole exception of an explicit
+/// `http://localhost` / `http://127.0.0.1` / `http://[::1]` for local/dev. Any
+/// other scheme (or an `http://` non-loopback host) is rejected so a bearer token
+/// is never sent to an unintended origin.
+fn validate_https_or_loopback(field: &'static str, url: &str) -> Result<(), CapabilityError> {
+    // Parse the URL rather than prefix-match the string: a prefix check admits
+    // `http://localhost.evil.com`, the `http://localhost@evil.com` userinfo trick,
+    // and IPv6-mapped / decimal-IP loopback spoofs, ALL of which would leak the
+    // Bearer (including the long-lived refresh token) to an attacker origin over
+    // cleartext. reqwest re-exports the `url` crate, so no new dependency.
+    let parsed = reqwest::Url::parse(url.trim()).map_err(|_| CapabilityError::InvalidUrl {
+        field,
+        reason: "is not a valid absolute URL",
+    })?;
+    let ok = match parsed.scheme() {
+        "https" => true,
+        // http:// permitted ONLY for an EXACT loopback host.
+        "http" => matches!(
+            parsed.host_str(),
+            Some("localhost") | Some("127.0.0.1") | Some("[::1]") | Some("::1")
+        ),
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(CapabilityError::InvalidUrl {
+            field,
+            reason: "must be https:// (or http:// only for an exact localhost / 127.0.0.1 / \
+                     [::1] host) so a bearer token is never sent to an unintended origin",
+        })
     }
-    // Allow plaintext HTTP ONLY for loopback (local/dev credit service).
-    if lower.starts_with("http://localhost")
-        || lower.starts_with("http://127.0.0.1")
-        || lower.starts_with("http://[::1]")
-    {
-        return Ok(());
-    }
-    Err(CapabilityError::InvalidStorageApiUrl {
-        reason: "must be https:// (or http:// only for localhost/127.0.0.1) to avoid \
-                 sending the session JWT to an unintended origin",
-    })
 }
 
-/// The access a caller needs for a given key. Maps onto [`SharePermissions`].
+/// A stable per-user path for the MCP's X25519 identity secret, used when neither
+/// the bundle's `identity_path` nor [`ENV_IDENTITY_PATH`] is set.
 ///
-/// These are *positive* permissions checked against a covering grant; there are
-/// no deny rules (the grant list is allow-only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Permission {
-    /// Read an object (GET).
-    Read,
-    /// Create or overwrite an object (PUT).
-    Write,
-    /// Delete an object (DELETE).
-    Delete,
-}
-
-impl Permission {
-    /// Is this permission granted by `perms`?
-    fn granted_by(self, perms: &SharePermissions) -> bool {
-        match self {
-            Permission::Read => perms.can_read,
-            Permission::Write => perms.can_write,
-            Permission::Delete => perms.can_delete,
-        }
-    }
+/// The path MUST be stable across runs: if it changes, [`McpIdentity::load_or_generate`]
+/// mints a fresh key and the wrapped link secret (addressed to the prior public
+/// key) can no longer be unwrapped. We prefer the OS per-user cache dir
+/// (`%LOCALAPPDATA%` on Windows, `$XDG_CACHE_HOME` or `$HOME/.cache` on Unix) and
+/// fall back to the temp dir only as a last resort.
+fn default_identity_path() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("fula-mcp").join("mcp_identity.key")
 }
 
 /// Errors surfaced by the capability layer.
@@ -191,329 +154,233 @@ pub enum CapabilityError {
     #[error("malformed capability bundle: {0}")]
     Malformed(String),
 
-    /// A base64 secret/key field did not decode to the required length.
-    #[error("invalid key material in bundle field `{field}`: {reason}")]
-    InvalidKeyMaterial {
-        /// Which JSON field failed.
-        field: &'static str,
-        /// Why it failed (length / decode).
-        reason: String,
-    },
-
     /// A required environment variable was not set.
     #[error("environment variable `{0}` is not set")]
     MissingEnv(&'static str),
 
-    /// A path/key/scope failed canonicalization (empty, traversal, etc.).
-    #[error("invalid path `{path}`: {reason}")]
-    InvalidPath {
-        /// The offending path.
-        path: String,
-        /// Why it is invalid.
+    /// A URL field that must not leak a bearer token failed validation.
+    #[error("invalid `{field}`: {reason}")]
+    InvalidUrl {
+        /// Which field failed (`webui_base` / `refresh_url` / `storage_api_url`).
+        field: &'static str,
+        /// Why it was rejected.
         reason: &'static str,
     },
 
-    /// The key is outside every granted scope (or no grant has the needed
-    /// permission). This is the access-DENIED outcome.
-    #[error("access denied: `{key}` not within any granted scope with `{needed:?}` permission")]
-    OutOfScope {
-        /// The key that was checked.
-        key: String,
-        /// The permission that was required.
-        needed: Permission,
-    },
+    /// A required string field was empty.
+    #[error("capability bundle field `{0}` must not be empty")]
+    EmptyField(&'static str),
 
-    /// Building the underlying encrypted client failed.
-    #[error("failed to build workspace client: {0}")]
-    Client(String),
+    /// Loading or generating the MCP's local identity key failed.
+    #[error("MCP identity load/generate failed: {0}")]
+    Identity(String),
 
-    /// Minting or accepting a share token failed.
-    #[error("share operation failed: {0}")]
-    Share(String),
+    /// The `wrapped_link_secret` was not a valid serialized `ShareToken`.
+    #[error("wrapped_link_secret is not a valid share token: {0}")]
+    InvalidShareToken(String),
 
-    /// The optional `storage_api_url` (the P10 quota host the bundle's JWT is
-    /// sent to) failed validation — it must be HTTPS (or an explicit loopback
-    /// `http://`) so a bearer token is never leaked to an unintended origin.
-    #[error("invalid storage_api_url: {reason}")]
-    InvalidStorageApiUrl {
-        /// Why the URL was rejected.
-        reason: &'static str,
-    },
+    /// The wrapped link secret could not be recovered with the MCP's identity —
+    /// it is not addressed to this MCP's public key (re-authorize the connection,
+    /// or check that `identity_path` points at the SAME key the owner authorized).
+    #[error("link secret recovery failed (identity mismatch — re-authorize this MCP): {0}")]
+    LinkSecretRecovery(String),
+
+    /// The reqwest HTTP client could not be built.
+    #[error("failed to build HTTP client: {0}")]
+    HttpClient(String),
 }
 
-/// One positive, scoped authority the session holds.
-///
-/// `scope` is a path *prefix* (e.g. `ai/` or `ai/notes`); `permissions` is the
-/// read/write/delete it grants under that prefix.
-#[derive(Clone, Deserialize)]
-pub struct Capability {
-    /// The path-prefix scope this capability covers (canonicalized at check time).
-    pub scope: String,
-    /// What the holder may do under `scope`.
-    pub permissions: SharePermissions,
-}
-
-impl std::fmt::Debug for Capability {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Capability")
-            .field("scope", &self.scope)
-            .field("permissions", &self.permissions)
-            .finish()
-    }
-}
-
-/// The MCP's in-memory, per-session capability bundle.
-///
-/// Constructed from an injected JSON blob via [`CapabilityBundle::from_json`] /
-/// [`CapabilityBundle::from_env`]. Holds secret key material; it is never written
-/// to disk and never logged (see the redacting [`Debug`] impl).
-pub struct CapabilityBundle {
-    /// S3 / gateway endpoint URL.
-    endpoint: String,
-    /// Scoped gateway JWT (bearer token). Carried verbatim; treated as a secret.
-    ///
-    /// Wrapped in an [`RwLock`](std::sync::RwLock) for **interior mutability**
-    /// (L1c): the short-lived JWT is swapped in place by [`Self::set_jwt`] when an
-    /// auto-refresh succeeds, while the bundle is shared immutably behind an `Arc`
-    /// (see `server.rs`). This mirrors the [`write_bucket`](Self::write_bucket)
-    /// interior-mutability pattern (a `Mutex` inside a shared-`&self` bundle). The
-    /// lock is only ever held briefly to clone/replace the string — never across
-    /// an `.await` — so a std lock (not a tokio one) is correct and cheap.
-    jwt: std::sync::RwLock<String>,
-    /// Client request timeout.
-    timeout: Duration,
-    /// The dedicated AI-workspace encryption secret (NOT the user's master KEK).
-    workspace_secret: SecretKey,
-    /// The MCP's own X25519 keypair (accepts owner -> MCP grants; signs AI -> owner
-    /// shares once token signing lands).
-    mcp_keypair: KekKeyPair,
-    /// The owner's X25519 public key (recipient of AI -> owner shares).
-    owner_public: PublicKey,
-    /// The owner's FxFiles `userId` (the `sha256(publicKey)[..16]` value), if the
-    /// session injector supplied one. OPTIONAL: it is informational — used by P8
-    /// to stamp the `userId` field of the AI's tag-metadata document for format
-    /// fidelity. Not a secret and not load-bearing for any authority check.
-    user_id: Option<String>,
-    /// The credit/quota host the P10 pre-check calls
-    /// (`GET {storage_api_url}/api/v1/storage`), if configured. `None` → the
-    /// quota pre-check is OFF (fail-open `NotConfigured`), exactly like the
-    /// gateway's `storage_api_url = None` behavior. Validated HTTPS-or-loopback at
-    /// parse time (see [`validate_storage_api_url`]).
-    storage_api_url: Option<String>,
-    /// The long-lived connection refresh token (L1c), if the session injector
-    /// supplied one. `None` → auto-refresh is OFF for this session (an expired
-    /// gateway JWT surfaces as the op's normal auth error, exactly as pre-L1c). A
-    /// SECRET, treated like the JWT: never logged, redacted in [`Debug`].
-    refresh_token: Option<String>,
-    /// The effective connection-JWT refresh endpoint (L1c): the bundle's explicit
-    /// `refresh_url` if present, else derived from `storage_api_url` by appending
-    /// the well-known refresh path. `None` only when neither was configured (then
-    /// a refresh can never be attempted even if a `refresh_token` were present).
-    /// Validated HTTPS-or-loopback at parse time (the refresh token is POSTed
-    /// here, so the same anti-leak guard as `storage_api_url` applies).
-    refresh_url: Option<String>,
-    /// The positive scoped grants this session holds.
-    grants: Vec<Capability>,
-    /// Per-session WRITE rate limiter (P10). A token bucket constructed ONCE here
-    /// (so it actually limits across calls) and shared by every write op via
-    /// [`Self::try_consume_write_token`]. Interior mutability lives inside the
-    /// bucket (a `Mutex`), so the bundle itself stays shareable behind an `Arc`.
-    write_bucket: TokenBucket,
-}
-
-/// On-the-wire JSON shape of the bundle. Deserialized, consumed, and dropped at
-/// construction — only the typed [`CapabilityBundle`] survives in memory.
-///
-/// This type is intentionally NOT public API beyond documentation: callers go
-/// through [`CapabilityBundle::from_json`].
+/// On-the-wire JSON shape of the collaboration bundle. Deserialized, consumed, and
+/// dropped at construction — only the typed [`CapabilityBundle`] survives.
 #[derive(Deserialize)]
 struct CapabilityBundleJson {
-    endpoint: String,
-    jwt: String,
-    /// Base64 of the 32-byte AI-workspace encryption secret.
-    workspace_secret_b64: String,
-    /// Base64 of the 32-byte MCP X25519 secret key.
-    mcp_secret_b64: String,
-    /// Base64 of the 32-byte owner X25519 public key.
-    owner_public_b64: String,
-    /// Optional FxFiles `userId` (`sha256(publicKey)[..16]`). Informational; used
-    /// by P8 to stamp the tag-metadata document's `userId` field. Absent in older
-    /// bundles (P3/P5/P6/P7) — those still parse.
+    /// Base URL for the `/api/collab/*` endpoints (e.g. `https://cloud.fx.land`).
+    webui_base: String,
+    /// The collaboration group UUID.
+    group_id: String,
+    /// Bucket the group's manifest lives in (informational).
+    manifest_bucket: String,
+    /// Key of the group's manifest in the bucket (informational).
+    manifest_key: String,
+    /// A `fula_crypto::sharing::ShareToken` (serde_json STRING) wrapping the
+    /// 32-byte link secret for the MCP's own X25519 public key.
+    wrapped_link_secret: String,
+    /// Optional path where the MCP persists its X25519 identity secret. Defaults to
+    /// [`ENV_IDENTITY_PATH`] then a per-user path ([`default_identity_path`]).
     #[serde(default)]
-    user_id: Option<String>,
+    identity_path: Option<String>,
+    /// Optional group-scoped Bearer for the WRITE endpoints. Absent ⇒ read-only.
+    #[serde(default)]
+    collab_write_token: Option<String>,
+    /// Optional long-lived token to re-mint `collab_write_token` on a 401/403.
+    #[serde(default)]
+    refresh_token: Option<String>,
+    /// Optional explicit URL that re-mints the write token (validated
+    /// HTTPS-or-loopback). The `refresh_token` is POSTed here.
+    #[serde(default)]
+    refresh_url: Option<String>,
     /// Optional client timeout (seconds). Defaults to [`DEFAULT_TIMEOUT_SECS`].
     #[serde(default)]
     timeout_secs: Option<u64>,
-    /// Optional credit/quota host for the P10 pre-check
-    /// (`GET {storage_api_url}/api/v1/storage`). Absent → quota checking OFF
-    /// (fail-open). Validated HTTPS-or-loopback. Older bundles omit it (still
-    /// parse).
+    /// Optional credit/quota host for the write pre-check. Absent ⇒ quota check OFF.
     #[serde(default)]
     storage_api_url: Option<String>,
-    /// Optional long-lived **connection refresh token** (L1c). When present, an
-    /// expired-JWT gateway rejection triggers a silent refresh against
-    /// [`Self::refresh_url`] (or the URL derived from `storage_api_url`) and a
-    /// single retry. Absent → NO auto-refresh (behavior byte-identical to a
-    /// pre-L1c bundle: the op's auth error surfaces as before). A SECRET — never
-    /// logged. Populated by FxFiles in L1d; optional here keeps L1c standalone.
+    /// Optional informational `userId` (not load-bearing for any authority check).
     #[serde(default)]
-    refresh_token: Option<String>,
-    /// Optional explicit URL for the connection-JWT refresh endpoint (L1c),
-    /// pinning-webui's `POST /api/mcp/tokens/refresh-connection`. If absent, the
-    /// effective refresh URL is DERIVED from `storage_api_url` (append the
-    /// well-known path to the trimmed base). Validated HTTPS-or-loopback (the
-    /// `refresh_token` is sent here, so it must not leak to an unintended
-    /// origin). Absent in older bundles (still parse).
-    #[serde(default)]
-    refresh_url: Option<String>,
-    /// Optional override for the P10 write-rate-limit burst (token-bucket
-    /// capacity). Defaults to [`DEFAULT_WRITE_BURST`].
+    user_id: Option<String>,
+    /// Optional override for the write-rate-limit burst (token-bucket capacity).
     #[serde(default)]
     write_burst: Option<u32>,
-    /// Optional override for the P10 write-rate-limit refill (tokens/sec).
-    /// Defaults to [`DEFAULT_WRITE_REFILL_PER_SEC`].
+    /// Optional override for the write-rate-limit refill (tokens/sec).
     #[serde(default)]
     write_refill_per_sec: Option<f64>,
-    /// The positive scoped grants.
-    #[serde(default)]
-    grants: Vec<Capability>,
+}
+
+/// The MCP's in-memory, per-session collaboration bundle. Holds the recovered link
+/// secret + write token; never written to disk, never logged (redacting [`Debug`]).
+pub struct CapabilityBundle {
+    webui_base: String,
+    group_id: String,
+    manifest_bucket: String,
+    manifest_key: String,
+    /// The recovered 32-byte group link secret (zeroized on drop). Derives the
+    /// manifest key, every collab-file key, and the link keypair for owner shares.
+    link_secret: Zeroizing<[u8; 32]>,
+    /// The MCP identity's X25519 public key, base64 (standard). Stamped as a
+    /// file's `addedByPublicKey` when the AI writes into the manifest.
+    mcp_public_b64: String,
+    /// The MCP identity's `FULA-…` share id — the string the owner authorized.
+    mcp_fula_id: String,
+    /// The shared HTTP client (timeout-configured), reused across ops.
+    http: reqwest::Client,
+    /// Group-scoped write Bearer, behind interior mutability so a refresh can swap
+    /// it in place while the bundle is shared `&self` behind an `Arc`. `None` ⇒
+    /// the session is read-only.
+    collab_write_token: std::sync::RwLock<Option<String>>,
+    /// Long-lived token to re-mint `collab_write_token` (a SECRET). `None` ⇒ no
+    /// write-token refresh.
+    refresh_token: Option<String>,
+    /// Endpoint that re-mints the write token (validated HTTPS-or-loopback).
+    refresh_url: Option<String>,
+    /// Credit/quota host for the write pre-check, if configured.
+    storage_api_url: Option<String>,
+    /// Informational owner `userId`.
+    user_id: Option<String>,
+    /// Per-session WRITE rate limiter (built once; limits across calls).
+    write_bucket: TokenBucket,
 }
 
 impl std::fmt::Debug for CapabilityBundle {
-    /// Redacting debug — NEVER prints any secret (workspace secret, MCP secret,
-    /// or JWT). Only non-sensitive shape is shown.
+    /// Redacting debug — NEVER prints the link secret, the write token, or the
+    /// refresh token.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CapabilityBundle")
-            .field("endpoint", &self.endpoint)
-            .field("jwt", &"<redacted>")
-            .field("timeout", &self.timeout)
-            .field("workspace_secret", &"<redacted>")
-            .field("mcp_secret", &"<redacted>")
-            // Public key is, by definition, public — safe to show.
-            .field("mcp_public", &self.mcp_keypair.public_key())
-            .field("owner_public", &self.owner_public)
-            // The refresh token is a SECRET (like the JWT) — redact it. The
-            // refresh URL is not a secret (it's a well-known endpoint).
+            .field("webui_base", &self.webui_base)
+            .field("group_id", &self.group_id)
+            .field("manifest_bucket", &self.manifest_bucket)
+            .field("manifest_key", &self.manifest_key)
+            .field("link_secret", &"<redacted>")
+            .field("mcp_public_b64", &self.mcp_public_b64)
+            .field("mcp_fula_id", &self.mcp_fula_id)
+            .field(
+                "collab_write_token",
+                &self
+                    .collab_write_token
+                    .read()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|_| "<redacted>")),
+            )
             .field("refresh_token", &self.refresh_token.as_ref().map(|_| "<redacted>"))
             .field("refresh_url", &self.refresh_url)
-            .field("grants", &self.grants)
+            .field("storage_api_url", &self.storage_api_url)
+            .field("user_id", &self.user_id)
             .finish()
     }
 }
 
-/// Decode a base64 field into a fixed 32-byte array, zeroizing the intermediate
-/// decoded `Vec` on the way out. The returned array is the caller's to wrap into
-/// a typed key (and then drop/zeroize per that type's policy).
-fn decode_secret_32(field: &'static str, b64: &str) -> Result<[u8; 32], CapabilityError> {
-    let mut raw = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .map_err(|e| CapabilityError::InvalidKeyMaterial {
-            field,
-            reason: format!("base64 decode failed: {e}"),
-        })?;
-    if raw.len() != 32 {
-        // Wipe whatever we decoded before erroring out.
-        raw.zeroize();
-        return Err(CapabilityError::InvalidKeyMaterial {
-            field,
-            reason: format!("expected 32 bytes, got {}", raw.len()),
-        });
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&raw);
-    raw.zeroize();
-    Ok(out)
-}
-
 impl CapabilityBundle {
-    /// Parse a bundle from its injected JSON form.
-    ///
-    /// The JSON string is parsed into [`CapabilityBundleJson`], the secret fields
-    /// are decoded into typed keys (intermediate bytes zeroized), and the JSON
-    /// struct is dropped. Nothing touches the disk.
+    /// Parse a bundle from its injected JSON form: load the MCP identity, unwrap the
+    /// link secret once, validate URLs, and build the HTTP client.
     ///
     /// # Errors
-    /// - [`CapabilityError::Malformed`] if the JSON is invalid or missing fields.
-    /// - [`CapabilityError::InvalidKeyMaterial`] if a secret/key field is not a
-    ///   valid base64 32-byte value.
+    /// See [`CapabilityError`] — malformed JSON, an empty required field, a bad URL,
+    /// an identity load failure, an invalid share token, or a link-secret recovery
+    /// failure (identity mismatch).
     pub fn from_json(json: &str) -> Result<Self, CapabilityError> {
-        let parsed: CapabilityBundleJson = serde_json::from_str(json)
-            .map_err(|e| CapabilityError::Malformed(e.to_string()))?;
+        let parsed: CapabilityBundleJson =
+            serde_json::from_str(json).map_err(|e| CapabilityError::Malformed(e.to_string()))?;
         Self::from_parsed(parsed)
     }
 
-    /// Build from the deserialized JSON struct, decoding key material and wiping
-    /// the base64 intermediates. `parsed` is consumed; its base64 secret strings
-    /// are zeroized before it drops.
-    fn from_parsed(mut parsed: CapabilityBundleJson) -> Result<Self, CapabilityError> {
-        // Decode workspace secret.
-        let mut ws_bytes = decode_secret_32("workspace_secret_b64", &parsed.workspace_secret_b64)?;
-        let workspace_secret = SecretKey::from_bytes(&ws_bytes).map_err(|e| {
-            CapabilityError::InvalidKeyMaterial {
-                field: "workspace_secret_b64",
-                reason: e.to_string(),
-            }
-        })?;
-        ws_bytes.zeroize();
+    fn from_parsed(parsed: CapabilityBundleJson) -> Result<Self, CapabilityError> {
+        // Required non-empty fields.
+        if parsed.webui_base.trim().is_empty() {
+            return Err(CapabilityError::EmptyField("webui_base"));
+        }
+        if parsed.group_id.trim().is_empty() {
+            return Err(CapabilityError::EmptyField("group_id"));
+        }
+        validate_https_or_loopback("webui_base", &parsed.webui_base)?;
 
-        // Decode MCP secret -> keypair.
-        let mut mcp_bytes = decode_secret_32("mcp_secret_b64", &parsed.mcp_secret_b64)?;
-        let mcp_secret = SecretKey::from_bytes(&mcp_bytes).map_err(|e| {
-            CapabilityError::InvalidKeyMaterial {
-                field: "mcp_secret_b64",
-                reason: e.to_string(),
-            }
-        })?;
-        mcp_bytes.zeroize();
-        let mcp_keypair = KekKeyPair::from_secret_key(mcp_secret);
+        // Resolve the identity path: env override > bundle field > per-user default.
+        let identity_path = std::env::var_os(ENV_IDENTITY_PATH)
+            .map(PathBuf::from)
+            .or_else(|| {
+                parsed
+                    .identity_path
+                    .as_ref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(default_identity_path);
 
-        // Decode owner public key (NOT a secret, but length-validated).
-        let owner_bytes = decode_secret_32("owner_public_b64", &parsed.owner_public_b64)?;
-        let owner_public =
-            PublicKey::from_bytes(&owner_bytes).map_err(|e| CapabilityError::InvalidKeyMaterial {
-                field: "owner_public_b64",
-                reason: e.to_string(),
-            })?;
+        // Load (or first-run generate) the MCP's persistent X25519 identity.
+        let identity = McpIdentity::load_or_generate(&identity_path)
+            .map_err(|e| CapabilityError::Identity(e.to_string()))?;
 
-        let timeout =
-            Duration::from_secs(parsed.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).max(1));
+        // Parse the wrapped link-secret share token, then recover the link secret
+        // with the MCP's own identity. A failure here means the token is not
+        // addressed to THIS identity (wrong/rotated key) — surface it as a clear
+        // re-authorize hint, never a panic.
+        let token: ShareToken = serde_json::from_str(parsed.wrapped_link_secret.trim())
+            .map_err(|e| CapabilityError::InvalidShareToken(e.to_string()))?;
+        let link_secret = identity
+            .accept_link_secret(&token)
+            .map_err(|e| CapabilityError::LinkSecretRecovery(e.to_string()))?;
 
-        // Validate the optional credit/quota host (the JWT is sent here in the
-        // P10 pre-check). Reject a non-HTTPS, non-loopback URL at parse time so a
-        // bearer token can never be leaked to an unintended origin. An empty
-        // string is treated as "not configured" (quota check off).
-        let storage_api_url = match parsed.storage_api_url.take().filter(|s| !s.is_empty()) {
+        let mcp_public_b64 = identity.public_key_b64();
+        let mcp_fula_id = identity.fula_id();
+        // `identity` (and its secret) drops here — only the public id + the
+        // recovered link secret survive into the bundle.
+
+        let timeout = Duration::from_secs(parsed.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).max(1));
+
+        // Validate the optional credit/quota host (a bearer is sent there).
+        let storage_api_url = match parsed.storage_api_url.filter(|s| !s.trim().is_empty()) {
             Some(u) => {
-                validate_storage_api_url(&u)?;
+                validate_https_or_loopback("storage_api_url", &u)?;
                 Some(u)
             }
             None => None,
         };
 
-        // L1c: compute the EFFECTIVE connection-JWT refresh URL. Prefer an explicit
-        // `refresh_url`; otherwise derive it from `storage_api_url` by appending the
-        // well-known path to the trimmed base. Either way it is validated
-        // HTTPS-or-loopback (the refresh token is POSTed here — same anti-leak guard
-        // as the quota host). When neither is configured the effective URL is `None`
-        // (a refresh can then never fire, even if a refresh_token were present).
-        let refresh_url = match parsed.refresh_url.take().filter(|s| !s.is_empty()) {
+        // Validate the optional write-token refresh URL (the refresh token is
+        // POSTed there).
+        let refresh_url = match parsed.refresh_url.filter(|s| !s.trim().is_empty()) {
             Some(u) => {
-                validate_storage_api_url(&u)?;
+                validate_https_or_loopback("refresh_url", &u)?;
                 Some(u)
             }
-            // `storage_api_url` is already validated above; the derived URL has
-            // the same scheme/host, so it inherits the HTTPS-or-loopback property —
-            // we just trim a trailing slash and append the path.
-            None => storage_api_url.as_ref().map(|base| {
-                format!("{}{}", base.trim_end_matches('/'), REFRESH_CONNECTION_PATH)
-            }),
+            None => None,
         };
-        // The refresh token itself (a secret) — kept verbatim, redacted in Debug,
-        // never logged. An empty string is treated as "not configured".
-        let refresh_token = parsed.refresh_token.take().filter(|s| !s.is_empty());
+        let refresh_token = parsed.refresh_token.filter(|s| !s.is_empty());
+        let collab_write_token = parsed.collab_write_token.filter(|s| !s.is_empty());
 
-        // Build the per-session WRITE rate limiter ONCE (so it limits across
-        // calls). Defaults are generous; the bundle may override both knobs.
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| CapabilityError::HttpClient(e.to_string()))?;
+
         let write_bucket = TokenBucket::new(
             parsed.write_burst.unwrap_or(DEFAULT_WRITE_BURST),
             parsed
@@ -521,66 +388,51 @@ impl CapabilityBundle {
                 .unwrap_or(DEFAULT_WRITE_REFILL_PER_SEC),
         );
 
-        let bundle = CapabilityBundle {
-            endpoint: std::mem::take(&mut parsed.endpoint),
-            jwt: std::sync::RwLock::new(std::mem::take(&mut parsed.jwt)),
-            timeout,
-            workspace_secret,
-            mcp_keypair,
-            owner_public,
-            user_id: parsed.user_id.take().filter(|s| !s.is_empty()),
-            storage_api_url,
+        Ok(CapabilityBundle {
+            webui_base: parsed.webui_base.trim_end_matches('/').to_string(),
+            group_id: parsed.group_id,
+            manifest_bucket: parsed.manifest_bucket,
+            manifest_key: parsed.manifest_key,
+            link_secret: Zeroizing::new(link_secret),
+            mcp_public_b64,
+            mcp_fula_id,
+            http,
+            collab_write_token: std::sync::RwLock::new(collab_write_token),
             refresh_token,
             refresh_url,
-            grants: std::mem::take(&mut parsed.grants),
+            storage_api_url,
+            user_id: parsed.user_id.filter(|s| !s.is_empty()),
             write_bucket,
-        };
-
-        // Best-effort wipe of the base64 secret strings in the parsed struct
-        // before it drops (the typed keys above are the authoritative copies).
-        // The refresh_token was MOVED out via `.take()` above, so the parsed
-        // struct no longer holds it.
-        parsed.workspace_secret_b64.zeroize();
-        parsed.mcp_secret_b64.zeroize();
-
-        Ok(bundle)
+        })
     }
 
     /// Construct a bundle from environment variables.
     ///
-    /// Reads the JSON blob from [`ENV_CAPABILITY`]. Then applies out-of-band
-    /// overrides, each only when set and non-empty:
-    /// - [`ENV_JWT_OVERRIDE`] replaces `jwt` (so the short-lived token can be
-    ///   injected separately from the rest of the bundle).
-    /// - [`ENV_STORAGE_API_URL`] replaces the credit/quota host (validated
-    ///   HTTPS-or-loopback, like the in-bundle field).
-    /// - [`ENV_WRITE_BURST`] / [`ENV_WRITE_REFILL_PER_SEC`] override the P10
-    ///   write rate-limit (the bucket is rebuilt with the new knobs).
+    /// Reads the JSON blob from [`ENV_CAPABILITY`], then applies out-of-band
+    /// overrides (each only when set and non-empty): [`ENV_WRITE_TOKEN_OVERRIDE`]
+    /// replaces `collab_write_token`, [`ENV_STORAGE_API_URL`] replaces the quota
+    /// host, and [`ENV_WRITE_BURST`] / [`ENV_WRITE_REFILL_PER_SEC`] rebuild the
+    /// write rate limiter.
     ///
     /// # Errors
     /// [`CapabilityError::MissingEnv`] if [`ENV_CAPABILITY`] is unset, plus any
-    /// parse error from [`CapabilityBundle::from_json`] (including
-    /// [`CapabilityError::InvalidStorageApiUrl`] for a bad env URL).
+    /// parse/validation error from [`CapabilityBundle::from_json`].
     pub fn from_env() -> Result<Self, CapabilityError> {
         let json =
             std::env::var(ENV_CAPABILITY).map_err(|_| CapabilityError::MissingEnv(ENV_CAPABILITY))?;
         let mut bundle = Self::from_json(&json)?;
-        if let Ok(jwt) = std::env::var(ENV_JWT_OVERRIDE) {
-            if !jwt.is_empty() {
-                // `bundle` is still uniquely owned here, but go through the
-                // interior-mutability setter so there is ONE place that writes the
-                // JWT lock (the L1c refresh path uses the same `set_jwt`).
-                bundle.set_jwt(jwt);
+
+        if let Ok(tok) = std::env::var(ENV_WRITE_TOKEN_OVERRIDE) {
+            if !tok.is_empty() {
+                bundle.set_collab_write_token(tok);
             }
         }
         if let Ok(url) = std::env::var(ENV_STORAGE_API_URL) {
             if !url.is_empty() {
-                validate_storage_api_url(&url)?;
+                validate_https_or_loopback("storage_api_url", &url)?;
                 bundle.storage_api_url = Some(url);
             }
         }
-        // Rate-limit env overrides: rebuild the bucket only if either is set, so
-        // the common case keeps the bucket built in `from_parsed` untouched.
         let env_burst = std::env::var(ENV_WRITE_BURST).ok().and_then(|s| s.parse::<u32>().ok());
         let env_refill = std::env::var(ENV_WRITE_REFILL_PER_SEC)
             .ok()
@@ -594,1082 +446,274 @@ impl CapabilityBundle {
         Ok(bundle)
     }
 
-    /// The configured gateway endpoint.
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
+    /// The base URL for the group's `/api/collab/*` endpoints (no trailing slash).
+    pub fn webui_base(&self) -> &str {
+        &self.webui_base
     }
 
-    /// The MCP's own X25519 public key (safe to share; e.g. so the owner can mint
-    /// `owner -> MCP` grants addressed to it).
-    pub fn mcp_public_key(&self) -> &PublicKey {
-        self.mcp_keypair.public_key()
+    /// The collaboration group UUID.
+    pub fn group_id(&self) -> &str {
+        &self.group_id
     }
 
-    /// The owner's X25519 public key (recipient of `AI -> owner` shares).
-    pub fn owner_public_key(&self) -> &PublicKey {
-        &self.owner_public
+    /// The bucket the group's manifest lives in (informational; used as the default
+    /// `bucket` stamped on collab files the AI writes).
+    pub fn manifest_bucket(&self) -> &str {
+        &self.manifest_bucket
     }
 
-    /// The owner's FxFiles `userId` (`sha256(publicKey)[..16]`), if the session
-    /// injector supplied one. Informational — used by P8 to stamp the tag
-    /// document's `userId` field for format fidelity; never used for authority.
-    pub fn user_id(&self) -> Option<&str> {
-        self.user_id.as_deref()
+    /// The key of the group's manifest in the bucket (informational).
+    pub fn manifest_key(&self) -> &str {
+        &self.manifest_key
     }
 
-    /// The positive scoped grants this session holds.
-    pub fn grants(&self) -> &[Capability] {
-        &self.grants
+    /// The recovered 32-byte group link secret. Used to derive the manifest key
+    /// (`enc1_*`), every collab-file key (`collab_file_*`), and the link keypair.
+    pub fn link_secret(&self) -> &[u8] {
+        &self.link_secret[..]
     }
 
-    /// The configured credit/quota host for the P10 pre-check, if any. `None`
-    /// means quota checking is OFF for this session (the pre-check fails open).
-    pub fn storage_api_url(&self) -> Option<&str> {
-        self.storage_api_url.as_deref()
+    /// Build the **link keypair** — the X25519 keypair derived from the link
+    /// secret. It is the recipient of the owner's per-file `fula` share tokens, so
+    /// any group member (anyone holding the link secret) can accept them.
+    ///
+    /// # Errors
+    /// [`CapabilityError::LinkSecretRecovery`] if the 32 bytes do not form a valid
+    /// secret key (unreachable for a well-formed link secret).
+    pub fn link_keypair(&self) -> Result<KekKeyPair, CapabilityError> {
+        let secret = SecretKey::from_bytes(&self.link_secret[..])
+            .map_err(|e| CapabilityError::LinkSecretRecovery(e.to_string()))?;
+        Ok(KekKeyPair::from_secret_key(secret))
     }
 
-    /// The long-lived connection refresh token (L1c), if configured. `None` means
-    /// auto-refresh is OFF for this session — an expired gateway JWT surfaces as
-    /// the op's normal auth error (pre-L1c behavior). This is a SECRET; callers
-    /// pass it to [`refresh_connection_jwt`] but MUST NEVER log it.
+    /// The MCP identity's X25519 public key (standard base64) — stamped as a file's
+    /// `addedByPublicKey` when the AI writes into the manifest.
+    pub fn mcp_public_b64(&self) -> &str {
+        &self.mcp_public_b64
+    }
+
+    /// The MCP identity's `FULA-…` share id (the string the owner authorized).
+    pub fn mcp_fula_id(&self) -> &str {
+        &self.mcp_fula_id
+    }
+
+    /// The shared, timeout-configured HTTP client.
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// A clone of the current group-scoped write Bearer, if the session has one.
+    /// `None` ⇒ the session is read-only (writes return a clear "not configured"
+    /// error before any network I/O).
+    pub fn collab_write_token(&self) -> Option<String> {
+        self.collab_write_token
+            .read()
+            .expect("collab_write_token lock poisoned")
+            .clone()
+    }
+
+    /// Swap in a freshly re-minted write Bearer (after a 401/403 refresh), in place,
+    /// behind the shared `&self`. The lock is held only for the brief replace.
+    pub fn set_collab_write_token(&self, new: String) {
+        *self
+            .collab_write_token
+            .write()
+            .expect("collab_write_token lock poisoned") = Some(new);
+    }
+
+    /// The long-lived token to re-mint the write Bearer, if configured (a SECRET —
+    /// callers pass it to the refresh helper but MUST NEVER log it).
     pub fn refresh_token(&self) -> Option<&str> {
         self.refresh_token.as_deref()
     }
 
-    /// The effective connection-JWT refresh endpoint (L1c): the explicit
-    /// `refresh_url` if the bundle carried one, else derived from
-    /// `storage_api_url`. `None` when neither was configured (a refresh can then
-    /// never be attempted). Validated HTTPS-or-loopback at parse time.
+    /// The endpoint that re-mints the write Bearer, if configured.
     pub fn refresh_url(&self) -> Option<&str> {
         self.refresh_url.as_deref()
     }
 
-    /// Swap in a freshly-refreshed scoped gateway JWT (L1c), in place, behind the
-    /// shared `&self`. Called after [`refresh_connection_jwt`] returns a new token
-    /// on an expired-JWT gateway rejection; the very next [`Self::workspace_client`]
-    /// (and [`Self::check_quota`]) then builds a client carrying the new token.
-    ///
-    /// Write-locks the JWT for the brief moment of the replace; the lock is never
-    /// held across an `.await`, so this is cheap and deadlock-free. `new` is a
-    /// SECRET — the caller must never log it.
-    pub fn set_jwt(&self, new: String) {
-        *self.jwt.write().expect("jwt lock poisoned") = new;
+    /// The configured credit/quota host, if any. `None` ⇒ the quota pre-check is
+    /// OFF (fail-open).
+    pub fn storage_api_url(&self) -> Option<&str> {
+        self.storage_api_url.as_deref()
     }
 
-    /// Run the P10 fail-fast quota pre-check for this session, reusing the
-    /// session's scoped JWT against the configured credit host. Returns a 3-state
-    /// [`QuotaDecision`]; only [`QuotaDecision::Denied`] should block a write —
-    /// every other outcome (including every fail-open case) proceeds, because the
-    /// gateway re-enforces quota on the real PUT. If no `storage_api_url` is
-    /// configured this is a no-network `SkippedFailOpen(NotConfigured)`.
-    ///
-    /// The JWT / URL are read from the bundle's private fields here so callers
-    /// never need to handle the token themselves.
+    /// The informational owner `userId`, if supplied.
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+
+    /// Run the fail-fast quota pre-check, sending the write Bearer to the credit
+    /// host. Only [`QuotaDecision::Denied`] should block a write; every other
+    /// outcome (including fail-open) proceeds. No `storage_api_url` ⇒ a no-network
+    /// `SkippedFailOpen`.
     pub async fn check_quota(&self) -> QuotaDecision {
-        // Read the (possibly-refreshed) JWT under the lock and hand an owned copy
-        // to the check. The lock is released immediately (the clone is cheap and
-        // the guard is NOT held across the `.await`).
-        let jwt = self.jwt.read().expect("jwt lock poisoned").clone();
-        check_quota(self.storage_api_url.as_deref(), Some(jwt.as_str())).await
+        let token = self.collab_write_token();
+        check_quota(self.storage_api_url.as_deref(), token.as_deref()).await
     }
 
-    /// Try to take one WRITE token from the per-session rate limiter. Returns
-    /// `true` if the write may proceed, `false` if the session is over its local
-    /// write-rate limit (→ the caller should surface a `RateLimited` error).
-    ///
-    /// Fully synchronous (the bucket's `Mutex` critical section is tiny and never
-    /// held across an `.await`); call it AFTER the scope/authority check so an
-    /// unauthorized attempt cannot drain the budget.
+    /// Take one WRITE token from the per-session rate limiter. `true` ⇒ proceed;
+    /// `false` ⇒ over the local write-rate limit. Call AFTER input validation so a
+    /// rejected write cannot drain the budget.
     pub fn try_consume_write_token(&self) -> bool {
         self.write_bucket.try_consume()
     }
-
-    /// Build the AI-workspace [`EncryptedClient`] from the workspace secret +
-    /// scoped JWT + endpoint.
-    ///
-    /// This is the client the AI uses to read/write its OWN workspace buckets.
-    /// It is encrypted under the *dedicated workspace secret*, NOT the user's
-    /// master KEK, so it can never decrypt the user's real files.
-    ///
-    /// # Errors
-    /// [`CapabilityError::Client`] if the underlying client cannot be built.
-    pub fn workspace_client(&self) -> Result<EncryptedClient, CapabilityError> {
-        // Read the current JWT under the lock (it may have been swapped by an L1c
-        // refresh). Cloning the string out releases the lock immediately, so a
-        // concurrent `set_jwt` is never blocked by client construction.
-        let jwt = self.jwt.read().expect("jwt lock poisoned").clone();
-        let config = Config::new(self.endpoint.clone())
-            .with_token(jwt)
-            .with_encryption()
-            .with_timeout(self.timeout);
-        // `EncryptionConfig::from_secret_key` takes the secret by value; clone the
-        // in-memory copy so the bundle retains ownership of its workspace secret.
-        let encryption = EncryptionConfig::from_secret_key(self.workspace_secret.clone());
-        EncryptedClient::new(config, encryption).map_err(|e| CapabilityError::Client(e.to_string()))
-    }
-
-    /// Accept an `owner -> MCP` grant share token using the MCP's own keypair.
-    ///
-    /// The owner mints a [`ShareToken`] addressed to [`Self::mcp_public_key`]
-    /// (wrapping a real file's content/folder DEK); this recovers the DEK + scope
-    /// so the AI can read that specific granted file. The strict v5
-    /// [`ShareRecipient::accept_share`] rejects any token not addressed to this
-    /// keypair (and any pre-v5 token).
-    ///
-    /// # Errors
-    /// [`CapabilityError::Share`] if the token is not addressed to the MCP, is
-    /// expired, or is otherwise invalid.
-    pub fn accept_grant(&self, token: &ShareToken) -> Result<AcceptedShare, CapabilityError> {
-        ShareRecipient::new(&self.mcp_keypair)
-            .accept_share(token)
-            .map_err(|e| CapabilityError::Share(e.to_string()))
-    }
-
-    /// Mint an `AI -> owner` share token: wrap a per-file content `dek` to the
-    /// **owner's** public key so the owner can read a file the AI wrote into the
-    /// workspace.
-    ///
-    /// Mirrors the proven P2 pattern exactly: the token carries the `path_scope`,
-    /// the single-block `nonce` (base64) and/or `chunked_metadata` (JSON), and
-    /// `encryption_version = 4` (AAD-bound content). The sender keypair is the
-    /// MCP's own (`mcp_keypair`) so the share is attributable to the MCP when
-    /// token signing lands. Permissions are read-write (the AI authored the file
-    /// under its scope, and the owner consuming it gets read-write semantics, as
-    /// in P2).
-    ///
-    /// `nonce_b64` and `chunked_metadata` are mutually-shaped: pass `nonce_b64`
-    /// for a single-block (v4) object, `chunked_metadata` for a chunked one. At
-    /// least conceptually one is present; both may be `None` for a degenerate
-    /// empty object, matching the builder's optionality.
-    ///
-    /// # Errors
-    /// [`CapabilityError::Share`] if the token cannot be built.
-    #[allow(clippy::too_many_arguments)]
-    pub fn mint_owner_share(
-        &self,
-        dek: &DekKey,
-        path_scope: &str,
-        nonce_b64: Option<&str>,
-        chunked_metadata: Option<&str>,
-        expires_in_secs: Option<i64>,
-    ) -> Result<ShareToken, CapabilityError> {
-        let mut builder = ShareBuilder::new(&self.mcp_keypair, &self.owner_public, dek)
-            .path_scope(path_scope)
-            .read_write()
-            .encryption_version(4);
-        if let Some(n) = nonce_b64 {
-            builder = builder.nonce(n.to_string());
-        }
-        if let Some(m) = chunked_metadata {
-            builder = builder.chunked_metadata(m.to_string());
-        }
-        if let Some(secs) = expires_in_secs {
-            builder = builder.expires_in(secs);
-        }
-        builder
-            .build()
-            .map_err(|e| CapabilityError::Share(e.to_string()))
-    }
-
-    /// Assert that `key` is within `scope` AND that the covering grant permits
-    /// `needed`. This is the security boundary that replaces the P2
-    /// substring-prefix footgun.
-    ///
-    /// `scope` names the grant the caller intends to use (e.g. `"ai/"`). The
-    /// check is twofold:
-    ///
-    /// 1. **Geometry** — `key` must be inside `scope` by *path segment* boundary
-    ///    (see [`Self::key_in_scope`]). A scope of `ai/note` does NOT admit
-    ///    `ai/notebook`; a scope of `a` does NOT admit `ai/foo`. Exact equality
-    ///    is admitted (a single-object grant).
-    /// 2. **Authority** — the bundle must actually hold a grant whose canonical
-    ///    scope equals the canonical `scope`, and that grant must include the
-    ///    `needed` permission. A caller cannot conjure authority by passing a
-    ///    `scope` the bundle never granted (e.g. `""` or `"/"`), and cannot
-    ///    upgrade Read to Write/Delete it was not given.
-    ///
-    /// # Errors
-    /// - [`CapabilityError::InvalidPath`] if `key` or `scope` fails
-    ///   canonicalization (empty, or contains a `.`/`..` traversal segment).
-    /// - [`CapabilityError::OutOfScope`] if `key` is not inside `scope`, the
-    ///   bundle holds no matching grant, or the grant lacks `needed`.
-    pub fn assert_in_scope(
-        &self,
-        key: &str,
-        scope: &str,
-        needed: Permission,
-    ) -> Result<(), CapabilityError> {
-        // Canonicalize. The KEY is checked STRICTLY (no empty/leading/trailing/
-        // doubled slash, no traversal): a key that passes is already in canonical
-        // textual form, so the SAME string the caller blesses here is the one it
-        // must hand to the storage client. Storage keys are hashed verbatim by
-        // `generate_flat_key(logical_path, …)`, so `ai//foo` and `ai/foo` are
-        // DIFFERENT objects — were we to canonicalize the key leniently, the
-        // blessed form could diverge from the stored form (a scope-broadening
-        // aliasing bug). The SCOPE is an authorization *pattern* that never
-        // reaches storage, so it is normalized leniently (the task requires both
-        // `ai/` and `ai` to work).
-        let key_segs = canonicalize_key(key)?;
-        let scope_segs = canonicalize_scope(scope)?;
-
-        // (1) Geometry: key must be inside the requested scope by segment prefix.
-        if !key_in_scope(&key_segs, &scope_segs) {
-            return Err(CapabilityError::OutOfScope {
-                key: key.to_string(),
-                needed,
-            });
-        }
-
-        // (2) Authority: the bundle must hold a grant whose canonical scope
-        //     EQUALS the requested scope, with the needed permission. We match on
-        //     equality (not "grant covers scope") so the caller-named scope is
-        //     itself an authorized grant — a caller cannot widen authority by
-        //     naming a broader scope than it was granted.
-        let authorized = self.grants.iter().any(|g| {
-            match canonicalize_scope(&g.scope) {
-                Ok(g_segs) => g_segs == scope_segs && needed.granted_by(&g.permissions),
-                // A malformed grant scope never authorizes anything.
-                Err(_) => false,
-            }
-        });
-
-        if !authorized {
-            return Err(CapabilityError::OutOfScope {
-                key: key.to_string(),
-                needed,
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Convenience: assert `key` is permitted for `needed` under ANY grant the
-    /// bundle holds (most-permissive-wins over the positive grant list).
-    ///
-    /// Unlike [`Self::assert_in_scope`], the caller need not name the scope; this
-    /// scans every grant and succeeds if any one canonically covers `key` with
-    /// the `needed` permission. Useful for an enforcement wrapper that just asks
-    /// "may I touch this key at all?".
-    ///
-    /// # Errors
-    /// - [`CapabilityError::InvalidPath`] if `key` fails canonicalization.
-    /// - [`CapabilityError::OutOfScope`] if no grant covers `key` with `needed`.
-    pub fn assert_key_allowed(
-        &self,
-        key: &str,
-        needed: Permission,
-    ) -> Result<(), CapabilityError> {
-        let key_segs = canonicalize_key(key)?;
-        let ok = self.grants.iter().any(|g| match canonicalize_scope(&g.scope) {
-            Ok(g_segs) => key_in_scope(&key_segs, &g_segs) && needed.granted_by(&g.permissions),
-            Err(_) => false,
-        });
-        if ok {
-            Ok(())
-        } else {
-            Err(CapabilityError::OutOfScope {
-                key: key.to_string(),
-                needed,
-            })
-        }
-    }
-}
-
-/// Reject bytes that are dangerous in any path position (key or scope).
-///
-/// Only NUL is rejected here. Percent (`%`) is intentionally NOT rejected: the
-/// logical path is fed verbatim into `generate_flat_key`
-/// (`blake3 …update(original_path.as_bytes())` — see
-/// `fula-crypto::private_forest::generate_flat_key`), and never placed into a URL
-/// that a layer would percent-decode. So `%` is just an ordinary byte here, and a
-/// legitimate AI filename like `q3-50%-off.txt` must not be falsely denied. NUL
-/// is rejected as pure upside (it can corrupt logging / FFI / tooling downstream).
-fn reject_dangerous_bytes(path: &str) -> Result<(), CapabilityError> {
-    if path.contains('\0') {
-        return Err(CapabilityError::InvalidPath {
-            path: path.to_string(),
-            reason: "contains NUL byte",
-        });
-    }
-    Ok(())
-}
-
-/// Canonicalize a **storage key** into path segments — STRICT.
-///
-/// A key is the identifier that reaches storage: `put_object_flat`/
-/// `get_object_flat` hash it verbatim via `generate_flat_key`, so two textually
-/// different keys (`ai/foo` vs `ai//foo` vs `/ai/foo`) are DIFFERENT objects.
-/// Because [`assert_in_scope`] returns only `Result<()>` (it cannot hand back a
-/// rewritten key), the *only* way to guarantee the key the check blesses is the
-/// key storage uses is to **reject any non-canonical key** here. A key that
-/// passes is already in canonical form and must be used verbatim by the caller.
-///
-/// Rejects: an empty key, a leading `/`, a trailing `/`, any doubled `//`
-/// (i.e. ANY empty segment), and any `.`/`..` traversal segment. Matching is
-/// **case-sensitive**; `\` is an ordinary byte (kept safe by exact segment
-/// equality, not treated as a separator).
-///
-/// [`assert_in_scope`]: CapabilityBundle::assert_in_scope
-///
-/// # Errors
-/// [`CapabilityError::InvalidPath`] for an empty key, any empty segment
-/// (leading/trailing/doubled slash), a `.`/`..` segment, or a NUL byte.
-fn canonicalize_key(key: &str) -> Result<Vec<&str>, CapabilityError> {
-    reject_dangerous_bytes(key)?;
-    if key.is_empty() {
-        return Err(CapabilityError::InvalidPath {
-            path: key.to_string(),
-            reason: "empty key",
-        });
-    }
-    let segs: Vec<&str> = key.split('/').collect();
-    for seg in &segs {
-        if seg.is_empty() {
-            return Err(CapabilityError::InvalidPath {
-                path: key.to_string(),
-                reason: "non-canonical key: empty segment (leading, trailing, or doubled '/')",
-            });
-        }
-        if *seg == "." || *seg == ".." {
-            return Err(CapabilityError::InvalidPath {
-                path: key.to_string(),
-                reason: "contains a '.' or '..' path-traversal segment",
-            });
-        }
-    }
-    Ok(segs)
-}
-
-/// Canonicalize an authorization **scope** into path segments — LENIENT.
-///
-/// A scope is a *pattern* used only to authorize; it NEVER reaches storage, so
-/// normalizing it cannot cause a check-vs-store mismatch. The task requires both
-/// `ai/` and `ai` to grant the `ai/` subtree, so empty segments (leading/
-/// trailing/doubled slash) are DROPPED. `.`/`..` are still rejected (a scope has
-/// nothing to resolve them against), as is an empty result and NUL.
-///
-/// # Errors
-/// [`CapabilityError::InvalidPath`] for an empty canonical form (e.g. `""` or
-/// `"/"`), a `.`/`..` segment, or a NUL byte.
-fn canonicalize_scope(scope: &str) -> Result<Vec<&str>, CapabilityError> {
-    reject_dangerous_bytes(scope)?;
-    let mut segs = Vec::new();
-    for seg in scope.split('/') {
-        if seg.is_empty() {
-            continue; // drop leading/trailing/doubled slash
-        }
-        if seg == "." || seg == ".." {
-            return Err(CapabilityError::InvalidPath {
-                path: scope.to_string(),
-                reason: "contains a '.' or '..' path-traversal segment",
-            });
-        }
-        segs.push(seg);
-    }
-    if segs.is_empty() {
-        return Err(CapabilityError::InvalidPath {
-            path: scope.to_string(),
-            reason: "scope is empty after canonicalization (no path segments)",
-        });
-    }
-    Ok(segs)
-}
-
-/// Is `key` inside `scope` by path-segment prefix?
-///
-/// True iff `key`'s segment list starts with `scope`'s segment list, compared
-/// element-by-element. Equal lists prefix each other, so an exact key == scope
-/// match is admitted (single-object grant). This is the segment-boundary check
-/// that closes the substring-prefix footgun: `["ai","note"]` does NOT prefix
-/// `["ai","notebook"]`, and `["a"]` does NOT prefix `["ai","foo"]`.
-fn key_in_scope(key_segs: &[&str], scope_segs: &[&str]) -> bool {
-    key_segs.starts_with(scope_segs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fula_crypto::{DekKey, sharing::ShareBuilder, KekKeyPair};
 
-    // ── canonicalize / key_in_scope: the security crux ─────────────────────
-
-    #[test]
-    fn scope_canon_drops_empty_and_normalizes_slashes() {
-        // Scope is lenient: leading/trailing/doubled slashes are dropped so both
-        // `ai/` and `ai` name the same subtree.
-        assert_eq!(canonicalize_scope("ai/foo").unwrap(), vec!["ai", "foo"]);
-        assert_eq!(canonicalize_scope("ai/").unwrap(), vec!["ai"]);
-        assert_eq!(canonicalize_scope("/ai").unwrap(), vec!["ai"]);
-        assert_eq!(canonicalize_scope("ai//foo").unwrap(), vec!["ai", "foo"]);
-        assert_eq!(canonicalize_scope("/ai/foo/").unwrap(), vec!["ai", "foo"]);
-        assert_eq!(canonicalize_scope("ai").unwrap(), vec!["ai"]);
-    }
-
-    #[test]
-    fn key_canon_is_strict_about_non_canonical_forms() {
-        // A key is the stored identifier; it must already be canonical so the
-        // checked string == the stored string. Non-canonical forms are REJECTED
-        // (not silently normalized) to prevent a check-vs-store aliasing gap.
-        assert_eq!(canonicalize_key("ai/foo").unwrap(), vec!["ai", "foo"]);
-        assert_eq!(
-            canonicalize_key("ai/notes/x.txt").unwrap(),
-            vec!["ai", "notes", "x.txt"]
-        );
-        // The lenient cases that scope accepts are HARD ERRORS for a key.
-        assert!(canonicalize_key("ai/").is_err(), "trailing slash key rejected");
-        assert!(canonicalize_key("/ai").is_err(), "leading slash key rejected");
-        assert!(canonicalize_key("ai//foo").is_err(), "doubled slash key rejected");
-        assert!(canonicalize_key("ai/foo/").is_err());
-        // Percent is a legitimate key byte (no decode layer) — must be ALLOWED.
-        assert_eq!(
-            canonicalize_key("ai/q3-50%-off.txt").unwrap(),
-            vec!["ai", "q3-50%-off.txt"]
-        );
-    }
-
-    #[test]
-    fn canon_rejects_empty_traversal_and_nul() {
-        // Empty / traversal / NUL rejected for BOTH key and scope.
-        for bad in ["", "/", "//", "ai/../etc", "../etc", "ai/./foo", ".", ".."] {
-            assert!(canonicalize_scope(bad).is_err(), "scope must reject {bad:?}");
-        }
-        for bad in ["", "ai/../etc", "../etc", "ai/./foo", ".", ".."] {
-            assert!(canonicalize_key(bad).is_err(), "key must reject {bad:?}");
-        }
-        assert!(canonicalize_key("ai/\0/foo").is_err()); // NUL
-        assert!(canonicalize_scope("ai/\0/foo").is_err()); // NUL
-    }
-
-    #[test]
-    fn segment_prefix_closes_the_p2_footgun() {
-        // The exact footgun P2 flagged: a substring check would admit these; a
-        // segment check must NOT.
-        let note = canonicalize_scope("ai/note").unwrap();
-        let notebook = canonicalize_key("ai/notebook.txt").unwrap();
-        assert!(
-            !key_in_scope(&notebook, &note),
-            "scope 'ai/note' must NOT admit 'ai/notebook.txt'"
-        );
-
-        // First-segment substring footgun: scope "a" must not admit "ai/foo".
-        let a = canonicalize_scope("a").unwrap();
-        let ai_foo = canonicalize_key("ai/foo").unwrap();
-        assert!(
-            !key_in_scope(&ai_foo, &a),
-            "scope 'a' must NOT admit 'ai/foo'"
-        );
-    }
-
-    #[test]
-    fn segment_prefix_admits_real_children_and_exact() {
-        let ai = canonicalize_scope("ai/").unwrap();
-        assert!(key_in_scope(&canonicalize_key("ai/foo").unwrap(), &ai));
-        assert!(key_in_scope(&canonicalize_key("ai/foo/bar.txt").unwrap(), &ai));
-        // Bare scope (no trailing slash) admits its children too.
-        let ai_bare = canonicalize_scope("ai").unwrap();
-        assert!(key_in_scope(&canonicalize_key("ai/foo.txt").unwrap(), &ai_bare));
-        // Exact match (single-object grant): key == scope segments.
-        let exact_key = canonicalize_key("ai/notes/x.txt").unwrap();
-        let exact_scope = canonicalize_scope("ai/notes/x.txt").unwrap();
-        assert!(key_in_scope(&exact_key, &exact_scope));
-        // A parent key is NOT inside a deeper scope.
-        let deep = canonicalize_scope("ai/notes/").unwrap();
-        assert!(!key_in_scope(&canonicalize_key("ai/x.txt").unwrap(), &deep));
-    }
-
-    #[test]
-    fn case_sensitive_matching() {
-        let ai = canonicalize_scope("ai/").unwrap();
-        assert!(
-            !key_in_scope(&canonicalize_key("AI/foo").unwrap(), &ai),
-            "matching must be case-sensitive: 'AI/foo' is not under 'ai/'"
-        );
-    }
-
-    // ── assert_in_scope: geometry + authority together ─────────────────────
-
-    /// A bundle with deterministic dummy material and the given grants.
-    fn bundle_with_grants(grants: Vec<Capability>) -> CapabilityBundle {
-        let ws = [7u8; 32];
-        let mcp = [9u8; 32];
-        let owner_secret = SecretKey::from_bytes(&[11u8; 32]).unwrap();
-        let owner_public = owner_secret.public_key();
-        CapabilityBundle {
-            endpoint: "https://gw.example".to_string(),
-            jwt: std::sync::RwLock::new("test-jwt".to_string()),
-            timeout: Duration::from_secs(60),
-            workspace_secret: SecretKey::from_bytes(&ws).unwrap(),
-            mcp_keypair: KekKeyPair::from_secret_key(SecretKey::from_bytes(&mcp).unwrap()),
-            owner_public,
-            user_id: None,
-            storage_api_url: None,
-            refresh_token: None,
-            refresh_url: None,
-            grants,
-            // A generous default bucket; the capability tests here never exercise
-            // the rate limiter (that lives in `quota.rs` + `store.rs` tests).
-            write_bucket: TokenBucket::new(DEFAULT_WRITE_BURST, DEFAULT_WRITE_REFILL_PER_SEC),
-        }
-    }
-
-    fn grant(scope: &str, perms: SharePermissions) -> Capability {
-        Capability {
-            scope: scope.to_string(),
-            permissions: perms,
-        }
-    }
-
-    #[test]
-    fn assert_in_scope_admits_child_with_permission() {
-        let b = bundle_with_grants(vec![grant("ai/", SharePermissions::read_write())]);
-        assert!(b
-            .assert_in_scope("ai/notes/x.txt", "ai/", Permission::Read)
-            .is_ok());
-        assert!(b
-            .assert_in_scope("ai/notes/x.txt", "ai/", Permission::Write)
-            .is_ok());
-    }
-
-    #[test]
-    fn assert_in_scope_denies_sibling_footgun() {
-        // Grant is "ai/note" (no trailing slash). "ai/notebook.txt" must be denied.
-        let b = bundle_with_grants(vec![grant("ai/note", SharePermissions::read_write())]);
-        let err = b
-            .assert_in_scope("ai/notebook.txt", "ai/note", Permission::Read)
-            .unwrap_err();
-        assert!(matches!(err, CapabilityError::OutOfScope { .. }));
-    }
-
-    #[test]
-    fn assert_in_scope_denies_first_segment_substring() {
-        // Grant "a"; "ai/foo" must be denied (substring would wrongly admit).
-        let b = bundle_with_grants(vec![grant("a", SharePermissions::full())]);
-        let err = b
-            .assert_in_scope("ai/foo", "a", Permission::Read)
-            .unwrap_err();
-        assert!(matches!(err, CapabilityError::OutOfScope { .. }));
-    }
-
-    #[test]
-    fn assert_in_scope_enforces_permission() {
-        // Read-only grant: Write and Delete must be denied even though geometry ok.
-        let b = bundle_with_grants(vec![grant("ai/", SharePermissions::read_only())]);
-        assert!(b
-            .assert_in_scope("ai/x.txt", "ai/", Permission::Read)
-            .is_ok());
-        assert!(matches!(
-            b.assert_in_scope("ai/x.txt", "ai/", Permission::Write)
-                .unwrap_err(),
-            CapabilityError::OutOfScope { .. }
-        ));
-        assert!(matches!(
-            b.assert_in_scope("ai/x.txt", "ai/", Permission::Delete)
-                .unwrap_err(),
-            CapabilityError::OutOfScope { .. }
-        ));
-    }
-
-    #[test]
-    fn assert_in_scope_rejects_unauthorized_scope_name() {
-        // Caller names a scope the bundle never granted -> denied, even if the
-        // geometry of key-vs-scope would pass. This is the "can't conjure
-        // authority by passing scope='' or a broader scope" guard.
-        let b = bundle_with_grants(vec![grant("ai/", SharePermissions::full())]);
-        // scope "" canonicalizes to an error (invalid path).
-        assert!(matches!(
-            b.assert_in_scope("ai/x", "", Permission::Read).unwrap_err(),
-            CapabilityError::InvalidPath { .. }
-        ));
-        // A syntactically-valid but ungranted scope: key is geometrically inside
-        // "ai/notes" but the bundle only granted "ai/" — naming "ai/notes" as the
-        // authority must fail because there is no grant whose scope == "ai/notes".
-        assert!(matches!(
-            b.assert_in_scope("ai/notes/x", "ai/notes", Permission::Read)
-                .unwrap_err(),
-            CapabilityError::OutOfScope { .. }
-        ));
-    }
-
-    #[test]
-    fn assert_in_scope_rejects_traversal_key() {
-        let b = bundle_with_grants(vec![grant("ai/", SharePermissions::full())]);
-        assert!(matches!(
-            b.assert_in_scope("ai/../secret", "ai/", Permission::Read)
-                .unwrap_err(),
-            CapabilityError::InvalidPath { .. }
-        ));
-    }
-
-    #[test]
-    fn assert_key_allowed_scans_all_grants() {
-        let b = bundle_with_grants(vec![
-            grant("ai/", SharePermissions::read_only()),
-            grant("shared/reports/", SharePermissions::read_write()),
-        ]);
-        // Covered by the first grant (read).
-        assert!(b.assert_key_allowed("ai/x.txt", Permission::Read).is_ok());
-        // Write under ai/ denied (read-only), but write under shared/reports ok.
-        assert!(b.assert_key_allowed("ai/x.txt", Permission::Write).is_err());
-        assert!(b
-            .assert_key_allowed("shared/reports/q1.pdf", Permission::Write)
-            .is_ok());
-        // Nothing grants delete.
-        assert!(b
-            .assert_key_allowed("ai/x.txt", Permission::Delete)
-            .is_err());
-        // Outside every grant.
-        assert!(b.assert_key_allowed("other/x", Permission::Read).is_err());
-    }
-
-    // ── bundle parse + redaction ───────────────────────────────────────────
-
-    fn sample_bundle_json() -> String {
-        let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
-        let mcp = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
-        let owner_pub = SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key();
-        let owner = base64::engine::general_purpose::STANDARD.encode(owner_pub.as_bytes());
-        format!(
-            r#"{{
-              "endpoint": "https://gw.example",
-              "jwt": "super-secret-jwt-value",
-              "workspace_secret_b64": "{ws}",
-              "mcp_secret_b64": "{mcp}",
-              "owner_public_b64": "{owner}",
-              "grants": [
-                {{ "scope": "ai/", "permissions": {{ "can_read": true, "can_write": true, "can_delete": false }} }}
-              ]
-            }}"#
-        )
-    }
-
-    #[test]
-    fn bundle_parses_with_expected_fields() {
-        let b = CapabilityBundle::from_json(&sample_bundle_json()).unwrap();
-        assert_eq!(b.endpoint(), "https://gw.example");
-        assert_eq!(b.grants().len(), 1);
-        assert_eq!(b.grants()[0].scope, "ai/");
-        assert!(b.grants()[0].permissions.can_write);
-        assert!(!b.grants()[0].permissions.can_delete);
-        // The MCP public key must be the X25519 derivation of [2u8;32].
-        let expected_mcp_pub = SecretKey::from_bytes(&[2u8; 32]).unwrap().public_key();
-        assert_eq!(b.mcp_public_key().as_bytes(), expected_mcp_pub.as_bytes());
-        // The owner public key must round-trip.
-        let expected_owner_pub = SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key();
-        assert_eq!(b.owner_public_key().as_bytes(), expected_owner_pub.as_bytes());
-        // The sample bundle carries no user_id → None (back-compat with older
-        // P3/P5/P6/P7 bundles).
-        assert_eq!(b.user_id(), None);
-    }
-
-    #[test]
-    fn bundle_parses_optional_user_id() {
-        // A bundle WITH a user_id surfaces it; an empty string is treated as None.
-        let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
-        let mcp = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
-        let owner = base64::engine::general_purpose::STANDARD
-            .encode(SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key().as_bytes());
-        let with = format!(
-            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "user_id": "deadbeef01234567" }}"#
-        );
-        assert_eq!(
-            CapabilityBundle::from_json(&with).unwrap().user_id(),
-            Some("deadbeef01234567")
-        );
-        let empty = format!(
-            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "user_id": "" }}"#
-        );
-        assert_eq!(CapabilityBundle::from_json(&empty).unwrap().user_id(), None);
-    }
-
-    #[test]
-    fn bundle_parses_and_validates_storage_api_url() {
-        // P10: an HTTPS storage_api_url is accepted and surfaced; absent → None.
-        let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
-        let mcp = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
-        let owner = base64::engine::general_purpose::STANDARD
-            .encode(SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key().as_bytes());
-        let with = format!(
-            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "storage_api_url": "https://cloud.fx.land" }}"#
-        );
-        let b = CapabilityBundle::from_json(&with).unwrap();
-        assert_eq!(b.storage_api_url(), Some("https://cloud.fx.land"));
-
-        // Loopback http:// is allowed (local/dev credit service).
-        let local = format!(
-            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "storage_api_url": "http://127.0.0.1:3001" }}"#
-        );
-        assert_eq!(
-            CapabilityBundle::from_json(&local).unwrap().storage_api_url(),
-            Some("http://127.0.0.1:3001")
-        );
-
-        // A plaintext http:// to a non-loopback host is REJECTED (would leak the
-        // bearer JWT to an unintended origin in cleartext).
-        let insecure = format!(
-            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "storage_api_url": "http://cloud.fx.land" }}"#
-        );
-        assert!(matches!(
-            CapabilityBundle::from_json(&insecure).unwrap_err(),
-            CapabilityError::InvalidStorageApiUrl { .. }
-        ));
-
-        // A non-http scheme is rejected too.
-        let ftp = format!(
-            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "storage_api_url": "ftp://evil.example" }}"#
-        );
-        assert!(matches!(
-            CapabilityBundle::from_json(&ftp).unwrap_err(),
-            CapabilityError::InvalidStorageApiUrl { .. }
-        ));
-
-        // No field → quota checking off (None).
-        let without = format!(
-            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}" }}"#
-        );
-        assert_eq!(
-            CapabilityBundle::from_json(&without).unwrap().storage_api_url(),
-            None
-        );
-    }
-
-    // ── L1c: refresh_token / refresh_url bundle fields ─────────────────────
-
-    /// A bundle JSON with the standard required fields plus an arbitrary set of
-    /// extra raw key/value JSON fragments (already formatted, comma-joined).
-    fn bundle_json_with_extra(extra: &str) -> String {
-        let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
-        let mcp = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
-        let owner = base64::engine::general_purpose::STANDARD
-            .encode(SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key().as_bytes());
-        let tail = if extra.is_empty() {
-            String::new()
-        } else {
-            format!(", {extra}")
-        };
-        format!(
-            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}"{tail} }}"#
-        )
-    }
-
-    #[test]
-    fn bundle_without_refresh_fields_is_backward_compatible() {
-        // The crux of L1c backward-compat: a pre-L1c bundle (no refresh_token,
-        // no refresh_url, no storage_api_url) parses fine and the getters return
-        // None → auto-refresh is OFF, behavior byte-identical to before.
-        let b = CapabilityBundle::from_json(&bundle_json_with_extra("")).unwrap();
-        assert_eq!(b.refresh_token(), None);
-        assert_eq!(b.refresh_url(), None);
-    }
-
-    #[test]
-    fn bundle_explicit_refresh_url_is_used_verbatim() {
-        // An explicit refresh_url is surfaced as-is (validated HTTPS); the token
-        // is surfaced too.
-        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
-            r#""refresh_token": "rt-secret", "refresh_url": "https://webui.fx.land/api/mcp/tokens/refresh-connection""#,
-        ))
-        .unwrap();
-        assert_eq!(b.refresh_token(), Some("rt-secret"));
-        assert_eq!(
-            b.refresh_url(),
-            Some("https://webui.fx.land/api/mcp/tokens/refresh-connection")
-        );
-    }
-
-    #[test]
-    fn bundle_refresh_url_derived_from_storage_api_url_when_absent() {
-        // No explicit refresh_url → derive from storage_api_url by appending the
-        // well-known path to the trimmed base (trailing slash dropped).
-        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
-            r#""refresh_token": "rt", "storage_api_url": "https://cloud.fx.land/""#,
-        ))
-        .unwrap();
-        assert_eq!(
-            b.refresh_url(),
-            Some("https://cloud.fx.land/api/mcp/tokens/refresh-connection")
-        );
-
-        // Without a trailing slash on the base, the join is identical.
-        let b2 = CapabilityBundle::from_json(&bundle_json_with_extra(
-            r#""refresh_token": "rt", "storage_api_url": "https://cloud.fx.land""#,
-        ))
-        .unwrap();
-        assert_eq!(
-            b2.refresh_url(),
-            Some("https://cloud.fx.land/api/mcp/tokens/refresh-connection")
-        );
-    }
-
-    #[test]
-    fn bundle_refresh_token_without_any_url_yields_no_refresh_url() {
-        // A refresh_token but NEITHER refresh_url NOR storage_api_url → the
-        // effective refresh URL is None (a refresh can never fire — no panic).
-        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
-            r#""refresh_token": "rt""#,
-        ))
-        .unwrap();
-        assert_eq!(b.refresh_token(), Some("rt"));
-        assert_eq!(b.refresh_url(), None);
-    }
-
-    #[test]
-    fn bundle_explicit_refresh_url_overrides_derivation() {
-        // When BOTH refresh_url and storage_api_url are present, the explicit
-        // refresh_url wins (no derivation).
-        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
-            r#""refresh_token": "rt", "refresh_url": "https://explicit.example/refresh", "storage_api_url": "https://cloud.fx.land""#,
-        ))
-        .unwrap();
-        assert_eq!(b.refresh_url(), Some("https://explicit.example/refresh"));
-    }
-
-    #[test]
-    fn bundle_rejects_insecure_refresh_url() {
-        // A plaintext http:// non-loopback refresh_url is rejected (the refresh
-        // token would leak to an unintended origin in cleartext).
-        assert!(matches!(
-            CapabilityBundle::from_json(&bundle_json_with_extra(
-                r#""refresh_url": "http://evil.example/refresh""#
-            ))
-            .unwrap_err(),
-            CapabilityError::InvalidStorageApiUrl { .. }
-        ));
-        // Loopback http:// IS allowed (local/dev webui).
-        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
-            r#""refresh_url": "http://127.0.0.1:3000/api/mcp/tokens/refresh-connection""#,
-        ))
-        .unwrap();
-        assert_eq!(
-            b.refresh_url(),
-            Some("http://127.0.0.1:3000/api/mcp/tokens/refresh-connection")
-        );
-    }
-
-    #[test]
-    fn bundle_empty_refresh_token_is_treated_as_absent() {
-        // An empty-string refresh_token → None (not configured), same convention
-        // as user_id / storage_api_url.
-        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
-            r#""refresh_token": """#,
-        ))
-        .unwrap();
-        assert_eq!(b.refresh_token(), None);
-    }
-
-    #[test]
-    fn debug_redacts_refresh_token() {
-        // The refresh token is a secret — it must never appear in Debug output.
-        let b = CapabilityBundle::from_json(&bundle_json_with_extra(
-            r#""refresh_token": "super-secret-refresh-token", "refresh_url": "https://webui.example/refresh""#,
-        ))
-        .unwrap();
-        let dbg = format!("{b:?}");
-        assert!(
-            !dbg.contains("super-secret-refresh-token"),
-            "Debug leaked the refresh token: {dbg}"
-        );
-        // The non-secret URL may appear; the redaction marker must be present.
-        assert!(dbg.contains("<redacted>"));
-    }
-
-    #[test]
-    fn validate_storage_api_url_accepts_https_and_loopback_rejects_others() {
-        assert!(validate_storage_api_url("https://cloud.fx.land").is_ok());
-        assert!(validate_storage_api_url("HTTPS://Cloud.FX.Land").is_ok()); // case-insensitive
-        assert!(validate_storage_api_url("http://localhost:3001").is_ok());
-        assert!(validate_storage_api_url("http://127.0.0.1").is_ok());
-        assert!(validate_storage_api_url("http://[::1]:3001").is_ok());
-        assert!(validate_storage_api_url("http://example.com").is_err());
-        assert!(validate_storage_api_url("ftp://x").is_err());
-        assert!(validate_storage_api_url("not a url").is_err());
-    }
-
-    #[test]
-    fn write_token_bucket_limits_per_session() {
-        // P10: a bundle with burst=2 admits exactly two write tokens, then denies.
-        // (The bundle owns ONE bucket, so this proves per-session limiting.)
-        let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
-        let mcp = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
-        let owner = base64::engine::general_purpose::STANDARD
-            .encode(SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key().as_bytes());
-        let json = format!(
-            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "write_burst": 2, "write_refill_per_sec": 0.0001 }}"#
-        );
-        let b = CapabilityBundle::from_json(&json).unwrap();
-        assert!(b.try_consume_write_token(), "1st write token");
-        assert!(b.try_consume_write_token(), "2nd write token");
-        assert!(!b.try_consume_write_token(), "3rd write over burst → denied");
-    }
-
-    #[test]
-    fn set_jwt_swap_is_visible_to_next_workspace_client() {
-        // L1c: after set_jwt swaps the token, the NEXT workspace_client() must
-        // build a client carrying the NEW JWT (the refresh-then-retry contract).
-        // We read it back via the client's public Config.access_token.
-        let b = CapabilityBundle::from_json(&sample_bundle_json()).unwrap();
-        let before = b
-            .workspace_client()
-            .unwrap()
-            .inner()
-            .config()
-            .access_token
-            .clone();
-        assert_eq!(before.as_deref(), Some("super-secret-jwt-value"));
-
-        b.set_jwt("freshly-refreshed-jwt".to_string());
-
-        let after = b
-            .workspace_client()
-            .unwrap()
-            .inner()
-            .config()
-            .access_token
-            .clone();
-        assert_eq!(
-            after.as_deref(),
-            Some("freshly-refreshed-jwt"),
-            "the rebuilt client must carry the swapped JWT"
-        );
-    }
-
-    #[tokio::test]
-    async fn check_quota_unconfigured_is_failopen_no_network() {
-        // A bundle with no storage_api_url → the pre-check is a no-network
-        // fail-open (NotConfigured), so it NEVER blocks a write on its own.
-        let b = bundle_with_grants(vec![]);
-        let decision = b.check_quota().await;
-        assert!(decision.allows(), "unconfigured quota check must fail open");
-    }
-
-    #[test]
-    fn malformed_bundle_errors_cleanly() {
-        // Not JSON.
-        assert!(matches!(
-            CapabilityBundle::from_json("not json").unwrap_err(),
-            CapabilityError::Malformed(_)
-        ));
-        // Missing required field (jwt).
-        let missing = r#"{ "endpoint": "x", "workspace_secret_b64": "AA", "mcp_secret_b64": "AA", "owner_public_b64": "AA" }"#;
-        assert!(matches!(
-            CapabilityBundle::from_json(missing).unwrap_err(),
-            CapabilityError::Malformed(_)
-        ));
-        // Wrong-length secret (valid base64 but not 32 bytes).
-        let short_secret = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
-        let owner_pub = base64::engine::general_purpose::STANDARD
-            .encode(SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key().as_bytes());
-        let bad = format!(
-            r#"{{ "endpoint": "x", "jwt": "j", "workspace_secret_b64": "{short_secret}", "mcp_secret_b64": "{short_secret}", "owner_public_b64": "{owner_pub}" }}"#
-        );
-        assert!(matches!(
-            CapabilityBundle::from_json(&bad).unwrap_err(),
-            CapabilityError::InvalidKeyMaterial { .. }
-        ));
-    }
-
-    #[test]
-    fn debug_never_prints_secrets() {
-        let json = sample_bundle_json();
-        let b = CapabilityBundle::from_json(&json).unwrap();
-        let dbg = format!("{b:?}");
-        // The JWT must not appear.
-        assert!(
-            !dbg.contains("super-secret-jwt-value"),
-            "Debug output leaked the JWT: {dbg}"
-        );
-        // Neither secret's base64 must appear.
-        let ws_b64 = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
-        let mcp_b64 = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
-        assert!(!dbg.contains(&ws_b64), "Debug leaked workspace secret: {dbg}");
-        assert!(!dbg.contains(&mcp_b64), "Debug leaked MCP secret: {dbg}");
-        // Redaction marker present; endpoint (non-secret) is fine to show.
-        assert!(dbg.contains("<redacted>"));
-        assert!(dbg.contains("https://gw.example"));
-    }
-
-    // ── share round-trips (accept_grant / mint_owner_share) ────────────────
-
-    #[test]
-    fn accept_grant_round_trip_and_wrong_key_rejected() {
-        // Owner mints a grant to the MCP's pubkey; the MCP accepts and recovers
-        // the DEK. A bundle with a DIFFERENT MCP key must NOT be able to accept.
-        let owner = KekKeyPair::from_secret_key(SecretKey::from_bytes(&[11u8; 32]).unwrap());
-
-        // Bundle whose MCP keypair is [9u8;32].
-        let b = bundle_with_grants(vec![]);
-        let mcp_pub = b.mcp_public_key().clone();
-
-        let dek = DekKey::generate();
-        // Owner mints a v5 token addressed to the MCP's public key.
-        let token = ShareBuilder::new(&owner, &mcp_pub, &dek)
-            .path_scope("photos/2026/")
-            .read_only()
+    /// Build a bundle JSON with a wrapped link secret addressed to `mcp_pubkey`.
+    fn bundle_json(
+        owner: &KekKeyPair,
+        mcp_pubkey: &fula_crypto::PublicKey,
+        link_secret: &[u8; 32],
+        identity_path: &str,
+        write_token: Option<&str>,
+    ) -> String {
+        let dek = DekKey::from_bytes(link_secret).unwrap();
+        let token = ShareBuilder::new(owner, mcp_pubkey, &dek)
+            .path_scope("/collab/group-1")
             .build()
             .unwrap();
-
-        let accepted = b.accept_grant(&token).unwrap();
-        assert_eq!(accepted.dek.as_bytes(), dek.as_bytes());
-        assert_eq!(accepted.path_scope, "photos/2026/");
-
-        // A different bundle (different MCP key) cannot accept the same token.
-        let other = CapabilityBundle {
-            mcp_keypair: KekKeyPair::from_secret_key(SecretKey::from_bytes(&[42u8; 32]).unwrap()),
-            ..bundle_with_grants(vec![])
+        let wrapped = serde_json::to_string(&token).unwrap();
+        let wt = match write_token {
+            Some(t) => format!(r#","collab_write_token":"{t}""#),
+            None => String::new(),
         };
-        assert!(other.accept_grant(&token).is_err());
+        format!(
+            r#"{{"webui_base":"https://cloud.fx.land","group_id":"group-1","manifest_bucket":"fula-metadata","manifest_key":"m/group-1.json","wrapped_link_secret":{wrapped:?},"identity_path":{identity_path:?}{wt}}}"#
+        )
+    }
+
+    fn temp_identity_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fula_mcp_cap_test_{}_{}_{:?}",
+            tag,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("mcp_identity.key")
     }
 
     #[test]
-    fn mint_owner_share_round_trip() {
-        use fula_crypto::{Aead, Nonce};
-
-        // The MCP mints a share to the owner; the owner accepts and decrypts the
-        // AI-written content byte-identically. Mirrors P2's pattern.
-        let owner = KekKeyPair::from_secret_key(SecretKey::from_bytes(&[11u8; 32]).unwrap());
-        // Bundle's owner_public is derived from [11u8;32] (see bundle_with_grants).
-        let b = bundle_with_grants(vec![grant("ai/", SharePermissions::read_write())]);
-
-        let logical_path = "ai/notes/summary.txt";
-        let plaintext = b"AI-written content that must round-trip to the owner.";
-        let dek = DekKey::generate();
-
-        // Encrypt with the v4 single-block format the upload path uses.
-        let storage_key = fula_crypto::generate_flat_key(logical_path, &dek, b"salt");
-        let aad = format!("fula:v4:content:{storage_key}").into_bytes();
-        let nonce = Nonce::generate();
-        let ciphertext = Aead::new_default(&dek)
-            .encrypt_with_aad(&nonce, plaintext, &aad)
-            .unwrap();
-
-        let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce.as_bytes());
-        let token = b
-            .mint_owner_share(&dek, logical_path, Some(&nonce_b64), None, Some(3600))
-            .unwrap();
-
-        // Owner accepts and decrypts.
-        let accepted = ShareRecipient::new(&owner).accept_share(&token).unwrap();
-        assert_eq!(accepted.dek.as_bytes(), dek.as_bytes());
-        assert_eq!(accepted.encryption_version, Some(4));
-        let recovered_nonce = {
-            let raw = base64::engine::general_purpose::STANDARD
-                .decode(accepted.nonce.as_ref().unwrap())
-                .unwrap();
-            Nonce::from_bytes(&raw).unwrap()
-        };
-        let decrypted = Aead::new_default(&accepted.dek)
-            .decrypt_with_aad(&recovered_nonce, &ciphertext, &aad)
-            .unwrap();
-        assert_eq!(decrypted.as_slice(), plaintext.as_slice());
+    fn validate_url_accepts_https_and_exact_loopback_rejects_spoofs() {
+        // Accept: https anywhere, and http ONLY for an exact loopback host.
+        for ok in [
+            "https://cloud.fx.land",
+            "https://cloud.fx.land/api/x?y=1",
+            "http://localhost:8787/cap",
+            "http://127.0.0.1:9000",
+            "http://[::1]:3000/refresh",
+            // Decimal-encoded 127.0.0.1: the url crate normalizes the host to
+            // 127.0.0.1, so this IS loopback (the user's own machine) — correctly
+            // accepted. A naive prefix check would have wrongly rejected it.
+            "http://2130706433/",
+        ] {
+            assert!(validate_https_or_loopback("f", ok).is_ok(), "should accept {ok}");
+        }
+        // Reject: cleartext non-loopback + the loopback-spoof family that a prefix
+        // check would have admitted (subdomain, userinfo trick, scheme).
+        for bad in [
+            "http://evil.com",
+            "http://localhost.evil.com",
+            "http://localhost@evil.com",
+            "http://localhost:80@evil.com",
+            "http://127.0.0.1.evil.com",
+            "ftp://localhost/x",
+            "file:///etc/passwd",
+            "not-a-url",
+        ] {
+            assert!(
+                validate_https_or_loopback("f", bad).is_err(),
+                "should REJECT {bad}"
+            );
+        }
     }
 
     #[test]
-    fn mint_owner_share_wrong_recipient_cannot_open() {
-        // The share is wrapped to the owner only; a stranger cannot open it.
-        let b = bundle_with_grants(vec![grant("ai/", SharePermissions::read_write())]);
-        let dek = DekKey::generate();
-        let token = b
-            .mint_owner_share(&dek, "ai/secret.txt", None, None, None)
-            .unwrap();
-        let stranger = KekKeyPair::generate();
-        assert!(ShareRecipient::new(&stranger).accept_share(&token).is_err());
+    fn from_json_recovers_link_secret_and_exposes_group() {
+        let id_path = temp_identity_path("recover");
+        let _ = std::fs::remove_file(&id_path);
+        // First-run: generate the identity by loading once.
+        let identity = McpIdentity::load_or_generate(&id_path).unwrap();
+        let owner = KekKeyPair::generate();
+        let link_secret = [0x11u8; 32];
+        let json = bundle_json(
+            &owner,
+            identity.public_key(),
+            &link_secret,
+            id_path.to_str().unwrap(),
+            Some("write-tok-abc"),
+        );
+
+        let bundle = CapabilityBundle::from_json(&json).unwrap();
+        assert_eq!(bundle.group_id(), "group-1");
+        assert_eq!(bundle.webui_base(), "https://cloud.fx.land");
+        assert_eq!(bundle.manifest_bucket(), "fula-metadata");
+        assert_eq!(bundle.link_secret(), &link_secret[..]);
+        assert_eq!(bundle.collab_write_token().as_deref(), Some("write-tok-abc"));
+        assert_eq!(bundle.mcp_public_b64(), identity.public_key_b64());
+        // The link keypair derives deterministically from the link secret.
+        let kp = bundle.link_keypair().unwrap();
+        let expected = KekKeyPair::from_secret_key(SecretKey::from_bytes(&link_secret).unwrap());
+        assert_eq!(kp.public_key().as_bytes(), expected.public_key().as_bytes());
+
+        let _ = std::fs::remove_file(&id_path);
+        let _ = std::fs::remove_dir(id_path.parent().unwrap());
+    }
+
+    #[test]
+    fn wrong_identity_cannot_recover_link_secret() {
+        // A bundle wrapped for a DIFFERENT identity must fail with a clear error,
+        // not a panic — this is the "re-authorize" path.
+        let id_path = temp_identity_path("wrong");
+        let _ = std::fs::remove_file(&id_path);
+        let _ours = McpIdentity::load_or_generate(&id_path).unwrap();
+        let owner = KekKeyPair::generate();
+        let stranger = McpIdentity::generate();
+        let json = bundle_json(
+            &owner,
+            stranger.public_key(), // wrapped for someone else
+            &[0x22u8; 32],
+            id_path.to_str().unwrap(),
+            None,
+        );
+        let err = CapabilityBundle::from_json(&json).unwrap_err();
+        assert!(matches!(err, CapabilityError::LinkSecretRecovery(_)));
+        let _ = std::fs::remove_file(&id_path);
+        let _ = std::fs::remove_dir(id_path.parent().unwrap());
+    }
+
+    #[test]
+    fn read_only_bundle_has_no_write_token() {
+        let id_path = temp_identity_path("readonly");
+        let _ = std::fs::remove_file(&id_path);
+        let identity = McpIdentity::load_or_generate(&id_path).unwrap();
+        let owner = KekKeyPair::generate();
+        let json = bundle_json(
+            &owner,
+            identity.public_key(),
+            &[0x33u8; 32],
+            id_path.to_str().unwrap(),
+            None,
+        );
+        let bundle = CapabilityBundle::from_json(&json).unwrap();
+        assert!(bundle.collab_write_token().is_none());
+        // A refresh can swap one in later.
+        bundle.set_collab_write_token("fresh".to_string());
+        assert_eq!(bundle.collab_write_token().as_deref(), Some("fresh"));
+        let _ = std::fs::remove_file(&id_path);
+        let _ = std::fs::remove_dir(id_path.parent().unwrap());
+    }
+
+    #[test]
+    fn rejects_non_https_webui_base() {
+        let json = r#"{"webui_base":"http://evil.example","group_id":"g","manifest_bucket":"b","manifest_key":"k","wrapped_link_secret":"{}"}"#;
+        let err = CapabilityBundle::from_json(json).unwrap_err();
+        assert!(matches!(err, CapabilityError::InvalidUrl { field: "webui_base", .. }));
     }
 }
