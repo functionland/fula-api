@@ -1,68 +1,72 @@
-//! Phase 9 — OFFLINE transport smoke test for the stdio MCP server.
+//! OFFLINE transport smoke test for the stdio MCP server (collaboration rework).
 //!
 //! Drives a real in-process rmcp **client** against [`FulaMcpServer`] over a
 //! `tokio::io::duplex` pipe — the same JSON-RPC protocol the stdio transport
-//! speaks, just over an in-memory duplex instead of stdin/stdout. This exercises
-//! the genuine MCP handshake end to end:
+//! speaks. It exercises the genuine MCP handshake (`initialize` + `tools/list`)
+//! and asserts the collaboration tool set is advertised with non-trivial schemas.
+//! `tools/list` is pure server metadata, so this runs fully OFFLINE.
 //!
-//!   1. `client.serve(transport)` performs the `initialize` request/response,
-//!   2. `peer().list_tools(None)` issues `tools/list`,
-//!
-//! and asserts all SIX `fula_*` tools are advertised, each with a non-trivial
-//! input JSON schema. No gateway is needed: `tools/list` is pure server
-//! metadata, so this runs fully OFFLINE and is part of the normal `cargo test`.
-//!
-//! Why a duplex client rather than spawning the binary: it is faithful (real
-//! rmcp client ↔ real rmcp server, real `initialize` + `tools/list` frames),
-//! deterministic, and needs no env-injected bundle or subprocess plumbing on
-//! Windows. The bundle here is a throwaway with a deterministic dummy secret and
-//! an unreachable endpoint — `tools/list` never touches it.
+//! The bundle here is a throwaway: a fresh local identity, a link secret wrapped
+//! to it, and an UNREACHABLE endpoint — `tools/list` never touches the network.
 
-use base64::Engine as _;
-use fula_crypto::SecretKey;
+use fula_crypto::{sharing::ShareBuilder, DekKey, KekKeyPair};
 use fula_mcp::capability::CapabilityBundle;
+use fula_mcp::identity::McpIdentity;
 use fula_mcp::server::FulaMcpServer;
 use rmcp::ServiceExt;
 
-/// The six tools the server must advertise.
-const EXPECTED_TOOLS: [&str; 6] = [
-    "fula_store_file",
+/// The collaboration tools the server must advertise.
+const EXPECTED_TOOLS: [&str; 8] = [
     "fula_read_file",
     "fula_list_files",
     "fula_search",
+    "fula_store_file",
+    "fula_create_folder",
+    "fula_remove_file",
     "fula_tag_file",
     "fula_list_tags",
 ];
 
-/// A throwaway bundle with a deterministic dummy secret + an UNREACHABLE
-/// endpoint. `tools/list` is server metadata, so this is never dereferenced.
+/// A throwaway collaboration bundle: a fresh local identity, a link secret wrapped
+/// to it, and an UNREACHABLE endpoint. `tools/list` is metadata, so it is never
+/// dereferenced.
 fn dummy_bundle() -> CapabilityBundle {
-    let ws = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
-    let mcp = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
-    let owner = base64::engine::general_purpose::STANDARD
-        .encode(SecretKey::from_bytes(&[3u8; 32]).unwrap().public_key().as_bytes());
+    let dir = std::env::temp_dir().join(format!(
+        "fula_mcp_smoke_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let id_path = dir.join("mcp_identity.key");
+    let _ = std::fs::remove_file(&id_path);
+
+    let identity = McpIdentity::load_or_generate(&id_path).unwrap();
+    let owner = KekKeyPair::generate();
+    let dek = DekKey::from_bytes(&[7u8; 32]).unwrap();
+    let token = ShareBuilder::new(&owner, identity.public_key(), &dek)
+        .path_scope("/collab/g")
+        .build()
+        .unwrap();
+    let wrapped = serde_json::to_string(&token).unwrap();
     let json = format!(
-        r#"{{ "endpoint": "https://offline.invalid", "jwt": "j", "workspace_secret_b64": "{ws}", "mcp_secret_b64": "{mcp}", "owner_public_b64": "{owner}", "grants": [{{ "scope": "ai/", "permissions": {{ "can_read": true, "can_write": true, "can_delete": false }} }}] }}"#
+        r#"{{"webui_base":"https://offline.invalid","group_id":"g","manifest_bucket":"b","manifest_key":"k","wrapped_link_secret":{wrapped:?},"identity_path":{id:?}}}"#,
+        id = id_path.to_str().unwrap(),
     );
     CapabilityBundle::from_json(&json).expect("dummy bundle must parse")
 }
 
 #[tokio::test]
-async fn initialize_and_tools_list_advertises_all_six_tools_with_schemas() {
+async fn initialize_and_tools_list_advertises_all_tools_with_schemas() {
     let server = FulaMcpServer::new(dummy_bundle());
 
-    // In-memory duplex stands in for stdio. One end drives the server, the other
-    // the client; `.serve()` performs the MCP `initialize` handshake on connect.
     let (server_transport, client_transport) = tokio::io::duplex(8192);
 
     let server_handle = tokio::spawn(async move { server.serve(server_transport).await });
-    // `()` is the default no-op ClientHandler; serving it runs `initialize`.
     let client = ()
         .serve(client_transport)
         .await
         .expect("client initialize handshake must succeed");
 
-    // `tools/list` over the wire.
     let listed = client
         .peer()
         .list_tools(None)
@@ -71,7 +75,6 @@ async fn initialize_and_tools_list_advertises_all_six_tools_with_schemas() {
 
     let names: Vec<&str> = listed.tools.iter().map(|t| t.name.as_ref()).collect();
 
-    // All six expected tools are present (and no fewer / no extras beyond them).
     for expected in EXPECTED_TOOLS {
         assert!(
             names.contains(&expected),
@@ -86,16 +89,9 @@ async fn initialize_and_tools_list_advertises_all_six_tools_with_schemas() {
         listed.tools.len()
     );
 
-    // Each tool carries a non-trivial input schema (an object with properties, or
-    // — for the zero-arg `fula_list_tags` — at least a well-formed object schema).
     for tool in &listed.tools {
-        let schema = &tool.input_schema; // Arc<Map<String, Value>>
-        assert!(
-            !schema.is_empty(),
-            "tool `{}` has an empty input schema",
-            tool.name
-        );
-        // The schema must declare an object type (MCP tool args are objects).
+        let schema = &tool.input_schema;
+        assert!(!schema.is_empty(), "tool `{}` has an empty input schema", tool.name);
         let ty = schema.get("type").and_then(|v| v.as_str());
         assert_eq!(
             ty,
@@ -103,19 +99,17 @@ async fn initialize_and_tools_list_advertises_all_six_tools_with_schemas() {
             "tool `{}` input schema is not an object: {schema:?}",
             tool.name
         );
-        // Tools that take arguments must expose `properties`; only the zero-arg
-        // list_tags is permitted to have none.
+        // Every tool except the zero-arg `fula_list_tags` exposes `properties`.
         if tool.name.as_ref() != "fula_list_tags" {
             assert!(
                 schema.contains_key("properties"),
-                "tool `{}` (takes args) is missing `properties` in its schema: {schema:?}",
+                "tool `{}` (takes args) is missing `properties`: {schema:?}",
                 tool.name
             );
         }
     }
 
-    // Spot-check that the key arg names made it into the schema (proves the
-    // serde/schemars derivation wired the real fields, not an empty placeholder).
+    // Spot-check that `fula_store_file`'s real fields wired through schemars.
     let store = listed
         .tools
         .iter()
@@ -126,17 +120,31 @@ async fn initialize_and_tools_list_advertises_all_six_tools_with_schemas() {
         .get("properties")
         .and_then(|v| v.as_object())
         .expect("fula_store_file must have properties");
-    for required_field in ["content", "name"] {
+    for required_field in ["content", "name", "subfolder_path"] {
         assert!(
             store_props.contains_key(required_field),
-            "fula_store_file schema missing `{required_field}` property: {store_props:?}"
+            "fula_store_file schema missing `{required_field}`: {store_props:?}"
         );
     }
-    // And the `path` field we deliberately DROPPED must NOT be present.
+    // No local-FS `path` arg on store (exfiltration risk; the subfolder is a
+    // logical group path, not a filesystem path).
     assert!(
         !store_props.contains_key("path"),
-        "fula_store_file must NOT expose a local-FS `path` arg (exfiltration risk)"
+        "fula_store_file must NOT expose a `path` arg"
     );
+
+    // `fula_read_file` addresses by file_id / path.
+    let read = listed
+        .tools
+        .iter()
+        .find(|t| t.name.as_ref() == "fula_read_file")
+        .unwrap();
+    let read_props = read
+        .input_schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .expect("fula_read_file must have properties");
+    assert!(read_props.contains_key("file_id") && read_props.contains_key("path"));
 
     client.cancel().await.ok();
     server_handle.abort();

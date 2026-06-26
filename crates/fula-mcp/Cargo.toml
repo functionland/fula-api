@@ -67,11 +67,18 @@ rmcp = { version = "1.7", default-features = false, features = ["server", "macro
 # must match what rmcp's `Parameters<T>` bound expects.
 schemars = "1"
 
-# HTTP client for the P10 quota pre-check (`GET {storage_api_url}/api/v1/storage`),
-# calling the SAME credit endpoint the gateway uses. Inherited from the workspace
-# (default-features off + rustls-tls + json) so we match the workspace TLS stack
-# rather than pulling a second one — same as `fula-cli`.
+# HTTP client for the collaboration `/api/collab/*` endpoints (collab.rs) and the
+# P10 quota pre-check (`GET {storage_api_url}/api/v1/storage`). Inherited from the
+# workspace (default-features off + rustls-tls + json) so we match the workspace
+# TLS stack rather than pulling a second one — same as `fula-cli`.
 reqwest = { workspace = true }
+
+# ISO-8601 timestamps for the collaboration manifest's `addedAt` / `updatedAt`
+# fields (and the merge `now`), matching the Dart `DateTime.toIso8601String()`
+# shape the `manifest.rs` model parses (`YYYY-MM-DDTHH:MM:SS.mmmZ`). Workspace
+# pin 0.4 (serde feature unused here — we only format, never (de)serialize a
+# `DateTime`).
+chrono = { workspace = true }
 
 [dev-dependencies]
 # Test-only helpers: RNG for random payloads, hex for derived-key debug output.
@@ -87,3 +94,9 @@ rmcp = { version = "1.7", default-features = false, features = ["server", "clien
 # `tokio::io::duplex` lives behind the `io-util` feature; the workspace tokio
 # already enables "full", so this is just an explicit note. (No extra dep.)
 tokio = { workspace = true }
+# Mock HTTP server for the collab-client WIRING tests (`tests/collab_http_mock.rs`):
+# asserts the reqwest calls hit the documented `/api/collab/*` path + query +
+# headers + body shape WITHOUT a real server. This covers the one layer the pure
+# parse tests cannot (it does NOT replace the live e2e — the real server's
+# behavior still needs `collab_read_e2e` / `collab_write_e2e`).
+wiremock = { workspace = true }
