@@ -607,6 +607,34 @@ fn generate_share_id() -> String {
 /// `CollabLinkSecretWrapper`, or the Cloudflare Worker) wrap a secret for an
 /// AI/MCP recipient without holding any long-lived key of its own.
 ///
+/// ## Security properties the caller MUST uphold
+///
+/// - **No sender authentication.** Because the sender is ephemeral and unbound,
+///   the token proves to the recipient only "this was wrapped *for my* public
+///   key" — NOT *who* wrapped it. Anyone who knows the recipient's (published)
+///   public key can mint a structurally valid token. The recovered secret is
+///   therefore a **bearer / possession** capability: the consumer (the MCP) must
+///   authorize a session on POSSESSION of the recovered secret, not on the
+///   wrap's origin. If owner attribution is ever required, the (currently
+///   unused) `owner_keypair` signing slot in [`ShareBuilder`] is where it would
+///   be added — it is intentionally not relied upon here.
+/// - **Authenticate the recipient public key out-of-band.** This function wraps
+///   for whatever public key you pass. If the caller obtained that key over an
+///   unauthenticated channel, a man-in-the-middle can substitute their own key
+///   and the wrap still "succeeds" — for the attacker. Callers MUST pin / verify
+///   the recipient's `FULA-` identity (TOFU-with-persistence, or signed by a
+///   stable owner key) before wrapping. This is the standard HPKE trust
+///   assumption, not a defect of this function.
+/// - **Recipient key validation.** Any 32 bytes are accepted as the recipient
+///   public key (matching `create_share_token`). The all-zero key and X25519
+///   low-order points are closed by RFC 9180 DHKEM, which aborts on an all-zero
+///   Diffie-Hellman shared secret, so `build()` returns `Err` rather than
+///   producing a trivially-decryptable token.
+/// - **Expiry semantics.** `expires_in_seconds` is a duration ADDED to "now":
+///   the token expires at `now + expires_in_seconds`. A negative value yields a
+///   born-expired token that `accept_share` rejects (fail-closed); `None` never
+///   expires.
+///
 /// ## Fail-closed input validation
 ///
 /// Both `secret` and `recipient_public_key` MUST be exactly 32 bytes; any other

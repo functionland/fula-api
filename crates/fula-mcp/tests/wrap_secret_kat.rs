@@ -91,3 +91,75 @@ fn kat_producer_fails_closed_on_bad_lengths() {
     // The all-valid call still succeeds.
     assert!(wrap_secret_for_recipient(&SECRET, pk, None, None).is_ok());
 }
+
+#[test]
+fn kat_tampered_metadata_is_rejected() {
+    // The v5 AAD binds the token's metadata fields. Tampering with `path_scope`
+    // or `expires_at` AFTER the wrap must make `accept_link_secret` fail closed —
+    // this is the integrity guarantee that makes those fields enforceable rather
+    // than advisory, exercised here on the secret-wrap -> MCP-accept path.
+    let mcp = McpIdentity::generate();
+    let token = wrap_secret_for_recipient(
+        &SECRET,
+        mcp.public_key().as_bytes(),
+        Some("/collab/group-original"),
+        Some(3600),
+    )
+    .expect("wrap must succeed");
+    let token_json = serde_json::to_string(&token).unwrap();
+
+    // Baseline: the untampered token is accepted.
+    {
+        let pristine: ShareToken = serde_json::from_str(&token_json).unwrap();
+        assert_eq!(mcp.accept_link_secret(&pristine).unwrap(), SECRET);
+    }
+
+    // Mutated path_scope -> generic auth failure.
+    {
+        let mut t: ShareToken = serde_json::from_str(&token_json).unwrap();
+        t.path_scope = "/collab/group-WIDENED".to_string();
+        assert!(
+            mcp.accept_link_secret(&t).is_err(),
+            "a mutated path_scope must be rejected by the AAD binding"
+        );
+    }
+
+    // Stretched expiry -> generic auth failure.
+    {
+        let mut t: ShareToken = serde_json::from_str(&token_json).unwrap();
+        t.expires_at = Some(t.expires_at.unwrap() + 86_400 * 365);
+        assert!(
+            mcp.accept_link_secret(&t).is_err(),
+            "a mutated expires_at must be rejected by the AAD binding"
+        );
+    }
+}
+
+#[test]
+fn kat_born_expired_token_is_rejected() {
+    // `expires_in_seconds` is `now + seconds`; a negative value is born-expired.
+    // The wrap still produces a token, but the consumer rejects it (fail-closed),
+    // proving the expiry plumbing through `wrap_secret_for_recipient`.
+    let mcp = McpIdentity::generate();
+    let token = wrap_secret_for_recipient(&SECRET, mcp.public_key().as_bytes(), None, Some(-3600))
+        .expect("wrap itself succeeds even for a past expiry");
+    let token_json = serde_json::to_string(&token).unwrap();
+    let token_back: ShareToken = serde_json::from_str(&token_json).unwrap();
+    assert!(
+        mcp.accept_link_secret(&token_back).is_err(),
+        "a born-expired token must be rejected"
+    );
+}
+
+#[test]
+fn kat_all_zero_recipient_pubkey_is_rejected_by_dhkem() {
+    // Defense-in-depth observation: an all-zero (or low-order) recipient X25519
+    // public key yields an all-zero DH shared secret, which RFC 9180 DHKEM must
+    // abort on — so the wrap fails closed rather than emitting a token anyone
+    // could open. (The producer does not add its own low-order check, matching
+    // `create_share_token`; this asserts the HPKE layer closes the hole.)
+    assert!(
+        wrap_secret_for_recipient(&SECRET, &[0u8; 32], None, None).is_err(),
+        "wrapping for an all-zero recipient public key must fail closed"
+    );
+}
