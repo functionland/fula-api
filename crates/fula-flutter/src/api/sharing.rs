@@ -227,6 +227,51 @@ pub async fn create_share_token_with_mode(
 }
 
 // ============================================================================
+// Secret Wrapping (Method-2 AI pairing — no client / no stored file needed)
+// ============================================================================
+
+/// Wrap an ARBITRARY 32-byte secret for a recipient X25519 public key,
+/// producing a serialized v5 ShareToken (JSON).
+///
+/// Unlike [`create_share_token`], this needs NO client and NO previously-stored
+/// file: it wraps the raw 32 bytes you pass in. It is the producer side of the
+/// secure "Method 2" AI-pairing — FxFiles' fail-closed `CollabLinkSecretWrapper`
+/// calls this to wrap a collaboration link secret for an AI/MCP recipient's
+/// public key. The recipient (the local MCP's
+/// `McpIdentity::accept_link_secret`, i.e. `fula_crypto` `ShareRecipient`)
+/// opens the token to recover the EXACT secret bytes.
+///
+/// The sender/owner keypair is generated EPHEMERALLY inside `fula-crypto`: the
+/// v5 token AAD binds the RECIPIENT public key, not the sender, so the caller
+/// needs no stable identity of its own.
+///
+/// # Arguments
+/// * `secret` - the 32 raw secret bytes to wrap.
+/// * `recipient_public_key` - the recipient's 32-byte X25519 public key.
+/// * `path_scope` - optional scope string bound into the token (defaults to `"/"`).
+/// * `expires_in_seconds` - optional expiry as seconds-from-now (`None` = never).
+///
+/// Returns the JSON-serialized ShareToken. Fails closed (returns `Err`) if
+/// `secret` or `recipient_public_key` is not exactly 32 bytes.
+pub async fn wrap_secret_for_recipient(
+    secret: Vec<u8>,
+    recipient_public_key: Vec<u8>,
+    path_scope: Option<String>,
+    expires_in_seconds: Option<i64>,
+) -> anyhow::Result<String> {
+    let token = fula_crypto::sharing::wrap_secret_for_recipient(
+        &secret,
+        &recipient_public_key,
+        path_scope.as_deref(),
+        expires_in_seconds,
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to wrap secret for recipient: {}", e))?;
+
+    serde_json::to_string(&token)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize share token: {}", e))
+}
+
+// ============================================================================
 // Share Acceptance
 // ============================================================================
 

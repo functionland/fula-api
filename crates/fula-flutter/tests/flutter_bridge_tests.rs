@@ -653,6 +653,65 @@ fn test_different_files_get_different_deks() {
     assert_ne!(dek1.as_bytes(), dek3.as_bytes(), "Each file should have unique DEK");
 }
 
+// ============================================================================
+// Secret-Wrap Binding Tests (Method-2 AI pairing)
+// ============================================================================
+
+/// The `wrap_secret_for_recipient` FRB binding must return a parseable v5
+/// ShareToken whose wrapped secret the recipient recovers verbatim.
+#[test]
+fn test_wrap_secret_for_recipient_binding_round_trips() {
+    use fula_crypto::keys::KekKeyPair;
+    use fula_crypto::sharing::ShareRecipient;
+    use fula_crypto::ShareToken;
+    use futures::executor::block_on;
+
+    let recipient = KekKeyPair::generate();
+    let secret: Vec<u8> = (0u8..32).collect(); // 0x00..0x1f
+
+    // Call the actual FRB binding (async-but-non-blocking, like the codebase's
+    // other pure bindings) and get the JSON ShareToken back.
+    let token_json = block_on(fula_flutter::api::sharing::wrap_secret_for_recipient(
+        secret.clone(),
+        recipient.public_key().as_bytes().to_vec(),
+        Some("/collab/group-flutter".to_string()),
+        Some(3600),
+    ))
+    .expect("binding must succeed for valid 32-byte inputs");
+
+    // It must parse as a ShareToken and be a strict v5 token.
+    let token: ShareToken =
+        serde_json::from_str(&token_json).expect("binding output must be a parseable ShareToken");
+    assert_eq!(token.version, 5, "must be a v5 token");
+    assert_eq!(token.path_scope, "/collab/group-flutter");
+
+    // The recipient recovers the EXACT secret (producer<->consumer round-trip).
+    let accepted = ShareRecipient::new(&recipient)
+        .accept_share(&token)
+        .expect("recipient must accept the token");
+    assert_eq!(
+        accepted.dek.as_bytes().as_slice(),
+        secret.as_slice(),
+        "recovered secret must equal the wrapped secret"
+    );
+}
+
+/// The binding fails closed on a non-32-byte secret.
+#[test]
+fn test_wrap_secret_for_recipient_binding_rejects_bad_secret() {
+    use fula_crypto::keys::KekKeyPair;
+    use futures::executor::block_on;
+
+    let recipient = KekKeyPair::generate();
+    let result = block_on(fula_flutter::api::sharing::wrap_secret_for_recipient(
+        vec![0u8; 31], // too short
+        recipient.public_key().as_bytes().to_vec(),
+        None,
+        None,
+    ));
+    assert!(result.is_err(), "a 31-byte secret must be rejected");
+}
+
 /// Test that derive_path_key produces DETERMINISTIC output (NOT suitable for FlatNamespace)
 #[test]
 fn test_derive_path_key_is_deterministic() {
