@@ -38,7 +38,7 @@ test('expectedHashFor reads flat map', () => {
 });
 
 test('expectedHashFor reads wrapped { checksums: {...} } map', () => {
-  const cs = { version: '0.6.17', checksums: { 'fula-mcp-x86_64-apple-darwin': 'B'.repeat(64) } };
+  const cs = { version: '0.6.18', checksums: { 'fula-mcp-x86_64-apple-darwin': 'B'.repeat(64) } };
   // also normalizes case to lowercase
   assert.equal(expectedHashFor(cs, 'fula-mcp-x86_64-apple-darwin'), 'b'.repeat(64));
 });
