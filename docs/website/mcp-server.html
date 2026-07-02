@@ -207,6 +207,39 @@
         a.ext-link:hover {
             text-decoration: underline;
         }
+        .ai-accordion {
+            background: var(--bg-code);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            margin-bottom: 12px;
+            overflow: hidden;
+        }
+        .ai-accordion > summary {
+            cursor: pointer;
+            padding: 14px 18px;
+            font-weight: 600;
+            color: var(--text-heading);
+            list-style: none;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .ai-accordion > summary::-webkit-details-marker { display: none; }
+        .ai-accordion > summary::before {
+            content: "\25B8";
+            color: var(--accent-blue);
+            font-size: 0.9em;
+        }
+        .ai-accordion[open] > summary::before { content: "\25BE"; }
+        .ai-accordion > summary:hover { background: var(--bg-sidebar); }
+        .accordion-body {
+            padding: 6px 18px 18px;
+            border-top: 1px solid var(--border-color);
+        }
+        .accordion-body p, .accordion-body li { font-size: 0.9rem; }
+        .accordion-body .code-block { margin-top: 12px; }
+        ol.step-list { padding-left: 22px; }
+        ol.step-list li { margin-bottom: 8px; line-height: 1.6; }
     </style>
 </head>
 <body>
@@ -258,7 +291,7 @@
                 <li><a href="#overview">What It Is</a></li>
                 <li><a href="#two-ways">Two Ways to Use It</a></li>
                 <li><a href="#local-binary">Local Binary Setup</a></li>
-                <li><a href="#hosted">Hosted Server Setup</a></li>
+                <li><a href="#hosted">Hosted Connector Setup</a></li>
                 <li><a href="#connect">How to Connect</a></li>
                 <li><a href="#capabilities">What the AI Can Do</a></li>
                 <li><a href="#security">Security &amp; Privacy</a></li>
@@ -270,7 +303,7 @@
         <!-- Hero Section -->
         <section class="x402-hero">
             <h1>Fula MCP Server</h1>
-            <p class="hero-subtitle">Let AI assistants store and read files in your own encrypted Fula workspace</p>
+            <p class="hero-subtitle">Let AI assistants read and write files in a folder you share with them, inside your own encrypted Fula storage</p>
             <div class="hero-badges">
                 <span class="badge-item">🤖 Works with Claude, ChatGPT, Gemini, Codex</span>
                 <span class="badge-item">🔐 End-to-End Encrypted</span>
@@ -282,22 +315,22 @@
         <!-- Overview / What it is -->
         <section id="overview" class="x402-section">
             <h2>What It Is</h2>
-            <p>The Fula <strong>MCP server</strong> lets AI assistants &mdash; like Claude, ChatGPT, Gemini, or Codex &mdash; store and read files in <em>your</em> Fula <strong>AI workspace</strong>. Files the AI writes are encrypted in exactly the same end-to-end-encrypted format the <a href="https://fx.land" class="ext-link">FxFiles</a> app uses, so they appear right alongside your own files in FxFiles.</p>
-            <p>The important part: the AI does this <strong>without ever getting the key that decrypts your other files</strong>. It is handed a dedicated workspace key that unlocks only its own AI workspace &mdash; nothing else. Your master encryption key never leaves your device and is never given to the AI or to any server.</p>
-            <p><a href="https://modelcontextprotocol.io/" class="ext-link">MCP (Model Context Protocol)</a> is the open standard AI assistants use to connect to external tools. The Fula MCP server is one such tool: it exposes a small set of "store / read / list / search / tag" file operations that the AI can call.</p>
+            <p>The Fula <strong>MCP server</strong> lets AI assistants &mdash; like Claude, ChatGPT, Gemini, or Codex &mdash; read and write files in a <strong>collaboration folder</strong> you share with them, inside <em>your</em> Fula storage. Files the AI writes are encrypted in exactly the same end-to-end-encrypted format the <a href="https://fx.land" class="ext-link">FxFiles</a> app uses, so they appear right alongside your own files in FxFiles.</p>
+            <p>The important part: the AI only ever gets access to the <strong>specific folder you share with it</strong> &mdash; the same way you would share a folder with another person. It never receives the key that decrypts your other files, and your master encryption key never leaves your device or is given to any AI or server.</p>
+            <p><a href="https://modelcontextprotocol.io/" class="ext-link">MCP (Model Context Protocol)</a> is the open standard AI assistants use to connect to external tools. The Fula MCP server is one such tool: it exposes a small set of "read / list / search / store / create-folder / remove" file operations, scoped to the one collaboration folder you shared.</p>
 
             <div class="info-grid">
                 <div class="info-card">
                     <h4>🤖 For your AI assistant</h4>
-                    <p>Give an AI a place to keep notes, documents, and results that persist across chats &mdash; encrypted, decentralized, and owned by you.</p>
+                    <p>Give an AI a shared folder to keep notes, documents, and results that persist across chats &mdash; encrypted, decentralized, and owned by you.</p>
                 </div>
                 <div class="info-card">
                     <h4>🔐 Same encryption as FxFiles</h4>
-                    <p>Every file the AI stores is individually encrypted in the FxFiles format. Open FxFiles and the AI's files are simply there, decryptable by you.</p>
+                    <p>Every file the AI stores is individually encrypted in the FxFiles format. Open FxFiles and the AI's files are simply there in that folder, decryptable by you.</p>
                 </div>
                 <div class="info-card">
                     <h4>🔑 Your other files stay private</h4>
-                    <p>The AI receives a workspace-only key derived one-way from your master key. It cannot reverse it, and it cannot reach your real files.</p>
+                    <p>The AI can reach only the folder you explicitly shared with it &mdash; never your master key, and never any of your other files.</p>
                 </div>
                 <div class="info-card">
                     <h4>🧩 Built on an open standard</h4>
@@ -309,21 +342,21 @@
         <!-- Two ways to use it -->
         <section id="two-ways" class="x402-section">
             <h2>Two Ways to Use It</h2>
-            <p>There are two ways to connect an AI to your Fula workspace. Pick the one that matches your AI assistant:</p>
+            <p>There are two ways to connect an AI to a collaboration folder in your Fula storage. Pick the one that matches your AI assistant:</p>
 
             <div class="info-grid">
                 <div class="info-card">
                     <h4>💻 Local binary</h4>
-                    <p>For desktop / terminal AI tools that run on your own computer &mdash; <strong>Claude Desktop, Claude Code, Codex CLI, Gemini CLI</strong>. The MCP server runs locally on your machine. No build step: it starts with a single <code>npx</code> command. This is the path that is available today.</p>
+                    <p>For desktop / terminal AI tools that run on your own computer &mdash; <strong>Claude Desktop, Claude Code, Codex CLI, Gemini CLI</strong>. The MCP server runs locally on your machine. No build step: it starts with a single <code>npx</code> command.</p>
                 </div>
                 <div class="info-card">
-                    <h4>🌐 Hosted server</h4>
-                    <p>For web AI assistants that can only reach a URL &mdash; <strong>Claude.ai, ChatGPT (web)</strong>. You add a hosted server URL as a custom connector and sign in. This path requires a hosted server to be deployed first (see below).</p>
+                    <h4>🌐 Hosted connector</h4>
+                    <p>For web AI assistants that can only reach a URL &mdash; <strong>Claude.ai, ChatGPT (web)</strong>. You add the hosted connector URL <code>https://mcp.cloud.fx.land/mcp</code> as a custom connector and sign in with Google.</p>
                 </div>
             </div>
 
             <div class="note-box">
-                <p><strong>Not sure which?</strong> If your AI runs as an app or in a terminal on your computer, use the <strong>local binary</strong>. If you use the AI through a website, you need the <strong>hosted server</strong>.</p>
+                <p><strong>Not sure which?</strong> If your AI runs as an app or in a terminal on your computer, use the <strong>local binary</strong>. If you use the AI through a website, use the <strong>hosted connector</strong>.</p>
             </div>
         </section>
 
@@ -336,16 +369,20 @@
                 <pre>npx @functionland/fula-mcp</pre>
             </div>
 
-            <p>In every example below you paste a <strong>connection bundle</strong> into the <code>FULA_MCP_CAPABILITY</code> environment variable. You get that bundle from the FxFiles app (see <a href="#connect">How to Connect</a>). It contains your scoped, workspace-only access &mdash; <strong>not</strong> your master key.</p>
+            <p>In every client below you paste a <strong>connection bundle</strong> into the <code>FULA_MCP_CAPABILITY</code> environment variable. You get that bundle from FxFiles when you share a folder with the AI &mdash; open a <strong>Collaborate</strong> folder, tap <strong>Share with AI Agent</strong>, and copy the <strong>Desktop</strong> configuration (see <a href="#connect">How to Connect</a>). It grants access to that one shared folder &mdash; <strong>not</strong> your master key.</p>
 
             <div class="warning-box">
                 <p><strong>Tip:</strong> Run <code>npx -y @functionland/fula-mcp</code> once in a terminal first. This warms the binary cache so your AI client does not time out waiting for the first download.</p>
             </div>
 
-            <h3>Claude Desktop</h3>
-            <p>Edit <code>claude_desktop_config.json</code> (on Windows: <code>%APPDATA%\Claude\claude_desktop_config.json</code>; on macOS: <code>~/Library/Application Support/Claude/claude_desktop_config.json</code>) and add a <code>fula</code> entry under <code>mcpServers</code>, then fully quit and reopen Claude Desktop:</p>
-            <div class="code-block">
-                <pre>{
+            <p>Click a client to expand its setup:</p>
+
+            <details class="ai-accordion">
+                <summary>Claude Desktop</summary>
+                <div class="accordion-body">
+                    <p>Edit <code>claude_desktop_config.json</code> (on Windows: <code>%APPDATA%\Claude\claude_desktop_config.json</code>; on macOS: <code>~/Library/Application Support/Claude/claude_desktop_config.json</code>) and add a <code>fula</code> entry under <code>mcpServers</code>, then fully quit and reopen Claude Desktop:</p>
+                    <div class="code-block">
+                        <pre>{
   "mcpServers": {
     "fula": {
       "command": "npx",
@@ -356,39 +393,51 @@
     }
   }
 }</pre>
-            </div>
+                    </div>
+                </div>
+            </details>
 
-            <h3>Claude Code</h3>
-            <p>Claude Code stores MCP servers in the same <code>mcpServers</code> shape (in <code>.mcp.json</code>). The simplest way to add one with an environment variable is the <code>add-json</code> command:</p>
-            <div class="code-block">
-                <pre>claude mcp add-json fula '{
+            <details class="ai-accordion">
+                <summary>Claude Code</summary>
+                <div class="accordion-body">
+                    <p>Claude Code stores MCP servers in the same <code>mcpServers</code> shape (in <code>.mcp.json</code>). The simplest way to add one with an environment variable is the <code>add-json</code> command:</p>
+                    <div class="code-block">
+                        <pre>claude mcp add-json fula '{
   "type": "stdio",
   "command": "npx",
   "args": ["-y", "@functionland/fula-mcp"],
   "env": { "FULA_MCP_CAPABILITY": "&lt;paste your connection bundle from FxFiles&gt;" }
 }'</pre>
-            </div>
-            <p>Use <code>--scope user</code> to make the server available across all your projects, or <code>--scope project</code> to share it with a repo via a checked-in <code>.mcp.json</code>.</p>
+                    </div>
+                    <p>Use <code>--scope user</code> to make the server available across all your projects, or <code>--scope project</code> to share it with a repo via a checked-in <code>.mcp.json</code>.</p>
+                </div>
+            </details>
 
-            <h3>Codex CLI</h3>
-            <p>Codex reads MCP servers from <code>~/.codex/config.toml</code>. Add a server section &mdash; note the table name is <code>mcp_servers</code> (with an underscore), and the environment variables go in a nested <code>.env</code> table:</p>
-            <div class="code-block">
-                <pre>[mcp_servers.fula]
+            <details class="ai-accordion">
+                <summary>Codex CLI</summary>
+                <div class="accordion-body">
+                    <p>Codex reads MCP servers from <code>~/.codex/config.toml</code>. Add a server section &mdash; note the table name is <code>mcp_servers</code> (with an underscore), and the environment variables go in a nested <code>.env</code> table:</p>
+                    <div class="code-block">
+                        <pre>[mcp_servers.fula]
 command = "npx"
 args = ["-y", "@functionland/fula-mcp"]
 
 [mcp_servers.fula.env]
 FULA_MCP_CAPABILITY = "&lt;paste your connection bundle from FxFiles&gt;"</pre>
-            </div>
-            <p>Or add it from the command line:</p>
-            <div class="code-block">
-                <pre>codex mcp add fula --env FULA_MCP_CAPABILITY="&lt;bundle&gt;" -- npx -y @functionland/fula-mcp</pre>
-            </div>
+                    </div>
+                    <p>Or add it from the command line:</p>
+                    <div class="code-block">
+                        <pre>codex mcp add fula --env FULA_MCP_CAPABILITY="&lt;bundle&gt;" -- npx -y @functionland/fula-mcp</pre>
+                    </div>
+                </div>
+            </details>
 
-            <h3>Gemini CLI</h3>
-            <p>Gemini CLI uses the same <code>mcpServers</code> object in its <code>settings.json</code>:</p>
-            <div class="code-block">
-                <pre>{
+            <details class="ai-accordion">
+                <summary>Gemini CLI</summary>
+                <div class="accordion-body">
+                    <p>Gemini CLI uses the same <code>mcpServers</code> object in its <code>settings.json</code>:</p>
+                    <div class="code-block">
+                        <pre>{
   "mcpServers": {
     "fula": {
       "command": "npx",
@@ -397,83 +446,133 @@ FULA_MCP_CAPABILITY = "&lt;paste your connection bundle from FxFiles&gt;"</pre>
     }
   }
 }</pre>
-            </div>
+                    </div>
+                </div>
+            </details>
 
             <div class="note-box">
                 <p><strong>Note:</strong> The <code>@functionland/fula-mcp</code> package and its config shape match the package's own README. MCP client configuration formats do change between releases &mdash; if an example does not match your installed version, check that client's current MCP documentation and use its <code>mcpServers</code> / <code>mcp_servers</code> equivalent with the same <code>command</code>, <code>args</code>, and <code>FULA_MCP_CAPABILITY</code> environment variable.</p>
             </div>
         </section>
 
-        <!-- Hosted server setup -->
+        <!-- Hosted connector setup -->
         <section id="hosted" class="x402-section">
-            <h2>Hosted Server Setup</h2>
-            <p>Web-based AI assistants (Claude.ai, ChatGPT on the web) cannot launch a local program &mdash; they can only reach a server over the internet. For those, you connect to a <strong>hosted</strong> Fula MCP server:</p>
-            <ul>
-                <li>In the AI assistant's settings, add a <strong>custom connector</strong> and paste the hosted server's <strong>URL</strong>.</li>
-                <li><strong>Sign in (OAuth)</strong> when prompted, to link the connector to your Fula account.</li>
-                <li>The AI can then store and read files in your AI workspace, the same way the local binary does.</li>
-            </ul>
+            <h2>Hosted Connector Setup (Web AIs)</h2>
+            <p>Web-based AI assistants (Claude.ai, ChatGPT on the web) cannot launch a local program &mdash; they can only reach a server over the internet. For those, add the hosted Fula MCP connector:</p>
+            <div class="code-block">
+                <pre>https://mcp.cloud.fx.land/mcp</pre>
+            </div>
+            <p>You add that URL as a <strong>custom connector</strong> in your AI, <strong>sign in with Google</strong> (use the <em>same</em> Google account you use in FxFiles), and the sign-in confirmation page shows your AI's <strong>Fula ID</strong> to copy. You then share a Collaborate folder with that Fula ID in FxFiles (see <a href="#connect">How to Connect</a>).</p>
 
-            <p>The hosted server is implemented as a <strong>Cloudflare Worker</strong> (an OAuth 2.1 resource server built on <code>@cloudflare/workers-oauth-provider</code>, running the same Fula crypto WASM as FxFiles, with per-user custody). The encryption key that wraps each user's workspace key is <strong>not</strong> held by the Worker: it lives in a <strong>self-hosted <a href="https://openbao.org" class="ext-link">OpenBao</a></strong> (the open-source Vault fork) on your own box &mdash; a separate trust domain &mdash; which the Worker calls to wrap/unwrap keys but can never export.</p>
+            <p>Click your web AI to expand its setup:</p>
 
-            <div class="warning-box">
-                <p><strong>Availability:</strong> The hosted server is <strong>available to self-host</strong> &mdash; it is not yet a managed service you can point at a ready-made URL. You deploy it to <strong>your own Cloudflare account</strong> with Wrangler (<code>wrangler deploy</code>) and stand up <strong>OpenBao on your own server</strong> for the encryption key, so you stay in control of your own trust domain. Until you (or your organization) deploy one, only the <a href="#local-binary">local binary</a> path is available. The code lives in the <code>cloudflare/</code> directory of the <a href="https://github.com/functionland/pinning-service" class="ext-link">pinning-service repository</a> (with the OpenBao installer under <code>scripts/</code>); follow its setup notes to deploy your own.</p>
+            <details class="ai-accordion">
+                <summary>Claude.ai (web)</summary>
+                <div class="accordion-body">
+                    <ol class="step-list">
+                        <li>In Claude.ai, open <strong>Settings → Connectors</strong> and choose <strong>Add custom connector</strong>.</li>
+                        <li>Paste the URL <code>https://mcp.cloud.fx.land/mcp</code> and add it.</li>
+                        <li><strong>Sign in with Google</strong> when prompted &mdash; the same account you use in FxFiles.</li>
+                        <li>On the confirmation page, <strong>Copy</strong> your AI's Fula ID, then click <strong>Finish connecting</strong> to return to Claude. (Didn't copy it? Ask the AI later: "What is my Fula id?")</li>
+                        <li>In FxFiles, share a Collaborate folder with that Fula ID (see <a href="#connect">How to Connect</a>).</li>
+                    </ol>
+                    <div class="note-box">
+                        <p>Custom connectors are a paid-plan feature on Claude.ai (Pro / Max / Team / Enterprise). If you don't see "Add custom connector", that is usually why.</p>
+                    </div>
+                </div>
+            </details>
+
+            <details class="ai-accordion">
+                <summary>ChatGPT (web)</summary>
+                <div class="accordion-body">
+                    <ol class="step-list">
+                        <li>In ChatGPT's <strong>Settings</strong>, add a <strong>custom connector</strong> (a remote <strong>MCP server</strong>).</li>
+                        <li>Add the URL <code>https://mcp.cloud.fx.land/mcp</code>.</li>
+                        <li><strong>Sign in with Google</strong> when prompted &mdash; the same account you use in FxFiles.</li>
+                        <li>On the confirmation page, <strong>Copy</strong> your AI's Fula ID, then finish to return to ChatGPT. (Didn't copy it? Ask the AI later: "What is my Fula id?")</li>
+                        <li>In FxFiles, share a Collaborate folder with that Fula ID (see <a href="#connect">How to Connect</a>).</li>
+                    </ol>
+                    <div class="note-box">
+                        <p>Custom MCP connectors on ChatGPT require an eligible plan, and the exact menu labels vary by ChatGPT version &mdash; but the flow is the same: add the URL above, sign in with Google, copy the Fula ID. Each AI (Claude vs ChatGPT) gets its <em>own</em> distinct Fula ID, so share the folder with each one separately.</p>
+                    </div>
+                </div>
+            </details>
+
+            <div class="note-box">
+                <p><strong>Self-hosting (advanced).</strong> The hosted connector is a <strong>Cloudflare Worker</strong> (an OAuth 2.1 server built on <code>@cloudflare/workers-oauth-provider</code>, running the same Fula crypto WASM as FxFiles, with per-connection custody). The key that wraps each connection's secrets is <strong>not</strong> held by the Worker &mdash; it lives in a self-hosted <a href="https://openbao.org" class="ext-link">OpenBao</a> (the open-source Vault fork) on your own server, a separate trust domain the Worker can call to wrap/unwrap but never export. To run your own instead of the default connector, the code lives in the <code>cloudflare/</code> directory of the <a href="https://github.com/functionland/pinning-service" class="ext-link">pinning-service repository</a> (OpenBao installer under <code>scripts/</code>); deploy it with <code>wrangler deploy</code> and point your AI at your own Worker URL.</p>
             </div>
         </section>
 
         <!-- How to connect -->
         <section id="connect" class="x402-section">
             <h2>How to Connect</h2>
-            <p>You grant an AI access from inside the FxFiles app, under <strong>AI Connections</strong>. You stay in control: you create the connection, and you can disconnect it at any time.</p>
+            <p>You grant an AI access from inside the FxFiles app (or the web app at <a href="https://files.fx.land" class="ext-link">files.fx.land</a>) by <strong>sharing a Collaborate folder</strong> with it. You stay in control: you choose the folder, and you can revoke access at any time.</p>
+
+            <ol class="step-list">
+                <li>Open FxFiles (app or web) and sign in as usual.</li>
+                <li>Go to <strong>Shared → Collaborate</strong> and tap <strong>New Collaborate</strong> to create a shared folder (or open an existing one).</li>
+                <li>Open that folder and tap the <strong>Share with AI Agent</strong> icon.</li>
+                <li>Paste the AI's <strong>Fula ID</strong> in the box:
+                    <ul>
+                        <li><strong>Web AI</strong> (Claude.ai / ChatGPT): copy the Fula ID from the sign-in confirmation page &mdash; see <a href="#hosted">Hosted Connector Setup</a>.</li>
+                        <li><strong>Desktop / terminal AI</strong>: the same dialog gives you the <strong>Desktop configuration</strong> (the <code>FULA_MCP_CAPABILITY</code> value) to paste into your client &mdash; see <a href="#local-binary">Local Binary Setup</a>.</li>
+                    </ul>
+                </li>
+            </ol>
+            <p>That's it &mdash; the AI can now read and write files in <em>that</em> folder. Add files yourself and ask it to read them; ask it to write notes or results; or remove a file from the folder to revoke the AI's access to that file.</p>
 
             <div class="info-grid">
                 <div class="info-card">
-                    <h4>Connect an AI (local)</h4>
-                    <p>Choose <strong>"Connect an AI"</strong>. FxFiles creates a one-time <strong>connection bundle</strong> for you to paste into your AI client's config (the <code>FULA_MCP_CAPABILITY</code> value above).</p>
+                    <h4>You choose the folder</h4>
+                    <p>The AI only ever sees the Collaborate folder(s) you shared with it &mdash; never your other files.</p>
                 </div>
                 <div class="info-card">
-                    <h4>Connect a hosted AI</h4>
-                    <p>Choose <strong>"Connect a hosted AI"</strong> to pair a web assistant with your hosted server by URL (the OAuth flow above).</p>
+                    <h4>Each AI is separate</h4>
+                    <p>Every AI has its own Fula ID. Share a folder with one AI without giving any other AI access.</p>
                 </div>
                 <div class="info-card">
-                    <h4>Disconnect anytime</h4>
-                    <p>Each connection is listed in FxFiles. <strong>Disconnect</strong> to cut off future access &mdash; see exactly how that takes effect in the <a href="#security">security section</a>.</p>
+                    <h4>Revoke anytime</h4>
+                    <p>Stop sharing the folder (or disconnect the AI) to cut off future access &mdash; see how that takes effect in the <a href="#security">security section</a>.</p>
                 </div>
             </div>
 
             <div class="note-box">
-                <p><strong>The bundle is sensitive.</strong> The connection bundle carries your workspace access. Treat it like a password: do not share it or commit it to a public repository. (It still cannot reach your non-workspace files &mdash; but anyone holding it can use your AI workspace until you disconnect.)</p>
+                <p><strong>The Desktop bundle is sensitive.</strong> For the local binary, the <code>FULA_MCP_CAPABILITY</code> bundle carries access to the shared folder. Treat it like a password: do not share it or commit it to a public repository. (It still cannot reach files outside the shared folder &mdash; but anyone holding it can use that folder until you revoke access.)</p>
             </div>
         </section>
 
         <!-- What the AI can do -->
         <section id="capabilities" class="x402-section">
             <h2>What the AI Can Do</h2>
-            <p>The MCP server exposes a small, fixed set of file operations. The AI can only call these, and only within its own workspace (plus any specific file you explicitly share with it):</p>
+            <p>The MCP server exposes a small, fixed set of file operations. The AI can only call these, and only within the <strong>collaboration folder you shared</strong> with it:</p>
 
             <div class="endpoint-card">
-                <h4><span class="method method-put">STORE</span> <span class="path">store a file</span></h4>
-                <p>Save a file into the AI's encrypted workspace. The file is individually encrypted and shows up in your FxFiles library.</p>
-            </div>
-            <div class="endpoint-card">
                 <h4><span class="method method-get">READ</span> <span class="path">read a file</span></h4>
-                <p>Read back a file from the workspace (or a specific file you granted the AI access to). Anything outside that scope is refused before any network request is made.</p>
+                <p>Read back a file from the shared folder (by file id or path). Anything outside the folder is refused before any network request is made.</p>
             </div>
             <div class="endpoint-card">
                 <h4><span class="method method-get">LIST</span> <span class="path">list files</span></h4>
-                <p>Enumerate the files in the AI's workspace, optionally narrowed by category or sub-folder.</p>
+                <p>Enumerate the files in the shared folder, optionally narrowed by category or sub-folder.</p>
             </div>
             <div class="endpoint-card">
                 <h4><span class="method method-get">SEARCH</span> <span class="path">search files</span></h4>
-                <p>Find workspace files by filename (case-insensitive substring match).</p>
+                <p>Find files in the shared folder by filename (case-insensitive substring match).</p>
             </div>
             <div class="endpoint-card">
-                <h4><span class="method method-post">TAG</span> <span class="path">tag a file / list tags</span></h4>
-                <p>Apply tags to a stored file, and list the tags in the workspace &mdash; written in the same tag format FxFiles uses, so your app can adopt them.</p>
+                <h4><span class="method method-put">STORE</span> <span class="path">store a file</span></h4>
+                <p>Save a file into the shared folder. The file is individually encrypted and shows up in FxFiles alongside your own files in that folder.</p>
+            </div>
+            <div class="endpoint-card">
+                <h4><span class="method method-put">CREATE FOLDER</span> <span class="path">create a sub-folder</span></h4>
+                <p>Create a sub-folder inside the shared folder to organize what it stores.</p>
+            </div>
+            <div class="endpoint-card">
+                <h4><span class="method method-delete">REMOVE</span> <span class="path">remove a file</span></h4>
+                <p>Remove a file from the shared folder's listing (a write-authorized session only; a read-only share cannot remove).</p>
             </div>
 
             <div class="note-box">
-                <p><strong>Scope is enforced, not advisory.</strong> Every operation is checked against the workspace scope before any work happens. A request for a key outside the AI workspace is denied outright.</p>
+                <p><strong>Scope is enforced, not advisory.</strong> Every operation is checked against the shared folder before any work happens &mdash; a request for anything outside it is denied outright. Whether a connection can <em>write</em> (store / create-folder / remove) or only <em>read</em> depends on how you shared the folder. (Tagging is not available in collaboration mode yet.)</p>
             </div>
         </section>
 
@@ -483,28 +582,25 @@ FULA_MCP_CAPABILITY = "&lt;paste your connection bundle from FxFiles&gt;"</pre>
             <p>This section states what is <strong>guaranteed</strong> and what the honest <strong>limits</strong> are. We do not claim more than the design delivers.</p>
 
             <h3>Guaranteed: the AI can never reach your other files on its own</h3>
-            <p>This is the one absolute guarantee, and it holds for both the local binary and the hosted server: the AI can never reach your other files <strong>on its own &mdash; without an explicit action by you</strong> (the single, owner-initiated exception is described just below). It rests on <strong>two independent mechanisms</strong> &mdash; either one alone would block access to your other files; both must be defeated for any leak, and the second does not depend on the cryptography of the first:</p>
+            <p>This is the one absolute guarantee, and it holds for both the local binary and the hosted connector: the AI can never reach files you did not share with it <strong>on its own &mdash; without an explicit action by you</strong>. It rests on <strong>two independent mechanisms</strong> &mdash; either one alone would block access to your other files; both must be defeated for any leak, and the second does not depend on the cryptography of the first:</p>
             <ul>
-                <li><strong>1. The master key is never shared.</strong> The AI never receives the master key that decrypts your real files. It receives only a dedicated <strong>AI-workspace key</strong>, computed as a <strong>one-way derivation</strong> of your master key (a BLAKE3 key-derivation under a fixed, workspace-specific label). One-way means the AI cannot work backwards from the workspace key to your master key, and the workspace key unlocks <em>only</em> the AI workspace &mdash; not your real files, not anything else.</li>
-                <li><strong>2. The storage gateway independently enforces scope.</strong> The AI's access token is restricted by the storage gateway itself to the AI-workspace bucket and operations. Even if the encryption were somehow bypassed, the gateway still refuses any request outside that scope. Crucially, isolation <em>between different users</em> comes from the gateway opening storage per account (keyed to your hashed user id and the token's subject) &mdash; not merely from a path prefix.</li>
+                <li><strong>1. The master key is never shared.</strong> The AI never receives the master key that decrypts your files. When you share a Collaborate folder with the AI, it is given access to <em>only that folder's</em> contents &mdash; the same way you would share the folder with another person &mdash; and nothing else. Your master key never leaves your device and is never given to the AI or to any server, so the AI cannot reach any file outside the folders you shared.</li>
+                <li><strong>2. The storage gateway independently enforces scope.</strong> The AI's access token is restricted by the storage gateway itself to the shared folder and the operations it is allowed. Even if the encryption were somehow bypassed, the gateway still refuses any request outside that scope. Crucially, isolation <em>between different users</em> comes from the gateway opening storage per account (keyed to your hashed user id and the token's subject) &mdash; not merely from a path prefix.</li>
             </ul>
             <div class="note-box">
-                <p><strong>What "your other files" means:</strong> your real FxFiles library, encrypted under your master key, is never reachable by the AI on its own. The one exception is intentional and owner-initiated: if <em>you</em> explicitly share a specific file with the AI, it can read <em>that</em> file &mdash; and nothing else. The AI can never reach your files unilaterally.</p>
+                <p><strong>What "your other files" means:</strong> everything outside the Collaborate folders you shared &mdash; your main FxFiles library, encrypted under your master key &mdash; is never reachable by the AI on its own. The AI only ever sees the folders you explicitly shared with it, and nothing else. It can never reach your files unilaterally.</p>
             </div>
 
-            <h3>Your AI workspace &mdash; local binary</h3>
+            <h3>Your shared folder &mdash; local binary</h3>
             <p>With the local binary, the connection bundle lives in your AI client's configuration file <strong>on your own computer</strong>. The server is stateless: it loads the bundle into memory at startup, never writes secrets to disk, and never logs them.</p>
             <div class="warning-box">
-                <p><strong>Your responsibility:</strong> because the bundle sits in a config file on your machine, keep that file secure (do not paste it into shared chats or public repos). Anyone who obtains the bundle can use your AI workspace until you disconnect &mdash; after which, with the gateway enforcing revocation (the standard deployment), their session is cut off within about 30 seconds; on a gateway without revocation enforcement it instead runs until its short-lived token expires (about an hour by default, up to 24). They still cannot reach your other files or your master key.</p>
+                <p><strong>Your responsibility:</strong> because the bundle sits in a config file on your machine, keep that file secure (do not paste it into shared chats or public repos). Anyone who obtains the bundle can use the <strong>shared folder</strong> until you revoke access &mdash; after which, with the gateway enforcing revocation (the standard deployment), their session is cut off within about 30 seconds; on a gateway without revocation enforcement it instead runs until its short-lived token expires (about an hour by default, up to 24). They still cannot reach your other files or your master key.</p>
             </div>
 
-            <h3>Your AI workspace &mdash; hosted server</h3>
-            <div class="warning-box">
-                <p><strong>Status &mdash; read first:</strong> the hosted server is <strong>not deployed as a public service</strong>. Everything in this subsection describes the <em>intended design of the self-hosted server</em>, not a running system you can rely on today. Deploy your own (see <a href="#hosted">Hosted Server Setup</a>) to obtain these protections.</p>
-            </div>
-            <p>By design, the hosted server &mdash; a <strong>Cloudflare Worker</strong> running in your own Cloudflare account &mdash; is built so that a stolen database or disk reveals nothing useful: it stores your workspace key <strong>encrypted</strong>, with the encryption key held in your <strong>own self-hosted OpenBao</strong> (a separate secrets vault on your own server &mdash; a distinct trust domain from the Worker). The Worker must call OpenBao to decrypt a workspace key in order to serve a request, and its OpenBao policy lets it only wrap/unwrap keys &mdash; never read or export the encryption key itself. (This holds as long as your OpenBao unseal/root keys are not kept on the same machine as the database.)</p>
+            <h3>Your shared folder &mdash; hosted connector</h3>
+            <p>The hosted connector &mdash; a <strong>Cloudflare Worker</strong> &mdash; is built so that a stolen database or disk reveals nothing useful: it stores each connection's secrets <strong>encrypted</strong>, with the encryption key held in a <strong>self-hosted OpenBao</strong> (a separate secrets vault on a server &mdash; a distinct trust domain from the Worker). The Worker must call OpenBao to decrypt in order to serve a request, and its OpenBao policy lets it only wrap/unwrap &mdash; never read or export the encryption key itself. (This holds as long as the OpenBao unseal/root keys are not kept on the same machine as the database.) For the default connector at <code>mcp.cloud.fx.land</code> this runs on Functionland's infrastructure; if you <a href="#hosted">self-host</a> the Worker, it runs entirely in your own trust domain.</p>
             <div class="note-box">
-                <p><strong>Honest limit of any hosted server:</strong> a stolen <em>database or disk</em> alone reveals nothing (the keys are encrypted, and the vault key is elsewhere). But a <em>live, fully-compromised</em> server &mdash; one an attacker actively controls while it is decrypting to serve requests &mdash; could read the workspaces of <strong>currently-active sessions</strong>. This is unavoidable for <em>any</em> server that decrypts data to hand it to an AI. Even then, it can <strong>never</strong> reach your master key, and <strong>never</strong> your other (non-workspace) files. Running the server yourself keeps that risk inside your own trust domain.</p>
+                <p><strong>Honest limit of any hosted server:</strong> a stolen <em>database or disk</em> alone reveals nothing (the secrets are encrypted, and the vault key is elsewhere). But a <em>live, fully-compromised</em> server &mdash; one an attacker actively controls while it is decrypting to serve requests &mdash; could read the shared folders of <strong>currently-active sessions</strong>. This is unavoidable for <em>any</em> server that decrypts data to hand it to an AI. Even then, it can <strong>never</strong> reach your master key, and <strong>never</strong> your files outside the folders you shared. Self-hosting the connector keeps that risk inside your own trust domain.</p>
             </div>
 
             <h3>Connection model &amp; revoking access</h3>
@@ -522,7 +618,7 @@ FULA_MCP_CAPABILITY = "&lt;paste your connection bundle from FxFiles&gt;"</pre>
             </ul>
 
             <div class="note-box">
-                <p><strong>In short:</strong> the guarantee that the AI cannot reach your other files <em>on its own</em> is absolute (two independent mechanisms, local and hosted alike); the only way it reads a real file is if you explicitly share that one file. Workspace privacy is strong but has the honest limits stated above &mdash; a stolen local bundle, or a live-compromised hosted server, can expose the <em>AI workspace</em> (never your master key, never your other files). We deliberately do <strong>not</strong> claim "100% everything."</p>
+                <p><strong>In short:</strong> the guarantee that the AI cannot reach files you did not share <em>on its own</em> is absolute (two independent mechanisms, local and hosted alike); it only ever sees the Collaborate folders you shared with it. That sharing is strong but has the honest limits stated above &mdash; a stolen local bundle, or a live-compromised hosted server, can expose the <em>shared folder</em> (never your master key, never your other files). We deliberately do <strong>not</strong> claim "100% everything."</p>
             </div>
         </section>
 
