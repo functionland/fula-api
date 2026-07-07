@@ -1,6 +1,6 @@
 {
   "name": "@functionland/fula-mcp",
-  "version": "0.6.18",
+  "version": "0.6.19",
   "description": "Local MCP (Model Context Protocol) stdio server for Fula decentralized storage — store/retrieve files in FxFiles' end-to-end-encrypted format directly from Claude Desktop, Claude Code, Codex CLI, or Gemini CLI. Run build-free via `npx @functionland/fula-mcp`.",
   "bin": {
     "fula-mcp": "bin/fula-mcp.js"
