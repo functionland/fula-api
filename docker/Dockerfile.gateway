@@ -1,0 +1,34 @@
+# fula-gateway — S3-compatible gateway (federated-master image).
+#
+# Build (repo root):  docker build -f docker/Dockerfile.gateway -t fula-gateway:latest .
+# Used by the federated-master stack: functionland/pinning-service
+# docker/master/docker-compose.master.yml ("gateway" profile, auto-enabled by
+# update-scripts/join-as-master.sh when this image exists on the box).
+#
+# All configuration is env-driven (clap): FULA_HOST (0.0.0.0), FULA_PORT
+# (9000), IPFS_API_URL, CLUSTER_API_URL, PINNING_SERVICE_ENDPOINT,
+# STORAGE_API_URL, JWT_SECRET, ADMIN_JWT_SECRET, FULA_BLOCK_CACHE_MB,
+# FULA_PIN_QUEUE_PATH (durable pin queue — production MUST set it to a
+# persistent mount), rate limits, etc. See crates/fula-cli/src/main.rs.
+FROM rust:1-bookworm AS build
+WORKDIR /src
+# Workspace build; fula-js (wasm) and fula-flutter are workspace members but
+# building only -p fula-cli avoids their toolchains.
+COPY . .
+RUN cargo build --release -p fula-cli --bin fula-gateway
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates netcat-openbsd \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/fula-gateway /usr/local/bin/fula-gateway
+# Persistent state lives at HARDCODED /var/lib/fula-gateway (pin_queue.redb,
+# registry.cid, local_retain.redb — see crates/fula-cli/src/config.rs defaults).
+# Mount a volume here or pin retries/crash recovery silently degrade to
+# fire-and-forget and the bucket registry resets on restart.
+RUN mkdir -p /var/lib/fula-gateway
+VOLUME ["/var/lib/fula-gateway"]
+ENV FULA_HOST=0.0.0.0 \
+    FULA_PORT=9000
+EXPOSE 9000
+ENTRYPOINT ["fula-gateway"]
