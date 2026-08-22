@@ -147,14 +147,6 @@ impl From<fula_client::ClientError> for FulaError {
         use fula_client::ClientError;
         match err {
             ClientError::Http(e) => FulaError::Network(e.to_string()),
-            // wasm-only: the browser has no reqwest builder timeout, so
-            // Config::timeout is enforced by racing a timer instead. Map it to
-            // Network alongside reqwest's own native timeout (which arrives as
-            // Http(_) and is already Network) so both targets present a
-            // transport failure identically to Dart.
-            ClientError::Timeout(d) => {
-                FulaError::Network(format!("request timed out after {:?}", d))
-            }
             ClientError::S3Error { code, message, .. } => {
                 match code.as_str() {
                     "NoSuchKey" => FulaError::NotFound {

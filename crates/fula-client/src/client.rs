@@ -1476,41 +1476,6 @@ impl FulaClient {
 
     // ==================== Helper Methods ====================
 
-    /// Send a prepared request, enforcing `Config::timeout` on every target.
-    ///
-    /// On native this is a plain `send()` - `FulaClient::new` already armed
-    /// `ClientBuilder::timeout`.
-    ///
-    /// On **wasm32 that builder call is a no-op**, so the browser client ran
-    /// with NO request timeout whatsoever and a stalled request could hang for
-    /// the lifetime of the tab. That was not theoretical: a gateway read that
-    /// never returned would hold the SDK's per-bucket lock indefinitely, and
-    /// (before the bridge handle became a bare `Arc`) the whole client with
-    /// it. Race the send against a timer instead.
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn send_bounded(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-        req.send().await.map_err(ClientError::Http)
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    async fn send_bounded(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-        use futures::future::{select, Either};
-        use gloo_timers::future::TimeoutFuture;
-
-        // TimeoutFuture takes u32 millis; saturate rather than wrap so an
-        // absurdly large configured timeout can't collapse to a tiny one.
-        let ms = u32::try_from(self.config.timeout.as_millis()).unwrap_or(u32::MAX);
-        let send = std::pin::pin!(req.send());
-        let timer = TimeoutFuture::new(ms);
-        match select(send, timer).await {
-            Either::Left((res, _)) => res.map_err(ClientError::Http),
-            // Dropping the abandoned request here aborts the underlying fetch -
-            // unlike a Dart-side .timeout(), this actually releases the work
-            // rather than orphaning it while it keeps holding locks.
-            Either::Right((_, _)) => Err(ClientError::Timeout(self.config.timeout)),
-        }
-    }
-
     async fn request(
         &self,
         method: &str,
@@ -1577,8 +1542,23 @@ impl FulaClient {
             req = req.body(data);
         }
 
+        // wasm32 only: `ClientBuilder::timeout` is a NO-OP in the browser (see
+        // `FulaClient::new`), so `Config::timeout` was silently dropped and a
+        // stalled request had no bound at all — it could hang for the lifetime
+        // of the tab while holding SDK locks. reqwest's wasm backend DOES
+        // honour a per-REQUEST timeout: it arms an `AbortController` from
+        // `req.timeout()` and wires the signal into fetch
+        // (reqwest-0.12/src/wasm/client.rs: `AbortGuard::new()` ->
+        // `abort.timeout(*timeout)` -> `init.signal(..)`), and `AbortGuard::drop`
+        // aborts in-flight. So set it per-request here rather than racing a
+        // timer ourselves — same abort mechanism, and the failure surfaces as
+        // an ordinary `reqwest::Error` with `is_timeout()`, identical to native.
+        // On native the builder-level timeout already covers this.
+        #[cfg(target_arch = "wasm32")]
+        let req = req.timeout(self.config.timeout);
+
         debug!("Sending {} request to {}", method, url);
-        let response = match self.send_bounded(req).await {
+        let response = match req.send().await {
             Ok(r) => r,
             Err(e) => {
                 // Connection-level error (refused, RST, DNS, timeout). For a
@@ -1590,9 +1570,7 @@ impl FulaClient {
                         gate.record_failure();
                     }
                 }
-                // Already a ClientError (Http on native / Http-or-Timeout in
-                // the browser) - pass it through.
-                return Err(e);
+                return Err(ClientError::Http(e));
             }
         };
 
