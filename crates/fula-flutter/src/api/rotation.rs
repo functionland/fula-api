@@ -1,4 +1,4 @@
-﻿//! Key rotation operations
+//! Key rotation operations
 //!
 //! Functions for rotating encryption keys to maintain security.
 //! Key rotation re-wraps data encryption keys with a new key encryption key.
@@ -16,7 +16,7 @@ use crate::api::types::*;
 /// The rotation manager handles the key rotation process,
 /// including tracking which keys have been rotated.
 pub async fn create_rotation_manager(client: &EncryptedClientHandle) -> RotationManagerHandle {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let manager = guard.create_rotation_manager();
     RotationManagerHandle {
         inner: Arc::new(manager),
@@ -35,7 +35,7 @@ pub async fn get_kek_version(
     bucket: String,
     storage_key: String,
 ) -> anyhow::Result<Option<u32>> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let version = guard.get_object_kek_version(&bucket, &storage_key).await?;
     Ok(version)
 }
@@ -49,7 +49,7 @@ pub async fn rewrap_object(
     storage_key: String,
     manager: &RotationManagerHandle,
 ) -> anyhow::Result<u32> {
-    let guard = client.inner.write().await;
+    let guard = &*client.inner;
     let version = guard.rewrap_object_dek(&bucket, &storage_key, &manager.inner).await?;
     Ok(version)
 }
@@ -63,7 +63,7 @@ pub async fn rotate_bucket(
     bucket: String,
     manager: &RotationManagerHandle,
 ) -> anyhow::Result<RotationReport> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let report = guard.rotate_bucket(&bucket, &manager.inner).await?;
 
     // Manual conversion since fula_client::encryption::RotationReport is not exported

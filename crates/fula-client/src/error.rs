@@ -12,6 +12,19 @@ pub enum ClientError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// Request exceeded `Config::timeout`.
+    ///
+    /// Produced on **wasm32 only**. `reqwest::ClientBuilder::timeout` is a
+    /// no-op in the browser, so `FulaClient::new` cannot arm it there and
+    /// `Config::timeout` was silently dropped - a stalled request had NO
+    /// bound at all and could hang for the lifetime of the tab. The wasm build
+    /// now races the send against a timer instead (see
+    /// `FulaClient::send_bounded`) and surfaces that as this variant.
+    ///
+    /// On native, reqwest enforces the same budget itself and reports it as
+    /// `ClientError::Http`, so this variant never appears there.
+    #[error("request timed out after {0:?}")]
+    Timeout(std::time::Duration),
     /// S3 API error
     #[error("S3 error ({code}): {message}")]
     S3Error {
