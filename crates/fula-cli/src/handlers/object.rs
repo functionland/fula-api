@@ -691,6 +691,70 @@ async fn pin_for_user_via_queue(
     }
 }
 
+/// Whether a `CoreError` raised while reading the prolly INDEX is a genuine
+/// block-miss that the gc-recovery fallback should try to serve.
+///
+/// `Timeout` is in this set deliberately (2026-08-23). Before, it was not, and
+/// that single omission made the whole recovery architecture unreachable in
+/// production:
+///
+///  * `cluster_fallback::classify_exhaustion` only rewrites `Timeout` ->
+///    `Unavailable` when the local daemon's offline probe returned a CLEAN
+///    miss. On a loaded box that probe errors out instead, so `responsive` is
+///    false and the `Timeout` survives.
+///  * A surviving `Timeout` has no arm in `ApiError::error_code()`, so it hits
+///    the `_` catch-all -> `InternalError` -> HTTP 500.
+///  * A 5xx trips the client SDK's health gate, which marks the ENTIRE backend
+///    down — the exact outcome the deliberate `Unavailable` -> 410 mapping
+///    exists to avoid.
+///  * And because `Timeout` was not a "miss", `try_recover_block` never ran, so
+///    the cluster mirror that still holds the data was never consulted.
+///
+/// Observed live: a gateway at load ~12.8, with kubo unable to answer
+/// `repo/stat` inside 30s, returned 500 for a bucket whose data was still
+/// pinned in the cluster.
+///
+/// Trade-off: a genuinely transient infra timeout now attempts recovery and,
+/// failing that, surfaces as a 404 the client can act on rather than a 500.
+/// Better for the client, but it does mean a real outage reads as "not found"
+/// on this path. Errors that indicate the daemon is actually unreachable
+/// (`Connection`, `IpfsApi`, …) are NOT in this set and still propagate as
+/// 5xx, so the health gate still trips on a true outage.
+fn is_recoverable_index_miss(e: &fula_core::CoreError) -> bool {
+    matches!(
+        e,
+        fula_core::CoreError::BlockStore(
+            BlockStoreError::NotFound(_)
+                | BlockStoreError::Unavailable(_)
+                | BlockStoreError::Timeout { .. }
+        )
+    )
+}
+
+/// Shared miss handler: try the server-side cluster-mirror recovery, then fall
+/// back to a 404 the CLIENT's by-CID recovery can act on.
+///
+/// Returning 404 (`NoSuchKey`) rather than 410 (`Gone`) is load-bearing: the
+/// client's `get_object_with_recovery_known_cid` fires on a reachable-master
+/// 404 and NEVER on 410, racing public IPFS for the CID hinted by its own
+/// forest (Walkable-v8 `chunk_cids` / `storage_cid`). A genuinely-lost block
+/// loses that race and surfaces a hard error; a still-reachable one is served.
+async fn recover_or_nosuchkey(
+    state: &Arc<AppState>,
+    bucket_name: &str,
+    key: &str,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
+    if let Some(rec) = crate::recovery_fallback::try_recover_block(state, bucket_name, key).await {
+        return Ok(recovery_block_response(rec.data, rec.cid, headers));
+    }
+    Err(ApiError::s3_with_resource(
+        S3ErrorCode::NoSuchKey,
+        "Object not found (gc-orphaned index; client recovers by CID)",
+        format!("{}/{}", bucket_name, key),
+    ))
+}
+
 /// GET /{bucket}/{key} - Get object with Range and conditional request support
 pub async fn get_object(
     State(state): State<Arc<AppState>>,
@@ -703,9 +767,29 @@ pub async fn get_object(
     }
     // P12: scoped MCP tokens may only GET within their bucket + `ai/` prefix.
     session.assert_mcp_scope(&bucket_name, Some(&key), McpAction::Read)?;
+    // (helpers `is_recoverable_index_miss` / `recover_or_nosuchkey` are defined
+    // above this function.)
 
-    // User-scoped bucket access
-    let bucket = state.bucket_manager.open_bucket_for_user(&session.hashed_user_id, &bucket_name).await?;
+    // User-scoped bucket access.
+    //
+    // NOT a bare `?`. `open_bucket_for_user` reads the prolly INDEX ROOT
+    // (`ProllyTree::load` -> `store.get_ipld(root_cid)`) — exactly the block
+    // class an `ipfs repo gc` orphans. A bare `?` handed that miss straight to
+    // the error mapper, so a ROOT-block miss never reached the recovery gate in
+    // the match below: `Unavailable` became a 410 with no recovery attempted
+    // and no client by-CID fallback (which fires only on 404), and `NotFound`
+    // became a 500. Route it through the same gate as an interior-node miss.
+    let bucket = match state
+        .bucket_manager
+        .open_bucket_for_user(&session.hashed_user_id, &bucket_name)
+        .await
+    {
+        Ok(b) => b,
+        Err(e) if is_recoverable_index_miss(&e) => {
+            return recover_or_nosuchkey(&state, &bucket_name, &key, &headers).await;
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     let metadata = match bucket.get_object(&key).await {
         Ok(Some(m)) => m,
@@ -719,36 +803,16 @@ pub async fn get_object(
         // (auth / infra / etc.) is propagated unchanged (codex: don't recover
         // on errors that aren't a genuine block-miss).
         other => {
-            let is_index_miss = matches!(
-                &other,
-                Ok(None)
-                    | Err(fula_core::CoreError::BlockStore(
-                        BlockStoreError::NotFound(_) | BlockStoreError::Unavailable(_)
-                    ))
-            );
+            let is_index_miss = match &other {
+                Ok(None) => true,
+                Err(e) => is_recoverable_index_miss(e),
+                Ok(Some(_)) => false, // handled by the arm above
+            };
             if !is_index_miss {
                 // Auth / infra / other — propagate unchanged, no recovery.
                 return Err(other.unwrap_err().into());
             }
-            // Server-side cluster-mirror fallback first.
-            if let Some(rec) =
-                crate::recovery_fallback::try_recover_block(&state, &bucket_name, &key).await
-            {
-                return Ok(recovery_block_response(rec.data, rec.cid, &headers));
-            }
-            // The gateway can't serve it (not in the cluster mirror) — but the
-            // block may still be reachable BY CID via the CLIENT's forest hints
-            // (Walkable-v8 `chunk_cids` / `storage_cid`). Return 404 NoSuchKey
-            // (NOT 410 Gone) so the client's by-CID recovery
-            // (`get_object_with_recovery_known_cid`) engages — it fires on a
-            // reachable-master 404 and NEVER on 410, racing public IPFS for the
-            // hinted CID. A genuinely-lost block then fails that race and
-            // surfaces a hard error; a still-reachable one is recovered.
-            return Err(ApiError::s3_with_resource(
-                S3ErrorCode::NoSuchKey,
-                "Object not found (gc-orphaned index; client recovers by CID)",
-                format!("{}/{}", bucket_name, key),
-            ));
+            return recover_or_nosuchkey(&state, &bucket_name, &key, &headers).await;
         }
     };
 
