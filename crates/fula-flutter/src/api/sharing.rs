@@ -1,4 +1,4 @@
-﻿//! Sharing operations
+//! Sharing operations
 //!
 //! Functions for creating and accepting share tokens to share
 //! encrypted files with other users.
@@ -37,7 +37,7 @@ pub async fn create_share_token(
         anyhow::bail!("Recipient public key must be exactly 32 bytes");
     }
 
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let enc_config = guard.encryption_config();
 
     // Get owner's keypair
@@ -135,7 +135,7 @@ pub async fn create_share_token_with_mode(
         anyhow::bail!("Recipient public key must be exactly 32 bytes");
     }
 
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let enc_config = guard.encryption_config();
 
     // Get owner's keypair
@@ -280,7 +280,7 @@ pub async fn accept_share(client: &EncryptedClientHandle, token_json: String) ->
     let token: fula_crypto::ShareToken = serde_json::from_str(&token_json)
         .map_err(|e| anyhow::anyhow!("Invalid token format: {}", e))?;
 
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let accepted = guard.accept_share(&token)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
@@ -295,7 +295,7 @@ pub async fn get_with_share(
     original_key: String,
     share: &AcceptedShareHandle,
 ) -> anyhow::Result<Vec<u8>> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let data = guard.get_object_with_share(&bucket, &storage_key, &original_key, &share.inner).await?;
     Ok(data.to_vec())
 }
@@ -311,7 +311,7 @@ pub async fn get_with_token(
     let token: fula_crypto::ShareToken = serde_json::from_str(&token_json)
         .map_err(|e| anyhow::anyhow!("Invalid token format: {}", e))?;
 
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let data = guard.get_object_with_token(&bucket, &storage_key, &original_key, &token).await?;
     Ok(data.to_vec())
 }

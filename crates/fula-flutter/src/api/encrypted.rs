@@ -1,4 +1,4 @@
-﻿//! Encrypted client operations
+//! Encrypted client operations
 //!
 //! These functions wrap EncryptedClient for client-side encrypted storage.
 
@@ -17,7 +17,7 @@ pub async fn put_encrypted(
     key: String,
     data: Vec<u8>,
 ) -> anyhow::Result<PutResult> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let result = guard.put_object_encrypted(&bucket, &key, Bytes::from(data)).await?;
     Ok(result.into())
 }
@@ -30,7 +30,7 @@ pub async fn put_encrypted_with_type(
     data: Vec<u8>,
     content_type: String,
 ) -> anyhow::Result<PutResult> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let result = guard.put_object_encrypted_with_type(
         &bucket,
         &key,
@@ -46,7 +46,7 @@ pub async fn get_decrypted(
     bucket: String,
     key: String,
 ) -> anyhow::Result<Vec<u8>> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let data = guard.get_object_decrypted(&bucket, &key).await?;
     Ok(data.to_vec())
 }
@@ -57,7 +57,7 @@ pub async fn get_decrypted_by_storage_key(
     bucket: String,
     storage_key: String,
 ) -> anyhow::Result<Vec<u8>> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let data = guard.get_object_decrypted_by_storage_key(&bucket, &storage_key).await?;
     Ok(data.to_vec())
 }
@@ -76,7 +76,7 @@ pub async fn get_decrypted_buffered(
     bucket: String,
     key: String,
 ) -> anyhow::Result<Vec<u8>> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let mut buf: Vec<u8> = Vec::new();
     guard
         .get_object_decrypted_buffered_to_writer(&bucket, &key, &mut buf)
@@ -92,7 +92,7 @@ pub async fn get_decrypted_buffered_by_storage_key(
     bucket: String,
     storage_key: String,
 ) -> anyhow::Result<Vec<u8>> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let mut buf: Vec<u8> = Vec::new();
     guard
         .get_object_decrypted_buffered_to_writer_by_storage_key(&bucket, &storage_key, &mut buf)
@@ -106,7 +106,7 @@ pub async fn get_with_private_metadata(
     bucket: String,
     storage_key: String,
 ) -> anyhow::Result<DecryptedObjectInfo> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let result = guard.get_object_with_private_metadata(&bucket, &storage_key).await?;
     Ok(result.into())
 }
@@ -117,7 +117,7 @@ pub async fn delete_encrypted(
     bucket: String,
     key: String,
 ) -> anyhow::Result<()> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     guard.delete_object(&bucket, &key).await?;
     Ok(())
 }
@@ -128,7 +128,7 @@ pub async fn delete_by_storage_key(
     bucket: String,
     storage_key: String,
 ) -> anyhow::Result<()> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     guard.delete_object_by_storage_key(&bucket, &storage_key).await?;
     Ok(())
 }
@@ -143,7 +143,7 @@ pub async fn head_decrypted(
     bucket: String,
     storage_key: String,
 ) -> anyhow::Result<FileMetadata> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let result = guard.head_object_decrypted(&bucket, &storage_key).await?;
     Ok(result.into())
 }
@@ -154,7 +154,7 @@ pub async fn list_decrypted(
     bucket: String,
     options: ListOptions,
 ) -> anyhow::Result<Vec<FileMetadata>> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let result = guard.list_objects_decrypted(&bucket, Some(options.into())).await?;
     Ok(result.into_iter().map(|m| m.into()).collect())
 }
@@ -165,7 +165,7 @@ pub async fn list_directory(
     bucket: String,
     prefix: Option<String>,
 ) -> anyhow::Result<DirectoryListing> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let result = guard.list_directory(&bucket, prefix.as_deref()).await?;
 
     // Convert the internal DirectoryListing to our type
@@ -191,13 +191,13 @@ pub async fn list_directory(
 
 /// Export the secret key for backup
 pub async fn export_secret_key(client: &EncryptedClientHandle) -> Vec<u8> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     guard.encryption_config().export_secret_key().as_bytes().to_vec()
 }
 
 /// Get the public key for sharing
 pub async fn get_public_key(client: &EncryptedClientHandle) -> Vec<u8> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     guard.encryption_config().public_key().as_bytes().to_vec()
 }
 
@@ -394,7 +394,7 @@ pub async fn derive_signing_seed(seed: String) -> Vec<u8> {
 
 /// Check if client uses FlatNamespace mode
 pub async fn is_flat_namespace(client: &EncryptedClientHandle) -> bool {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     guard.is_flat_namespace()
 }
 
@@ -404,21 +404,21 @@ pub async fn is_flat_namespace(client: &EncryptedClientHandle) -> bool {
 
 /// List buckets (delegated to inner client)
 pub async fn enc_list_buckets(client: &EncryptedClientHandle) -> anyhow::Result<Vec<BucketInfo>> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let result = guard.list_buckets().await?;
     Ok(result.buckets.into_iter().map(|b| b.into()).collect())
 }
 
 /// Create bucket (delegated to inner client)
 pub async fn enc_create_bucket(client: &EncryptedClientHandle, name: String) -> anyhow::Result<()> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     guard.create_bucket(&name).await?;
     Ok(())
 }
 
 /// Delete bucket (delegated to inner client)
 pub async fn enc_delete_bucket(client: &EncryptedClientHandle, name: String) -> anyhow::Result<()> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     guard.delete_bucket(&name).await?;
     Ok(())
 }

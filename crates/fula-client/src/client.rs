@@ -1542,6 +1542,21 @@ impl FulaClient {
             req = req.body(data);
         }
 
+        // wasm32 only: `ClientBuilder::timeout` is a NO-OP in the browser (see
+        // `FulaClient::new`), so `Config::timeout` was silently dropped and a
+        // stalled request had no bound at all — it could hang for the lifetime
+        // of the tab while holding SDK locks. reqwest's wasm backend DOES
+        // honour a per-REQUEST timeout: it arms an `AbortController` from
+        // `req.timeout()` and wires the signal into fetch
+        // (reqwest-0.12/src/wasm/client.rs: `AbortGuard::new()` ->
+        // `abort.timeout(*timeout)` -> `init.signal(..)`), and `AbortGuard::drop`
+        // aborts in-flight. So set it per-request here rather than racing a
+        // timer ourselves — same abort mechanism, and the failure surfaces as
+        // an ordinary `reqwest::Error` with `is_timeout()`, identical to native.
+        // On native the builder-level timeout already covers this.
+        #[cfg(target_arch = "wasm32")]
+        let req = req.timeout(self.config.timeout);
+
         debug!("Sending {} request to {}", method, url);
         let response = match req.send().await {
             Ok(r) => r,

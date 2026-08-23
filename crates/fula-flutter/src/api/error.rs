@@ -1,4 +1,4 @@
-﻿//! Error types for Flutter bindings
+//! Error types for Flutter bindings
 //!
 //! Provides a unified error type that maps from various internal error types
 //! and is suitable for FFI/flutter_rust_bridge serialization.

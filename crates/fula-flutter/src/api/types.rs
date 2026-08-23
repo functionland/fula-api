@@ -5,14 +5,12 @@
 
 use std::sync::Arc;
 
-// Use tokio::sync on native, async_lock on WASM
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::sync::RwLock;
+// Use tokio::sync on native, async_lock on WASM.
+// (RwLock used to be imported for EncryptedClientHandle; that handle is now a
+// bare Arc - see its docs. Semaphore is still used by MultipartHandle.)
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use tokio::sync::Semaphore;
 
-#[cfg(target_arch = "wasm32")]
-use async_lock::RwLock;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use async_lock::Semaphore;
 
@@ -672,10 +670,43 @@ pub struct FulaClientHandle {
 
 /// Handle to an EncryptedClient instance
 ///
-/// This wraps the encrypted client with interior mutability for forest state.
+/// Bare `Arc`, no lock — matching [`FulaClientHandle`] above.
+///
+/// This was `Arc<RwLock<EncryptedClient>>`, and that outer lock was the single
+/// worst bottleneck in the web client. `load_forest` took the EXCLUSIVE guard
+/// and held it across the whole network fetch, so one slow bucket froze every
+/// other call in the app. Captured live on a phone:
+///
+/// ```text
+/// loadForest: ENTER tag-metadata            <- ~30s, holds the write guard
+/// getFlat:    ENTER website-metadata-v8/..  <- never completes
+/// loadForest: ENTER tag-metadata-v8         <- never completes (healthy
+///                                              bucket, normally 0.1s)
+/// ```
+///
+/// A Dart-side `.timeout()` cannot rescue that: the FRB binding exposes no
+/// cancel handle for `load_forest`, so the Rust future keeps running and keeps
+/// the guard after the caller has given up.
+///
+/// Removing it is safe, not merely expedient:
+///
+///  * `EncryptedClient` has **no** `&mut self` methods — all ~180 public
+///    methods take `&self`. The lock was never protecting mutability.
+///  * The SDK already owns finer-grained locking: `forest_cache` (a DashMap),
+///    per-bucket `migration_locks`, and `bucket_write_mutex`, documented there
+///    as "the OUTERMOST per-bucket lock … per-bucket, so different buckets
+///    continue to flush in parallel". A per-bucket lock at THIS layer would
+///    only duplicate that one level up — and would not even cover the calls
+///    that carry no bucket (`get_public_key`, `export_secret_key`, …).
+///  * The read/write split here encoded no invariant: `save_forest` (read) and
+///    `flush_forest` (write) had byte-identical bodies, and `rewrap_object`
+///    took `write()` for a single object while `rotate_bucket` took `read()`
+///    for an entire bucket.
+///  * No bridge function composed two SDK calls under one guard, so nothing
+///    depended on atomicity it appeared to provide.
 #[derive(Clone)]
 pub struct EncryptedClientHandle {
-    pub(crate) inner: Arc<RwLock<fula_client::EncryptedClient>>,
+    pub(crate) inner: Arc<fula_client::EncryptedClient>,
     /// Phase 19 — same dispatcher pattern as FulaClientHandle.
     /// Encrypted-client construction also threads the callback into
     /// the underlying `fula_client::Config` so warm-cache + cold-

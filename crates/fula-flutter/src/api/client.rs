@@ -1,4 +1,4 @@
-﻿//! Core FulaClient wrapper operations
+//! Core FulaClient wrapper operations
 //!
 //! These functions wrap the underlying FulaClient for plain (unencrypted) operations.
 
@@ -7,11 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use anyhow::Context;
 
-// Use tokio::sync on native, async_lock on WASM
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::sync::RwLock;
-#[cfg(target_arch = "wasm32")]
-use async_lock::RwLock;
+// (No RwLock import: EncryptedClientHandle is a bare `Arc`.)
 
 use crate::api::types::*;
 
@@ -199,7 +195,7 @@ pub async fn create_encrypted_client(
     let client = fula_client::EncryptedClient::new(inner_config, enc_config)?;
 
     Ok(EncryptedClientHandle {
-        inner: Arc::new(RwLock::new(client)),
+        inner: Arc::new(client),
         health_dispatcher: dispatcher,
     })
 }
@@ -262,7 +258,7 @@ pub async fn create_encrypted_client_with_pinning(
     )?;
 
     Ok(EncryptedClientHandle {
-        inner: Arc::new(RwLock::new(client)),
+        inner: Arc::new(client),
         health_dispatcher: dispatcher,
     })
 }

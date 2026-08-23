@@ -1,4 +1,4 @@
-﻿//! Forest/FlatNamespace operations
+//! Forest/FlatNamespace operations
 //!
 //! These functions manage the encrypted file index (PrivateForest)
 //! for organized file storage with human-readable paths.
@@ -26,7 +26,7 @@ pub async fn load_forest(
     client: &EncryptedClientHandle,
     bucket: String,
 ) -> anyhow::Result<()> {
-    let guard = client.inner.write().await;
+    let guard = &*client.inner;
     match guard.load_forest(&bucket).await {
         Ok(_) => Ok(()),
         Err(e) if e.to_string().contains("forest is sharded") => Ok(()),
@@ -42,7 +42,7 @@ pub async fn save_forest(
     client: &EncryptedClientHandle,
     bucket: String,
 ) -> anyhow::Result<()> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     guard.flush_forest(&bucket).await?;
     Ok(())
 }
@@ -52,14 +52,14 @@ pub async fn flush_forest(
     client: &EncryptedClientHandle,
     bucket: String,
 ) -> anyhow::Result<()> {
-    let guard = client.inner.write().await;
+    let guard = &*client.inner;
     guard.flush_forest(&bucket).await?;
     Ok(())
 }
 
 /// Check if there are pending (unsaved) forest changes
 pub async fn has_pending_changes(client: &EncryptedClientHandle, bucket: String) -> bool {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     guard.has_pending_forest_changes(&bucket).await
 }
 
@@ -79,7 +79,7 @@ pub async fn has_pending_changes(client: &EncryptedClientHandle, bucket: String)
 /// Typical app wiring: call on pull-to-refresh, tab-resume, reconnect,
 /// or any cache-revalidation path, then re-run `list_from_forest`.
 pub async fn invalidate_forest_cache(client: &EncryptedClientHandle, bucket: String) {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     guard.invalidate_forest_cache(&bucket);
 }
 
@@ -89,7 +89,7 @@ pub async fn invalidate_forest_cache(client: &EncryptedClientHandle, bucket: Str
 /// dropped; forests with pending (unsaved) changes are kept, matching
 /// the per-bucket dirty-safe contract.
 pub async fn invalidate_all_forest_caches(client: &EncryptedClientHandle) {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     guard.invalidate_all_forest_caches();
 }
 
@@ -108,7 +108,7 @@ pub async fn put_flat(
     data: Vec<u8>,
     content_type: Option<String>,
 ) -> anyhow::Result<PutResult> {
-    let guard = client.inner.write().await;
+    let guard = &*client.inner;
     let result = guard.put_object_flat(
         &bucket,
         &path,
@@ -129,7 +129,7 @@ pub async fn put_flat_deferred(
     data: Vec<u8>,
     content_type: Option<String>,
 ) -> anyhow::Result<PutResult> {
-    let guard = client.inner.write().await;
+    let guard = &*client.inner;
     let result = guard.put_object_flat_deferred(
         &bucket,
         &path,
@@ -145,7 +145,7 @@ pub async fn get_flat(
     bucket: String,
     path: String,
 ) -> anyhow::Result<Vec<u8>> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let data = guard.get_object_flat(&bucket, &path).await?;
     Ok(data.to_vec())
 }
@@ -156,7 +156,7 @@ pub async fn delete_flat(
     bucket: String,
     path: String,
 ) -> anyhow::Result<()> {
-    let guard = client.inner.write().await;
+    let guard = &*client.inner;
     guard.delete_object_flat(&bucket, &path).await?;
     Ok(())
 }
@@ -169,7 +169,7 @@ pub async fn list_from_forest(
     client: &EncryptedClientHandle,
     bucket: String,
 ) -> anyhow::Result<Vec<FileMetadata>> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let result = guard.list_files_from_forest(&bucket).await?;
     Ok(result.into_iter().map(|m| m.into()).collect())
 }
@@ -194,7 +194,7 @@ pub async fn put_flat_from_path(
 ) -> anyhow::Result<PutResult> {
     let data = tokio::fs::read(&file_path).await
         .with_context(|| format!("Failed to read file: {}", file_path))?;
-    let guard = client.inner.write().await;
+    let guard = &*client.inner;
     let result = guard.put_object_flat(
         &bucket,
         &path,
@@ -228,7 +228,7 @@ pub async fn put_flat_from_path_deferred(
 ) -> anyhow::Result<PutResult> {
     let data = tokio::fs::read(&file_path).await
         .with_context(|| format!("Failed to read file: {}", file_path))?;
-    let guard = client.inner.write().await;
+    let guard = &*client.inner;
     let result = guard.put_object_flat_deferred(
         &bucket,
         &path,
@@ -293,7 +293,7 @@ pub async fn put_flat_resumable_from_path(
     // `EncryptedClient::put_object_encrypted_resumable` via the
     // `bucket_write_mutex` extension (issue #17). Different buckets
     // parallelize through this `read().await`.
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let manifest = std::path::PathBuf::from(manifest_path);
     let result = guard.put_object_encrypted_resumable(
         &bucket,
@@ -341,7 +341,7 @@ pub async fn resume_flat_upload_from_path(
     // `EncryptedClient::resume_upload`, which loads the manifest first
     // (bucket name lives there) and acquires the bucket_write_mutex
     // post-load (issue #17).
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let manifest = std::path::PathBuf::from(manifest_path);
     let result = guard.resume_upload(&manifest, &data).await?;
     Ok(result.into())
@@ -417,7 +417,7 @@ pub async fn put_flat_resumable_from_path_cancellable(
 ) -> anyhow::Result<PutResult> {
     let data = tokio::fs::read(&file_path).await
         .with_context(|| format!("Failed to read file: {}", file_path))?;
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let manifest = std::path::PathBuf::from(manifest_path);
     let result = guard.put_object_encrypted_resumable_with_cancel(
         &bucket,
@@ -455,7 +455,7 @@ pub async fn resume_flat_upload_from_path_cancellable(
 ) -> anyhow::Result<PutResult> {
     let data = tokio::fs::read(&file_path).await
         .with_context(|| format!("Failed to read file: {}", file_path))?;
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let manifest = std::path::PathBuf::from(manifest_path);
     let result = guard.resume_upload_with_cancel(
         &manifest,
@@ -491,7 +491,7 @@ pub async fn resume_flat_upload_from_path_cancellable(
 /// abort, see [`cancel_handle_trigger`] on a [`CancelHandle`] passed to
 /// the `_cancellable` variants (issue #18).
 ///
-/// **Lock scope.** `client.inner.read().await` â€” same as the resumable
+/// **Lock scope.** None at this layer any more (bare Arc) â€” same as the resumable
 /// bridge functions. The underlying `abort_upload` doesn't touch the
 /// encrypted forest (only the raw storage backend for chunk deletes
 /// plus the local manifest file), so B1's per-bucket write mutex is
@@ -512,7 +512,7 @@ pub async fn abort_resumable_upload(
     if !manifest.exists() {
         return Ok(());
     }
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     guard
         .abort_upload(&manifest)
         .await
@@ -624,7 +624,7 @@ pub async fn put_flat_with_progress(
     progress: &ProgressHandle,
 ) -> anyhow::Result<PutResult> {
     let cb = progress_cb(progress);
-    let guard = client.inner.write().await;
+    let guard = &*client.inner;
     let result = guard
         .put_object_flat_with_progress(&bucket, &path, Bytes::from(data), content_type.as_deref(), cb)
         .await?;
@@ -648,7 +648,7 @@ pub async fn put_flat_with_progress_cancellable(
     cancel: &CancelHandle,
 ) -> anyhow::Result<PutResult> {
     let cb = progress_cb(progress);
-    let guard = client.inner.write().await;
+    let guard = &*client.inner;
     let result = guard
         .put_object_flat_with_progress_cancellable(
             &bucket,
@@ -723,7 +723,7 @@ pub async fn streaming_upload_begin(
     content_type: Option<String>,
 ) -> anyhow::Result<StreamingUploadHandle> {
     let (storage_key, dek, wrapped_dek, kek_version) = {
-        let guard = client.inner.read().await;
+        let guard = &*client.inner;
         guard.streaming_begin(&bucket, &key).await?
     };
     let aad_prefix = format!("fula:v4:chunk:{}", storage_key);
@@ -796,7 +796,7 @@ pub async fn streaming_upload_finalize_plan(
     // streaming_finalize_plan is synchronous; the client read guard is only for
     // method access. No handle lock held here.
     let (chunked_metadata, private_meta, encrypted_meta) = {
-        let guard = client.inner.read().await;
+        let guard = &*client.inner;
         guard.streaming_finalize_plan(
             encoder,
             &dek,
@@ -847,7 +847,7 @@ pub async fn streaming_upload_chunk(
         }
     };
     let (_chunk_key, cid) = {
-        let guard = client.inner.read().await;
+        let guard = &*client.inner;
         guard
             .streaming_put_chunk(
                 &bucket,
@@ -931,7 +931,7 @@ pub async fn streaming_upload_finish(
     let chunked_metadata = std::sync::Arc::try_unwrap(chunked_metadata)
         .unwrap_or_else(|arc| (*arc).clone());
     let result = {
-        let guard = client.inner.read().await;
+        let guard = &*client.inner;
         guard
             .streaming_finish(
                 &bucket,
@@ -965,7 +965,7 @@ pub async fn put_flat_resumable_from_path_with_progress(
         .await
         .with_context(|| format!("Failed to read file: {}", file_path))?;
     let cb = progress_cb(progress);
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let manifest = std::path::PathBuf::from(manifest_path);
     let result = guard
         .put_object_encrypted_resumable_with_cancel_and_progress(
@@ -1013,7 +1013,7 @@ pub async fn resume_flat_upload_from_path_with_progress(
         .await
         .with_context(|| format!("Failed to read file: {}", file_path))?;
     let cb = progress_cb(progress);
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let manifest = std::path::PathBuf::from(manifest_path);
     let result = guard
         .resume_upload_with_cancel_and_progress(
@@ -1050,7 +1050,7 @@ pub async fn get_forest_subtree(
     bucket: String,
     prefix: String,
 ) -> anyhow::Result<ForestSubtree> {
-    let guard = client.inner.read().await;
+    let guard = &*client.inner;
     let subtree = guard.get_forest_subtree(&bucket, &prefix).await?;
 
     // Serialize the subtree
