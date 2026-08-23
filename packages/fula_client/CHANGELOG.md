@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.20] - 2026-08-23
+
+### Fixed
+
+- **The bridge no longer serialises every call behind one lock.**
+  `EncryptedClientHandle` wrapped the client in a single
+  `Arc<RwLock<EncryptedClient>>` -- not per-bucket. `loadForest` took the
+  EXCLUSIVE guard and held it across the whole network fetch, so ONE slow or
+  damaged bucket blocked every other call in the app, including reads of
+  healthy buckets. A Dart-side `.timeout()` could not rescue it: the binding
+  exposes no cancel handle for `loadForest`, so the Rust future kept running
+  and kept the guard after the caller gave up. The lock is removed rather than
+  made per-bucket -- `EncryptedClient` has no `&mut self` methods, and the
+  SDK already owns per-bucket locking (`forest_cache`, `migration_locks`,
+  `bucket_write_mutex`).
+
+- **Web builds now honour `timeoutSeconds`.** `reqwest`'s client-level
+  timeout is a no-op on `wasm32`, so the browser ran with NO request timeout
+  at all and a stalled fetch could hang for the lifetime of the tab. The wasm
+  build now sets the timeout per-request, which reqwest enforces with an
+  `AbortController`. A browser timeout surfaces as an ordinary transport
+  error, identical in shape to native.
+
+### Known issue
+
+- Key rotation (`rewrapObject` / `rotateBucket`) is no longer serialised
+  against uploads by the removed bridge lock. `rewrap_object_dek` is a
+  GET-modify-PUT that takes no per-bucket lock, so an upload landing between
+  its GET and PUT is overwritten by the re-encrypted old data. Fix is
+  `If-Match`/ETag optimistic concurrency inside `rewrap_object_dek`;
+  tracked separately.
 ## [0.6.12] - 2026-06-16
 
 ## [0.6.11] - 2026-06-16
