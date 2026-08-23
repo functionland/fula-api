@@ -36,6 +36,25 @@ services:
       - /var/lib/fula-gateway:/var/lib/fula-gateway
     network_mode: host
     restart: unless-stopped
+    # --- Blast-radius cap (2026-08-23) ---
+    # Measured on the live host: this container was holding 11.35 GiB of the
+    # box's 29.37 GiB while sitting at 1.3% CPU — i.e. idle but fat — against a
+    # configured 256 MB LRU block cache. Roughly 240 MB/hour of growth over a
+    # 47-hour uptime, which is a leak, not a working set.
+    #
+    # The box has NO swap and, until this line, no container had any limit at
+    # all. That combination means whichever service grows first invokes the
+    # kernel OOM killer against the WHOLE machine rather than against itself —
+    # and kubo/ipfs-cluster are started with `restart: no`, so collateral
+    # damage there does not come back on its own.
+    #
+    # 8g is deliberately generous: it leaves ~21 GiB for kubo, ipfs-cluster,
+    # postgres and the host, and at the observed leak rate gives ~33 hours
+    # between restarts. Paired with `restart: unless-stopped` above, the
+    # failure mode becomes "one container recycles" instead of "the host
+    # falls over". This CONTAINS the leak; it does not fix it — the 12 GiB
+    # RSS still wants its own investigation.
+    mem_limit: 8g
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/healthz"]
       interval: 30s
