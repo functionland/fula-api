@@ -195,9 +195,20 @@ async fn reconcile_once(pool: &PgPool, cluster_url: &str) -> anyhow::Result<u64>
     // minutes, which restarts the S3 gateway users upload through. Now only one
     // batch is ever alive.
     let mut cfg = ClusterConfig::with_url(cluster_url.to_string());
-    cfg.timeout = Duration::from_secs(300);
+    // reqwest's timeout is a TOTAL deadline — "from when the request starts
+    // connecting until the response body has finished". Buffering put the
+    // upserts AFTER the body was consumed, so 300s only had to cover the
+    // download (~90s measured). Streaming interleaves ~2000 upserts INTO the
+    // body read, so the deadline now covers the database too; at 300s a merely
+    // slow Postgres would abort the sweep every cycle and the mirror would
+    // never finish refreshing. This client is constructed here and used for
+    // nothing else, so the longer deadline cannot affect the S3 request path.
+    // Cycles are sequential (the loop awaits, then sleeps), so a long one
+    // cannot overlap the next.
+    cfg.timeout = Duration::from_secs(1800);
     let cluster = ClusterClient::new(cfg).await?;
 
+    let started = std::time::Instant::now();
     // Atomics, not `&mut`: an `FnMut` closure cannot let a mutable borrow of a
     // captured variable escape into the future it returns, and these counters
     // have to survive across batches.
@@ -260,6 +271,16 @@ async fn reconcile_once(pool: &PgPool, cluster_url: &str) -> anyhow::Result<u64>
     if named == 0 {
         anyhow::bail!("cluster returned 0 named pins ({streamed} streamed); keeping previous mirror");
     }
+    // Log the shape of the sweep: `streamed` is the whole pinset (2.1M in
+    // production) and `secs` is what the deadline above has to accommodate.
+    // If these ever approach the timeout, that is the signal to raise it or
+    // widen the interval — rather than discovering it as a silent no-op.
+    info!(
+        streamed,
+        named,
+        secs = started.elapsed().as_secs(),
+        "recovery reconcile: streamed cluster pinset"
+    );
     Ok(changed.load(Ordering::Relaxed))
 }
 
