@@ -100,6 +100,31 @@ impl Default for PinStatus {
     }
 }
 
+/// Locate the next COMPLETE newline-delimited line in `buf` starting at `from`.
+///
+/// Returns `(start, end, next_from)` where `buf[start..end]` is the line with
+/// its terminator stripped (CRLF as well as bare LF), and `next_from` is where
+/// scanning should resume. `None` means no complete line remains — the tail is
+/// a partial line that must wait for more bytes.
+///
+/// Split out from the streaming reader because this is the part that is easy to
+/// get subtly wrong: a line that straddles two network chunks, a `\r` that ends
+/// up alone at a chunk boundary, an empty line, or a final line with no
+/// terminator at all. Pure and allocation-free so it can be tested directly.
+fn next_ndjson_line(buf: &[u8], from: usize) -> Option<(usize, usize, usize)> {
+    if from >= buf.len() {
+        return None;
+    }
+    let offset = buf[from..].iter().position(|&b| b == b'\n')?;
+    let end = from + offset;
+    let trimmed = if end > from && buf[end - 1] == b'\r' {
+        end - 1
+    } else {
+        end
+    };
+    Some((from, trimmed, end + 1))
+}
+
 /// IPFS Cluster client
 #[derive(Clone)]
 pub struct ClusterClient {
@@ -387,6 +412,11 @@ impl ClusterClient {
     /// peers). Much faster than [`Self::list_pins`] for large pinsets —
     /// `GET /pins` aggregates per-peer status across the whole cluster (slow at
     /// 100k+ pins), whereas `GET /allocations` returns just the pin specs.
+    #[deprecated(
+        note = "buffers the ENTIRE pinset (1.17 GiB / 2.1M pins in production) as one String \
+                plus a Vec, which ratchets RSS until the container is OOM-killed. \
+                Use `for_each_allocation_batch`, which streams."
+    )]
     pub async fn list_allocations(&self) -> Result<Vec<PinAllocation>> {
         let url = format!("{}/allocations", self.config.api_url);
         let mut req = self.client.get(&url);
@@ -419,6 +449,112 @@ impl ClusterClient {
         }
 
         Ok(out)
+    }
+
+    /// Maximum length of a single NDJSON line before we refuse to keep
+    /// buffering. A well-formed pin spec is a few hundred bytes; anything
+    /// approaching this means the response is not what we think it is, and
+    /// buffering it unbounded is how a parser becomes a memory bug.
+    const MAX_ALLOCATION_LINE_BYTES: usize = 1024 * 1024;
+
+    /// Stream `/allocations` in fixed-size batches instead of materialising it.
+    ///
+    /// [`ClusterClient::list_allocations`] buffers the ENTIRE newline-delimited
+    /// body as one `String` and then a `Vec` of every pin. On the production
+    /// cluster that body is **1.17 GiB across 2.1M pins**, so each call briefly
+    /// holds well over a gigabyte — and because the allocator does not hand
+    /// freed arenas back to the OS, RSS ratchets upward every cycle until the
+    /// container hits its memory cap and is OOM-killed. Measured on the live
+    /// host: a kill every ~25 minutes, i.e. every couple of reconcile passes.
+    ///
+    /// This keeps only the current batch plus one partial line alive, so peak
+    /// memory is a few hundred KB however large the pinset grows. Returns the
+    /// number of pin specs streamed.
+    pub async fn for_each_allocation_batch<F, Fut>(
+        &self,
+        batch_size: usize,
+        mut on_batch: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(Vec<PinAllocation>) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<(), String>>,
+    {
+        use futures::StreamExt;
+
+        let batch_size = batch_size.max(1);
+        let url = format!("{}/allocations", self.config.api_url);
+        let mut req = self.client.get(&url);
+        if let Some((user, pass)) = &self.config.basic_auth {
+            req = req.basic_auth(user, Some(pass));
+        }
+
+        let response = req.send().await?;
+        if !response.status().is_success() {
+            let error = response.text().await.unwrap_or_default();
+            return Err(BlockStoreError::ClusterApi(format!(
+                "Failed to list allocations: {}",
+                error
+            )));
+        }
+
+        // Unknown fields are ignored by serde, so a line costs only cid + name.
+        fn parse_line(line: &[u8]) -> Result<Option<PinAllocation>> {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            serde_json::from_slice::<PinAllocation>(line)
+                .map(Some)
+                .map_err(|e| BlockStoreError::ClusterApi(e.to_string()))
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut batch: Vec<PinAllocation> = Vec::with_capacity(batch_size);
+        let mut total = 0usize;
+
+        while let Some(chunk) = stream.next().await {
+            pending.extend_from_slice(&chunk?);
+
+            let mut start = 0usize;
+            while let Some((line_start, line_end, next)) = next_ndjson_line(&pending, start) {
+                if let Some(pin) = parse_line(&pending[line_start..line_end])? {
+                    batch.push(pin);
+                    total += 1;
+                    if batch.len() >= batch_size {
+                        on_batch(std::mem::take(&mut batch))
+                            .await
+                            .map_err(BlockStoreError::ClusterApi)?;
+                        batch.reserve(batch_size);
+                    }
+                }
+                start = next;
+            }
+            pending.drain(..start);
+
+            if pending.len() > Self::MAX_ALLOCATION_LINE_BYTES {
+                return Err(BlockStoreError::ClusterApi(format!(
+                    "allocations stream: single line exceeded {} bytes",
+                    Self::MAX_ALLOCATION_LINE_BYTES
+                )));
+            }
+        }
+
+        // A final line with no trailing newline.
+        let tail = std::mem::take(&mut pending);
+        let tail_slice = if tail.last() == Some(&b'\r') {
+            &tail[..tail.len() - 1]
+        } else {
+            &tail[..]
+        };
+        if let Some(pin) = parse_line(tail_slice)? {
+            batch.push(pin);
+            total += 1;
+        }
+        if !batch.is_empty() {
+            on_batch(batch).await.map_err(BlockStoreError::ClusterApi)?;
+        }
+
+        Ok(total)
     }
 
     /// Add and pin data in one operation
@@ -563,6 +699,100 @@ mod tests {
         assert!(config.basic_auth.is_none());
     }
 
+    /// Collect every complete line the way the streaming reader does, so these
+    /// exercise the real loop shape rather than a re-implementation.
+    fn drain(buf: &mut Vec<u8>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        while let Some((s, e, next)) = next_ndjson_line(buf, start) {
+            out.push(String::from_utf8_lossy(&buf[s..e]).into_owned());
+            start = next;
+        }
+        buf.drain(..start);
+        out
+    }
+
+    #[test]
+    fn ndjson_splits_plain_lines_and_keeps_the_partial_tail() {
+        let mut buf = b"{\"a\":1}\n{\"b\":2}\n{\"c\"".to_vec();
+        assert_eq!(drain(&mut buf), vec!["{\"a\":1}", "{\"b\":2}"]);
+        // The incomplete third line must survive for the next chunk.
+        assert_eq!(buf, b"{\"c\"".to_vec());
+    }
+
+    #[test]
+    fn ndjson_reassembles_a_line_split_across_chunks() {
+        // The failure mode that matters: a pin spec straddling two network
+        // chunks must not be dropped or truncated.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"{\"cid\":\"bafy");
+        assert!(drain(&mut buf).is_empty(), "no complete line yet");
+        buf.extend_from_slice(b"aaa\",\"name\":\"k\"}\n");
+        assert_eq!(drain(&mut buf), vec!["{\"cid\":\"bafyaaa\",\"name\":\"k\"}"]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn ndjson_handles_crlf_including_a_lone_cr_at_a_chunk_boundary() {
+        let mut buf = b"{\"a\":1}\r\n{\"b\":2}\r".to_vec();
+        assert_eq!(drain(&mut buf), vec!["{\"a\":1}"]);
+        // The dangling \r belongs to an unterminated line; it must be kept.
+        assert_eq!(buf, b"{\"b\":2}\r".to_vec());
+        buf.extend_from_slice(b"\n");
+        assert_eq!(drain(&mut buf), vec!["{\"b\":2}"]);
+    }
+
+    #[test]
+    fn ndjson_yields_empty_lines_for_the_caller_to_skip() {
+        // Blank lines are legal filler in NDJSON; the reader skips them when
+        // parsing, but the splitter must still advance past them.
+        let mut buf = b"\n{\"a\":1}\n\n".to_vec();
+        assert_eq!(drain(&mut buf), vec!["", "{\"a\":1}", ""]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn ndjson_reports_nothing_for_an_unterminated_final_line() {
+        // The reader handles this tail explicitly after the stream ends;
+        // the splitter must NOT hand it over early.
+        let mut buf = b"{\"a\":1}".to_vec();
+        assert!(drain(&mut buf).is_empty());
+        assert_eq!(buf, b"{\"a\":1}".to_vec());
+    }
+
+    #[test]
+    fn ndjson_is_byte_exact_across_every_possible_chunk_split() {
+        // Feed the same payload one byte at a time and assert we recover the
+        // identical set of lines — the property that makes chunk boundaries
+        // irrelevant.
+        let payload = b"{\"cid\":\"a\",\"name\":\"x\"}\n{\"cid\":\"b\",\"name\":\"y\"}\n{\"cid\":\"c\",\"name\":\"z\"}\n";
+        let mut buf = Vec::new();
+        let mut got = Vec::new();
+        for byte in payload.iter() {
+            buf.push(*byte);
+            got.extend(drain(&mut buf));
+        }
+        assert_eq!(
+            got,
+            vec![
+                "{\"cid\":\"a\",\"name\":\"x\"}",
+                "{\"cid\":\"b\",\"name\":\"y\"}",
+                "{\"cid\":\"c\",\"name\":\"z\"}",
+            ]
+        );
+        assert!(buf.is_empty(), "nothing left pending");
+    }
+
+    #[test]
+    fn ndjson_parses_a_real_allocation_line_into_cid_and_name() {
+        // Unknown fields (allocations, replication factors, timestamps) must
+        // be ignored so a line costs only cid + name.
+        let line = br#"{"cid":"bafkr4ictest","name":"website-assets/foo.jpg","allocations":["12D3Koo"],"replication_factor_min":2,"replication_factor_max":3,"created":"2026-09-12T00:00:00Z"}"#;
+        let pin: PinAllocation = serde_json::from_slice(line).expect("parses");
+        assert_eq!(pin.cid, "bafkr4ictest");
+        assert_eq!(pin.name.as_deref(), Some("website-assets/foo.jpg"));
+    }
+
     #[test]
     fn test_config_with_auth() {
         let config = ClusterConfig::with_url("http://cluster:9094")
@@ -631,5 +861,153 @@ mod tests {
             peers[1].ipfs.as_ref().unwrap().addresses.as_ref().unwrap()[0],
             "/ip4/5.6.7.8/tcp/4001"
         );
+    }
+
+    async fn allocations_server(body: String) -> httpmock::MockServer {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/id");
+                then.status(200).body("{}");
+            })
+            .await;
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/allocations");
+                then.status(200).body(body.clone());
+            })
+            .await;
+        server
+    }
+
+    fn alloc_line(cid: &str, name: &str) -> String {
+        serde_json::json!({
+            "cid": cid,
+            "name": name,
+            "allocations": ["12D3KooWtest"],
+            "replication_factor_min": 2,
+            "replication_factor_max": 3,
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn for_each_allocation_batch_batches_and_streams_everything() {
+        // 2500 pins at a batch size of 1000 → 1000 / 1000 / 500, and every pin
+        // accounted for. The production pinset is 2.1M, so the batching is the
+        // whole point: only one batch is ever resident.
+        let body: String = (0..2500)
+            .map(|i| format!("{}\n", alloc_line(&format!("bafy{i}"), &format!("key/{i}"))))
+            .collect();
+        let server = allocations_server(body).await;
+        let client = ClusterClient::new(ClusterConfig::with_url(server.base_url()))
+            .await
+            .unwrap();
+
+        let mut sizes = Vec::new();
+        let mut seen = Vec::new();
+        let total = client
+            .for_each_allocation_batch(1000, |batch| {
+                sizes.push(batch.len());
+                for p in &batch {
+                    seen.push(p.cid.clone());
+                }
+                async { Ok(()) }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(total, 2500);
+        assert_eq!(sizes, vec![1000, 1000, 500]);
+        assert_eq!(seen.len(), 2500);
+        assert_eq!(seen[0], "bafy0");
+        assert_eq!(seen[2499], "bafy2499");
+    }
+
+    #[tokio::test]
+    async fn for_each_allocation_batch_skips_blank_lines_and_a_missing_final_newline() {
+        let body = format!(
+            "{}\n\n{}",
+            alloc_line("bafyA", "a"),
+            alloc_line("bafyB", "b") // no trailing newline
+        );
+        let server = allocations_server(body).await;
+        let client = ClusterClient::new(ClusterConfig::with_url(server.base_url()))
+            .await
+            .unwrap();
+
+        let mut seen = Vec::new();
+        let total = client
+            .for_each_allocation_batch(1000, |batch| {
+                for p in &batch {
+                    seen.push(p.cid.clone());
+                }
+                async { Ok(()) }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(total, 2, "blank line skipped, unterminated last line kept");
+        assert_eq!(seen, vec!["bafyA".to_string(), "bafyB".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn for_each_allocation_batch_aborts_when_the_callback_fails() {
+        // A DB failure mid-stream must stop the sweep and surface, not be
+        // silently swallowed while the remaining batches keep writing.
+        let body: String = (0..3000)
+            .map(|i| format!("{}\n", alloc_line(&format!("bafy{i}"), &format!("k{i}"))))
+            .collect();
+        let server = allocations_server(body).await;
+        let client = ClusterClient::new(ClusterConfig::with_url(server.base_url()))
+            .await
+            .unwrap();
+
+        let mut calls = 0usize;
+        let err = client
+            .for_each_allocation_batch(1000, |_batch| {
+                calls += 1;
+                let fail = calls == 2;
+                async move {
+                    if fail {
+                        Err("upsert failed: boom".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err}").contains("boom"), "got: {err}");
+        assert_eq!(calls, 2, "stopped at the failing batch");
+    }
+
+    #[tokio::test]
+    async fn for_each_allocation_batch_reports_an_http_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/id");
+                then.status(200).body("{}");
+            })
+            .await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/allocations");
+                then.status(500).body("cluster exploded");
+            })
+            .await;
+
+        let client = ClusterClient::new(ClusterConfig::with_url(server.base_url()))
+            .await
+            .unwrap();
+        let err = client
+            .for_each_allocation_batch(1000, |_b| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("Failed to list allocations"), "got: {err}");
     }
 }

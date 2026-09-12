@@ -33,6 +33,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Rows per upsert round-trip, and therefore the only thing held in memory
+/// while the pinset streams past. 1000 keeps the UNNEST arrays small enough to
+/// bind comfortably while still amortising the round-trip over 2M+ pins.
+const UPSERT_BATCH: usize = 1000;
+
 use bytes::Bytes;
 use cid::Cid;
 use fula_blockstore::{BlockStore, ClusterClient, ClusterConfig};
@@ -179,47 +184,83 @@ async fn ensure_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
 async fn reconcile_once(pool: &PgPool, cluster_url: &str) -> anyhow::Result<u64> {
     // Use `/allocations` (pin SPECS: cid + name), NOT `/pins` (per-peer STATUS
     // aggregation, which is far too slow — it timed out at 300s on a 345k-pin
-    // cluster, while `/allocations` returns the same set in ~23s). Still buffers
-    // the response transiently (~a few hundred MB at very large scale);
-    // streaming is a future optimization if memory pressure shows up. The
-    // generous timeout guards a slow cluster without risking the 60s default.
+    // cluster, while `/allocations` returns the same set in ~23s). The generous
+    // timeout guards a slow cluster without risking the 60s default.
+    //
+    // STREAMED, not buffered. Reading the whole body first used to hold 1.17 GiB
+    // (2.1M pins on the production cluster) as a single String, plus a Vec of
+    // every pin, plus a dedup HashMap, plus a duplicate Vec — and since freed
+    // arenas are not returned to the OS, RSS ratcheted up every pass until the
+    // 8 GiB container cap killed the gateway. Measured: an OOM kill every ~25
+    // minutes, which restarts the S3 gateway users upload through. Now only one
+    // batch is ever alive.
     let mut cfg = ClusterConfig::with_url(cluster_url.to_string());
     cfg.timeout = Duration::from_secs(300);
     let cluster = ClusterClient::new(cfg).await?;
-    let pins = cluster.list_allocations().await?;
 
-    // Dedup by name (last CID wins) so a single UNNEST upsert can't hit the
-    // same conflict row twice, and so versioned duplicates collapse.
-    let mut map: HashMap<String, String> = HashMap::with_capacity(pins.len());
-    for p in pins {
-        if let Some(name) = p.name {
-            if !name.is_empty() && !p.cid.is_empty() {
-                map.insert(name, p.cid);
+    // Atomics, not `&mut`: an `FnMut` closure cannot let a mutable borrow of a
+    // captured variable escape into the future it returns, and these counters
+    // have to survive across batches.
+    let changed = AtomicU64::new(0);
+    let named = AtomicU64::new(0);
+
+    let streamed = cluster
+        .for_each_allocation_batch(UPSERT_BATCH, |batch| {
+            // Dedup WITHIN the batch: one UNNEST upsert must not hit the same
+            // conflict row twice. Across batches a later occurrence simply
+            // overwrites the earlier one, which is the same "last CID wins"
+            // the whole-set HashMap gave us.
+            let mut map: HashMap<String, String> = HashMap::with_capacity(batch.len());
+            for p in batch {
+                if let Some(name) = p.name {
+                    if !name.is_empty() && !p.cid.is_empty() {
+                        map.insert(name, p.cid);
+                    }
+                }
             }
-        }
-    }
-    if map.is_empty() {
-        anyhow::bail!("cluster returned 0 named pins; keeping previous mirror");
-    }
-
-    let entries: Vec<(String, String)> = map.into_iter().collect();
-    let mut changed = 0u64;
-    for chunk in entries.chunks(1000) {
-        let names: Vec<String> = chunk.iter().map(|(n, _)| n.clone()).collect();
-        let cids: Vec<String> = chunk.iter().map(|(_, c)| c.clone()).collect();
-        let res = sqlx::query(
-            "INSERT INTO recovery_key_cid (name, cid, synced_at) \
-             SELECT u.name, u.cid, now() FROM UNNEST($1::text[], $2::text[]) AS u(name, cid) \
-             ON CONFLICT (name) DO UPDATE SET cid = EXCLUDED.cid, synced_at = now() \
-             WHERE recovery_key_cid.cid IS DISTINCT FROM EXCLUDED.cid",
-        )
-        .bind(&names)
-        .bind(&cids)
-        .execute(pool)
+            let changed_ref: &AtomicU64 = &changed;
+            let named_ref: &AtomicU64 = &named;
+            async move {
+                if map.is_empty() {
+                    return Ok(());
+                }
+                named_ref.fetch_add(map.len() as u64, Ordering::Relaxed);
+                let mut names: Vec<String> = Vec::with_capacity(map.len());
+                let mut cids: Vec<String> = Vec::with_capacity(map.len());
+                for (n, c) in map {
+                    names.push(n);
+                    cids.push(c);
+                }
+                let res = sqlx::query(
+                    "INSERT INTO recovery_key_cid (name, cid, synced_at) \
+                     SELECT u.name, u.cid, now() FROM UNNEST($1::text[], $2::text[]) AS u(name, cid) \
+                     ON CONFLICT (name) DO UPDATE SET cid = EXCLUDED.cid, synced_at = now() \
+                     WHERE recovery_key_cid.cid IS DISTINCT FROM EXCLUDED.cid",
+                )
+                .bind(&names)
+                .bind(&cids)
+                .execute(pool)
+                .await;
+                match res {
+                    Ok(r) => {
+                        changed_ref.fetch_add(r.rows_affected(), Ordering::Relaxed);
+                        Ok(())
+                    }
+                    // Aborts the stream; surfaces through the `?` below.
+                    Err(e) => Err(format!("upsert failed: {e}")),
+                }
+            }
+        })
         .await?;
-        changed += res.rows_affected();
+
+    // Same guard as before: a transient empty/garbled response must never be
+    // read as "the cluster has nothing". Upserts only ever ADD or UPDATE, so
+    // nothing was wiped either way — this just reports it honestly.
+    let named = named.load(Ordering::Relaxed);
+    if named == 0 {
+        anyhow::bail!("cluster returned 0 named pins ({streamed} streamed); keeping previous mirror");
     }
-    Ok(changed)
+    Ok(changed.load(Ordering::Relaxed))
 }
 
 /// Background loop: build/refresh the cluster→CID mirror every `interval`.
